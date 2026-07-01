@@ -184,6 +184,50 @@ static void test_embed(q27::DeviceModel& dm, const q27::Model& m) {
     check("embed_row_q8(token 1234)", maxd, 1e-6);
 }
 
+static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
+    const q27::Tensor& t = m.get(name);
+    const q27::DevTensor& d = dm.upload(name);
+    int64_t rows = t.rows(), cols = t.cols();
+    const int NB = 3;
+
+    q27k::XQuant xqs[4];
+    float *d_x, *d_yb, *d_y1;
+    CUDA_CHECK(cudaMalloc(&d_x, cols * 4));
+    CUDA_CHECK(cudaMalloc(&d_yb, (size_t)NB * rows * 4));
+    CUDA_CHECK(cudaMalloc(&d_y1, rows * 4));
+    for (int n = 0; n < NB; n++) {
+        std::vector<float> x = rand_vec(cols, 100 + n);
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), cols * 4, cudaMemcpyHostToDevice));
+        xqs[n] = q27k::xquant_alloc(cols);
+        q27k::quantize_x(d_x, cols, xqs[n]);
+    }
+    double maxd = 0;
+    if (t.dtype == DType::Q4_G64) {
+        q27k::gemv_q4_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, d_yb, rows, cols);
+        for (int n = 0; n < NB; n++) {
+            q27k::gemv_q4((const uint8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
+            std::vector<float> yb(rows), y1(rows);
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
+            for (int64_t r = 0; r < rows; r++)
+                maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
+        }
+    } else {
+        q27k::gemv_q8_n((const int8_t*)d.data, (const __half*)d.scales, xqs, NB, d_yb, rows, cols);
+        for (int n = 0; n < NB; n++) {
+            q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
+            std::vector<float> yb(rows), y1(rows);
+            CUDA_CHECK(cudaMemcpy(yb.data(), d_yb + (size_t)n * rows, rows * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(y1.data(), d_y1, rows * 4, cudaMemcpyDeviceToHost));
+            for (int64_t r = 0; r < rows; r++)
+                maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
+        }
+    }
+    char label[128];
+    snprintf(label, sizeof label, "gemv_n(3) vs 3x gemv %s", name);
+    check(label, maxd, 1e-5); // same math, same order -> near bit-identical
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -195,6 +239,8 @@ int main(int argc, char** argv) {
     test_gemv(dm, m, "blk.0.ffn_gate.weight");      // Q4 GEMV
     test_gemv(dm, m, "blk.3.attn_k.weight");        // Q8 GEMV
     test_gemv(dm, m, "blk.0.ssm_alpha.weight");     // F16 GEMV
+    test_gemv_batch(dm, m, "blk.0.ffn_gate.weight");
+    test_gemv_batch(dm, m, "blk.3.attn_k.weight");
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

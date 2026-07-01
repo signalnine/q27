@@ -29,6 +29,13 @@ void gemv_q4(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int6
              int64_t cols, cudaStream_t st = 0);
 void gemv_q8(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
              int64_t cols, cudaStream_t st = 0);
+
+// Batched: one weight pass, N quantized activation columns -> y[n][rows]
+// (y column-major by batch: y + n*rows). N in 2..4. The speculative-verify core.
+void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch, float* y,
+               int64_t rows, int64_t cols, cudaStream_t st = 0);
+void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* xqs, int nbatch, float* y,
+               int64_t rows, int64_t cols, cudaStream_t st = 0);
 void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t cols,
               cudaStream_t st = 0);
 

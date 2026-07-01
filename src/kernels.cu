@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "cuda_common.h"
 #include "kernels.cuh"
 
@@ -176,6 +178,135 @@ __global__ void k_gemv_q8(const int8_t* __restrict__ W, const __half* __restrict
     }
     acc = warp_reduce(acc);
     if (lane == 0) y[row] = acc;
+}
+
+// ---------------- batched GEMV (speculative verify) ----------------
+// Same warp-per-row walk as the single-column kernels, but each weight chunk is
+// dp4a'd against N activation columns. Weight bytes amortize N ways.
+
+template <int N>
+__global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                            const uint2* __restrict__ eo0, const uint2* __restrict__ eo1,
+                            const uint2* __restrict__ eo2, const uint2* __restrict__ eo3,
+                            const float* __restrict__ xs0, const float* __restrict__ xs1,
+                            const float* __restrict__ xs2, const float* __restrict__ xs3,
+                            const int* __restrict__ is0, const int* __restrict__ is1,
+                            const int* __restrict__ is2, const int* __restrict__ is3,
+                            float* __restrict__ y, int64_t rows, int64_t cols) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint4* wr = (const uint4*)(W + row * (cols / 2));
+    const __half* sr = S + row * (cols / 64);
+    const int n_chunks = (int)(cols / 32);
+
+    const uint2* eos[4] = {eo0, eo1, eo2, eo3};
+    const float* xss[4] = {xs0, xs1, xs2, xs3};
+    const int* iss[4] = {is0, is1, is2, is3};
+    float acc[N];
+#pragma unroll
+    for (int n = 0; n < N; n++) acc[n] = 0.f;
+
+    for (int ch = lane; ch < n_chunks; ch += 32) {
+        uint4 w = __ldg(wr + ch);
+        const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+        float wsc = __half2float(__ldg(sr + (ch >> 1)));
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            const uint2* xp = eos[n] + (size_t)ch * 4;
+            int di = 0;
+#pragma unroll
+            for (int u = 0; u < 4; u++) {
+                uint2 xv = __ldg(xp + u);
+                di = __dp4a((int)(ws[u] & 0x0F0F0F0Fu), (int)xv.x, di);
+                di = __dp4a((int)((ws[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
+            }
+            acc[n] += wsc * __ldg(xss[n] + ch) * (float)(di - 8 * __ldg(iss[n] + ch));
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; n++) {
+        float v = warp_reduce(acc[n]);
+        if (lane == 0) y[(size_t)n * rows + row] = v;
+    }
+}
+
+template <int N>
+__global__ void k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
+                            const int8_t* __restrict__ n0, const int8_t* __restrict__ n1,
+                            const int8_t* __restrict__ n2, const int8_t* __restrict__ n3,
+                            const float* __restrict__ xs0, const float* __restrict__ xs1,
+                            const float* __restrict__ xs2, const float* __restrict__ xs3,
+                            float* __restrict__ y, int64_t rows, int64_t cols) {
+    int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const uint4* wr = (const uint4*)(W + row * cols);
+    const __half* sr = S + row * (cols / 128);
+    const int n_chunks = (int)(cols / 32);
+
+    const int8_t* nats[4] = {n0, n1, n2, n3};
+    const float* xss[4] = {xs0, xs1, xs2, xs3};
+    float acc[N];
+#pragma unroll
+    for (int n = 0; n < N; n++) acc[n] = 0.f;
+
+    for (int ch = lane; ch < n_chunks; ch += 32) {
+        uint4 w0 = __ldg(wr + 2 * ch), w1 = __ldg(wr + 2 * ch + 1);
+        float wsc = __half2float(__ldg(sr + (ch >> 2)));
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            const uint4* xr = (const uint4*)nats[n];
+            uint4 x0 = __ldg(xr + 2 * ch), x1 = __ldg(xr + 2 * ch + 1);
+            int di = 0;
+            di = __dp4a((int)w0.x, (int)x0.x, di);
+            di = __dp4a((int)w0.y, (int)x0.y, di);
+            di = __dp4a((int)w0.z, (int)x0.z, di);
+            di = __dp4a((int)w0.w, (int)x0.w, di);
+            di = __dp4a((int)w1.x, (int)x1.x, di);
+            di = __dp4a((int)w1.y, (int)x1.y, di);
+            di = __dp4a((int)w1.z, (int)x1.z, di);
+            di = __dp4a((int)w1.w, (int)x1.w, di);
+            acc[n] += wsc * __ldg(xss[n] + ch) * (float)di;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < N; n++) {
+        float v = warp_reduce(acc[n]);
+        if (lane == 0) y[(size_t)n * rows + row] = v;
+    }
+}
+
+void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float* y,
+               int64_t rows, int64_t cols, cudaStream_t st) {
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    const XQuant &a = q[0], &b = q[nb > 1 ? 1 : 0], &c = q[nb > 2 ? 2 : 0], &d = q[nb > 3 ? 3 : 0];
+    switch (nb) {
+        case 2: k_gemv_q4_n<2><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+        case 3: k_gemv_q4_n<3><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+        case 4: k_gemv_q4_n<4><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+        default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float* y, int64_t rows,
+               int64_t cols, cudaStream_t st) {
+    unsigned blocks = (unsigned)((rows + 7) / 8);
+    const XQuant &a = q[0], &b = q[nb > 1 ? 1 : 0], &c = q[nb > 2 ? 2 : 0], &d = q[nb > 3 ? 3 : 0];
+    switch (nb) {
+        case 2: k_gemv_q8_n<2><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
+                b.scale, c.scale, d.scale, y, rows, cols); break;
+        case 3: k_gemv_q8_n<3><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
+                b.scale, c.scale, d.scale, y, rows, cols); break;
+        case 4: k_gemv_q8_n<4><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
+                b.scale, c.scale, d.scale, y, rows, cols); break;
+        default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void k_gemv_f16(const __half* __restrict__ W, const float* __restrict__ x,
