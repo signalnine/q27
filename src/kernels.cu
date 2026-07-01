@@ -192,7 +192,9 @@ __global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restr
                             const float* __restrict__ xs2, const float* __restrict__ xs3,
                             const int* __restrict__ is0, const int* __restrict__ is1,
                             const int* __restrict__ is2, const int* __restrict__ is3,
-                            float* __restrict__ y, int64_t rows, int64_t cols) {
+                            float* __restrict__ y0, float* __restrict__ y1,
+                            float* __restrict__ y2, float* __restrict__ y3,
+                            int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -224,10 +226,11 @@ __global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restr
             acc[n] += wsc * __ldg(xss[n] + ch) * (float)(di - 8 * __ldg(iss[n] + ch));
         }
     }
+    float* const yy[4] = {y0, y1, y2, y3};
 #pragma unroll
     for (int n = 0; n < N; n++) {
         float v = warp_reduce(acc[n]);
-        if (lane == 0) y[(size_t)n * rows + row] = v;
+        if (lane == 0) yy[n][row] = v;
     }
 }
 
@@ -237,7 +240,9 @@ __global__ void k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restri
                             const int8_t* __restrict__ n2, const int8_t* __restrict__ n3,
                             const float* __restrict__ xs0, const float* __restrict__ xs1,
                             const float* __restrict__ xs2, const float* __restrict__ xs3,
-                            float* __restrict__ y, int64_t rows, int64_t cols) {
+                            float* __restrict__ y0, float* __restrict__ y1,
+                            float* __restrict__ y2, float* __restrict__ y3,
+                            int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -270,40 +275,46 @@ __global__ void k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restri
             acc[n] += wsc * __ldg(xss[n] + ch) * (float)di;
         }
     }
+    float* const yy[4] = {y0, y1, y2, y3};
 #pragma unroll
     for (int n = 0; n < N; n++) {
         float v = warp_reduce(acc[n]);
-        if (lane == 0) y[(size_t)n * rows + row] = v;
+        if (lane == 0) yy[n][row] = v;
     }
 }
 
-void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float* y,
+void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float* const* ys,
                int64_t rows, int64_t cols, cudaStream_t st) {
     unsigned blocks = (unsigned)((rows + 7) / 8);
     const XQuant &a = q[0], &b = q[nb > 1 ? 1 : 0], &c = q[nb > 2 ? 2 : 0], &d = q[nb > 3 ? 3 : 0];
+    float *y0 = ys[0], *y1 = ys[nb > 1 ? 1 : 0], *y2 = ys[nb > 2 ? 2 : 0], *y3 = ys[nb > 3 ? 3 : 0];
     switch (nb) {
         case 2: k_gemv_q4_n<2><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
-                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y0, y1, y2, y3, rows,
+                cols); break;
         case 3: k_gemv_q4_n<3><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
-                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y0, y1, y2, y3, rows,
+                cols); break;
         case 4: k_gemv_q4_n<4><<<blocks, 256, 0, st>>>(W, S, a.eo, b.eo, c.eo, d.eo, a.scale,
-                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y, rows, cols); break;
+                b.scale, c.scale, d.scale, a.isum, b.isum, c.isum, d.isum, y0, y1, y2, y3, rows,
+                cols); break;
         default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float* y, int64_t rows,
-               int64_t cols, cudaStream_t st) {
+void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float* const* ys,
+               int64_t rows, int64_t cols, cudaStream_t st) {
     unsigned blocks = (unsigned)((rows + 7) / 8);
     const XQuant &a = q[0], &b = q[nb > 1 ? 1 : 0], &c = q[nb > 2 ? 2 : 0], &d = q[nb > 3 ? 3 : 0];
+    float *y0 = ys[0], *y1 = ys[nb > 1 ? 1 : 0], *y2 = ys[nb > 2 ? 2 : 0], *y3 = ys[nb > 3 ? 3 : 0];
     switch (nb) {
         case 2: k_gemv_q8_n<2><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
-                b.scale, c.scale, d.scale, y, rows, cols); break;
+                b.scale, c.scale, d.scale, y0, y1, y2, y3, rows, cols); break;
         case 3: k_gemv_q8_n<3><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
-                b.scale, c.scale, d.scale, y, rows, cols); break;
+                b.scale, c.scale, d.scale, y0, y1, y2, y3, rows, cols); break;
         case 4: k_gemv_q8_n<4><<<blocks, 256, 0, st>>>(W, S, a.nat, b.nat, c.nat, d.nat, a.scale,
-                b.scale, c.scale, d.scale, y, rows, cols); break;
+                b.scale, c.scale, d.scale, y0, y1, y2, y3, rows, cols); break;
         default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());

@@ -203,7 +203,8 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
     }
     double maxd = 0;
     if (t.dtype == DType::Q4_G64) {
-        q27k::gemv_q4_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, d_yb, rows, cols);
+        float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
+        q27k::gemv_q4_n((const uint8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
         for (int n = 0; n < NB; n++) {
             q27k::gemv_q4((const uint8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
             std::vector<float> yb(rows), y1(rows);
@@ -213,7 +214,8 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
                 maxd = std::max(maxd, (double)std::fabs(yb[r] - y1[r]));
         }
     } else {
-        q27k::gemv_q8_n((const int8_t*)d.data, (const __half*)d.scales, xqs, NB, d_yb, rows, cols);
+        float* const ysb[3] = {d_yb, d_yb + rows, d_yb + 2 * rows};
+        q27k::gemv_q8_n((const int8_t*)d.data, (const __half*)d.scales, xqs, NB, ysb, rows, cols);
         for (int n = 0; n < NB; n++) {
             q27k::gemv_q8((const int8_t*)d.data, (const __half*)d.scales, xqs[n], d_y1, rows, cols);
             std::vector<float> yb(rows), y1(rows);

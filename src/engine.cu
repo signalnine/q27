@@ -53,6 +53,12 @@ struct Engine {
     float *S_spare[N_LAYER], *ring_spare[N_LAYER];
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
+    int parity = 0; // which of S/S_spare (and rings) is primary; flips on accept
+    cudaGraphExec_t spec_graph[2] = {nullptr, nullptr};
+    float* Sp(int il) { return parity ? S_spare[il] : S[il]; }
+    float* Ss(int il) { return parity ? S[il] : S_spare[il]; }
+    float* Rp(int il) { return parity ? ring_spare[il] : conv_ring[il]; }
+    float* Rs(int il) { return parity ? conv_ring[il] : ring_spare[il]; }
     q27k::XQuant xq;
     // layer state
     float* conv_ring[N_LAYER];
@@ -275,17 +281,15 @@ struct Engine {
         q27k::quantize_x(xa, cols, xq2[0], stm);
         q27k::quantize_x(xb, cols, xq2[1], stm);
     }
-    // batched matmul over xq2 -> writes [2][rows] into y2big; returns per-token ptrs
+    // batched matmul over xq2, direct per-token outputs (no split copies)
     void mm2(const DevTensor& w, float* out_a, float* out_b) {
+        float* const ys[2] = {out_a, out_b};
         if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, xq2, 2, y2big,
-                            w.rows, w.cols, stm);
+            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, xq2, 2, ys, w.rows,
+                            w.cols, stm);
         else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, xq2, 2, y2big,
-                            w.rows, w.cols, stm);
-        CUDA_CHECK(cudaMemcpyAsync(out_a, y2big, w.rows * 4, cudaMemcpyDeviceToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(out_b, y2big + w.rows, w.rows * 4, cudaMemcpyDeviceToDevice,
-                                   stm));
+            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, xq2, 2, ys, w.rows,
+                            w.cols, stm);
     }
 
     void gdn_pair(int il) {
@@ -306,14 +310,14 @@ struct Engine {
         q27k::gdn_gates(alpha, betar, sa, sdt, g, beta, GDN_HEADS, stm);
         q27k::gdn_gates(alpha_b, betar_b, sa, sdt, g_b, beta_b, GDN_HEADS, stm);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
-        q27k::conv_step(conv_ring[il], conv_ring[il], qkv, cw, convout, GDN_CH, stm); // a: commit
-        q27k::conv_step(conv_ring[il], ring_spare[il], qkv_b, cw, convout_b, GDN_CH, stm); // b
+        q27k::conv_step(Rp(il), Rp(il), qkv, cw, convout, GDN_CH, stm);   // a: commit in place
+        q27k::conv_step(Rp(il), Rs(il), qkv_b, cw, convout_b, GDN_CH, stm); // b: to spare
         q27k::l2norm_heads(convout, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout + 2048, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout_b, 16, GDN_DIM, eps, stm);
         q27k::l2norm_heads(convout_b + 2048, 16, GDN_DIM, eps, stm);
-        q27k::delta_step(S[il], S[il], convout, g, beta, o, stm);          // a: commit
-        q27k::delta_step(S[il], S_spare[il], convout_b, g_b, beta_b, o_b, stm); // b: spare
+        q27k::delta_step(Sp(il), Sp(il), convout, g, beta, o, stm);        // a: commit
+        q27k::delta_step(Sp(il), Ss(il), convout_b, g_b, beta_b, o_b, stm); // b: spare
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
         q27k::gated_norm_gdn(o, nw, z, og, GDN_HEADS, GDN_DIM, eps, stm);
         q27k::gated_norm_gdn(o_b, nw, z_b, og_b, GDN_HEADS, GDN_DIM, eps, stm);
@@ -361,14 +365,9 @@ struct Engine {
         mm2(T(il, "ffn_down.weight"), y, y_b);
     }
 
-    // one speculative round; returns tokens emitted (1 or 2)
-    // entry: d_token = committed next token t1, h_next = h(P) post-output-norm
-    // host `pos` = P (position of last committed processed token)
-    int spec_round(int P, int* emit) {
-        int pa = P + 1, pb = P + 2;
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &pa, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &pb, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &pa, 4, cudaMemcpyHostToDevice, stm));
+    // launch sequence for one speculative round (graph-capturable: all state
+    // through device memory, pointers fixed for a given parity)
+    void spec_round_launches() {
         mtp_forward(); // -> d_draft (uses shared a-side buffers; done before pair pass)
 
         const DevTensor& emb = dm.get("token_embd.weight");
@@ -395,13 +394,51 @@ struct Engine {
         q27k::rmsnorm(h, on, x1, N_EMBD, EPS, stm);
         q27k::rmsnorm(h_b, on, x1_b, N_EMBD, EPS, stm);
         qx2(x1, x1_b, N_EMBD);
-        {
-            const DevTensor& w = dm.get("output.weight");
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, xq2, 2, logits2,
-                            w.rows, w.cols, stm);
-        }
+        mm2(dm.get("output.weight"), logits2, logits2 + VOCAB);
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
         q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
+    }
+
+    void build_spec_graphs() {
+        // one warm (executing) round to initialize lazy CUDA state, then reset
+        int z0 = 0, z1 = 1;
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
+        spec_round_launches();
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
+                CUDA_CHECK(cudaMemset(S[il], 0, sb));
+                CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
+                CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
+            }
+        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        // capture both parities (capture records; it does not execute)
+        for (int p = 0; p < 2; p++) {
+            parity = p;
+            cudaGraph_t gr;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_round_launches();
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
+            CUDA_CHECK(cudaGraphInstantiate(&spec_graph[p], gr, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gr));
+        }
+        parity = 0;
+        fprintf(stderr, "spec graphs captured (parity pair)\n");
+    }
+
+    // one speculative round; returns tokens emitted (1 or 2)
+    int spec_round(int P, int* emit) {
+        int pa = P + 1, pb = P + 2;
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &pa, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &pb, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &pa, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaGraphLaunch(spec_graph[parity], stm));
 
         int va, vb, draft, t1;
         CUDA_CHECK(cudaMemcpyAsync(&va, d_va, 4, cudaMemcpyDeviceToHost, stm));
@@ -410,12 +447,8 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(&t1, d_token, 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
 
-        if (va == draft) { // accept: commit b's state, emit t1 + draft, next = vb
-            for (int il = 0; il < N_LAYER; il++)
-                if (!attn_layer[il]) {
-                    std::swap(S[il], S_spare[il]);
-                    std::swap(conv_ring[il], ring_spare[il]);
-                }
+        if (va == draft) { // accept: b's spare state becomes primary (parity flip)
+            parity ^= 1;
             emit[0] = t1; emit[1] = draft;
             CUDA_CHECK(cudaMemcpyAsync(d_token, &vb, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(h_next, x1_b, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
@@ -489,6 +522,7 @@ int main(int argc, char** argv) {
 
     Engine e(path, ctx);
     e.build_graph();
+    if (spec) e.build_spec_graphs();
 
     // prompt (with MTP KV warmup when measuring acceptance: pair h(i) with the
     // ACTUAL next prompt token at position i+1, mirroring llama.cpp prefill)
