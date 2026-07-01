@@ -1,0 +1,3 @@
+*.q27
+__pycache__/
+build/
