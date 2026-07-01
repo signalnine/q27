@@ -35,6 +35,8 @@ def policy(name: str) -> int:
         return DTYPE_F16
     if name in ("token_embd.weight", "output.weight") or name.startswith("blk.64."):
         return DTYPE_Q8
+    if re.match(r"blk\.\d+\.attn_(k|v)\.weight$", name):
+        return DTYPE_Q8  # KV projections: worst Q4 RMSE + errors persist in KV cache; ~84 MB total
     if name.endswith(".weight"):
         return DTYPE_Q4
     return DTYPE_F32  # biases and anything unrecognized stay f32
@@ -93,7 +95,7 @@ def main():
     t0 = time.time()
     r = GGUFReader(args.input)
 
-    meta = {"q27_version": VERSION, "quant_policy": "v1",
+    meta = {"q27_version": VERSION, "quant_policy": "v1.1",
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
