@@ -128,16 +128,16 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_kv_store3(CP3 kp, CP3 vp, float* __restrict__ kc, float* __restrict__ vc,
+__global__ void k_kv_store3(CP3 kp, CP3 vp, __half* __restrict__ kc, __half* __restrict__ vc,
                             IP3 pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
     size_t off = (size_t)(*pos.p[t]) * rowlen + i;
-    kc[off] = kp.p[t][i];
-    vc[off] = vp.p[t][i];
+    kc[off] = __float2half_rn(kp.p[t][i]);
+    vc[off] = __float2half_rn(vp.p[t][i]);
 }
-void kv_store3(CP3 k, CP3 v, float* kc, float* vc, IP3 pos, int rowlen, cudaStream_t st) {
+void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st) {
     dim3 g((rowlen + 255) / 256, 3);
     k_kv_store3<<<g, 256, 0, st>>>(k, v, kc, vc, pos, rowlen);
     CUDA_CHECK(cudaGetLastError());
@@ -152,8 +152,8 @@ static inline P3 out2p(float* o) { return P3{{o, o, o}}; }
 static constexpr int FD_NS = 16;   // splits over positions
 static constexpr int FD_ST = 258;  // per-partial stride: m, l, acc[256]
 
-__global__ void k_attn_fd(CP3 qp, int q_stride, const float* __restrict__ kc,
-                          const float* __restrict__ vc, float* __restrict__ part, IP3 pos,
+__global__ void k_attn_fd(CP3 qp, int q_stride, const __half* __restrict__ kc,
+                          const __half* __restrict__ vc, float* __restrict__ part, IP3 pos,
                           int n_kv_heads, int gqa, int head_dim, float scale) {
     const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
     const int seq = *pos.p[t] + 1;
@@ -179,13 +179,13 @@ __global__ void k_attn_fd(CP3 qp, int q_stride, const float* __restrict__ kc,
     float* accw = s_acc + warp * 6 * 256;
 
     for (int p = p_lo + warp; p < p_hi; p += NW) {
-        const float* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        const float* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        const __half* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        const __half* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
         float kv[8], vv[8];
 #pragma unroll
         for (int u = 0; u < 8; u++) {
-            kv[u] = kp[lane + 32 * u];
-            vv[u] = vp[lane + 32 * u];
+            kv[u] = __half2float(kp[lane + 32 * u]);
+            vv[u] = __half2float(vp[lane + 32 * u]);
         }
 #pragma unroll
         for (int j = 0; j < 6; j++) {
@@ -260,7 +260,7 @@ __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n
     }
 }
 
-void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out, float* scratch,
+void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st) {
     (void)max_ctx;
@@ -281,7 +281,7 @@ void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out,
 }
 
 // single-token plain-path attention through the same flash-decode kernels
-void attn_decode(const float* q, int q_stride, const float* kcache, const float* vcache,
+void attn_decode(const float* q, int q_stride, const __half* kcache, const __half* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
                  int n_kv_heads, int head_dim, float scale, cudaStream_t st) {
     (void)max_ctx;

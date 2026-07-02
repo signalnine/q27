@@ -47,7 +47,7 @@ struct Engine {
     unsigned long long* d_amax;
     // MTP draft head state (stage 1: host-driven acceptance measurement)
     float *h_next, *e_hn, *x_mtp, *mtp_logits;
-    float *mtp_k, *mtp_v;
+    __half *mtp_k, *mtp_v;
     int *d_pos_m, *d_draft;
     // speculative decode (depth-1): b-token buffers, spare GDN state, batch quant
     float *h_b, *x1_b, *y_b, *qg_b, *kbuf_b, *vbuf_b, *attnout_b;
@@ -102,7 +102,7 @@ struct Engine {
     // layer state
     float* conv_ring[N_LAYER];
     float* S[N_LAYER];
-    std::vector<float*> kcache, vcache;
+    std::vector<__half*> kcache, vcache;
     std::vector<int> attn_cache_idx;
 
     Engine(const std::string& path, int ctx)
@@ -136,8 +136,8 @@ struct Engine {
         A((void**)&d_amax, 8);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
-        A((void**)&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
-        A((void**)&mtp_v, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
+        A((void**)&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * 2);
+        A((void**)&mtp_v, (size_t)max_ctx * N_KV * HEAD_DIM * 2);
         A((void**)&d_pos_m, 4); A((void**)&d_draft, 4);
         A((void**)&h_b, N_EMBD * 4); A((void**)&x1_b, N_EMBD * 4); A((void**)&y_b, N_EMBD * 4);
         A((void**)&qg_b, 2 * N_HEAD * HEAD_DIM * 4);
@@ -170,8 +170,8 @@ struct Engine {
         A((void**)&d_pos_c, 4); A((void**)&d_pos_m2, 4); A((void**)&d_draft2, 4);
         A((void**)&d_vc, 4);
         A((void**)&d_P, 4); A((void**)&d_outcome, 16);
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
@@ -201,9 +201,9 @@ struct Engine {
         int cache_slot = 0;
         for (int il = 0; il < N_LAYER; il++) {
             if (attn_layer[il]) {
-                float *k, *v;
-                A((void**)&k, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
-                A((void**)&v, (size_t)max_ctx * N_KV * HEAD_DIM * 4);
+                __half *k, *v;
+                A((void**)&k, (size_t)max_ctx * N_KV * HEAD_DIM * 2);
+                A((void**)&v, (size_t)max_ctx * N_KV * HEAD_DIM * 2);
                 kcache.push_back(k); vcache.push_back(v);
                 attn_cache_idx.push_back(cache_slot++);
                 conv_ring[il] = nullptr; S[il] = nullptr;
@@ -271,8 +271,8 @@ struct Engine {
         mm(T(il, "ssm_out.weight"), og, yout);
     }
 
-    void attn_block(int il, const float* xin, float* yout, float* kc = nullptr,
-                    float* vc = nullptr, const int* pos_src = nullptr) {
+    void attn_block(int il, const float* xin, float* yout, __half* kc = nullptr,
+                    __half* vc = nullptr, const int* pos_src = nullptr) {
         if (!kc) {
             int ci = attn_cache_idx[il];
             kc = kcache[ci];
@@ -512,8 +512,8 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
             }
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
         // capture all 3 cyclic permutations (capture records; does not execute)
         for (int p = 0; p < 3; p++) {
             perm = p;
@@ -584,7 +584,7 @@ struct Engine {
         mmT(T2(il, "ssm_out.weight"), ogT, yT, T);
     }
 
-    void attn_block_T(int il, int base, int T, float* kc, float* vc) {
+    void attn_block_T(int il, int base, int T, __half* kc, __half* vc) {
         const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
         qxT(x1T, N_EMBD, T);
         mmT(T2(il, "attn_q.weight"), x1T, qgT, T);
@@ -710,8 +710,8 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
             }
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
+        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
         CUDA_CHECK(cudaStreamSynchronize(stm));
     }
 

@@ -176,8 +176,15 @@ int main(int argc, char** argv) {
         auto s_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
         auto s_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto s_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
-        auto s_kc = grab(e.kcache[0], (size_t)T * N_KV * HEAD_DIM * 4);
-        auto s_mk = grab(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM * 4);
+        auto grabh = [&](const __half* dev, size_t n) {
+            std::vector<__half> tmp(n);
+            CUDA_CHECK(cudaMemcpy(tmp.data(), dev, n * 2, cudaMemcpyDeviceToHost));
+            std::vector<float> out(n);
+            for (size_t i = 0; i < n; i++) out[i] = __half2float(tmp[i]);
+            return out;
+        };
+        auto s_kc = grabh(e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
+        auto s_mk = grabh(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
         // pass 2: batched (chunked prefill only, no final serial token)
         e.reset();
         if (e.d_prompt_cap < N) {
@@ -199,8 +206,8 @@ int main(int argc, char** argv) {
         auto b_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
         auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
         auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
-        auto b_kc = grab(e.kcache[0], (size_t)T * N_KV * HEAD_DIM * 4);
-        auto b_mk = grab(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM * 4);
+        auto b_kc = grabh(e.kcache[0], (size_t)T * N_KV * HEAD_DIM);
+        auto b_mk = grabh(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM);
         printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
         printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
         printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");

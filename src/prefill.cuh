@@ -39,11 +39,11 @@ void gated_norm_gdn_T(const float* o, const float* w, const float* z, float* out
                       int head_dim, int T, float eps, cudaStream_t st);
 void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT, int channels,
                     int T, cudaStream_t st);
-void kv_store_T(const float* kT, const float* vT, float* kc, float* vc, int base_pos,
+void kv_store_T(const float* kT, const float* vT, __half* kc, __half* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st);
 // Two-pass softmax attention for a sub-batch of SB tokens starting at (base_pos+t0).
 // scratch: [SB][n_heads][max_ctx] floats.
-void attn_prefill_T(const float* qT, int q_stride, int q_row, const float* kc, const float* vc,
+void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, const __half* vc,
                     float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
                     int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                     cudaStream_t st);

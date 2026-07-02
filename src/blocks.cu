@@ -76,16 +76,16 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 // attention decode implemented in spec3.cu (flash-decode)
 
 __global__ void k_kv_store(const float* __restrict__ kbuf, const float* __restrict__ vbuf,
-                           float* __restrict__ kc, float* __restrict__ vc,
+                           __half* __restrict__ kc, __half* __restrict__ vc,
                            const int* __restrict__ d_pos, int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     size_t off = (size_t)(*d_pos) * rowlen + i;
-    kc[off] = kbuf[i];
-    vc[off] = vbuf[i];
+    kc[off] = __float2half_rn(kbuf[i]);
+    vc[off] = __float2half_rn(vbuf[i]);
 }
 
-void kv_store(const float* kbuf, const float* vbuf, float* kcache, float* vcache,
+void kv_store(const float* kbuf, const float* vbuf, __half* kcache, __half* vcache,
               const int* d_pos, int rowlen, cudaStream_t st) {
     k_kv_store<<<(rowlen + 255) / 256, 256, 0, st>>>(kbuf, vbuf, kcache, vcache, d_pos, rowlen);
     CUDA_CHECK(cudaGetLastError());

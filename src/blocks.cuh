@@ -2,6 +2,7 @@
 // VERIFY-flag assumptions are compile-time constants below — flip when the
 // source-verification workflow reports.
 #pragma once
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -30,12 +31,12 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 // Causal decode attention for one new token; seq_len = *d_pos + 1 read on device.
 // Q strided (interleaved qg), caches contiguous [pos][n_kv][head_dim] f32.
 // scratch: [n_q_heads * max_ctx] floats.
-void attn_decode(const float* q, int q_stride, const float* kcache, const float* vcache,
+void attn_decode(const float* q, int q_stride, const __half* kcache, const __half* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
                  int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0);
 
 // Store this token's K/V rows into the caches at position *d_pos.
-void kv_store(const float* kbuf, const float* vbuf, float* kcache, float* vcache,
+void kv_store(const float* kbuf, const float* vbuf, __half* kcache, __half* vcache,
               const int* d_pos, int rowlen, cudaStream_t st = 0);
 
 // End-of-token bookkeeping (device-chained decode): d_gen[*d_step] = *d_token;

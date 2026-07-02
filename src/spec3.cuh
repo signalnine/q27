@@ -31,11 +31,11 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
            cudaStream_t st = 0);
 
 // KV store for 3 tokens (disjoint slots).
-void kv_store3(CP3 k, CP3 v, float* kc, float* vc, IP3 pos, int rowlen, cudaStream_t st = 0);
+void kv_store3(CP3 k, CP3 v, __half* kc, __half* vc, IP3 pos, int rowlen, cudaStream_t st = 0);
 
 // causal decode attention for 3 tokens; token t attends cache[0 .. *pos.p[t]].
 // scratch: [3][n_q_heads][max_ctx].
-void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out, float* scratch,
+void attn_decode3(CP3 q, int q_stride, const __half* kc, const __half* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st = 0);
 

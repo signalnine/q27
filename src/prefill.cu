@@ -461,17 +461,17 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
 }
 
 __global__ void k_kv_store_T(const float* __restrict__ kT, const float* __restrict__ vT,
-                             float* __restrict__ kc, float* __restrict__ vc, int base_pos,
+                             __half* __restrict__ kc, __half* __restrict__ vc, int base_pos,
                              int rowlen) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rowlen) return;
     int t = blockIdx.y;
     size_t off = (size_t)(base_pos + t) * rowlen + i;
-    kc[off] = kT[(size_t)t * rowlen + i];
-    vc[off] = vT[(size_t)t * rowlen + i];
+    kc[off] = __float2half_rn(kT[(size_t)t * rowlen + i]);
+    vc[off] = __float2half_rn(vT[(size_t)t * rowlen + i]);
 }
 
-void kv_store_T(const float* kT, const float* vT, float* kc, float* vc, int base_pos,
+void kv_store_T(const float* kT, const float* vT, __half* kc, __half* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st) {
     dim3 grid((rowlen + 255) / 256, T);
     k_kv_store_T<<<grid, 256, 0, st>>>(kT, vT, kc, vc, base_pos, rowlen);
@@ -485,7 +485,7 @@ void kv_store_T(const float* kT, const float* vT, float* kc, float* vc, int base
 // summation order differs from the serial decode kernel; gated empirically
 // on identical continuations.
 __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int q_row,
-                                 const float* __restrict__ kc, const float* __restrict__ vc,
+                                 const __half* __restrict__ kc, const __half* __restrict__ vc,
                                  float* __restrict__ outT, int out_row, int base_pos,
                                  int tile_t0, int T, int n_kv_heads, int gqa, int head_dim,
                                  float scale) {
@@ -519,8 +519,8 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
         for (int idx = threadIdx.x; idx < np * HD; idx += blockDim.x) {
             int pp = idx / HD, d = idx % HD;
             size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
-            s_kv[(pp * 2) * HD + d] = kc[off];
-            s_kv[(pp * 2 + 1) * HD + d] = vc[off];
+            s_kv[(pp * 2) * HD + d] = __half2float(kc[off]);
+            s_kv[(pp * 2 + 1) * HD + d] = __half2float(vc[off]);
         }
         __syncthreads();
         if (!live) continue;
@@ -557,7 +557,7 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
     }
 }
 
-void attn_prefill_T(const float* qT, int q_stride, int q_row, const float* kc, const float* vc,
+void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, const __half* vc,
                     float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
                     int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                     cudaStream_t st) {
