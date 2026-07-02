@@ -349,6 +349,98 @@ void gemv_f16(const __half* W, const float* x, float* y, int64_t rows, int64_t c
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---------------- grid-merged 3-token variants ----------------
+
+__global__ void k_rmsnorm3(CP3 xp, const float* __restrict__ w, P3 yp, int n, float eps) {
+    const float* x = xp.p[blockIdx.x];
+    float* y = yp.p[blockIdx.x];
+    __shared__ float sh[32];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
+    acc = warp_reduce(acc);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+        v = warp_reduce(v);
+        if (threadIdx.x == 0) sh[0] = v;
+    }
+    __syncthreads();
+    float inv = rsqrtf(sh[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+}
+void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st) {
+    k_rmsnorm3<<<3, 1024, 0, st>>>(x, w, y, n, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_add3(P3 xp, CP3 yp, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) xp.p[blockIdx.y][i] += yp.p[blockIdx.y][i];
+}
+void add3(P3 x, CP3 y, int n, cudaStream_t st) {
+    dim3 g((n + 255) / 256, 3);
+    k_add3<<<g, 256, 0, st>>>(x, y, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_silu_mul3(P3 gp, CP3 up, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = gp.p[blockIdx.y][i];
+    gp.p[blockIdx.y][i] = (v / (1.f + expf(-v))) * up.p[blockIdx.y][i];
+}
+void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st) {
+    dim3 gr((n + 255) / 256, 3);
+    k_silu_mul3<<<gr, 256, 0, st>>>(g, u, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_quantize_x3(CP3 xp, int8_t* n0, int8_t* n1, int8_t* n2, uint2* e0, uint2* e1,
+                              uint2* e2, float* s0, float* s1, float* s2, int* i0, int* i1,
+                              int* i2, int nblocks) {
+    int b = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (b >= nblocks) return;
+    const int t = blockIdx.y;
+    const float* x = xp.p[t];
+    int8_t* nat = t == 0 ? n0 : t == 1 ? n1 : n2;
+    uint2* eo = t == 0 ? e0 : t == 1 ? e1 : e2;
+    float* scale = t == 0 ? s0 : t == 1 ? s1 : s2;
+    int* isum = t == 0 ? i0 : t == 1 ? i1 : i2;
+    int lane = threadIdx.x & 31;
+    float v = x[b * 32 + lane];
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    float s = amax / 127.f;
+    float inv = s > 0.f ? 1.f / s : 0.f;
+    int q = __float2int_rn(v * inv);
+    q = max(-127, min(127, q));
+    nat[b * 32 + lane] = (int8_t)q;
+    int bsum = q;
+    for (int off = 16; off > 0; off >>= 1) bsum += __shfl_xor_sync(0xffffffff, bsum, off);
+    if (lane == 0) { scale[b] = s; isum[b] = bsum; }
+    int base = (lane & 3) * 8;
+    uint32_t e = 0, o = 0;
+#pragma unroll
+    for (int kk = 0; kk < 4; kk++) {
+        int qe = __shfl_sync(0xffffffff, q, base + 2 * kk);
+        int qo = __shfl_sync(0xffffffff, q, base + 2 * kk + 1);
+        e |= (uint32_t)(uint8_t)(int8_t)qe << (8 * kk);
+        o |= (uint32_t)(uint8_t)(int8_t)qo << (8 * kk);
+    }
+    if (lane < 4) eo[b * 4 + lane] = make_uint2(e, o);
+}
+void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st) {
+    int nblocks = (int)(cols / 32);
+    dim3 g((nblocks + 7) / 8, 3);
+    k_quantize_x3<<<g, 256, 0, st>>>(x, xq.q[0].nat, xq.q[1].nat, xq.q[2].nat, xq.q[0].eo,
+                                     xq.q[1].eo, xq.q[2].eo, xq.q[0].scale, xq.q[1].scale,
+                                     xq.q[2].scale, xq.q[0].isum, xq.q[1].isum, xq.q[2].isum,
+                                     nblocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---------------- elementwise ----------------
 
 __global__ void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w,

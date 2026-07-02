@@ -313,9 +313,8 @@ struct Engine {
     }
 
     void qx3(const float* xa, const float* xb, const float* xc, int cols) {
-        q27k::quantize_x(xa, cols, xq2[0], stm);
-        q27k::quantize_x(xb, cols, xq2[1], stm);
-        q27k::quantize_x(xc, cols, xqC, stm);
+        q27k::XQ3 q{{xq2[0], xq2[1], xqC}};
+        q27k::quantize3({{xa, xb, xc}}, cols, q, stm);
     }
     void mm3(const DevTensor& w, float* out_a, float* out_b, float* out_c) {
         q27k::XQuant qs[3] = {xq2[0], xq2[1], xqC};
@@ -414,9 +413,7 @@ struct Engine {
         qx3(x1, x1_b, x1_c, N_EMBD);
         mm3(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b, ffn_g_c);
         mm3(T(il, "ffn_up.weight"), ffn_u, ffn_u_b, ffn_u_c);
-        q27k::silu_mul(ffn_g, ffn_u, ffn_g, N_FFN, stm);
-        q27k::silu_mul(ffn_g_b, ffn_u_b, ffn_g_b, N_FFN, stm);
-        q27k::silu_mul(ffn_g_c, ffn_u_c, ffn_g_c, N_FFN, stm);
+        q27k::silu_mul3({{ffn_g, ffn_g_b, ffn_g_c}}, {{ffn_u, ffn_u_b, ffn_u_c}}, N_FFN, stm);
         qx3(ffn_g, ffn_g_b, ffn_g_c, N_FFN);
         mm3(T(il, "ffn_down.weight"), y, y_b, y_c);
     }
@@ -437,29 +434,21 @@ struct Engine {
                            h_b, stm);
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_draft2, N_EMBD,
                            h_c, stm);
+        q27k::CP3 Hc{{h, h_b, h_c}}, Yc{{y, y_b, y_c}};
+        q27k::P3 Hm{{h, h_b, h_c}}, X1m{{x1, x1_b, x1_c}};
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm(h, an, x1, N_EMBD, EPS, stm);
-            q27k::rmsnorm(h_b, an, x1_b, N_EMBD, EPS, stm);
-            q27k::rmsnorm(h_c, an, x1_c, N_EMBD, EPS, stm);
+            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm);
             if (attn_layer[il]) attn_pair(il);
             else gdn_pair(il);
-            q27k::add_inplace(h, y, N_EMBD, stm);
-            q27k::add_inplace(h_b, y_b, N_EMBD, stm);
-            q27k::add_inplace(h_c, y_c, N_EMBD, stm);
+            q27k::add3(Hm, Yc, N_EMBD, stm);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm(h, pn, x1, N_EMBD, EPS, stm);
-            q27k::rmsnorm(h_b, pn, x1_b, N_EMBD, EPS, stm);
-            q27k::rmsnorm(h_c, pn, x1_c, N_EMBD, EPS, stm);
+            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm);
             ffn_pair(il);
-            q27k::add_inplace(h, y, N_EMBD, stm);
-            q27k::add_inplace(h_b, y_b, N_EMBD, stm);
-            q27k::add_inplace(h_c, y_c, N_EMBD, stm);
+            q27k::add3(Hm, Yc, N_EMBD, stm);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm(h, on, x1, N_EMBD, EPS, stm);
-        q27k::rmsnorm(h_b, on, x1_b, N_EMBD, EPS, stm);
-        q27k::rmsnorm(h_c, on, x1_c, N_EMBD, EPS, stm);
+        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm);
         qx3(x1, x1_b, x1_c, N_EMBD);
         mm3(dm.get("output.weight"), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB);
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);

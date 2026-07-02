@@ -33,7 +33,9 @@ def policy(name: str) -> int:
         return DTYPE_F32
     if "ssm_alpha" in name or "ssm_beta" in name:
         return DTYPE_F16
-    if name in ("token_embd.weight", "output.weight") or name.startswith("blk.64."):
+    if name == "output.weight":
+        return DTYPE_Q4  # v1.2: logits head to Q4 -- 3 full reads/spec-round, argmax-only consumer
+    if name == "token_embd.weight" or name.startswith("blk.64."):
         return DTYPE_Q8
     if re.match(r"blk\.\d+\.attn_(k|v)\.weight$", name):
         return DTYPE_Q8  # KV projections: worst Q4 RMSE + errors persist in KV cache; ~84 MB total
@@ -95,7 +97,7 @@ def main():
     t0 = time.time()
     r = GGUFReader(args.input)
 
-    meta = {"q27_version": VERSION, "quant_policy": "v1.1",
+    meta = {"q27_version": VERSION, "quant_policy": "v1.2",
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):

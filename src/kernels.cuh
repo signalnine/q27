@@ -50,4 +50,15 @@ void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_
 void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t cols, float* out,
                   cudaStream_t st = 0);
 
+// Grid-merged 3-token variants for the speculative round: identical per-token
+// work distribution, tokens mapped to an extra grid dimension (1 launch vs 3).
+struct P3 { float* p[3]; };
+struct CP3 { const float* p[3]; };
+struct XQ3 { XQuant q[3]; };
+
+void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0);
+void add3(P3 x, CP3 y, int n, cudaStream_t st = 0);
+void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st = 0);
+void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st = 0);
+
 } // namespace q27k
