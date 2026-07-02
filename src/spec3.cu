@@ -222,4 +222,48 @@ void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cud
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void k_prep_round(const int* __restrict__ dP, const int* __restrict__ dtok,
+                             int* pa, int* pb, int* pc, int* pm, int* pm2, int* outcome) {
+    int P = *dP;
+    *pa = P + 1;
+    *pb = P + 2;
+    *pc = P + 3;
+    *pm = P + 1;
+    *pm2 = P + 2;
+    outcome[1] = *dtok; // t1 snapshot (pre-round)
+}
+void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
+                int* pos_m, int* pos_m2, int* outcome, cudaStream_t st) {
+    k_prep_round<<<1, 1, 0, st>>>(d_P, d_token, pos_a, pos_b, pos_c, pos_m, pos_m2, outcome);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
+                               const int* __restrict__ dr1p, const int* __restrict__ dr2p,
+                               const int* __restrict__ vap, const int* __restrict__ vbp,
+                               const int* __restrict__ vcp, const float* __restrict__ x1a,
+                               const float* __restrict__ x1b, const float* __restrict__ x1c,
+                               float* __restrict__ h_next, int* __restrict__ outcome,
+                               int n_embd) {
+    int dr1 = *dr1p, dr2 = *dr2p, va = *vap, vb = *vbp, vc = *vcp;
+    int n = 1 + (va == dr1 ? 1 : 0) + ((va == dr1 && vb == dr2) ? 1 : 0);
+    const float* src = n == 3 ? x1c : n == 2 ? x1b : x1a;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
+        h_next[i] = src[i];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *dtok = n == 3 ? vc : n == 2 ? vb : va;
+        *dP += n;
+        outcome[0] = n;
+        outcome[2] = dr1;
+        outcome[3] = dr2;
+    }
+}
+void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2, const int* va,
+                  const int* vb, const int* vc, const float* x1a, const float* x1b,
+                  const float* x1c, float* h_next, int* outcome, int n_embd, cudaStream_t st) {
+    k_finish_round<<<4, 256, 0, st>>>(d_P, d_token, d_draft, d_draft2, va, vb, vc, x1a, x1b, x1c,
+                                      h_next, outcome, n_embd);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace q27k

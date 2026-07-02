@@ -59,6 +59,7 @@ struct Engine {
     float *h_next2;
     q27k::XQuant xqC;
     int *d_pos_c, *d_pos_m2, *d_draft2, *d_vc;
+    int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
     // GDN state as 3 physical buffers with a cyclic role permutation:
@@ -146,6 +147,7 @@ struct Engine {
         xqC = q27k::xquant_alloc(N_FFN);
         A((void**)&d_pos_c, 4); A((void**)&d_pos_m2, 4); A((void**)&d_draft2, 4);
         A((void**)&d_vc, 4);
+        A((void**)&d_P, 4); A((void**)&d_outcome, 16);
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 4));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
@@ -406,6 +408,8 @@ struct Engine {
     // launch sequence for one speculative round (graph-capturable: all state
     // through device memory, pointers fixed for a given parity)
     void spec_round_launches() {
+        q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_m, d_pos_m2, d_outcome,
+                         stm);
         // draft 1: (h_next, embed(t1)) at pos_m -> d_draft; MTP's own post-head-norm
         // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2 (also fills MTP KV)
         mtp_forward(h_next, d_token, d_draft, d_pos_m);
@@ -437,6 +441,8 @@ struct Engine {
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
         q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
         q27k::argmax(logits2 + 2 * (size_t)VOCAB, VOCAB, d_vc, d_amax, stm);
+        q27k::finish_round(d_P, d_token, d_draft, d_draft2, d_va, d_vb, d_vc, x1, x1_b, x1_c,
+                           h_next, d_outcome, N_EMBD, stm);
     }
 
     void build_spec_graphs() {
@@ -448,6 +454,7 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemset(d_P, 0, 4));
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         for (int il = 0; il < N_LAYER; il++)
@@ -476,43 +483,19 @@ struct Engine {
         fprintf(stderr, "spec graphs captured (3 perms, depth-2)\n");
     }
 
-    // one speculative round (depth 2); returns tokens emitted (1..3)
-    int spec_round(int P, int* emit) {
-        int pa = P + 1, pb = P + 2, pc = P + 3;
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &pa, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &pb, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &pc, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &pa, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &pb, 4, cudaMemcpyHostToDevice, stm));
+    // one speculative round (depth 2); returns tokens emitted (1..3).
+    // All position math + acceptance runs on device; host reads 16 bytes.
+    int spec_round(int* emit) {
         CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
-
-        int va, vb, vc, dr1, dr2, t1;
-        CUDA_CHECK(cudaMemcpyAsync(&va, d_va, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&vb, d_vb, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&vc, d_vc, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&dr1, d_draft, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&dr2, d_draft2, 4, cudaMemcpyDeviceToHost, stm));
-        CUDA_CHECK(cudaMemcpyAsync(&t1, d_token, 4, cudaMemcpyDeviceToHost, stm));
+        int oc[4];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 16, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
-
-        if (va == dr1 && vb == dr2) { // both drafts verified
-            perm = (perm + 2) % 3;
-            emit[0] = t1; emit[1] = dr1; emit[2] = dr2;
-            CUDA_CHECK(cudaMemcpyAsync(d_token, &vc, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(h_next, x1_c, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-            return 3;
-        }
-        if (va == dr1) { // first draft verified
-            perm = (perm + 1) % 3;
-            emit[0] = t1; emit[1] = dr1;
-            CUDA_CHECK(cudaMemcpyAsync(d_token, &vb, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(h_next, x1_b, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-            return 2;
-        }
-        emit[0] = t1;
-        CUDA_CHECK(cudaMemcpyAsync(d_token, &va, 4, cudaMemcpyHostToDevice, stm));
-        CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        return 1;
+        int n = oc[0];
+        emit[0] = oc[1];
+        if (n >= 2) emit[1] = oc[2];
+        if (n == 3) emit[2] = oc[3];
+        perm = (perm + (n - 1)) % 3;
+        return n;
     }
 
     void build_graph() {
@@ -619,10 +602,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, e.stm));
         std::vector<int> out;
         int P = (int)toks.size() - 1;
+        CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
         int total_emitted = 0, rounds = 0, hist1 = 0, hist2 = 0, hist3 = 0;
         while ((int)out.size() < n_gen) {
             int em[3];
-            int n = e.spec_round(P, em);
+            int n = e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
             total_emitted += n;

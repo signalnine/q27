@@ -42,4 +42,14 @@ void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out,
 // embedding row lookup for 3 device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0);
 
+// Device-side round bookkeeping: prep derives all positions from *d_P and
+// snapshots t1; finish decides acceptance, selects next token + h_next, bumps
+// *d_P, and writes outcome = {n, t1, dr1, dr2} for a single 16B readback.
+void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
+                int* pos_m, int* pos_m2, int* outcome, cudaStream_t st = 0);
+void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
+                  const int* va, const int* vb, const int* vc, const float* x1a,
+                  const float* x1b, const float* x1c, float* h_next, int* outcome, int n_embd,
+                  cudaStream_t st = 0);
+
 } // namespace q27k

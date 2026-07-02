@@ -70,7 +70,8 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 | + dual lm_head: Q4 drafts, Q8 verify (v1.3 repack) | 121.1 |
 | steady state (128-token bench, 2.39 tok/round) | **133.5** |
 | `--fast-head` opt-in (Q4 verify; output differs, coherent) | 143.0 |
-| + full grid merges (l2/f16/gates/rope/kv/attn/sigmoid/embed x3) | **145.8** lossless / **156.5** fast |
+| + full grid merges (l2/f16/gates/rope/kv/attn/sigmoid/embed x3) | 145.8 lossless / 156.5 fast |
+| + device-side round bookkeeping (1 sync + 16B readback/round) | **146.0** lossless / **156.5** fast |
 
 ## Risk register
 
