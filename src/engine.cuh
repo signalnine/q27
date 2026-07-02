@@ -598,10 +598,9 @@ struct Engine {
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
         q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm);
-        for (int t0 = 0; t0 < T; t0 += PF_SB)
-            q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM,
-                                 pf_scratch, base, t0, min(PF_SB, T - t0), max_ctx, N_HEAD,
-                                 N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm);
+        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM,
+                             pf_scratch, base, 0, T, max_ctx, N_HEAD, N_KV, HEAD_DIM,
+                             1.0f / sqrtf((float)HEAD_DIM), stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT(T2(il, "attn_output.weight"), attnT, yT, T);

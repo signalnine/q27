@@ -478,76 +478,82 @@ void kv_store_T(const float* kT, const float* vT, float* kc, float* vc, int base
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Two-pass softmax attention, sub-batched (blockIdx.y = token in sub-batch,
-// causal bound per token). Warp-cooperative phases: warps stride positions,
-// lanes stride head dims, so K/V reads are coalesced 128B transactions
-// (the naive per-thread layout collapsed at long contexts).
+// FA-lite attention prefill: block per (kv head, 8-token tile). Warp w owns
+// token (tile_t0 + w) and all 6 GQA q-heads of this kv head; K/V rows are
+// staged in shared memory once per 32-position tile and shared by all 48
+// (head, token) pairs. Online softmax (no position scratch). Note: fp
+// summation order differs from the serial decode kernel; gated empirically
+// on identical continuations.
 __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int q_row,
                                  const float* __restrict__ kc, const float* __restrict__ vc,
-                                 float* __restrict__ outT, int out_row,
-                                 float* __restrict__ scratch, int base_pos, int t0,
-                                 int max_ctx, int n_kv_heads, int head_dim, float scale) {
-    const int y = blockIdx.y;
-    const int t = t0 + y;
-    const int seq_len = base_pos + t + 1;
-    const int h = blockIdx.x;
-    const int kvh = h / (gridDim.x / n_kv_heads);
+                                 float* __restrict__ outT, int out_row, int base_pos,
+                                 int tile_t0, int T, int n_kv_heads, int gqa, int head_dim,
+                                 float scale) {
+    constexpr int TT = 8, PP = 32, HD = 256;
+    const int kvh = blockIdx.x;
+    const int t0 = tile_t0 + blockIdx.y * TT;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
-    constexpr int NW = 8; // 256 threads
-    const float* qh = qT + (size_t)t * q_row + (size_t)h * q_stride;
-    float* sc = scratch + ((size_t)y * gridDim.x + h) * max_ctx;
-    __shared__ float s_q[256];
-    __shared__ float s_red[NW];
-    __shared__ float s_part[NW][256 + 4];
+    const int t = t0 + warp;            // this warp's token (local chunk index)
+    const bool live = t < T;
+    const int bound = base_pos + t + 1; // causal bound for this token
+    const int tile_max = base_pos + min(t0 + TT, T); // positions needed by tile
 
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) s_q[i] = qh[i];
-    __syncthreads();
-
-    // scores: warp per position (lane-strided dot, coalesced K reads)
-    float lmax = -FLT_MAX;
-    for (int p = warp; p < seq_len; p += NW) {
-        const float* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        float d = 0.f;
-        for (int i = lane; i < head_dim; i += 32) d += s_q[i] * kp[i];
-        d = warp_reduce_f(d);
-        d = __shfl_sync(0xffffffff, d, 0) * scale;
-        if (lane == 0) sc[p] = d;
-        lmax = fmaxf(lmax, d);
+    extern __shared__ float s_kv[];     // [PP][2][HD]: K then V per position
+    float q[6][8], acc[6][8], m[6], l[6];
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        m[j] = -FLT_MAX;
+        l[j] = 0.f;
+#pragma unroll
+        for (int d = 0; d < 8; d++) {
+            acc[j][d] = 0.f;
+            q[j][d] = live ? qT[(size_t)t * q_row + (size_t)(kvh * gqa + j) * q_stride +
+                                lane + 32 * d]
+                           : 0.f;
+        }
     }
-    for (int off = 16; off > 0; off >>= 1)
-        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
-    if (lane == 0) s_red[warp] = lmax;
-    __syncthreads();
-    float bmax = -FLT_MAX;
-    for (int w = 0; w < NW; w++) bmax = fmaxf(bmax, s_red[w]);
-    __syncthreads();
 
-    float lsum = 0.f;
-    for (int p = threadIdx.x; p < seq_len; p += blockDim.x) {
-        float e = expf(sc[p] - bmax);
-        sc[p] = e;
-        lsum += e;
+    for (int p0 = 0; p0 < tile_max; p0 += PP) {
+        __syncthreads();
+        const int np = min(PP, tile_max - p0);
+        for (int idx = threadIdx.x; idx < np * HD; idx += blockDim.x) {
+            int pp = idx / HD, d = idx % HD;
+            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
+            s_kv[(pp * 2) * HD + d] = kc[off];
+            s_kv[(pp * 2 + 1) * HD + d] = vc[off];
+        }
+        __syncthreads();
+        if (!live) continue;
+        const int lim = min(np, bound - p0);
+        for (int pp = 0; pp < lim; pp++) {
+            const float* kp = s_kv + (pp * 2) * HD;
+            const float* vp = s_kv + (pp * 2 + 1) * HD;
+#pragma unroll
+            for (int j = 0; j < 6; j++) {
+                float d = 0.f;
+#pragma unroll
+                for (int u = 0; u < 8; u++) d += q[j][u] * kp[lane + 32 * u];
+                for (int off = 16; off > 0; off >>= 1)
+                    d += __shfl_down_sync(0xffffffff, d, off);
+                d = __shfl_sync(0xffffffff, d, 0) * scale;
+                float mn = fmaxf(m[j], d);
+                float sc_old = expf(m[j] - mn), w = expf(d - mn);
+                l[j] = l[j] * sc_old + w;
+                m[j] = mn;
+#pragma unroll
+                for (int u = 0; u < 8; u++)
+                    acc[j][u] = acc[j][u] * sc_old + w * vp[lane + 32 * u];
+            }
+        }
     }
-    lsum = warp_reduce_f(lsum);
-    if (lane == 0) s_red[warp] = lsum;
-    __syncthreads();
-    float bsum = 0.f;
-    for (int w = 0; w < NW; w++) bsum += s_red[w];
-    const float inv = 1.0f / bsum;
-
-    float* part = s_part[warp];
-    for (int i = lane; i < head_dim; i += 32) part[i] = 0.f;
-    __syncwarp();
-    for (int p = warp; p < seq_len; p += NW) {
-        const float* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        float w = sc[p];
-        for (int i = lane; i < head_dim; i += 32) part[i] += w * vp[i];
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float acc = 0.f;
-        for (int w = 0; w < NW; w++) acc += s_part[w][i];
-        outT[(size_t)t * out_row + (size_t)h * head_dim + i] = acc * inv;
+    if (!live) return;
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        float inv = 1.0f / l[j];
+#pragma unroll
+        for (int u = 0; u < 8; u++)
+            outT[(size_t)t * out_row + (size_t)(kvh * gqa + j) * head_dim + lane + 32 * u] =
+                acc[j][u] * inv;
     }
 }
 
@@ -555,9 +561,20 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const float* kc, c
                     float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
                     int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                     cudaStream_t st) {
-    dim3 grid(n_q_heads, SB);
-    k_attn_prefill_T<<<grid, 256, 0, st>>>(qT, q_stride, q_row, kc, vc, outT, out_row, scratch,
-                                           base_pos, t0, max_ctx, n_kv_heads, head_dim, scale);
+    (void)scratch; (void)max_ctx;
+    constexpr int TT = 8, PP = 32;
+    const size_t SM = (size_t)PP * 2 * 256 * sizeof(float);
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_T,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+        attr = true;
+    }
+    int gqa = n_q_heads / n_kv_heads;
+    dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
+    k_attn_prefill_T<<<grid, 256, SM, st>>>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                            base_pos, t0, t0 + SB, n_kv_heads, gqa, head_dim,
+                                            scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
