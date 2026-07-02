@@ -143,79 +143,164 @@ void kv_store3(CP3 k, CP3 v, float* kc, float* vc, IP3 pos, int rowlen, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void k_attn_decode3(CP3 qp, int q_stride, const float* __restrict__ kc,
-                               const float* __restrict__ vc, P3 outp,
-                               float* __restrict__ scratch, IP3 pos, int max_ctx, int n_kv_heads,
-                               int head_dim, float scale) {
-    // warp-cooperative: warps stride positions, lanes stride dims (coalesced K/V)
-    const int t = blockIdx.y;
-    const int seq_len = *pos.p[t] + 1;
-    const int h = blockIdx.x;
-    const int kvh = h / (gridDim.x / n_kv_heads);
+static inline P3 out2p(float* o) { return P3{{o, o, o}}; }
+
+// Flash-decode: grid (kv_head, split, token). Each block covers one position
+// range for ALL 6 GQA q-heads of its kv head (K/V read once, not 6x), online
+// softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
+// combine kernel merges splits. Works for 1..3 tokens via gridDim.z.
+static constexpr int FD_NS = 16;   // splits over positions
+static constexpr int FD_ST = 258;  // per-partial stride: m, l, acc[256]
+
+__global__ void k_attn_fd(CP3 qp, int q_stride, const float* __restrict__ kc,
+                          const float* __restrict__ vc, float* __restrict__ part, IP3 pos,
+                          int n_kv_heads, int gqa, int head_dim, float scale) {
+    const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    const int seq = *pos.p[t] + 1;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     constexpr int NW = 8;
-    const float* qh = qp.p[t] + (size_t)h * q_stride;
-    float* sc = scratch + ((size_t)t * gridDim.x + h) * max_ctx;
-    __shared__ float s_q[256];
-    __shared__ float s_red[NW];
-    __shared__ float s_part[NW][256 + 4];
 
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) s_q[i] = qh[i];
+    extern __shared__ float smem[];
+    float* s_q = smem;                  // [6][256]
+    float* s_acc = smem + 6 * 256;      // [NW][6][256]
+    __shared__ float s_ml[NW][6][2];
+
+    for (int idx = threadIdx.x; idx < gqa * head_dim; idx += blockDim.x)
+        s_q[idx] = qp.p[t][(size_t)(kvh * gqa + idx / head_dim) * q_stride + idx % head_dim];
+    for (int idx = threadIdx.x; idx < NW * 6 * 256; idx += blockDim.x) s_acc[idx] = 0.f;
     __syncthreads();
 
-    float lmax = -FLT_MAX;
-    for (int p = warp; p < seq_len; p += NW) {
+    const int chunk = (seq + FD_NS - 1) / FD_NS;
+    const int p_lo = sp * chunk, p_hi = min(seq, p_lo + chunk);
+
+    float m[6], l[6];
+#pragma unroll
+    for (int j = 0; j < 6; j++) { m[j] = -FLT_MAX; l[j] = 0.f; }
+    float* accw = s_acc + warp * 6 * 256;
+
+    for (int p = p_lo + warp; p < p_hi; p += NW) {
         const float* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        float d = 0.f;
-        for (int i = lane; i < head_dim; i += 32) d += s_q[i] * kp[i];
-        for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffff, d, off);
-        d = __shfl_sync(0xffffffff, d, 0) * scale;
-        if (lane == 0) sc[p] = d;
-        lmax = fmaxf(lmax, d);
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
-    if (lane == 0) s_red[warp] = lmax;
-    __syncthreads();
-    float bmax = -FLT_MAX;
-    for (int w = 0; w < NW; w++) bmax = fmaxf(bmax, s_red[w]);
-    __syncthreads();
-
-    float lsum = 0.f;
-    for (int p = threadIdx.x; p < seq_len; p += blockDim.x) {
-        float e = expf(sc[p] - bmax);
-        sc[p] = e;
-        lsum += e;
-    }
-    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
-    if (lane == 0) s_red[warp] = lsum;
-    __syncthreads();
-    float bsum = 0.f;
-    for (int w = 0; w < NW; w++) bsum += s_red[w];
-    const float inv = 1.0f / bsum;
-
-    float* part = s_part[warp];
-    for (int i = lane; i < head_dim; i += 32) part[i] = 0.f;
-    __syncwarp();
-    for (int p = warp; p < seq_len; p += NW) {
         const float* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
-        float w = sc[p];
-        for (int i = lane; i < head_dim; i += 32) part[i] += w * vp[i];
+        float kv[8], vv[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            kv[u] = kp[lane + 32 * u];
+            vv[u] = vp[lane + 32 * u];
+        }
+#pragma unroll
+        for (int j = 0; j < 6; j++) {
+            float d = 0.f;
+#pragma unroll
+            for (int u = 0; u < 8; u++) d += s_q[j * 256 + lane + 32 * u] * kv[u];
+            for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffff, d, off);
+            d = __shfl_sync(0xffffffff, d, 0) * scale;
+            float mn = fmaxf(m[j], d);
+            float so = expf(m[j] - mn), w = expf(d - mn);
+            l[j] = l[j] * so + w;
+            m[j] = mn;
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                float* a = accw + j * 256 + lane + 32 * u;
+                *a = *a * so + w * vv[u];
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        if (lane == 0) { s_ml[warp][j][0] = m[j]; s_ml[warp][j][1] = l[j]; }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float acc = 0.f;
-        for (int w = 0; w < NW; w++) acc += s_part[w][i];
-        outp.p[t][(size_t)h * head_dim + i] = acc * inv;
+
+    // merge the 8 warps' partials -> one {m, l, acc} per head for this split
+    for (int j = warp; j < 6; j += NW) { // warps 0..5 each own a head
+        float mb = -FLT_MAX;
+        for (int w = 0; w < NW; w++) mb = fmaxf(mb, s_ml[w][j][0]);
+        float lb = 0.f;
+        float sc[NW];
+        for (int w = 0; w < NW; w++) {
+            sc[w] = s_ml[w][j][0] == -FLT_MAX ? 0.f : expf(s_ml[w][j][0] - mb);
+            lb += s_ml[w][j][1] * sc[w];
+        }
+        size_t pair = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
+        float* dst = part + (pair * FD_NS + sp) * FD_ST;
+        if (lane == 0) { dst[0] = mb; dst[1] = lb; }
+        for (int d = lane; d < head_dim; d += 32) {
+            float a = 0.f;
+            for (int w = 0; w < NW; w++) a += s_acc[(w * 6 + j) * 256 + d] * sc[w];
+            dst[2 + d] = a;
+        }
+    }
+}
+
+__global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n_heads,
+                                  int head_dim) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    size_t pair = (size_t)t * n_heads + h;
+    const float* pp = part + pair * FD_NS * FD_ST;
+    __shared__ float s_m, s_l;
+    if (threadIdx.x == 0) {
+        float mg = -FLT_MAX;
+        for (int sp = 0; sp < FD_NS; sp++) mg = fmaxf(mg, pp[sp * FD_ST]);
+        float lg = 0.f;
+        for (int sp = 0; sp < FD_NS; sp++)
+            if (pp[sp * FD_ST] != -FLT_MAX)
+                lg += pp[sp * FD_ST + 1] * expf(pp[sp * FD_ST] - mg);
+        s_m = mg;
+        s_l = lg;
+    }
+    __syncthreads();
+    const float mg = s_m, inv = 1.0f / s_l;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float a = 0.f;
+        for (int sp = 0; sp < FD_NS; sp++) {
+            float ms = pp[sp * FD_ST];
+            if (ms != -FLT_MAX) a += pp[sp * FD_ST + 2 + d] * expf(ms - mg);
+        }
+        outp.p[t][(size_t)h * head_dim + d] = a * inv;
     }
 }
 
 void attn_decode3(CP3 q, int q_stride, const float* kc, const float* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st) {
-    dim3 g(n_q_heads, 3);
-    k_attn_decode3<<<g, 256, 0, st>>>(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_kv_heads,
-                                      head_dim, scale);
+    (void)max_ctx;
+    int gqa = n_q_heads / n_kv_heads;
+    size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_fd,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
+        attr = true;
+    }
+    dim3 g1(n_kv_heads, FD_NS, 3);
+    k_attn_fd<<<g1, 256, sm, st>>>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa,
+                                   head_dim, scale);
+    dim3 g2(n_q_heads, 3);
+    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// single-token plain-path attention through the same flash-decode kernels
+void attn_decode(const float* q, int q_stride, const float* kcache, const float* vcache,
+                 float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
+                 int n_kv_heads, int head_dim, float scale, cudaStream_t st) {
+    (void)max_ctx;
+    int gqa = n_q_heads / n_kv_heads;
+    size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_attn_fd,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
+        attr = true;
+    }
+    CP3 qp{{q, q, q}};
+    IP3 pp{{d_pos, d_pos, d_pos}};
+    P3 op{{out, out, out}};
+    dim3 g1(n_kv_heads, FD_NS, 1);
+    k_attn_fd<<<g1, 256, sm, st>>>(qp, q_stride, kcache, vcache, scratch, pp, n_kv_heads, gqa,
+                                   head_dim, scale);
+    dim3 g2(n_q_heads, 1);
+    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out2p(out), n_q_heads, head_dim);
     CUDA_CHECK(cudaGetLastError());
 }
 

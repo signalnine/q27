@@ -112,6 +112,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | + device-side round bookkeeping (1 sync + 16B readback/round) | 146.0 lossless / 156.5 fast |
 | E1: display compositor off GPU 0 (cosmic-comp/Xwayland stole ~10%) | **157.4** lossless / **168.5** fast |
 | warp-cooperative decode attention (coalesced K/V) | **168.6** lossless @2k; 65.8 @8k ctx (~2x long-ctx) |
+| flash-decode (split-K, K/V shared across GQA heads) | **173.1** @2k / **159.6** @8k ctx lossless; 178.1 fast |
 
 ## Prefill (M6)
 
@@ -149,8 +150,7 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
    (fork reference: ~2,300-2,400 t/s; q27 at 583 @512 / 528 @4k / ~300 @26k)
 2. FA-lite tiled attention prefill (smem K/V tiles shared across the 32-token
    sub-batch; kills the remaining quadratic degradation at long contexts)
-2b. fp16/fp8 KV cache: long-ctx decode is now K/V-bandwidth-bound (f32 rows);
-   halving/quartering KV bytes is the next big long-ctx decode lever
+2b. fp16/fp8 KV cache: halves/quarters remaining K/V traffic at long ctx
 3. Decode queue from the nsys research plan: E2 mem OC (user gate), E3
    instrumentation pack, E4 per-shape GEMV tuning (+6-8%), E5 grid-dim fusions
    (+4-6%), E6 confidence-gated depth-3, E7 draft-head diet (ceiling ~187)
