@@ -12,6 +12,7 @@
 
 #include "engine.cuh"
 #include "tokenizer.h"
+#include "think_split.h"
 #include "../third_party/httplib.h"
 #include "../third_party/json.hpp"
 
@@ -87,11 +88,18 @@ int main(int argc, char** argv) {
             if (!sys.empty()) msgs.push_back({"system", sys});
         }
         for (auto& m : body["messages"]) {
-            std::string role = m.value("role", "user"), content;
+            std::string role = m.value("role", "user"), think, content;
             if (m["content"].is_string()) content = m["content"];
             else if (m["content"].is_array())
-                for (auto& part : m["content"])
-                    if (part.value("type", "") == "text") content += part.value("text", "");
+                for (auto& part : m["content"]) {
+                    std::string ty = part.value("type", "");
+                    if (ty == "text") content += part.value("text", "");
+                    else if (ty == "thinking") think += part.value("thinking", "");
+                    // tool_use / tool_result handled by the responses path, not here
+                }
+            // reconstruct assistant reasoning so multi-turn context is faithful
+            if (role == "assistant" && !think.empty())
+                content = "<think>\n" + think + "\n</think>\n" + content;
             msgs.push_back({role, content});
         }
         return tok.apply_chat_template(msgs);
@@ -172,12 +180,23 @@ int main(int argc, char** argv) {
 
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
-            std::string text;
-            int n = eng.generate(prompt, n_max, EOS,
-                                 [&](int id) { text += tok.decode_one(id); return true; });
+            q27::ThinkSplitter sp;
+            std::string think, text;
+            int n = eng.generate(prompt, n_max, EOS, [&](int id) {
+                for (auto& [ch, t] : sp.feed(tok.decode_one(id)))
+                    (ch == q27::ThinkSplitter::THINK ? think : text) += t;
+                return true;
+            });
+            for (auto& [ch, t] : sp.flush())
+                (ch == q27::ThinkSplitter::THINK ? think : text) += t;
+            json content = json::array();
+            std::string th = q27::strip_ws(think);
+            if (!th.empty())
+                content.push_back({{"type", "thinking"}, {"thinking", th},
+                                   {"signature", "q27-local"}});
+            content.push_back({{"type", "text"}, {"text", q27::strip_ws(text)}});
             json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                        {"model", "q27-qwopus-27b"},
-                        {"content", json::array({{{"type", "text"}, {"text", text}}})},
+                        {"model", "q27-qwopus-27b"}, {"content", content},
                         {"stop_reason", n >= n_max ? "max_tokens" : "end_turn"},
                         {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
@@ -191,6 +210,7 @@ int main(int argc, char** argv) {
             "text/event-stream",
             [&, prompt, n_max, mid](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
+                int block_counter = 0;
                 auto ev = [&](const char* name, const json& j) {
                     std::string s = std::string("event: ") + name + "\ndata: " + j.dump() + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -200,14 +220,58 @@ int main(int argc, char** argv) {
                             {"stop_reason", nullptr}, {"stop_sequence", nullptr},
                             {"usage", {{"input_tokens", (int)prompt.size()}, {"output_tokens", 0}}}};
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
-                ev("content_block_start", {{"type", "content_block_start"}, {"index", 0},
-                                           {"content_block", {{"type", "text"}, {"text", ""}}}});
+
+                q27::ThinkSplitter sp;
+                int idx = -1;            // current open content block index, -1 = none
+                int chan_open = -1;      // which channel the open block is (0 text, 1 think)
+                bool any = false;        // any block opened yet (to drop leading ws)
+                auto open_block = [&](int chan) {
+                    if (idx >= 0 && chan_open != chan) { // close the wrong-channel block
+                        if (chan_open == 1)
+                            ev("content_block_delta", {{"type", "content_block_delta"},
+                                {"index", idx},
+                                {"delta", {{"type", "signature_delta"}, {"signature", "q27-local"}}}});
+                        ev("content_block_stop", {{"type", "content_block_stop"}, {"index", idx}});
+                        idx = -1;
+                    }
+                    if (idx < 0) {
+                        idx = block_counter++;
+                        json cb = chan == 1 ? json{{"type", "thinking"}, {"thinking", ""}}
+                                            : json{{"type", "text"}, {"text", ""}};
+                        ev("content_block_start", {{"type", "content_block_start"},
+                                                   {"index", idx}, {"content_block", cb}});
+                        chan_open = chan;
+                        any = true;
+                    }
+                };
+                auto emit_seg = [&](int chan, const std::string& t) {
+                    if (t.empty()) return;
+                    if (chan == 0 && !any && q27::strip_ws(t).empty()) return; // drop leading ws
+                    open_block(chan);
+                    if (chan == 1)
+                        ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
+                            {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
+                    else
+                        ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
+                            {"delta", {{"type", "text_delta"}, {"text", t}}}});
+                };
                 int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
-                    json d = {{"type", "content_block_delta"}, {"index", 0},
-                              {"delta", {{"type", "text_delta"}, {"text", tok.decode_one(id)}}}};
-                    return ev("content_block_delta", d);
+                    for (auto& [ch, t] : sp.feed(tok.decode_one(id)))
+                        emit_seg(ch == q27::ThinkSplitter::THINK ? 1 : 0, t);
+                    return true;
                 });
-                ev("content_block_stop", {{"type", "content_block_stop"}, {"index", 0}});
+                for (auto& [ch, t] : sp.flush())
+                    emit_seg(ch == q27::ThinkSplitter::THINK ? 1 : 0, t);
+                if (idx < 0) { // nothing emitted: open an empty text block for protocol validity
+                    idx = block_counter++;
+                    ev("content_block_start", {{"type", "content_block_start"}, {"index", idx},
+                                               {"content_block", {{"type", "text"}, {"text", ""}}}});
+                }
+                // thinking blocks need a signature_delta before close
+                if (chan_open == 1)
+                    ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
+                        {"delta", {{"type", "signature_delta"}, {"signature", "q27-local"}}}});
+                ev("content_block_stop", {{"type", "content_block_stop"}, {"index", idx}});
                 ev("message_delta", {{"type", "message_delta"},
                                      {"delta", {{"stop_reason",
                                                  produced >= n_max ? "max_tokens" : "end_turn"},
