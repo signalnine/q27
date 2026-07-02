@@ -109,7 +109,8 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | steady state (128-token bench, 2.39 tok/round) | **133.5** |
 | `--fast-head` opt-in (Q4 verify; output differs, coherent) | 143.0 |
 | + full grid merges (l2/f16/gates/rope/kv/attn/sigmoid/embed x3) | 145.8 lossless / 156.5 fast |
-| + device-side round bookkeeping (1 sync + 16B readback/round) | **146.0** lossless / **156.5** fast |
+| + device-side round bookkeeping (1 sync + 16B readback/round) | 146.0 lossless / 156.5 fast |
+| E1: display compositor off GPU 0 (cosmic-comp/Xwayland stole ~10%) | **157.4** lossless / **168.5** fast |
 
 ## Risk register
 
