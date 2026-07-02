@@ -26,15 +26,22 @@ static __device__ __forceinline__ float warp_reduce_f(float v) {
 // dp4a'd against TB tokens' activations (weight DRAM traffic /TB; activation
 // tile stays L2-resident).
 
-template <int TB>
+template <int TB, int CS>
 __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                             const uint2* __restrict__ eo, const float* __restrict__ xs,
                             const int* __restrict__ xisum, float* __restrict__ y,
                             int64_t rows, int64_t cols, int T, int t0) {
-    // 16 warps = 16 rows per block; activations for a 32-chunk x TB-token tile
-    // staged in shared memory once and reused by all rows. Per-lane accumulation
-    // order matches the serial k_gemv_q4 walk exactly (bitwise-identical sums).
-    constexpr int RB = 16, CS = 32;
+    // RB warps = RB rows per block; a CS-chunk x TB-token activation tile is
+    // staged in dynamic shared memory and reused by all rows. Per-lane chunk
+    // order (c0+lane, c0+lane+32, ...) matches the serial k_gemv_q4 walk, so
+    // sums are bitwise-identical to the single-token path.
+    constexpr int RB = 16;
+    constexpr int EOP = TB * 4 + 1, XSP = TB + 1; // padded rows (bank conflicts)
+    extern __shared__ unsigned char smem_raw[];
+    uint2* s_eo = (uint2*)smem_raw;
+    float* s_xs = (float*)(s_eo + CS * EOP);
+    int* s_is = (int*)(s_xs + CS * XSP);
+
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     int64_t row = (int64_t)blockIdx.x * RB + warp;
     const int nt = min(TB, T - t0);
@@ -43,46 +50,48 @@ __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restr
     const uint4* wr = row < rows ? (const uint4*)(W + row * (cols / 2)) : nullptr;
     const __half* sr = row < rows ? S + row * (cols / 64) : nullptr;
 
-    // rows padded so lane-major reads don't hit a 128B-aligned stride
-    __shared__ uint2 s_eo[CS * (TB * 4 + 1)];
-    __shared__ float s_xs[CS * (TB + 1)];
-    __shared__ int s_is[CS * (TB + 1)];
-
     float acc[TB];
 #pragma unroll
     for (int i = 0; i < TB; i++) acc[i] = 0.f;
 
     for (int c0 = 0; c0 < n_chunks; c0 += CS) {
         __syncthreads();
-        // cooperative stage: (cc, tt, u) grid over 512 threads
         for (int idx = threadIdx.x; idx < CS * TB * 4; idx += blockDim.x) {
-            int u = idx & 3, tt = (idx >> 2) & (TB - 1), cc = idx >> 7;
-            s_eo[cc * (TB * 4 + 1) + tt * 4 + u] =
-                __ldg(eo + (size_t)(t0 + tt) * ept + (size_t)(c0 + cc) * 4 + u);
+            int u = idx & 3, r = idx >> 2, tt = r % TB, cc = r / TB;
+            s_eo[cc * EOP + tt * 4 + u] =
+                c0 + cc < n_chunks
+                    ? __ldg(eo + (size_t)(t0 + tt) * ept + (size_t)(c0 + cc) * 4 + u)
+                    : make_uint2(0, 0);
         }
         for (int idx = threadIdx.x; idx < CS * TB; idx += blockDim.x) {
-            int tt = idx & (TB - 1), cc = idx / TB;
-            s_xs[cc * (TB + 1) + tt] = __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc);
-            s_is[cc * (TB + 1) + tt] = __ldg(xisum + (size_t)(t0 + tt) * n_chunks + c0 + cc);
+            int tt = idx % TB, cc = idx / TB;
+            bool ok = c0 + cc < n_chunks;
+            s_xs[cc * XSP + tt] =
+                ok ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
+            s_is[cc * XSP + tt] =
+                ok ? __ldg(xisum + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0;
         }
         __syncthreads();
         if (!wr) continue;
-        const int ch = c0 + lane; // same lane->chunk mapping as the serial walk
-        uint4 w = __ldg(wr + ch);
-        float ws = __half2float(__ldg(sr + (ch >> 1)));
-        const uint32_t wv[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
-        for (int tt = 0; tt < TB; tt++) {
-            if (tt >= nt) break;
-            int di = 0;
+        for (int cc = lane; cc < CS; cc += 32) {
+            const int ch = c0 + cc;
+            if (ch >= n_chunks) break;
+            uint4 w = __ldg(wr + ch);
+            float ws = __half2float(__ldg(sr + (ch >> 1)));
+            const uint32_t wv[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
-            for (int u = 0; u < 4; u++) {
-                uint2 xv = s_eo[lane * (TB * 4 + 1) + tt * 4 + u];
-                di = __dp4a((int)(wv[u] & 0x0F0F0F0Fu), (int)xv.x, di);
-                di = __dp4a((int)((wv[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
+            for (int tt = 0; tt < TB; tt++) {
+                if (tt >= nt) break;
+                int di = 0;
+#pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    uint2 xv = s_eo[cc * EOP + tt * 4 + u];
+                    di = __dp4a((int)(wv[u] & 0x0F0F0F0Fu), (int)xv.x, di);
+                    di = __dp4a((int)((wv[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
+                }
+                acc[tt] += ws * s_xs[cc * XSP + tt] * (float)(di - 8 * s_is[cc * XSP + tt]);
             }
-            acc[tt] += ws * s_xs[lane * (TB + 1) + tt] *
-                       (float)(di - 8 * s_is[lane * (TB + 1) + tt]);
         }
     }
     if (!wr) return;
@@ -93,20 +102,22 @@ __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restr
     }
 }
 
-template <int TB>
+template <int TB, int CS>
 __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restrict__ S,
                             const int8_t* __restrict__ nat, const float* __restrict__ xs,
                             float* __restrict__ y, int64_t rows, int64_t cols, int T, int t0) {
-    constexpr int RB = 16, CS = 32;
+    constexpr int RB = 16;
+    constexpr int XP = TB * 2 + 1, XSP = TB + 1;
+    extern __shared__ unsigned char smem_raw[];
+    uint4* s_x = (uint4*)smem_raw;
+    float* s_xs = (float*)(s_x + CS * XP);
+
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     int64_t row = (int64_t)blockIdx.x * RB + warp;
     const int nt = min(TB, T - t0);
     const int n_chunks = (int)(cols / 32);
     const uint4* wr = row < rows ? (const uint4*)(W + row * cols) : nullptr;
     const __half* sr = row < rows ? S + row * (cols / 128) : nullptr;
-
-    __shared__ uint4 s_x[CS * (TB * 2 + 1)];
-    __shared__ float s_xs[CS * (TB + 1)];
 
     float acc[TB];
 #pragma unroll
@@ -115,34 +126,40 @@ __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restri
     for (int c0 = 0; c0 < n_chunks; c0 += CS) {
         __syncthreads();
         for (int idx = threadIdx.x; idx < CS * TB * 2; idx += blockDim.x) {
-            int u = idx & 1, tt = (idx >> 1) & (TB - 1), cc = idx >> 6;
-            s_x[cc * (TB * 2 + 1) + tt * 2 + u] =
-                __ldg((const uint4*)(nat + (size_t)(t0 + tt) * cols) + 2 * (c0 + cc) + u);
+            int u = idx & 1, r = idx >> 1, tt = r % TB, cc = r / TB;
+            s_x[cc * XP + tt * 2 + u] =
+                c0 + cc < n_chunks
+                    ? __ldg((const uint4*)(nat + (size_t)(t0 + tt) * cols) + 2 * (c0 + cc) + u)
+                    : make_uint4(0, 0, 0, 0);
         }
         for (int idx = threadIdx.x; idx < CS * TB; idx += blockDim.x) {
-            int tt = idx & (TB - 1), cc = idx / TB;
-            s_xs[cc * (TB + 1) + tt] = __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc);
+            int tt = idx % TB, cc = idx / TB;
+            s_xs[cc * XSP + tt] =
+                c0 + cc < n_chunks ? __ldg(xs + (size_t)(t0 + tt) * n_chunks + c0 + cc) : 0.f;
         }
         __syncthreads();
         if (!wr) continue;
-        const int ch = c0 + lane;
-        uint4 w0 = __ldg(wr + 2 * ch), w1 = __ldg(wr + 2 * ch + 1);
-        float ws = __half2float(__ldg(sr + (ch >> 2)));
 #pragma unroll
-        for (int tt = 0; tt < TB; tt++) {
-            if (tt >= nt) break;
-            uint4 x0 = s_x[lane * (TB * 2 + 1) + tt * 2],
-                  x1 = s_x[lane * (TB * 2 + 1) + tt * 2 + 1];
-            int di = 0;
-            di = __dp4a((int)w0.x, (int)x0.x, di);
-            di = __dp4a((int)w0.y, (int)x0.y, di);
-            di = __dp4a((int)w0.z, (int)x0.z, di);
-            di = __dp4a((int)w0.w, (int)x0.w, di);
-            di = __dp4a((int)w1.x, (int)x1.x, di);
-            di = __dp4a((int)w1.y, (int)x1.y, di);
-            di = __dp4a((int)w1.z, (int)x1.z, di);
-            di = __dp4a((int)w1.w, (int)x1.w, di);
-            acc[tt] += ws * s_xs[lane * (TB + 1) + tt] * (float)di;
+        for (int cc = lane; cc < CS; cc += 32) {
+            const int ch = c0 + cc;
+            if (ch >= n_chunks) break;
+            uint4 w0 = __ldg(wr + 2 * ch), w1 = __ldg(wr + 2 * ch + 1);
+            float ws = __half2float(__ldg(sr + (ch >> 2)));
+#pragma unroll
+            for (int tt = 0; tt < TB; tt++) {
+                if (tt >= nt) break;
+                uint4 x0 = s_x[cc * XP + tt * 2], x1 = s_x[cc * XP + tt * 2 + 1];
+                int di = 0;
+                di = __dp4a((int)w0.x, (int)x0.x, di);
+                di = __dp4a((int)w0.y, (int)x0.y, di);
+                di = __dp4a((int)w0.z, (int)x0.z, di);
+                di = __dp4a((int)w0.w, (int)x0.w, di);
+                di = __dp4a((int)w1.x, (int)x1.x, di);
+                di = __dp4a((int)w1.y, (int)x1.y, di);
+                di = __dp4a((int)w1.z, (int)x1.z, di);
+                di = __dp4a((int)w1.w, (int)x1.w, di);
+                acc[tt] += ws * s_xs[cc * XSP + tt] * (float)di;
+            }
         }
     }
     if (!wr) return;
@@ -155,20 +172,37 @@ __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restri
 
 void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st) {
-    constexpr int TB = 32, RB = 16;
+    constexpr int TB = 32, CS = 32, RB = 16;
+    constexpr size_t SM = (size_t)CS * (TB * 4 + 1) * sizeof(uint2) +
+                          (size_t)CS * (TB + 1) * (sizeof(float) + sizeof(int));
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_q4_T<TB, CS>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+        attr = true;
+    }
     dim3 grid((unsigned)((rows + RB - 1) / RB));
     for (int t0 = 0; t0 < T; t0 += TB)
-        k_gemm_q4_T<TB><<<grid, RB * 32, 0, st>>>(W, S, xq.eo, xq.scale, xq.isum, y, rows,
-                                                  cols, T, t0);
+        k_gemm_q4_T<TB, CS><<<grid, RB * 32, SM, st>>>(W, S, xq.eo, xq.scale, xq.isum, y, rows,
+                                                       cols, T, t0);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st) {
-    constexpr int TB = 32, RB = 16;
+    constexpr int TB = 32, CS = 32, RB = 16;
+    constexpr size_t SM = (size_t)CS * (TB * 2 + 1) * sizeof(uint4) +
+                          (size_t)CS * (TB + 1) * sizeof(float);
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_q8_T<TB, CS>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+        attr = true;
+    }
     dim3 grid((unsigned)((rows + RB - 1) / RB));
     for (int t0 = 0; t0 < T; t0 += TB)
-        k_gemm_q8_T<TB><<<grid, RB * 32, 0, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T, t0);
+        k_gemm_q8_T<TB, CS><<<grid, RB * 32, SM, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T,
+                                                       t0);
     CUDA_CHECK(cudaGetLastError());
 }
 
