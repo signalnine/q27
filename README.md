@@ -130,14 +130,21 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | fp16 KV cache (attn + MTP) | 169.7 @2k / 159.7 @8k; halves KV bytes, -2.1GB @32k ctx |
 | E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
 | E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
+| P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
 weights load once -- a bit flipped by a marginal OC during a long session is a
 persistent silent error the token-identity gates cannot catch (they compare
-against the same resident state). The +5000 512-token stock-identical soak was
-a point-in-time check, not a long-session guarantee. For unattended multi-hour
-serving, stock clocks are the conservative choice.
+against the same resident state). **OBSERVED 2026-07-02:** after ~30 min of
+sustained VRAM load (long-context benches), the canonical 128-token sequence
+came out WRONG -- deterministically across immediate re-runs -- then returned
+to correct after a few minutes of cooldown, on an unchanged binary. Everything
+fits a heat-marginal +4000 offset flipping a resident weight bit. Treat +4000
+as unsafe for sustained load; +3000 (where E2 measured the gains flattening)
+or stock is the recommendation for anything long-running. A device-side
+weight-checksum tool (verify after load, recheck on demand) is on the roadmap
+as the detection mechanism.
 
 ## Prefill (M6)
 
@@ -192,20 +199,44 @@ few candidate repacks). Budget: each Q4->Q8 tensor class costs decode
 bandwidth, so gate on (PPL gain) / (t/s cost). Repack invalidates all
 canonical token gates -- re-derive canonicals in the same commit.
 
-**P1 -- prefill via int8 tensor-core MMA (biggest user-visible lever):**
+**P1 -- DONE 2026-07-02: prefill 2.35x, cold 28.1K TTFT 63.8s -> 35.7s.**
+Kernel: k_gemm_mma_T (prefill.cu), one mma.sync per 32-element quant block,
+Q4 nibbles unpacked to s8 (offset folded) in smem staging; unit-gated at
+1e-6 vs dp4a on all four weight shapes; full-corpus PPL +0.04% (fp reorder);
+needle 3/3 @64K; decode canonicals untouched; Q27_PREFILL=dp4a keeps the
+exact-reference path. nsys at 28K now shows attention prefill dominant
+(~16.4s of the remaining ~36s wall) with delta_scan next (~3.8s) -- the
+long-context TTFT lever is attention prefill now, NOT GEMM. GEMM tile
+tuning (ldmatrix, cp.async, wider N tile to cut the 8x weight re-read)
+still pays at short ctx but is deferred. Original plan below for reference.
+
+**P1 (original plan) -- prefill via int8 tensor-core MMA:**
 mma.sync m16n8k32 s8s8s32 (sm_80+ PTX, works on sm_120) replaces dp4a in the
-prefill GEMM. Key property: int32 accumulation is order-independent, and the
-per-group fp scale-and-add already matches serial order -- so THE BITWISE
-IDENTITY GATE SURVIVES, unlike an fp16/fp8 MMA path (risk 6). No CUTLASS
-needed; "plain CUDA" stays true. dp4a prefill: ~590 t/s @512 / ~300 @26K;
-fork reference 2,300-2,400. Realistic target 2-4x -> cold 26.7K TTFT from
-61s toward ~15-25s. Fallbacks if hand-rolled IMMA stalls: scoped cuBLASLt
-int8 GEMM for prefill only, or status quo + prefix cache.
+prefill GEMM. CORRECTION (2026-07-02, found during implementation): the
+within-chunk int32 dots are exact under MMA, but the per-32-block activation
+scales force one fp multiply-add per chunk, and dp4a's fp structure per
+output (32 stride-32 lane-partials + shuffle tree, matching serial GEMV)
+cannot be reproduced by an MMA accumulator without infeasible register cost.
+So the ORIGINAL review point stands: the MMA path needs a tolerance gate,
+not the bitwise gate. Divergence is pure fp-reorder noise (~1e-6 rel;
+integer dots exact), so tolerance is tight. Gates: unit test (MMA chunk
+dots == dp4a exactly), --pfdbg state maxdiff at fp-noise level, full-corpus
+--nll PPL delta < 0.02% vs dp4a prefill, needle 3/3, Q27_PREFILL=dp4a env
+keeps the exact path as reference/fallback, decode canonicals untouched.
+Still no CUTLASS; "plain CUDA" stays true. dp4a prefill: ~590 t/s @512 /
+~300 @26K; fork reference 2,300-2,400. Realistic target 2-4x -> cold 26.7K
+TTFT from 61s toward ~15-25s.
 
 **P2 -- fp8 (E4M3) KV cache:** halves KV again (68 -> 34 KB/token: ~8.9 GB
 @256K) and cuts long-ctx decode KV bandwidth. NOT lossless -- changes logits,
 so it lands behind the P0 gates and ships opt-in until the needle/PPL gates
 pass at tolerance. Design-decisions section already marks it planned.
+
+**P1.5 -- attention prefill rewrite (new long-ctx TTFT lever, from the P1
+nsys):** attn_prefill_T is ~16.4s of the remaining ~36s at 28K (two-pass
+softmax, 32-token sub-batches). Streaming FA-style single pass and/or larger
+sub-batch. Also: weight-checksum tool (load-time CRC + on-demand device
+recheck) to detect OC/heat bit flips -- see the OC incident note.
 
 **P3 -- decode odds and ends (only after the above):**
 - E6 round-cost audit: round time rose 15% for depth-3 but only ~7% is

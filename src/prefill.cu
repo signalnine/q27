@@ -1,5 +1,7 @@
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "blocks.cuh"
 #include "prefill.cuh"
@@ -170,8 +172,190 @@ __global__ void k_gemm_q8_T(const int8_t* __restrict__ W, const __half* __restri
     }
 }
 
+// ---------------- int8 tensor-core GEMM (P1) ----------------
+// mma.sync m16n8k32: each MMA covers exactly one 32-element activation quant
+// block, so the int32 dot per (row, token, chunk) equals the dp4a path's
+// integer exactly (Q4 nibbles are unpacked to s8 with the -8 offset folded in
+// during staging). The fp scale-and-add per chunk has a different ACCUMULATION
+// ORDER than the serial GEMV's lane-partial tree, so outputs differ from the
+// dp4a path by fp rounding only (~1e-6 rel) -- gated by unit test + --pfdbg +
+// full-corpus --nll, with Q27_PREFILL=dp4a keeping the exact path available.
+//
+// Tile: block = 256 threads = 8 warps as 4(M) x 2(N); block tile 64 rows x
+// 32 tokens; K staged 128 elements at a time in smem.
+
+static __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3, uint32_t a0,
+                                              uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                              uint32_t b1) {
+    const int z = 0;
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
+}
+
+// Q4IN: weights arrive nibble-packed (Q4_G64, scale per 64) and are unpacked
+// to s8 in staging; otherwise s8 rows (Q8_G128, scale per 128).
+template <bool Q4IN>
+__global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                             const int8_t* __restrict__ nat, const float* __restrict__ xs,
+                             float* __restrict__ y, int64_t rows, int64_t cols, int T) {
+    constexpr int MR = 64, NT = 32, KS = 128;   // block tile: rows, tokens, staged K
+    constexpr int LDW = KS + 16, LDX = KS + 16; // padded smem strides (bytes)
+    extern __shared__ unsigned char smem_raw[];
+    int8_t* s_w = (int8_t*)smem_raw;                  // [MR][LDW]
+    int8_t* s_x = (int8_t*)(s_w + MR * LDW);          // [NT][LDX]
+    float* s_ws = (float*)(s_x + NT * LDX);           // [MR][KS/64 or KS/128]
+    float* s_xs = (float*)(s_ws + MR * (Q4IN ? 2 : 1)); // [NT][4]
+
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int wm = warp % 4, wn = warp / 4;      // warp tile: rows wm*16, tokens wn*16
+    const int gid = lane >> 2, tg = lane & 3;    // mma fragment coords
+    const int64_t r0 = (int64_t)blockIdx.x * MR; // block row base
+    const int t0 = blockIdx.y * NT;              // block token base
+    const int n_stages = (int)(cols / KS);
+
+    float acc[2][4];
+#pragma unroll
+    for (int s = 0; s < 2; s++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) acc[s][e] = 0.f;
+
+    for (int st = 0; st < n_stages; st++) {
+        const int64_t k0 = (int64_t)st * KS;
+        __syncthreads();
+        // stage weights: MR rows x KS elements (unpack nibbles if Q4)
+        if (Q4IN) {
+            // KS/2 = 64 packed bytes per row; thread handles 4 packed -> 8 s8
+            for (int idx = threadIdx.x; idx < MR * (KS / 2) / 4; idx += blockDim.x) {
+                int rr = idx / 16, pb4 = idx % 16; // 16 u32 of packed bytes per row
+                uint32_t p = r0 + rr < rows
+                                 ? __ldg((const uint32_t*)(W + (r0 + rr) * (cols / 2) + k0 / 2) +
+                                         pb4)
+                                 : 0x88888888u; // unpacks to 0 after -8
+                int8_t* dst = s_w + rr * LDW + pb4 * 8;
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    uint32_t byte = (p >> (8 * b)) & 0xFF;
+                    dst[2 * b] = (int8_t)((int)(byte & 0xF) - 8);
+                    dst[2 * b + 1] = (int8_t)((int)(byte >> 4) - 8);
+                }
+            }
+        } else {
+            for (int idx = threadIdx.x; idx < MR * KS / 4; idx += blockDim.x) {
+                int rr = idx / (KS / 4), u = idx % (KS / 4);
+                *(uint32_t*)(s_w + rr * LDW + u * 4) =
+                    r0 + rr < rows ? __ldg((const uint32_t*)(W + (r0 + rr) * cols + k0) + u) : 0u;
+            }
+        }
+        // stage activations: NT tokens x KS bytes (zero-fill past T)
+        for (int idx = threadIdx.x; idx < NT * KS / 4; idx += blockDim.x) {
+            int tt = idx / (KS / 4), u = idx % (KS / 4);
+            *(uint32_t*)(s_x + tt * LDX + u * 4) =
+                t0 + tt < T ? __ldg((const uint32_t*)(nat + (size_t)(t0 + tt) * cols + k0) + u)
+                            : 0u;
+        }
+        // stage scales: weight scale per group, x scale per 32-chunk
+        if (Q4IN) {
+            for (int idx = threadIdx.x; idx < MR * 2; idx += blockDim.x) {
+                int rr = idx / 2, g = idx % 2;
+                s_ws[rr * 2 + g] =
+                    r0 + rr < rows
+                        ? __half2float(__ldg(S + (r0 + rr) * (cols / 64) + k0 / 64 + g))
+                        : 0.f;
+            }
+        } else {
+            for (int idx = threadIdx.x; idx < MR; idx += blockDim.x)
+                s_ws[idx] = r0 + idx < rows
+                                ? __half2float(__ldg(S + (r0 + idx) * (cols / 128) + k0 / 128))
+                                : 0.f;
+        }
+        for (int idx = threadIdx.x; idx < NT * 4; idx += blockDim.x) {
+            int tt = idx / 4, cc = idx % 4;
+            s_xs[tt * 4 + cc] =
+                t0 + tt < T
+                    ? __ldg(xs + (size_t)(t0 + tt) * (cols / 32) + k0 / 32 + cc)
+                    : 0.f;
+        }
+        __syncthreads();
+
+        // 4 chunks of 32 per stage; per chunk, 2 mma (token subtiles of 8)
+#pragma unroll
+        for (int cc = 0; cc < 4; cc++) {
+            const int kb = cc * 32;
+            const int8_t* wrow0 = s_w + (wm * 16 + gid) * LDW + kb;
+            uint32_t a0 = *(const uint32_t*)(wrow0 + tg * 4);
+            uint32_t a1 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4);
+            uint32_t a2 = *(const uint32_t*)(wrow0 + tg * 4 + 16);
+            uint32_t a3 = *(const uint32_t*)(wrow0 + 8 * LDW + tg * 4 + 16);
+            const float wsc0 = s_ws[(wm * 16 + gid) * (Q4IN ? 2 : 1) + (Q4IN ? kb / 64 : 0)];
+            const float wsc1 =
+                s_ws[(wm * 16 + gid + 8) * (Q4IN ? 2 : 1) + (Q4IN ? kb / 64 : 0)];
+#pragma unroll
+            for (int s = 0; s < 2; s++) {
+                const int tb = wn * 16 + s * 8; // token subtile base
+                const int8_t* xcol = s_x + (tb + gid) * LDX + kb;
+                uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
+                uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+                int d0, d1, d2, d3;
+                mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                const float xs0 = s_xs[(tb + tg * 2) * 4 + cc];
+                const float xs1 = s_xs[(tb + tg * 2 + 1) * 4 + cc];
+                acc[s][0] += wsc0 * xs0 * (float)d0;
+                acc[s][1] += wsc0 * xs1 * (float)d1;
+                acc[s][2] += wsc1 * xs0 * (float)d2;
+                acc[s][3] += wsc1 * xs1 * (float)d3;
+            }
+        }
+    }
+
+    const int64_t row0 = r0 + wm * 16 + gid;
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int tok0 = t0 + wn * 16 + s * 8 + tg * 2;
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int64_t row = row0 + (e >= 2 ? 8 : 0);
+            int tok = tok0 + (e & 1);
+            if (row < rows && tok < T) y[(size_t)tok * rows + row] = acc[s][e];
+        }
+    }
+}
+
+// Re-read each launch (a getenv is noise next to a kernel launch) so tests
+// can flip paths in-process via setenv.
+static bool prefill_use_mma() {
+    const char* e = getenv("Q27_PREFILL");
+    return !(e && !strcmp(e, "dp4a"));
+}
+
+template <bool Q4IN>
+static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
+                            int64_t rows, int64_t cols, int T, cudaStream_t st) {
+    constexpr int MR = 64, NT = 32, KS = 128, LDW = KS + 16, LDX = KS + 16;
+    const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * 4) * 4;
+    if (cols % KS) {
+        fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);
+        exit(1);
+    }
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(k_gemm_mma_T<Q4IN>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+        attr = true;
+    }
+    dim3 grid((unsigned)((rows + MR - 1) / MR), (unsigned)((T + NT - 1) / NT));
+    k_gemm_mma_T<Q4IN><<<grid, 256, SM, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st) {
+    if (prefill_use_mma()) {
+        launch_gemm_mma<true>(W, S, xq, y, rows, cols, T, st);
+        return;
+    }
     constexpr int TB = 32, CS = 32, RB = 16;
     constexpr size_t SM = (size_t)CS * (TB * 4 + 1) * sizeof(uint2) +
                           (size_t)CS * (TB + 1) * (sizeof(float) + sizeof(int));
@@ -190,6 +374,10 @@ void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, in
 
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
                int64_t cols, int T, cudaStream_t st) {
+    if (prefill_use_mma()) {
+        launch_gemm_mma<false>((const uint8_t*)W, S, xq, y, rows, cols, T, st);
+        return;
+    }
     constexpr int TB = 32, CS = 32, RB = 16;
     constexpr size_t SM = (size_t)CS * (TB * 2 + 1) * sizeof(uint4) +
                           (size_t)CS * (TB + 1) * sizeof(float);

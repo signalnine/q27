@@ -2,6 +2,7 @@
 // No external ground truth needed; validates layout, nibble order, scales, GEMV.
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
+#include "prefill.cuh"
 
 using q27::DType;
 
@@ -230,6 +232,56 @@ static void test_gemv_batch(q27::DeviceModel& dm, const q27::Model& m, const cha
     check(label, maxd, 1e-5); // same math, same order -> near bit-identical
 }
 
+// P1: MMA prefill GEMM vs dp4a on real tensors. Same integer chunk dots by
+// construction; fp accumulation order differs, so compare at rounding-noise
+// tolerance. T=33 exercises the token-tail path. A real indexing/unpack bug
+// shows as O(1)+ relative error -- clean separation from the 1e-6 noise floor.
+static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
+    const q27::Tensor& t = m.get(name);
+    const q27::DevTensor& d = dm.upload(name);
+    int64_t rows = t.rows(), cols = t.cols();
+    const int T = 33;
+
+    std::vector<float> x = rand_vec((size_t)T * cols, 7);
+    float *d_x, *d_ya, *d_yb;
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)T * cols * 4));
+    CUDA_CHECK(cudaMalloc(&d_ya, (size_t)T * rows * 4));
+    CUDA_CHECK(cudaMalloc(&d_yb, (size_t)T * rows * 4));
+    CUDA_CHECK(cudaMemcpy(d_x, x.data(), (size_t)T * cols * 4, cudaMemcpyHostToDevice));
+    // dp4a GEMM staging over-reads activations to the full 32-token tile (the
+    // discard is via nt guards downstream), so the XQuant buffer must be
+    // token-tile padded exactly like the engine's xqT (PF_T tokens).
+    const int Tpad = (T + 31) & ~31;
+    q27k::XQuant xq = q27k::xquant_alloc((size_t)Tpad * cols);
+    q27k::quantize_x(d_x, (size_t)T * cols, xq);
+
+    auto run = [&](const char* mode, float* y) {
+        setenv("Q27_PREFILL", mode, 1);
+        if (t.dtype == DType::Q4_G64)
+            q27k::gemm_q4_T((const uint8_t*)d.data, (const __half*)d.scales, xq, y, rows, cols,
+                            T, 0);
+        else
+            q27k::gemm_q8_T((const int8_t*)d.data, (const __half*)d.scales, xq, y, rows, cols,
+                            T, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    run("dp4a", d_ya);
+    run("mma", d_yb);
+    unsetenv("Q27_PREFILL");
+    std::vector<float> ya((size_t)T * rows), yb((size_t)T * rows);
+    CUDA_CHECK(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(yb.data(), d_yb, yb.size() * 4, cudaMemcpyDeviceToHost));
+    double maxrel = 0;
+    for (size_t i = 0; i < ya.size(); i++)
+        maxrel = std::max(maxrel, (double)std::fabs(ya[i] - yb[i]) / (1.0 + std::fabs(ya[i])));
+    char label[128];
+    snprintf(label, sizeof label, "gemm MMA vs dp4a %s", name);
+    check(label, maxrel, 1e-4);
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_ya));
+    CUDA_CHECK(cudaFree(d_yb));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -243,6 +295,10 @@ int main(int argc, char** argv) {
     test_gemv(dm, m, "blk.0.ssm_alpha.weight");     // F16 GEMV
     test_gemv_batch(dm, m, "blk.0.ffn_gate.weight");
     test_gemv_batch(dm, m, "blk.3.attn_k.weight");
+    test_gemm_mma(dm, m, "blk.0.attn_qkv.weight");  // Q4 10240x5120
+    test_gemm_mma(dm, m, "blk.0.ffn_down.weight");  // Q4 5120x17408 (K tail shapes)
+    test_gemm_mma(dm, m, "blk.3.attn_k.weight");    // Q8 1024x5120
+    test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

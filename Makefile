@@ -18,9 +18,9 @@ build:
 build/inspect: src/inspect.cpp src/loader.cpp src/loader.h | build
 	$(CXX) $(CXXFLAGS) src/inspect.cpp src/loader.cpp -o $@
 
-build/test_kernels: src/test_kernels.cu src/kernels.cu src/device_model.cu src/loader.cpp \
-                    src/kernels.cuh src/device_model.h src/loader.h src/cuda_common.h | build
-	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
+build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/device_model.cu src/loader.cpp \
+                    src/kernels.cuh src/prefill.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
 
 
 build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu \
