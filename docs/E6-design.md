@@ -1,4 +1,17 @@
-# E6: confidence-gated depth-3 speculation -- design
+# E6: depth-3 speculation -- design
+
+> **2026-07-02 Phase-0b RESULT (supersedes the gated design below):**
+> measured p(d3 | d1,d2 correct) = 83.7% ungated over 512 positions
+> (design assumed ~65%). Every margin bin pays for itself (worst bin:
+> 25.9% prefix x 71.4% d3 = +0.185 t/round vs ~5.5% round tax), so E6
+> ships **ungated always-on depth-3**: no D/V graph split, no second host
+> sync, no top2_margin kernel, no theta. One fused graph per perm (4
+> perms), round drafts 3 (pass 3 chains from pass-2 hidden) and
+> batch-4-verifies {t1, dr1, dr2, dr3}. Everything else below (4-buffer
+> mod-4 rollback, P3->p[4] widening, finish_round4, lane-d buffers, MTP
+> KV semantics, phased gates) applies unchanged. Conservative net
+> estimate ~+15% decode (round-level prefix acceptance 64.7% x 83.7% =
+> +0.54 t/round on 2.53, minus ~5.5% round-time cost).
 
 Goal: extend the depth-2 MTP self-speculation round to depth 3 when the pass-2
 draft is confident, per E3 data (margin>=2 covers 64% of rounds at ~86% draft-2

@@ -55,6 +55,7 @@ struct Engine {
     float *ffn_g_b, *ffn_u_b, *logits2, *y2big;
     float *S_spare[N_LAYER], *ring_spare[N_LAYER];
     float *S_spare2[N_LAYER], *ring_spare2[N_LAYER];
+    float *S_spare3[N_LAYER], *ring_spare3[N_LAYER];
     float *h_c, *x1_c, *y_c, *qg_c, *kbuf_c, *vbuf_c, *attnout_c;
     float *qkv_c, *convout_c, *z_c, *alpha_c, *betar_c, *g_c, *beta_c, *o_c, *og_c;
     float *ffn_g_c, *ffn_u_c;
@@ -64,9 +65,10 @@ struct Engine {
     int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
-    // GDN state as 3 physical buffers with a cyclic role permutation:
-    // role r (0=primary, 1=post-b, 2=post-c) -> physical (r + perm) % 3.
-    // accept-1 token -> perm += 1; accept-2 -> perm += 2 (mod 3). 3 captured graphs.
+    // GDN state as 4 physical buffers with a cyclic role permutation:
+    // role r (0=primary, 1=post-b, 2=post-c, 3=post-d) -> physical (r+perm)%4.
+    // accept n tokens -> perm += n-1 (mod 4). One captured graph per perm.
+    // Invariant: role 0 always holds the last-committed state.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     bool batched_prefill = true;
 
@@ -89,14 +91,18 @@ struct Engine {
     std::vector<int> snap_toks;
     bool have_snap = false;
     int perm = 0;
-    cudaGraphExec_t spec_graph[3] = {nullptr, nullptr, nullptr};
+    cudaGraphExec_t spec_graph[4] = {nullptr, nullptr, nullptr, nullptr};
     float* SBuf(int il, int role) {
-        int ph = (role + perm) % 3;
-        return ph == 0 ? S[il] : ph == 1 ? S_spare[il] : S_spare2[il];
+        int ph = (role + perm) % 4;
+        return ph == 0 ? S[il] : ph == 1 ? S_spare[il] : ph == 2 ? S_spare2[il]
+                                                                 : S_spare3[il];
     }
     float* RBuf(int il, int role) {
-        int ph = (role + perm) % 3;
-        return ph == 0 ? conv_ring[il] : ph == 1 ? ring_spare[il] : ring_spare2[il];
+        int ph = (role + perm) % 4;
+        return ph == 0 ? conv_ring[il]
+               : ph == 1 ? ring_spare[il]
+               : ph == 2 ? ring_spare2[il]
+                         : ring_spare3[il];
     }
     q27k::XQuant xq;
     // layer state
@@ -219,6 +225,8 @@ struct Engine {
                 A((void**)&ring_spare[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare2[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
                 A((void**)&ring_spare2[il], 3 * GDN_CH * 4);
+                A((void**)&S_spare3[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                A((void**)&ring_spare3[il], 3 * GDN_CH * 4);
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -514,11 +522,13 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
+                CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
-        // capture all 3 cyclic permutations (capture records; does not execute)
-        for (int p = 0; p < 3; p++) {
+        // capture all 4 cyclic permutations (capture records; does not execute)
+        for (int p = 0; p < 4; p++) {
             perm = p;
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -528,7 +538,7 @@ struct Engine {
             CUDA_CHECK(cudaGraphDestroy(gr));
         }
         perm = 0;
-        fprintf(stderr, "spec graphs captured (3 perms, depth-2)\n");
+        fprintf(stderr, "spec graphs captured (4 perms, depth-2)\n");
     }
 
     // one speculative round (depth 2); returns tokens emitted (1..3).
@@ -542,7 +552,7 @@ struct Engine {
         emit[0] = oc[1];
         if (n >= 2) emit[1] = oc[2];
         if (n == 3) emit[2] = oc[3];
-        perm = (perm + (n - 1)) % 3;
+        perm = (perm + (n - 1)) % 4;
         return n;
     }
 
@@ -709,9 +719,11 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
+                CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * 2));
