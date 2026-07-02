@@ -72,6 +72,11 @@ void gated_norm_gdn(const float* o, const float* w, const float* z, float* out, 
 void add_inplace(float* x, const float* y, int n, cudaStream_t st = 0);
 
 // index of max element (greedy sampling). d_out: single int on device.
+// Teacher-forced NLL over a [nrows, vocab] row-major logit matrix:
+// nll[r] = logsumexp(logits[r,:]) - logits[r, tgt[r]].
+void nll_rows(const float* logits, const int* tgt, float* nll, int nrows, int64_t vocab,
+              cudaStream_t st = 0);
+
 // d_scratch: one u64 on device (caller-allocated; no allocation during graph capture).
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
             cudaStream_t st = 0);

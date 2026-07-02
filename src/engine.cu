@@ -28,6 +28,9 @@ int main(int argc, char** argv) {
     bool pfcache = false;
     int stats_n = 0;
     int pfdbg_n = 0;
+    std::string nll_path;
+    int nll_chunk = 512, nll_long = 0, nll_max = 0;
+    bool nll_serial = false;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
@@ -36,8 +39,13 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--pfcache")) pfcache = true;
         if (!strcmp(argv[i], "--stats") && i + 1 < argc) stats_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--pfdbg") && i + 1 < argc) pfdbg_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--nll") && i + 1 < argc) nll_path = argv[++i];
+        if (!strcmp(argv[i], "--nll-chunk") && i + 1 < argc) nll_chunk = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--nll-long") && i + 1 < argc) nll_long = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--nll-max") && i + 1 < argc) nll_max = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
     }
-    if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
+    if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
     Engine e(path, ctx);
     e.fast_head = fast;
@@ -206,6 +214,142 @@ int main(int argc, char** argv) {
                    "p(d3|prefix,gate)=%5.1f%%  extra t/round=+%.3f\n",
                    tl[t], 100 * f, 100 * ppre, 100 * pd3, f * ppre * pd3);
         }
+        return 0;
+    }
+
+    if (!nll_path.empty()) {
+        // P0 quality gate: teacher-forced NLL. Chunked mode replicates the
+        // llama-perplexity protocol exactly (independent chunks of C tokens,
+        // logits rows [C/2, C-2] predict targets [C/2+1, C-1], leftover
+        // tokens dropped, no BOS -- this model has add_bos=false), so the
+        // resulting PPL is directly comparable to `llama-perplexity -c C` on
+        // the same token stream. --nll-long: one pass, no resets, NLL
+        // bucketed by position (long-context degradation gate).
+        FILE* f = fopen(nll_path.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", nll_path.c_str()); return 1; }
+        fseek(f, 0, SEEK_END);
+        long fb = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        std::vector<int> tk(fb / 4);
+        if (fread(tk.data(), 4, tk.size(), f) != tk.size()) {
+            fprintf(stderr, "short read on %s\n", nll_path.c_str());
+            return 1;
+        }
+        fclose(f);
+        const DevTensor& onw = e.dm.get("output_norm.weight");
+        const DevTensor& head = e.dm.get("output.weight");
+        const int PT = Engine::PF_T;
+
+        if (nll_long > 0) {
+            int N = std::min((int)tk.size(), std::min(nll_long, ctx));
+            fprintf(stderr, "nll-long: %d tokens, single pass, no resets\n", N);
+            int* d_toks;
+            float *d_lg, *d_nll;
+            CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)N * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)PT * VOCAB * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_nll, PT * 4));
+            CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+            e.reset();
+            const int NB = 6;
+            const int bl[NB + 1] = {0, 2048, 8192, 16384, 32768, 49152, 1 << 30};
+            const char* bn[NB] = {"0-2k", "2k-8k", "8k-16k", "16k-32k", "32k-48k", "48k+"};
+            double bs[NB] = {0};
+            long bc[NB] = {0};
+            std::vector<float> h_nll(PT);
+            for (int c0 = 0; c0 < N - 1; c0 += PT) {
+                int T = std::min(PT, N - c0);
+                e.prefill_chunk(d_toks + c0, c0, T);
+                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                e.qxT(e.x1T, N_EMBD, T);
+                e.mmT(head, e.x1T, d_lg, T);
+                int nrows = std::min(T, N - 1 - c0);
+                q27k::nll_rows(d_lg, d_toks + c0 + 1, d_nll, nrows, VOCAB, e.stm);
+                CUDA_CHECK(cudaMemcpyAsync(h_nll.data(), d_nll, (size_t)nrows * 4,
+                                           cudaMemcpyDeviceToHost, e.stm));
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                for (int r = 0; r < nrows; r++) {
+                    int tpos = c0 + r + 1;
+                    int b = 0;
+                    while (tpos >= bl[b + 1]) b++;
+                    bs[b] += h_nll[r];
+                    bc[b]++;
+                }
+                if ((c0 / PT) % 32 == 0) fprintf(stderr, "  pos %d/%d\r", c0, N);
+            }
+            printf("\nlong-context NLL by target position (%d tokens, no resets):\n", N);
+            for (int b = 0; b < NB; b++)
+                if (bc[b])
+                    printf("  %-8s: mean NLL %.4f  PPL %8.3f  (n=%ld)\n", bn[b], bs[b] / bc[b],
+                           exp(bs[b] / bc[b]), bc[b]);
+            return 0;
+        }
+
+        const int C = nll_chunk, first = C / 2;
+        int nchunks = (int)tk.size() / C;
+        if (nll_max > 0) nchunks = std::min(nchunks, nll_max);
+        fprintf(stderr, "nll: %zu tokens, %d chunks of %d, count rows [%d, %d] (%s)\n",
+                tk.size(), nchunks, C, first, C - 2, nll_serial ? "serial" : "batched");
+        double sum = 0;
+        long count = 0;
+        if (nll_serial) {
+            std::vector<float> lg(VOCAB);
+            for (int ch = 0; ch < nchunks; ch++) {
+                const int* ck = tk.data() + (size_t)ch * C;
+                e.reset();
+                for (int i = 0; i < C; i++) {
+                    e.step_with(ck[i]);
+                    if (i >= first && i <= C - 2) {
+                        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                        CUDA_CHECK(cudaMemcpy(lg.data(), e.logits, (size_t)VOCAB * 4,
+                                              cudaMemcpyDeviceToHost));
+                        double mx = -1e30;
+                        for (int v = 0; v < VOCAB; v++) mx = std::max(mx, (double)lg[v]);
+                        double se = 0;
+                        for (int v = 0; v < VOCAB; v++) se += exp((double)lg[v] - mx);
+                        sum += log(se) + mx - (double)lg[ck[i + 1]];
+                        count++;
+                    }
+                }
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            }
+        } else {
+            int* d_toks;
+            float *d_lg, *d_nll;
+            CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)C * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)PT * VOCAB * 4));
+            CUDA_CHECK(cudaMalloc((void**)&d_nll, PT * 4));
+            std::vector<float> h_nll(PT);
+            for (int ch = 0; ch < nchunks; ch++) {
+                e.reset();
+                CUDA_CHECK(cudaMemcpyAsync(d_toks, tk.data() + (size_t)ch * C, (size_t)C * 4,
+                                           cudaMemcpyHostToDevice, e.stm));
+                for (int c0 = 0; c0 < C; c0 += PT) {
+                    int T = std::min(PT, C - c0);
+                    e.prefill_chunk(d_toks + c0, c0, T);
+                    q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, T, EPS, e.stm);
+                    e.qxT(e.x1T, N_EMBD, T);
+                    e.mmT(head, e.x1T, d_lg, T);
+                    int nrows = std::min(T, C - 1 - c0);
+                    if (nrows <= 0) continue;
+                    q27k::nll_rows(d_lg, d_toks + c0 + 1, d_nll, nrows, VOCAB, e.stm);
+                    CUDA_CHECK(cudaMemcpyAsync(h_nll.data(), d_nll, (size_t)nrows * 4,
+                                               cudaMemcpyDeviceToHost, e.stm));
+                    CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                    for (int r = 0; r < nrows; r++) {
+                        int row = c0 + r;
+                        if (row >= first && row <= C - 2) {
+                            sum += h_nll[r];
+                            count++;
+                        }
+                    }
+                }
+                if (ch % 32 == 0 && count)
+                    fprintf(stderr, "  [%d/%d] running PPL %.4f\r", ch, nchunks,
+                            exp(sum / count));
+            }
+        }
+        printf("\nnll: %ld predictions over %d chunks: mean NLL %.6f, PPL %.4f\n", count,
+               nchunks, sum / count, exp(sum / count));
         return 0;
     }
 

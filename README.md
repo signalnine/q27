@@ -6,7 +6,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. The advertised 262K native does NOT fit on this card at fp16 alongside 16.75 GB of weights -- practical allocation ceiling is ~180K (fp8 KV, planned, would double that); correctness is only validated to 8K so far (see risk 5)
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. The advertised 262K native does NOT fit on this card at fp16 alongside 16.75 GB of weights -- practical allocation ceiling is ~180K (fp8 KV, planned, would double that); correctness validated to 64K (see risk 5)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -177,13 +177,20 @@ negative). The user-visible gaps are cold prefill (~8x behind the fork's
 tensor-core GEMM; 61s cold TTFT @26.7K, warm turns 1.3s via prefix cache) and
 two advertised claims with no measurement behind them. Cheapest-blocking-first:
 
-**P0 -- claims gates (one session; block every advertised number):**
-- Long-context correctness gate: needle/consistency check vs llama.cpp at
-  >=64K (risk 5). Validates M-RoPE sections + GDN state over length, and is
-  the first real test of a large --ctx allocation (~4.3 GB KV @64K).
-- 4-bit PPL/NLL delta vs Q5_K_M (risk 2, threshold >3%, never run). Needs a
-  small teacher-forced NLL mode in the CLI (--dump-logits generalized over a
-  token file). The t/s-vs-fork comparison is only honest next to this number.
+**P0 -- claims gates: DONE 2026-07-02.**
+- Long-context: validated to 64K (risk 5: flat NLL-by-position, +2.0%
+  cross-engine at [32K,64K), needle 3/3). `--nll` / `--nll-long` added to the
+  CLI (batched teacher-forced NLL, protocol-identical to llama-perplexity;
+  gated vs a serial reference path).
+- PPL delta: **+3.35% vs Q5_K_M** (7.2135 vs 6.9797), marginally over the 3%
+  bar -> NEW ITEM below.
+
+**P0.5 -- v1.4 quant policy (opened by the PPL measurement):** recover part
+of the 3.35% by moving the most PPL-sensitive tensors up-bit (usual suspects:
+early-layer ffn_down / attn_v; measure per-tensor sensitivity with --nll on a
+few candidate repacks). Budget: each Q4->Q8 tensor class costs decode
+bandwidth, so gate on (PPL gain) / (t/s cost). Repack invalidates all
+canonical token gates -- re-derive canonicals in the same commit.
 
 **P1 -- prefill via int8 tensor-core MMA (biggest user-visible lever):**
 mma.sync m16n8k32 s8s8s32 (sm_80+ PTX, works on sm_120) replaces dp4a in the
@@ -213,8 +220,8 @@ pass at tolerance. Design-decisions section already marks it planned.
 ## Risk register
 
 1. **Gated DeltaNet decode kernel** is the new risk center (was "simple dense" until we read the GGUF). llama.cpp's implementation is the semantic reference; validate per-layer.
-2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: the PPL delta has never actually been measured** -- the threshold is unbacked, and the t/s win over Q5_K_M partly comes from reading 14.8 GB instead of 18.2, so the speed comparison is only honest next to a quality number. OPEN.
+2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED 2026-07-02** -- wikitext-2 test, identical tokens and chunk protocol (`--nll`, replicates llama-perplexity -c 512): q27 4-bit PPL **7.2135** vs Q5_K_M **6.9797 +/- 0.046** = **+3.35%**, marginally over the 3% bar (and against a 5.5-bpw quant reading 18.2 GB vs q27's 14.8 -- part of the t/s win is bit-width). Mitigation opened in the roadmap: v1.4 quant policy (bump the most PPL-sensitive tensors to Q8 / importance-weighted scales). CAUTION: any repack changes the model file, which invalidates every canonical token gate -- re-derive canonicals immediately after.
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
-5. **Long-context correctness is untested.** All token-identity gates run at 2-8K. Risk 3 (M-RoPE) is precisely the failure mode that is correct at 2K and silently degraded at 128K. Needed before any context number is advertised as fact: needle/consistency check vs llama.cpp at >=64K. OPEN.
+5. **Long-context correctness: VALIDATED to 64K (2026-07-02).** Three gates: (a) `--nll-long 65536` (one pass, no resets) shows NLL flat across position buckets -- 32-48K: PPL 5.45, 48K+: 5.80, no late-position blowup; (b) cross-engine: q27 pooled [32K,64K) PPL 5.622 vs llama-perplexity -c 65536 chunk-1 5.511 = **+2.0%, smaller than the +3.35% short-context delta**, so no length-dependent divergence (M-RoPE + GDN state hold); (c) needle retrieval 3/3 at depths 3/50/95% of a ~55K-token haystack through q27-server, think traces correctly naming surrounding sections. Beyond 64K remains unvalidated (VRAM alloc ceiling ~180K at fp16 KV); rerun tools: `--nll-long`, scratchpad needle harness. Risk 3 is covered to 64K by (a)+(b).
 6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the roadmap's int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). STILL OPEN for fp8 KV (P2) and any future fp16/fp8 MMA: those change logits, so a tolerance gate (logit cosine / top-k agreement vs the exact path, plus the P0 needle/PPL gates) must exist before they ship. The old fork-in-the-road (scoped CUTLASS/cuBLASLt vs hand-rolled vs status quo) is now the P1 fallback ladder rather than a blocker.

@@ -301,4 +301,46 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cu
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---------------- teacher-forced NLL (P0 quality gate) ----------------
+
+// nll[r] = logsumexp(logits[r, :]) - logits[r, tgt[r]] over a [nrows, vocab]
+// row-major logit matrix. Block per row, two passes (max, then sum-exp).
+__global__ void k_nll_rows(const float* __restrict__ logits, const int* __restrict__ tgt,
+                           float* __restrict__ nll, int64_t vocab) {
+    const float* row = logits + (size_t)blockIdx.x * vocab;
+    __shared__ float sh[32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float mx = -FLT_MAX;
+    for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) mx = fmaxf(mx, row[i]);
+    for (int off = 16; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+    if (lane == 0) sh[wid] = mx;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (unsigned)nw ? sh[threadIdx.x] : -FLT_MAX;
+        for (int off = 16; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
+        if (threadIdx.x == 0) sh[0] = v;
+    }
+    __syncthreads();
+    mx = sh[0];
+    __syncthreads();
+    float se = 0.f;
+    for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) se += expf(row[i] - mx);
+    for (int off = 16; off > 0; off >>= 1) se += __shfl_xor_sync(0xffffffff, se, off);
+    if (lane == 0) sh[wid] = se;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int w = 0; w < nw; w++) s += sh[w];
+        nll[blockIdx.x] = logf(s) + mx - row[tgt[blockIdx.x]];
+    }
+}
+
+void nll_rows(const float* logits, const int* tgt, float* nll, int nrows, int64_t vocab,
+              cudaStream_t st) {
+    k_nll_rows<<<nrows, 1024, 0, st>>>(logits, tgt, nll, vocab);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace q27k
