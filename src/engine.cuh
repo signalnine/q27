@@ -86,7 +86,6 @@ struct Engine {
     int d_prompt_cap = 0;
     float *hT, *x1T, *yT, *qkvT, *convT, *zT, *oT, *ogT, *qgT, *kT, *vT, *attnT;
     float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
-    float* pf_scratch;
     q27k::XQuant xqT;
 
     // ---- prefix cache (M6.5): snapshot of GDN state + conv rings taken right
@@ -219,7 +218,6 @@ struct Engine {
         ffnGT = fal((size_t)PF_T * N_FFN); ffnUT = fal((size_t)PF_T * N_FFN);
         embT = fal((size_t)PF_T * N_EMBD); ehnT = fal((size_t)PF_T * 2 * N_EMBD);
         xmtpT = fal((size_t)PF_T * N_EMBD);
-        pf_scratch = fal((size_t)PF_SB * N_HEAD * max_ctx);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN);
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
@@ -253,7 +251,8 @@ struct Engine {
         }
         fprintf(stderr, "uploading weights...\n");
         dm.upload_all();
-        fprintf(stderr, "resident: %.2f GB\n", dm.bytes_resident() / 1e9);
+        dm.checksum_baseline();
+        fprintf(stderr, "resident: %.2f GB (checksummed)\n", dm.bytes_resident() / 1e9);
     }
 
     const DevTensor& T(int il, const char* leaf) {
@@ -653,7 +652,7 @@ struct Engine {
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
         q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm);
         q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM,
-                             pf_scratch, base, 0, T, max_ctx, N_HEAD, N_KV, HEAD_DIM,
+                             nullptr, base, 0, T, max_ctx, N_HEAD, N_KV, HEAD_DIM,
                              1.0f / sqrtf((float)HEAD_DIM), stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
@@ -777,6 +776,13 @@ struct Engine {
     template <typename F>
     int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token) {
         int NP = (int)prompt.size();
+        // prefill writes KV rows [0, NP); nothing downstream bounds NP against
+        // the cache allocations (found by kernel review) -- refuse cleanly
+        // instead of corrupting adjacent buffers
+        if (NP > max_ctx) {
+            fprintf(stderr, "[gen] prompt %d exceeds ctx %d -- refusing\n", NP, max_ctx);
+            return 0;
+        }
         if (batched_prefill && NP >= 32) {
             // prefix-cache hit: prompt extends the snapshotted prefix -> restore
             // recurrent state and prefill only the new suffix

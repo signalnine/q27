@@ -15,6 +15,7 @@ struct DevTensor {
     uint64_t rows = 0, cols = 0;
     void* data = nullptr;   // device
     void* scales = nullptr; // device, nullptr if none
+    uint64_t data_bytes = 0, scales_bytes = 0;
 };
 
 class DeviceModel {
@@ -31,9 +32,18 @@ class DeviceModel {
     bool model_has(const std::string& name) const { return model_.find(name) != nullptr; }
     size_t bytes_resident() const { return bytes_; }
 
+    // Weight-integrity checksums: order-independent u64 word-sums of every
+    // resident tensor, taken once after upload. checksum_verify() recomputes
+    // and reports any drift -- detects OC/heat bit flips in resident weights,
+    // which token-identity gates cannot see (they compare against the same
+    // corrupted state). ~10 ms for the full 16.75 GB model.
+    void checksum_baseline();
+    int checksum_verify(bool print) const; // returns number of mismatched tensors
+
   private:
     const Model& model_;
     std::unordered_map<std::string, DevTensor> dev_;
+    std::unordered_map<std::string, unsigned long long> sums_;
     size_t bytes_ = 0;
 };
 

@@ -131,6 +131,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | E2: GDDR7 mem offset +4000 (tools/mem_oc.py, volatile) | **176.6** lossless / **185** fast-head; prefill ~+6% |
 | E6: ungated depth-3 speculation (3.12 tok/round; batch-4 verify) | **188.9** @2k (128-tok) / **204.8** long-gen; 8000-token output bit-identical to depth-2 |
 | P1: int8 tensor-core prefill GEMM (mma.sync m16n8k32) | prefill **1380 t/s** @600 / **1384** @4K (dp4a: 592/580, 2.35x); cold 28.1K TTFT **63.8s -> 35.7s**; PPL delta vs dp4a +0.04% (fp reorder only) |
+| P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -237,11 +238,21 @@ TTFT from 61s toward ~15-25s.
 so it lands behind the P0 gates and ships opt-in until the needle/PPL gates
 pass at tolerance. Design-decisions section already marks it planned.
 
-**P1.5 -- attention prefill rewrite (new long-ctx TTFT lever, from the P1
-nsys):** attn_prefill_T is ~16.4s of the remaining ~36s at 28K (two-pass
-softmax, 32-token sub-batches). Streaming FA-style single pass and/or larger
-sub-batch. Also: weight-checksum tool (load-time CRC + on-demand device
-recheck) to detect OC/heat bit flips -- see the OC incident note.
+**P1.5 -- DONE 2026-07-02: cold 28.1K TTFT 35.7s -> 24.3s.**
+k_attn_prefill_mma: fp16 flash-attention prefill on mma.sync.m16n8k16 --
+block per (kv head, 16-token tile), 6 warps = 6 GQA q-heads, K/V slabs
+smem-shared, S->P register-identity reuse, fp32 softmax/O. Attention at 28K:
+~16s -> ~4s. Gates: unit A/B vs FA-lite at 3.8e-4 (edge shapes T=23/base=37),
+PPL 7.2139 (+0.006%), needle 3/3 @64K, canonicals untouched, 3-lens
+adversarial kernel review with 0 confirmed findings; Q27_ATTN_PF=lite
+fallback. Weight-checksum tool also landed: baseline at load, --verify-weights
+(CLI) and /health?verify=1 (server), 867 tensors in ~20 ms. Review minors
+fixed: prompt>ctx now refused in generate() (was a silent KV overrun,
+pre-existing), dead pf_scratch removed (~100 MB @32K). Remaining minors
+noted: both attention prefill kernels hardcode gqa=6/head_dim=256 (fine for
+this model, silent wrongness if reused elsewhere); Q fp16 saturation above
+65504 is theoretical for rmsnormed heads. Next long-ctx cost: delta_scan_T
+(~3.8s @28K), then GEMM tile tuning at short ctx.
 
 **P3 -- decode odds and ends (only after the above):**
 - E6 round-cost audit: round time rose 15% for depth-3 but only ~7% is

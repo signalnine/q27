@@ -666,6 +666,209 @@ void kv_store_T(const float* kT, const float* vT, __half* kc, __half* vc, int ba
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ---------------- fp16 tensor-core flash-attention prefill (P1.5) ----------
+// Block per (kv head, 16-token tile); 6 warps, warp j owns GQA q-head j of
+// this kv head with an m16 tile of 16 tokens. K/V slabs of 32 positions are
+// staged in smem once and shared by all 6 warps. QK^T and P*V run on
+// mma.sync.m16n8k16 (f16 in, f32 accumulate); softmax stats and O stay fp32.
+// Q is rounded to fp16 (K/V already are, in cache) -- numerics differ from
+// the fp32-dot FA-lite kernel at rounding level; tolerance-gated like P1.
+// Q27_ATTN_PF=lite selects the old kernel.
+
+static __device__ __forceinline__ void mma_f16(float& d0, float& d1, float& d2, float& d3,
+                                               uint32_t a0, uint32_t a1, uint32_t a2,
+                                               uint32_t a3, uint32_t b0, uint32_t b1, float c0,
+                                               float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2),
+          "f"(c3));
+}
+
+static __device__ __forceinline__ uint32_t h2u(__half2 h) {
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__global__ void __launch_bounds__(192, 1)
+k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
+                   const __half* __restrict__ kc, const __half* __restrict__ vc,
+                   float* __restrict__ outT, int out_row, int base_pos, int tile_t0, int T,
+                   int n_kv_heads, int head_dim, float scale) {
+    constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8; // padded smem rows (halfs)
+    const int kvh = blockIdx.x;
+    const int t0 = tile_t0 + blockIdx.y * TT;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+
+    extern __shared__ __half s_h[];
+    __half* s_q = s_h;                    // [6][TT][LDH]
+    __half* s_k = s_q + 6 * TT * LDH;     // [PP][LDH]
+    __half* s_v = s_k + PP * LDH;         // [PP][LDH]
+
+    // stage Q (fp32 -> fp16) once: warp w stages its own head's 16 tokens
+    {
+        const int qh = kvh * 6 + warp;
+        for (int idx = lane; idx < TT * HD; idx += 32) {
+            int tt = idx / HD, d = idx % HD;
+            int t = t0 + tt;
+            float v = t < T ? qT[(size_t)t * q_row + (size_t)qh * q_stride + d] : 0.f;
+            s_q[(warp * TT + tt) * LDH + d] = __float2half_rn(v);
+        }
+    }
+
+    // per-warp state: O accumulators (16 tokens x 256 dims across the warp),
+    // row stats for the 2 fragment rows this thread touches (gid, gid+8)
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; i++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[i][e] = 0.f;
+    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
+
+    const int tile_last = min(t0 + TT, T) - 1;            // last live token in tile
+    const int tile_max = base_pos + tile_last + 1;        // positions the tile needs
+    if (tile_last < t0) return;                           // whole tile past T
+
+    for (int p0 = 0; p0 < tile_max; p0 += PP) {
+        const int np = min(PP, tile_max - p0);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < PP * HD; idx += blockDim.x) {
+            int pp = idx / HD, d = idx % HD;
+            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
+            bool ok = pp < np;
+            s_k[pp * LDH + d] = ok ? kc[off] : __float2half_rn(0.f);
+            s_v[pp * LDH + d] = ok ? vc[off] : __float2half_rn(0.f);
+        }
+        __syncthreads();
+
+        // S = Q K^T for this warp's 16 tokens x 32 positions (4 n8 subtiles)
+        float s[4][4];
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[n][e] = 0.f;
+        const __half* qb = s_q + warp * TT * LDH;
+#pragma unroll
+        for (int kk = 0; kk < HD / 16; kk++) {
+            const int kb = kk * 16;
+            uint32_t a0 = h2u(*(const __half2*)(qb + gid * LDH + kb + tg * 2));
+            uint32_t a1 = h2u(*(const __half2*)(qb + (gid + 8) * LDH + kb + tg * 2));
+            uint32_t a2 = h2u(*(const __half2*)(qb + gid * LDH + kb + tg * 2 + 8));
+            uint32_t a3 = h2u(*(const __half2*)(qb + (gid + 8) * LDH + kb + tg * 2 + 8));
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                uint32_t b0 = h2u(*(const __half2*)(s_k + (n * 8 + gid) * LDH + kb + tg * 2));
+                uint32_t b1 =
+                    h2u(*(const __half2*)(s_k + (n * 8 + gid) * LDH + kb + tg * 2 + 8));
+                // B is col-major k x n: b regs must hold {K[n][k], K[n][k+1]}
+                // pairs along k -- but s_k rows are contiguous in k, so the
+                // half2 load above is exactly {k=tg*2, k=tg*2+1} of column
+                // n*8+gid. Correct by construction.
+                mma_f16(s[n][0], s[n][1], s[n][2], s[n][3], a0, a1, a2, a3, b0, b1, s[n][0],
+                        s[n][1], s[n][2], s[n][3]);
+            }
+        }
+
+        // mask + online softmax. Thread's elements: rows gid (e0,e1), gid+8
+        // (e2,e3); cols n*8 + tg*2, +1. Causal bound per row; np bound per col.
+        const int r0g = t0 + gid, r1g = t0 + gid + 8; // global token index per row
+        const int b0r = base_pos + r0g + 1 - p0;      // valid cols for row gid
+        const int b1r = base_pos + r1g + 1 - p0;
+        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int c0 = n * 8 + tg * 2, c1 = c0 + 1;
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[n][e] *= scale;
+            if (c0 >= b0r || c0 >= np) s[n][0] = -FLT_MAX;
+            if (c1 >= b0r || c1 >= np) s[n][1] = -FLT_MAX;
+            if (c0 >= b1r || c0 >= np) s[n][2] = -FLT_MAX;
+            if (c1 >= b1r || c1 >= np) s[n][3] = -FLT_MAX;
+            rmax0 = fmaxf(rmax0, fmaxf(s[n][0], s[n][1]));
+            rmax1 = fmaxf(rmax1, fmaxf(s[n][2], s[n][3]));
+        }
+        // reduce row max across the 4 threads of each row quad (same gid)
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, off));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, off));
+        }
+        const float mn0 = fmaxf(m0, rmax0), mn1 = fmaxf(m1, rmax1);
+        const float sc0 = expf(m0 - mn0), sc1 = expf(m1 - mn1);
+        float rl0 = 0.f, rl1 = 0.f;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            s[n][0] = s[n][0] == -FLT_MAX ? 0.f : expf(s[n][0] - mn0);
+            s[n][1] = s[n][1] == -FLT_MAX ? 0.f : expf(s[n][1] - mn0);
+            s[n][2] = s[n][2] == -FLT_MAX ? 0.f : expf(s[n][2] - mn1);
+            s[n][3] = s[n][3] == -FLT_MAX ? 0.f : expf(s[n][3] - mn1);
+            rl0 += s[n][0] + s[n][1];
+            rl1 += s[n][2] + s[n][3];
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rl0 += __shfl_xor_sync(0xffffffff, rl0, off);
+            rl1 += __shfl_xor_sync(0xffffffff, rl1, off);
+        }
+        l0 = l0 * sc0 + rl0;
+        l1 = l1 * sc1 + rl1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            o[i][0] *= sc0;
+            o[i][1] *= sc0;
+            o[i][2] *= sc1;
+            o[i][3] *= sc1;
+        }
+
+        // P (fp16 A-frags, k = 32 positions = 2 k16 steps) x V -> O
+        // A-frag identity: subtile pair (2n, 2n+1) of S supplies a0..a3.
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            pa[h][0] = h2u(__floats2half2_rn(s[2 * h][0], s[2 * h][1]));
+            pa[h][1] = h2u(__floats2half2_rn(s[2 * h][2], s[2 * h][3]));
+            pa[h][2] = h2u(__floats2half2_rn(s[2 * h + 1][0], s[2 * h + 1][1]));
+            pa[h][3] = h2u(__floats2half2_rn(s[2 * h + 1][2], s[2 * h + 1][3]));
+        }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int d0 = n * 8 + gid;
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int kp = h * 16 + tg * 2;
+                uint32_t b0 =
+                    h2u(__halves2half2(s_v[kp * LDH + d0], s_v[(kp + 1) * LDH + d0]));
+                uint32_t b1 =
+                    h2u(__halves2half2(s_v[(kp + 8) * LDH + d0], s_v[(kp + 9) * LDH + d0]));
+                mma_f16(o[n][0], o[n][1], o[n][2], o[n][3], pa[h][0], pa[h][1], pa[h][2],
+                        pa[h][3], b0, b1, o[n][0], o[n][1], o[n][2], o[n][3]);
+            }
+        }
+    }
+
+    // normalize + write: thread's O elements are (rows gid/gid+8, cols
+    // n*8 + tg*2, +1) of the 16x256 tile
+    const int qh = kvh * 6 + warp;
+    const float inv0 = l0 > 0.f ? 1.0f / l0 : 0.f, inv1 = l1 > 0.f ? 1.0f / l1 : 0.f;
+    const int tr0 = t0 + gid, tr1 = t0 + gid + 8;
+#pragma unroll
+    for (int n = 0; n < 32; n++) {
+        const int d0 = n * 8 + tg * 2;
+        if (tr0 < T) {
+            outT[(size_t)tr0 * out_row + (size_t)qh * head_dim + d0] = o[n][0] * inv0;
+            outT[(size_t)tr0 * out_row + (size_t)qh * head_dim + d0 + 1] = o[n][1] * inv0;
+        }
+        if (tr1 < T) {
+            outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0] = o[n][2] * inv1;
+            outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0 + 1] = o[n][3] * inv1;
+        }
+    }
+}
+
 // FA-lite attention prefill: block per (kv head, 8-token tile). Warp w owns
 // token (tile_t0 + w) and all 6 GQA q-heads of this kv head; K/V rows are
 // staged in shared memory once per 32-position tile and shared by all 48
@@ -750,6 +953,25 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const __half* kc, 
                     int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                     cudaStream_t st) {
     (void)scratch; (void)max_ctx;
+    const char* e = getenv("Q27_ATTN_PF");
+    const bool use_mma =
+        !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads;
+    if (use_mma) {
+        constexpr int TT = 16, PP = 32, LDH = 256 + 8;
+        const size_t SM = (size_t)(6 * TT + 2 * PP) * LDH * sizeof(__half);
+        static bool attr2 = false;
+        if (!attr2) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+            attr2 = true;
+        }
+        dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
+        k_attn_prefill_mma<<<grid, 192, SM, st>>>(qT, q_stride, q_row, kc, vc, outT, out_row,
+                                                  base_pos, t0, t0 + SB, n_kv_heads, head_dim,
+                                                  scale);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     constexpr int TT = 8, PP = 32;
     const size_t SM = (size_t)PP * 2 * 256 * sizeof(float);
     static bool attr = false;

@@ -282,6 +282,54 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
     CUDA_CHECK(cudaFree(d_yb));
 }
 
+// P1.5: MMA flash-attention prefill vs the FA-lite reference on random data.
+// Edge shapes on purpose: T=23 (partial 16-token tile), base_pos=37 (slab
+// boundary misalignment). Differences = fp16 Q/P rounding + reorder (~1e-3);
+// a masking or fragment bug shows as O(1).
+static void test_attn_mma() {
+    const int NKV = 4, GQA = 6, HD = 256, T = 23, BASE = 37;
+    const int QROW = NKV * GQA * 2 * HD, OROW = NKV * GQA * HD, SEQ = BASE + T;
+    std::vector<float> qh = rand_vec((size_t)T * QROW, 11);
+    std::vector<float> kvh = rand_vec((size_t)SEQ * NKV * HD * 2, 12);
+    std::vector<__half> kvhalf(kvh.size());
+    for (size_t i = 0; i < kvh.size(); i++) kvhalf[i] = __float2half_rn(kvh[i]);
+
+    float *d_q, *d_oa, *d_ob;
+    __half *d_k, *d_v;
+    CUDA_CHECK(cudaMalloc(&d_q, (size_t)T * QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_oa, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_ob, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_k, (size_t)SEQ * NKV * HD * 2));
+    CUDA_CHECK(cudaMalloc(&d_v, (size_t)SEQ * NKV * HD * 2));
+    CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, kvhalf.data(), (size_t)SEQ * NKV * HD * 2,
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, kvhalf.data() + (size_t)SEQ * NKV * HD,
+                          (size_t)SEQ * NKV * HD * 2, cudaMemcpyHostToDevice));
+
+    auto run = [&](const char* mode, float* out) {
+        setenv("Q27_ATTN_PF", mode, 1);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, nullptr, BASE, 0, T, SEQ,
+                             NKV * GQA, NKV, HD, 1.0f / sqrtf((float)HD), 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    run("lite", d_oa);
+    run("mma", d_ob);
+    unsetenv("Q27_ATTN_PF");
+    std::vector<float> oa((size_t)T * OROW), ob((size_t)T * OROW);
+    CUDA_CHECK(cudaMemcpy(oa.data(), d_oa, oa.size() * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ob.data(), d_ob, ob.size() * 4, cudaMemcpyDeviceToHost));
+    double maxrel = 0;
+    for (size_t i = 0; i < oa.size(); i++)
+        maxrel = std::max(maxrel, (double)std::fabs(oa[i] - ob[i]) / (1.0 + std::fabs(oa[i])));
+    check("attn prefill MMA vs lite (T=23, base=37)", maxrel, 5e-3);
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_oa));
+    CUDA_CHECK(cudaFree(d_ob));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -299,6 +347,7 @@ int main(int argc, char** argv) {
     test_gemm_mma(dm, m, "blk.0.ffn_down.weight");  // Q4 5120x17408 (K tail shapes)
     test_gemm_mma(dm, m, "blk.3.attn_k.weight");    // Q8 1024x5120
     test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
+    test_attn_mma();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

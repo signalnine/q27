@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
     int pfdbg_n = 0;
     std::string nll_path;
     int nll_chunk = 512, nll_long = 0, nll_max = 0;
-    bool nll_serial = false;
+    bool nll_serial = false, verify_weights = false;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--nll-long") && i + 1 < argc) nll_long = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-max") && i + 1 < argc) nll_max = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll-serial")) nll_serial = true;
+        if (!strcmp(argv[i], "--verify-weights")) verify_weights = true;
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
@@ -632,6 +633,7 @@ int main(int argc, char** argv) {
         printf("\nspec decode: %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round over %d rounds)\n",
                (int)out.size(), msf, out.size() * 1000.0f / msf,
                (double)accepted / drafted, drafted);
+        if (verify_weights && e.dm.checksum_verify(true)) return 2;
         return 0;
     }
     if (mtp_stats) {

@@ -62,7 +62,16 @@ int main(int argc, char** argv) {
                 res.status);
     });
 
-    srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
+        // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
+        // safe concurrently with generation -- read-only, separate stream).
+        if (req.has_param("verify")) {
+            int bad = eng.dm.checksum_verify(true);
+            res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +
+                                "\",\"weight_mismatches\":" + std::to_string(bad) + "}",
+                            "application/json");
+            return;
+        }
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
 
