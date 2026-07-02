@@ -40,18 +40,56 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - **KV cache**: FP8 E4M3 for the 17 attention layers. DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline repack tool is Python (runs once).
-- **Serving**: bench harness first, then minimal OpenAI-compatible HTTP.
+- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary.
 
 ## Milestones
 
 - **M0** DONE -- repack tool: BF16 GGUF -> q27 4-bit format (policy v1.2)
 - **M1** DONE -- correctness: greedy decode, output verified vs llama.cpp
 - **M2** DONE -- dp4a GEMVs + CUDA-graph decode: 80.1 t/s plain
-- **M3** IN PROGRESS -- MTP speculative pipeline, lossless (token-identical):
-  depth-2 drafting, batched verify, 3-perm cyclic state graphs. **115 t/s**
-  (llama.cpp MTP fork on same model/GPU: 101.5). Target 165.
-- **M4** -- remaining: Q4 lm_head, MTP-pass trim, graph gap squeeze
-- **M5** -- HTTP server (OpenAI shape)
+- **M3** DONE -- MTP speculative pipeline, lossless (token-identical):
+  depth-2 drafting, batched verify, 3-perm cyclic state graphs. **146.0 t/s**
+  (llama.cpp MTP fork on same model/GPU: 101.5). Stretch target was 165;
+  verify-GEMV bandwidth floor makes the remaining gap ~1-2%/iteration work.
+- **M4** DONE -- dual lm_head (Q4 draft / Q8 verify), grid merges, device-side
+  round bookkeeping. `--fast-head` opt-in: **156.5 t/s**
+- **M5** DONE -- HTTP serving: OpenAI + Anthropic + OpenAI Responses, exact
+  byte-level BPE tokenizer (gated 21/21 vs llama-tokenize), tool calling
+
+## Serving
+
+```
+make build/q27-server
+./build/q27-server model.q27 model.tok --port 8080 --ctx 8192 [--fast-head]
+```
+
+Three API shapes on one server:
+- **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)
+- **Anthropic**: `/v1/messages` -- native Messages API with thinking blocks
+  (Qwopus `<think>` mapped to thinking/signature blocks), tool_use/tool_result,
+  input_json_delta streaming. Claude Code-compatible:
+  `ANTHROPIC_BASE_URL=http://host:8080 claude`
+- **OpenAI Responses**: `/v1/responses` -- Codex CLI-compatible: function
+  tools, `custom` freeform tools (apply_patch bridged through a
+  one-string-param function), function_call/function_call_output history,
+  reasoning items; event set verified against the codex-rs client source.
+
+Codex config (`~/.codex/config.toml`):
+```toml
+model_provider = "q27"
+model = "gpt-5-codex"
+
+[model_providers.q27]
+name = "q27 local"
+base_url = "http://localhost:8080/v1"
+wire_api = "responses"
+```
+
+Model tool protocol: tools rendered as JSON in the system `<tools>` block per
+the qwen35 chat template; `<tool_call>` output parsed by a streaming splitter
+(src/stream_split.h) that also routes `<think>`. Single slot (spec decode is
+single-stream), greedy sampling. `--fast-head` trades output exactness for
+~7% more t/s.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
