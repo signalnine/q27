@@ -112,6 +112,24 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | + device-side round bookkeeping (1 sync + 16B readback/round) | 146.0 lossless / 156.5 fast |
 | E1: display compositor off GPU 0 (cosmic-comp/Xwayland stole ~10%) | **157.4** lossless / **168.5** fast |
 
+## Prefill (M6)
+
+Batched prefill: 256-token chunks, smem-staged dp4a GEMM (16 rows/block share
+one activation tile; per-lane accumulation order matches the serial GEMV
+exactly, so prefill is bitwise-identical to the serial path -- gated on
+identical continuations). GDN state scans sequentially inside one kernel with
+S resident in shared memory; attention runs two-pass softmax in 32-token
+sub-batches; MTP warm skips attention/FFN (only the K/V stores matter).
+
+| prompt | serial | batched | speedup |
+|---|---|---|---|
+| 512 | 76 t/s | 567 t/s | 7.5x |
+| 4096 | 53 t/s | 453 t/s | 8.5x |
+
+Known gap: llama.cpp fork prefills ~2,300-2,400 t/s on large contexts
+(tensor-core GEMM). Next levers: double-buffered staging, TB=48/64 tiles via
+dynamic smem, tensor-core path.
+
 ## Risk register
 
 1. **Gated DeltaNet decode kernel** is the new risk center (was "simple dense" until we read the GGUF). llama.cpp's implementation is the semantic reference; validate per-layer.

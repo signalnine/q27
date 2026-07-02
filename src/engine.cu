@@ -1,4 +1,5 @@
 // q27 CLI: bench / greedy / spec-decode harness.
+#include <chrono>
 #include "engine.cuh"
 
 int main(int argc, char** argv) {
@@ -22,10 +23,14 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
     }
     bool mtp_stats = false, spec = false, fast = false;
+    int pf_n = 0;
+    int pfdbg_n = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
         if (!strcmp(argv[i], "--fast-head")) fast = true;
+        if (!strcmp(argv[i], "--pf") && i + 1 < argc) pf_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--pfdbg") && i + 1 < argc) pfdbg_n = atoi(argv[++i]);
     }
     if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
@@ -33,6 +38,175 @@ int main(int argc, char** argv) {
     e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
+
+    if (pfdbg_n == 1) { // --pfdbg 1: stage diff, layer 0, token 0
+        int tok0 = toks[0];
+        auto grab = [&](const void* dev, size_t n) {
+            std::vector<float> h_(n);
+            CUDA_CHECK(cudaMemcpy(h_.data(), dev, n * 4, cudaMemcpyDeviceToHost));
+            return h_;
+        };
+        auto md = [](const char* name, const std::vector<float>& a, const std::vector<float>& b) {
+            float m = 0; size_t at = 0;
+            for (size_t i = 0; i < a.size(); i++) {
+                float d = fabsf(a[i] - b[i]);
+                if (d > m) { m = d; at = i; }
+            }
+            printf("%-8s maxdiff %.6g at %zu (a=%.6g b=%.6g)\n", name, m, at,
+                   m > 0 ? a[at] : 0.f, m > 0 ? b[at] : 0.f);
+        };
+        // serial layer 0
+        e.reset();
+        const DevTensor& emb = e.dm.get("token_embd.weight");
+        CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
+        q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
+                           N_EMBD, e.h, e.stm);
+        q27k::rmsnorm(e.h, (const float*)e.T(0, "attn_norm.weight").data, e.x1, N_EMBD, EPS,
+                      e.stm);
+        e.gdn_block(0, e.x1, e.y);
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        auto s_x1 = grab(e.x1, N_EMBD), s_qkv = grab(e.qkv, GDN_CH), s_z = grab(e.z, GDN_V);
+        auto s_al = grab(e.alpha, GDN_HEADS), s_g = grab(e.g, GDN_HEADS),
+             s_be = grab(e.beta, GDN_HEADS);
+        auto s_co = grab(e.convout, GDN_CH), s_o = grab(e.o, GDN_V), s_og = grab(e.og, GDN_V);
+        auto s_y = grab(e.y, N_EMBD), s_S = grab(e.S[0], 48 * 128 * 128);
+        // batched layer 0, T=1
+        e.reset();
+        CUDA_CHECK(cudaMemcpy(e.d_token, &tok0, 4, cudaMemcpyHostToDevice));
+        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, e.d_token,
+                              N_EMBD, 1, e.hT, e.stm);
+        q27k::rmsnorm_T(e.hT, (const float*)e.T(0, "attn_norm.weight").data, e.x1T, N_EMBD, 1,
+                        EPS, e.stm);
+        e.gdn_block_T(0, 1);
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        md("x1", s_x1, grab(e.x1T, N_EMBD));
+        md("qkv", s_qkv, grab(e.qkvT, GDN_CH));
+        md("z", s_z, grab(e.zT, GDN_V));
+        md("alpha", s_al, grab(e.alphaT, GDN_HEADS));
+        md("g", s_g, grab(e.gT, GDN_HEADS));
+        md("beta", s_be, grab(e.betaT, GDN_HEADS));
+        md("convout", s_co, grab(e.convT, GDN_CH));
+        md("o", s_o, grab(e.oT, GDN_V));
+        md("og", s_og, grab(e.ogT, GDN_V));
+        md("y", s_y, grab(e.yT, N_EMBD));
+        md("S0", s_S, grab(e.S[0], 48 * 128 * 128));
+        return 0;
+    }
+
+    if (pfdbg_n > 0) {
+        // state diff: serial vs batched prefill of the SAME N-1 tokens
+        int N = pfdbg_n;
+        std::vector<int> prompt;
+        for (int i = 0; i < N; i++) prompt.push_back(toks[i % toks.size()]);
+        int T = N - 1;
+        auto grab = [&](const void* dev, size_t bytes) {
+            std::vector<float> h_(bytes / 4);
+            CUDA_CHECK(cudaMemcpy(h_.data(), dev, bytes, cudaMemcpyDeviceToHost));
+            return h_;
+        };
+        auto maxdiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            float m = 0;
+            size_t at = 0;
+            for (size_t i = 0; i < a.size(); i++) {
+                float d = fabsf(a[i] - b[i]);
+                if (d > m) { m = d; at = i; }
+            }
+            printf(" maxdiff %.6g at %zu", m, at);
+            return m;
+        };
+        // pass 1: serial
+        e.reset();
+        for (int i = 0; i < T; i++) {
+            e.step_with(prompt[i]);
+            if (i + 1 < T) {
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4,
+                                           cudaMemcpyDeviceToDevice, e.stm));
+                int nt = prompt[i + 1], mp = i + 1;
+                CUDA_CHECK(cudaMemcpyAsync(e.d_token, &nt, 4, cudaMemcpyHostToDevice, e.stm));
+                CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp, 4, cudaMemcpyHostToDevice, e.stm));
+                e.mtp_forward();
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        auto s_h = grab(e.h, N_EMBD * 4);
+        auto s_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
+        auto s_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
+        auto s_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
+        auto s_kc = grab(e.kcache[0], (size_t)T * N_KV * HEAD_DIM * 4);
+        auto s_mk = grab(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM * 4);
+        // pass 2: batched (chunked prefill only, no final serial token)
+        e.reset();
+        if (e.d_prompt_cap < N) {
+            if (e.d_prompt) cudaFree(e.d_prompt);
+            CUDA_CHECK(cudaMalloc((void**)&e.d_prompt, (size_t)N * 4));
+            e.d_prompt_cap = N;
+        }
+        CUDA_CHECK(cudaMemcpy(e.d_prompt, prompt.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+        for (int c0 = 0; c0 < T; c0 += Engine::PF_T) {
+            int Tc = std::min((int)Engine::PF_T, T - c0);
+            e.prefill_chunk(e.d_prompt + c0, c0, Tc);
+            q27k::rmsnorm_T(e.hT, (const float*)e.dm.get("output_norm.weight").data, e.x1T,
+                            N_EMBD, Tc, EPS, e.stm);
+            e.mtp_warm_T(e.d_prompt + c0 + 1, c0, Tc);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        int lastrow = (T - 1) % Engine::PF_T;
+        auto b_h = grab(e.hT + (size_t)lastrow * N_EMBD, N_EMBD * 4);
+        auto b_S0 = grab(e.S[0], 48 * 128 * 128 * 4);
+        auto b_S62 = grab(e.S[62], 48 * 128 * 128 * 4);
+        auto b_ring0 = grab(e.conv_ring[0], 3 * GDN_CH * 4);
+        auto b_kc = grab(e.kcache[0], (size_t)T * N_KV * HEAD_DIM * 4);
+        auto b_mk = grab(e.mtp_k, (size_t)(T) * N_KV * HEAD_DIM * 4);
+        printf("h(last):"); maxdiff(s_h, b_h); printf("\n");
+        printf("S[0]   :"); maxdiff(s_S0, b_S0); printf("\n");
+        printf("S[62]  :"); maxdiff(s_S62, b_S62); printf("\n");
+        printf("ring[0]:"); maxdiff(s_ring0, b_ring0); printf("\n");
+        printf("kcache :"); maxdiff(s_kc, b_kc); printf("\n");
+        printf("mtp_k  :"); maxdiff(s_mk, b_mk); printf("\n");
+        return 0;
+    }
+
+    if (pf_n > 0) {
+        // M6 gate: identical generation after serial vs batched prefill + prefill t/s
+        if (!spec) e.build_spec_graphs();
+        std::vector<int> prompt;
+        for (int i = 0; i < pf_n; i++) prompt.push_back(toks[i % toks.size()]);
+        auto run = [&](bool batched, std::vector<int>& out) {
+            e.batched_prefill = batched;
+            auto t0 = std::chrono::steady_clock::now();
+            double ttft = 0;
+            bool first = true;
+            e.generate(prompt, 32, -1, [&](int id) {
+                if (first) {
+                    ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                               .count();
+                    first = false;
+                }
+                out.push_back(id);
+                return true;
+            });
+            return ttft;
+        };
+        std::vector<int> a, b;
+        double ts = run(false, a);
+        double tb = run(true, b);
+        printf("prefill %d tokens: serial TTFT %.2fs (%.1f t/s) | batched TTFT %.3fs "
+               "(%.1f t/s) | speedup %.1fx\n",
+               pf_n, ts, pf_n / ts, tb, pf_n / tb, ts / tb);
+        printf("continuations %s (%zu vs %zu tokens)\n",
+               a == b ? "IDENTICAL -- gate PASS" : "MISMATCH -- gate FAIL", a.size(), b.size());
+        if (a != b) {
+            printf("serial : ");
+            for (size_t i = 0; i < a.size() && i < 16; i++) printf("%d ", a[i]);
+            printf("\nbatched: ");
+            for (size_t i = 0; i < b.size() && i < 16; i++) printf("%d ", b[i]);
+            printf("\n");
+            return 1;
+        }
+        return 0;
+    }
 
     // prompt (with MTP KV warmup when measuring acceptance: pair h(i) with the
     // ACTUAL next prompt token at position i+1, mirroring llama.cpp prefill)

@@ -1,6 +1,7 @@
 // q27 Engine: qwen35 hybrid forward + MTP speculative decode. Header-only
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -8,6 +9,7 @@
 
 #include "blocks.cuh"
 #include "spec3.cuh"
+#include "prefill.cuh"
 #include "cuda_common.h"
 #include "device_model.h"
 #include "kernels.cuh"
@@ -65,6 +67,17 @@ struct Engine {
     // role r (0=primary, 1=post-b, 2=post-c) -> physical (r + perm) % 3.
     // accept-1 token -> perm += 1; accept-2 -> perm += 2 (mod 3). 3 captured graphs.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
+    bool batched_prefill = true;
+
+    // ---- batched prefill (M6) ----
+    static constexpr int PF_T = 256;  // chunk size
+    static constexpr int PF_SB = 32;  // attention sub-batch (scratch rows)
+    int* d_prompt = nullptr;          // whole prompt on device
+    int d_prompt_cap = 0;
+    float *hT, *x1T, *yT, *qkvT, *convT, *zT, *oT, *ogT, *qgT, *kT, *vT, *attnT;
+    float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
+    float* pf_scratch;
+    q27k::XQuant xqT;
     int perm = 0;
     cudaGraphExec_t spec_graph[3] = {nullptr, nullptr, nullptr};
     float* SBuf(int il, int role) {
@@ -152,6 +165,22 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
+        // batched prefill buffers (~130MB) + attention scratch
+        auto fal = [](size_t n) { float* p; CUDA_CHECK(cudaMalloc((void**)&p, n * 4)); return p; };
+        hT = fal((size_t)PF_T * N_EMBD); x1T = fal((size_t)PF_T * N_EMBD);
+        yT = fal((size_t)PF_T * N_EMBD); qkvT = fal((size_t)PF_T * GDN_CH);
+        convT = fal((size_t)PF_T * GDN_CH); zT = fal((size_t)PF_T * GDN_V);
+        oT = fal((size_t)PF_T * GDN_V); ogT = fal((size_t)PF_T * GDN_V);
+        qgT = fal((size_t)PF_T * N_HEAD * 2 * HEAD_DIM);
+        kT = fal((size_t)PF_T * N_KV * HEAD_DIM); vT = fal((size_t)PF_T * N_KV * HEAD_DIM);
+        attnT = fal((size_t)PF_T * N_HEAD * HEAD_DIM);
+        alphaT = fal((size_t)PF_T * GDN_HEADS); betarT = fal((size_t)PF_T * GDN_HEADS);
+        gT = fal((size_t)PF_T * GDN_HEADS); betaT = fal((size_t)PF_T * GDN_HEADS);
+        ffnGT = fal((size_t)PF_T * N_FFN); ffnUT = fal((size_t)PF_T * N_FFN);
+        embT = fal((size_t)PF_T * N_EMBD); ehnT = fal((size_t)PF_T * 2 * N_EMBD);
+        xmtpT = fal((size_t)PF_T * N_EMBD);
+        pf_scratch = fal((size_t)PF_SB * N_HEAD * max_ctx);
+        xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN);
 
         int cache_slot = 0;
         for (int il = 0; il < N_LAYER; il++) {
@@ -184,6 +213,7 @@ struct Engine {
         snprintf(buf, sizeof buf, "blk.%d.%s", il, leaf);
         return dm.get(buf);
     }
+    const DevTensor& T2(int il, const char* leaf) { return T(il, leaf); }
 
     void qx(const float* x, int cols) { q27k::quantize_x(x, cols, xq, stm); }
 
@@ -497,6 +527,131 @@ struct Engine {
         return n;
     }
 
+    // ---- batched prefill (M6): T-token chunk versions of the blocks ----
+    void qxT(const float* x, int cols, int T) { q27k::quantize_x(x, (int64_t)T * cols, xqT, stm); }
+    void mmT(const DevTensor& w, const float* xT, float* yout, int T) {
+        switch (w.dtype) {
+            case DType::Q4_G64:
+                q27k::gemm_q4_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
+                                w.rows, w.cols, T, stm);
+                break;
+            case DType::Q8_G128:
+                q27k::gemm_q8_T((const int8_t*)w.data, (const __half*)w.scales, xqT, yout,
+                                w.rows, w.cols, T, stm);
+                break;
+            case DType::F16:
+                q27k::gemm_f16_T((const __half*)w.data, xT, yout, w.rows, w.cols, T, stm);
+                break;
+            default:
+                fprintf(stderr, "mmT: unsupported dtype\n");
+                exit(1);
+        }
+    }
+
+    void gdn_block_T(int il, int T) {
+        qxT(x1T, N_EMBD, T);
+        mmT(T2(il, "attn_qkv.weight"), x1T, qkvT, T);
+        mmT(T2(il, "attn_gate.weight"), x1T, zT, T);
+        mmT(T2(il, "ssm_alpha.weight"), x1T, alphaT, T);
+        mmT(T2(il, "ssm_beta.weight"), x1T, betarT, T);
+        q27k::gdn_gates_T(alphaT, betarT, (const float*)T2(il, "ssm_a").data,
+                          (const float*)T2(il, "ssm_dt.bias").data, gT, betaT, GDN_HEADS, T, stm);
+        q27k::conv_prefill_T(conv_ring[il], qkvT,
+                             (const float*)T2(il, "ssm_conv1d.weight").data, convT, GDN_CH, T,
+                             stm);
+        q27k::l2norm_heads_T(convT, 16, GDN_DIM, GDN_CH, T, EPS, stm);
+        q27k::l2norm_heads_T(convT + 2048, 16, GDN_DIM, GDN_CH, T, EPS, stm);
+        q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm);
+        q27k::gated_norm_gdn_T(oT, (const float*)T2(il, "ssm_norm.weight").data, zT, ogT,
+                               GDN_HEADS, GDN_DIM, T, EPS, stm);
+        qxT(ogT, GDN_V, T);
+        mmT(T2(il, "ssm_out.weight"), ogT, yT, T);
+    }
+
+    void attn_block_T(int il, int base, int T, float* kc, float* vc) {
+        const int QROW = N_HEAD * 2 * HEAD_DIM, KVROW = N_KV * HEAD_DIM;
+        qxT(x1T, N_EMBD, T);
+        mmT(T2(il, "attn_q.weight"), x1T, qgT, T);
+        q27k::rmsnorm_heads_T(qgT, (const float*)T2(il, "attn_q_norm.weight").data, qgT, N_HEAD,
+                              HEAD_DIM, 2 * HEAD_DIM, QROW, T, EPS, stm);
+        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
+                              HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
+        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        q27k::rope_neox_T(qgT, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, QROW, base, T, FREQ_BASE,
+                          stm);
+        q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
+        q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm);
+        for (int t0 = 0; t0 < T; t0 += PF_SB)
+            q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM,
+                                 pf_scratch, base, t0, min(PF_SB, T - t0), max_ctx, N_HEAD,
+                                 N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm);
+        q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
+        qxT(attnT, N_HEAD * HEAD_DIM, T);
+        mmT(T2(il, "attn_output.weight"), attnT, yT, T);
+    }
+
+    void ffn_T(int il, int T) {
+        qxT(x1T, N_EMBD, T);
+        mmT(T2(il, "ffn_gate.weight"), x1T, ffnGT, T);
+        mmT(T2(il, "ffn_up.weight"), x1T, ffnUT, T);
+        q27k::silu_mul(ffnGT, ffnUT, ffnGT, (int64_t)T * N_FFN, stm);
+        qxT(ffnGT, N_FFN, T);
+        mmT(T2(il, "ffn_down.weight"), ffnGT, yT, T);
+    }
+
+    // Forward a chunk of T prompt tokens starting at absolute position `base`.
+    // Leaves hT = final residual for each token. Updates conv rings, GDN state,
+    // attention KV caches in place.
+    void prefill_chunk(const int* d_toks, int base, int T) {
+        const DevTensor& emb = dm.get("token_embd.weight");
+        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
+                              N_EMBD, T, hT, stm);
+        for (int il = 0; il < N_LAYER; il++) {
+            q27k::rmsnorm_T(hT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
+                            EPS, stm);
+            if (attn_layer[il]) {
+                int ci = attn_cache_idx[il];
+                attn_block_T(il, base, T, kcache[ci], vcache[ci]);
+            } else {
+                gdn_block_T(il, T);
+            }
+            q27k::add_inplace(hT, yT, (int64_t)T * N_EMBD, stm);
+            q27k::rmsnorm_T(hT, (const float*)T2(il, "post_attention_norm.weight").data, x1T,
+                            N_EMBD, T, EPS, stm);
+            ffn_T(il, T);
+            q27k::add_inplace(hT, yT, (int64_t)T * N_EMBD, stm);
+        }
+    }
+
+    // Warm the MTP KV cache for pairs (h(base+t), token[base+t+1]) -> stored at
+    // position base+t+1. Only the K/V projections matter for warming; the MTP
+    // attention/FFN outputs were always discarded here, so they are skipped.
+    void mtp_warm_T(const int* d_toks_next, int base, int T) {
+        const int il = 64;
+        const DevTensor& emb = dm.get("token_embd.weight");
+        const int KVROW = N_KV * HEAD_DIM;
+        // x1T currently holds output_norm(hT) (set by caller)
+        q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks_next,
+                              N_EMBD, T, embT, stm);
+        q27k::rmsnorm_T(embT, (const float*)T2(il, "nextn.enorm.weight").data, ehnT, N_EMBD, T,
+                        EPS, stm, N_EMBD, 2 * N_EMBD);
+        q27k::rmsnorm_T(x1T, (const float*)T2(il, "nextn.hnorm.weight").data, ehnT + N_EMBD,
+                        N_EMBD, T, EPS, stm, N_EMBD, 2 * N_EMBD);
+        qxT(ehnT, 2 * N_EMBD, T);
+        mmT(T2(il, "nextn.eh_proj.weight"), ehnT, xmtpT, T);
+        q27k::rmsnorm_T(xmtpT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
+                        EPS, stm);
+        qxT(x1T, N_EMBD, T);
+        mmT(T2(il, "attn_k.weight"), x1T, kT, T);
+        q27k::rmsnorm_heads_T(kT, (const float*)T2(il, "attn_k_norm.weight").data, kT, N_KV,
+                              HEAD_DIM, HEAD_DIM, KVROW, T, EPS, stm);
+        mmT(T2(il, "attn_v.weight"), x1T, vT, T);
+        q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base + 1, T, FREQ_BASE,
+                          stm);
+        q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm);
+    }
+
     // Reset all decode state for a fresh request (positions, GDN recurrent state,
     // conv rings, MTP KV). Weight buffers and captured graphs are unaffected.
     void reset() {
@@ -525,16 +680,39 @@ struct Engine {
     template <typename F>
     int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token) {
         reset();
-        for (size_t i = 0; i < prompt.size(); i++) {
-            step_with(prompt[i]);
-            if (i + 1 < prompt.size()) {
-                CUDA_CHECK(cudaStreamSynchronize(stm));
-                CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-                int nt = prompt[i + 1], mp = (int)i + 1;
-                CUDA_CHECK(cudaMemcpyAsync(d_token, &nt, 4, cudaMemcpyHostToDevice, stm));
-                CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &mp, 4, cudaMemcpyHostToDevice, stm));
-                mtp_forward();
-                CUDA_CHECK(cudaStreamSynchronize(stm));
+        int NP = (int)prompt.size();
+        if (batched_prefill && NP >= 32) {
+            if (d_prompt_cap < NP) {
+                if (d_prompt) CUDA_CHECK(cudaFree(d_prompt));
+                CUDA_CHECK(cudaMalloc((void**)&d_prompt, (size_t)NP * 4));
+                d_prompt_cap = NP;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_prompt, prompt.data(), (size_t)NP * 4,
+                                       cudaMemcpyHostToDevice, stm));
+            const DevTensor& onw = dm.get("output_norm.weight");
+            for (int c0 = 0; c0 < NP - 1; c0 += PF_T) {
+                int Tc = std::min((int)PF_T, (NP - 1) - c0);
+                prefill_chunk(d_prompt + c0, c0, Tc);
+                q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
+                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+            }
+            int pos_last = NP - 1;
+            CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
+            CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));
+            step_with(prompt[NP - 1]);
+        } else {
+            for (size_t i = 0; i < prompt.size(); i++) {
+                step_with(prompt[i]);
+                if (i + 1 < prompt.size()) {
+                    CUDA_CHECK(cudaStreamSynchronize(stm));
+                    CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                               stm));
+                    int nt = prompt[i + 1], mp = (int)i + 1;
+                    CUDA_CHECK(cudaMemcpyAsync(d_token, &nt, 4, cudaMemcpyHostToDevice, stm));
+                    CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &mp, 4, cudaMemcpyHostToDevice, stm));
+                    mtp_forward();
+                    CUDA_CHECK(cudaStreamSynchronize(stm));
+                }
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(stm));
