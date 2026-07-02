@@ -149,9 +149,6 @@ static inline P3 out2p(float* o) { return P3{{o, o, o}}; }
 // range for ALL 6 GQA q-heads of its kv head (K/V read once, not 6x), online
 // softmax per warp, block-merged partials {m, l, acc[256]} to scratch; a
 // combine kernel merges splits. Works for 1..3 tokens via gridDim.z.
-static constexpr int FD_NS = 16;   // splits over positions
-static constexpr int FD_ST = 258;  // per-partial stride: m, l, acc[256]
-
 __global__ void k_attn_fd(CP3 qp, int q_stride, const __half* __restrict__ kc,
                           const __half* __restrict__ vc, float* __restrict__ part, IP3 pos,
                           int n_kv_heads, int gqa, int head_dim, float scale) {

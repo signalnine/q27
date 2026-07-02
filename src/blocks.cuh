@@ -30,7 +30,7 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 
 // Causal decode attention for one new token; seq_len = *d_pos + 1 read on device.
 // Q strided (interleaved qg), caches contiguous [pos][n_kv][head_dim] f32.
-// scratch: [n_q_heads * max_ctx] floats.
+// scratch: [n_q_heads][FD_NS][FD_ST] floats (flash-decode partials, spec3.cuh).
 void attn_decode(const float* q, int q_stride, const __half* kcache, const __half* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
                  int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0);
