@@ -63,6 +63,7 @@ struct Engine {
     // GDN state as 3 physical buffers with a cyclic role permutation:
     // role r (0=primary, 1=post-b, 2=post-c) -> physical (r + perm) % 3.
     // accept-1 token -> perm += 1; accept-2 -> perm += 2 (mod 3). 3 captured graphs.
+    bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     int perm = 0;
     cudaGraphExec_t spec_graph[3] = {nullptr, nullptr, nullptr};
     float* SBuf(int il, int role) {
@@ -455,7 +456,9 @@ struct Engine {
         const float* on = (const float*)dm.get("output_norm.weight").data;
         q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm);
         qx3(x1, x1_b, x1_c, N_EMBD);
-        mm3(dm.get("output.weight"), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB);
+        const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
+                                                                          : "output.weight";
+        mm3(dm.get(vh), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB);
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
         q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
         q27k::argmax(logits2 + 2 * (size_t)VOCAB, VOCAB, d_vc, d_amax, stm);
@@ -590,14 +593,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
     }
-    bool mtp_stats = false, spec = false;
+    bool mtp_stats = false, spec = false, fast = false;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
+        if (!strcmp(argv[i], "--fast-head")) fast = true;
     }
     if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
 
     Engine e(path, ctx);
+    e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
 
@@ -639,15 +644,17 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, e.stm));
         std::vector<int> out;
         int P = (int)toks.size() - 1;
-        int total_emitted = 0, rounds = 0;
+        int total_emitted = 0, rounds = 0, hist1 = 0, hist2 = 0, hist3 = 0;
         while ((int)out.size() < n_gen) {
             int em[3];
             int n = e.spec_round(P, em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
             total_emitted += n;
+            if (n == 1) hist1++; else if (n == 2) hist2++; else hist3++;
             P += n;
         }
+        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d\n", hist1, hist2, hist3);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

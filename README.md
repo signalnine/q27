@@ -67,7 +67,9 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 | + parity-pair captured graphs | 109.3 |
 | + depth-2 drafting (2.13 tok/round) | 107.3 |
 | + grid-merged 3-token small kernels | 115.1 |
-| + dual lm_head: Q4 drafts, Q8 verify (v1.3 repack) | **121.1** |
+| + dual lm_head: Q4 drafts, Q8 verify (v1.3 repack) | 121.1 |
+| steady state (128-token bench, 2.39 tok/round) | **133.5** |
+| `--fast-head` opt-in (Q4 verify; output differs, coherent) | 143.0 |
 
 ## Risk register
 
