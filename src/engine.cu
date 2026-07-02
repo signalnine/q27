@@ -466,6 +466,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
         int total_emitted = 0, rounds = 0, hist[4] = {0, 0, 0, 0};
         while ((int)out.size() < n_gen) {
+            if (P + 5 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
             int em[4];
             int n = e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
@@ -483,7 +484,7 @@ int main(int argc, char** argv) {
         float msf = 0;
         CUDA_CHECK(cudaEventElapsedTime(&msf, t0, t1));
         printf("generated:");
-        for (int i = 0; i < n_gen; i++) printf(" %d", out[i]);
+        for (int i = 0; i < n_gen && i < (int)out.size(); i++) printf(" %d", out[i]);
         printf("\nspec decode: %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round over %d rounds)\n",
                (int)out.size(), msf, out.size() * 1000.0f / msf,
                (double)accepted / drafted, drafted);

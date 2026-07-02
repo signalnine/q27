@@ -838,9 +838,17 @@ struct Engine {
             fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
                     emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
         };
+        // ctx guard: a round writes attention-KV rows P+1..P+4 (and MTP rows
+        // P+1..P+3); launching with P > max_ctx-5 would write past the caches
+        // and corrupt adjacent allocations (which the prefix cache would then
+        // reuse). Stop instead -- a max-length response ends a few tokens
+        // short of the absolute ceiling rather than corrupting state.
+        int Ph = P;
         while (emitted < n_max) {
+            if (Ph + 5 > max_ctx) { done("ctx-guard"); return emitted; }
             int em[4];
             int n = spec_round(em);
+            Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {
                 if (em[k] == eos) { done("eos"); return emitted; }
                 if (!on_token(em[k])) { done("client-stop"); return emitted; }
