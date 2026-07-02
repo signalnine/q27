@@ -48,6 +48,8 @@ int main(int argc, char** argv) {
         // E3 instrumentation: draft acceptance vs margin, rank-2 capture,
         // Q4-vs-Q8 draft-head agreement. Host-driven on the plain path.
         int N = stats_n;
+        FILE* hid_dump = getenv("Q27_DUMP_HIDDENS") ? fopen(getenv("Q27_DUMP_HIDDENS"), "wb")
+                                                    : nullptr;
         std::vector<float> l1(VOCAB), l2(VOCAB);
         float* d_l2;
         CUDA_CHECK(cudaMalloc((void**)&d_l2, (size_t)VOCAB * 4));
@@ -109,6 +111,11 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
                                   cudaMemcpyDeviceToHost));
             auto [d1, d1b, m1] = top2(l1);
+            if (hid_dump) { // E7 gate: dump the shared-head-norm hidden
+                static std::vector<float> hbuf(N_EMBD);
+                CUDA_CHECK(cudaMemcpy(hbuf.data(), e.x1, N_EMBD * 4, cudaMemcpyDeviceToHost));
+                fwrite(hbuf.data(), 4, N_EMBD, hid_dump);
+            }
             if (known_idx + 1 < (int)pend1.size()) {
                 pend1[known_idx + 1] = {d1, pos + 2, m1, d1b};
             }
@@ -137,6 +144,7 @@ int main(int argc, char** argv) {
             // restore d_token for the next step_free
             CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
         }
+        if (hid_dump) fclose(hid_dump);
         printf("\nE3 stats over %ld draft-1 / %ld draft-2 evaluations:\n", n1, n2);
         printf("  p(draft1)          = %.1f%%\n", 100.0 * n1ok / (n1 ? n1 : 1));
         printf("  p(draft2 chained)  = %.1f%%\n", 100.0 * n2ok / (n2 ? n2 : 1));
