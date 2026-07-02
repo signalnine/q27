@@ -57,6 +57,10 @@ int main(int argc, char** argv) {
     std::atomic<long> req_counter{0};
 
     httplib::Server srv;
+    srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+        fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(),
+                res.status);
+    });
 
     srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -219,7 +223,15 @@ int main(int argc, char** argv) {
         int n_max = body.value("max_tokens", 1024);
         bool stream = body.value("stream", false);
         json tools = anthropic_tools(body);
-        std::vector<int> prompt = tok.encode(q27::chatml_prompt(anthropic_msgs(body), tools));
+        auto tk0 = std::chrono::steady_clock::now();
+        std::string rendered = q27::chatml_prompt(anthropic_msgs(body), tools);
+        auto tk1 = std::chrono::steady_clock::now();
+        std::vector<int> prompt = tok.encode(rendered);
+        auto tk2 = std::chrono::steady_clock::now();
+        fprintf(stderr, "[timing] render %.1fms encode %.1fms (%zu chars -> %zu toks)\n",
+                std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
+                std::chrono::duration<double, std::milli>(tk2 - tk1).count(),
+                rendered.size(), prompt.size());
         if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
         long rid = req_counter++;
         std::string mid = "msg_q27_" + std::to_string(rid);

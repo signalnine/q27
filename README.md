@@ -126,9 +126,31 @@ sub-batches; MTP warm skips attention/FFN (only the K/V stores matter).
 | 512 | 76 t/s | 567 t/s | 7.5x |
 | 4096 | 53 t/s | 453 t/s | 8.5x |
 
-Known gap: llama.cpp fork prefills ~2,300-2,400 t/s on large contexts
-(tensor-core GEMM). Next levers: double-buffered staging, TB=48/64 tiles via
-dynamic smem, tensor-core path.
+**Prefix cache (M6.5)**: GDN state + conv rings snapshotted after prefill
+(attention/MTP KV rows are append-only, so prefix rows stay valid); next
+request LCP-matches the snapshot and prefills only the suffix. Claude Code
+turn 2 on a 26.7k-token context: **1.3s** (26,670/26,693 tokens reused).
+Unconditionally correct: any mismatch falls back to full prefill; warm-vs-cold
+continuations gated identical.
+
+Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
+| | TTFT |
+|---|---|
+| pre-M6 (serial prefill) | 15-min timeout, 0 tokens |
+| M6 (batched) | 139s |
+| + coalesced attention prefill | 90s |
+| turn 2+ with prefix cache | **1.3s** |
+
+## Backlog
+
+1. Prefill GEMM tuning: double-buffered staging, TB=48/64 via dynamic smem
+   (fork reference: ~2,300-2,400 t/s; q27 at 583 @512 / 528 @4k / ~300 @26k)
+2. FA-lite tiled attention prefill (smem K/V tiles shared across the 32-token
+   sub-batch; kills the remaining quadratic degradation at long contexts)
+3. Decode queue from the nsys research plan: E2 mem OC (user gate), E3
+   instrumentation pack, E4 per-shape GEMV tuning (+6-8%), E5 grid-dim fusions
+   (+4-6%), E6 confidence-gated depth-3, E7 draft-head diet (ceiling ~187)
+4. Tensor-core prefill path (parity+ with the fork's cuBLAS GEMM prefill)
 
 ## Risk register
 

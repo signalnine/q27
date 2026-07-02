@@ -24,12 +24,14 @@ int main(int argc, char** argv) {
     }
     bool mtp_stats = false, spec = false, fast = false;
     int pf_n = 0;
+    bool pfcache = false;
     int pfdbg_n = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
         if (!strcmp(argv[i], "--spec")) { spec = true; mtp_stats = true; } // spec needs MTP warmup
         if (!strcmp(argv[i], "--fast-head")) fast = true;
         if (!strcmp(argv[i], "--pf") && i + 1 < argc) pf_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--pfcache")) pfcache = true;
         if (!strcmp(argv[i], "--pfdbg") && i + 1 < argc) pfdbg_n = atoi(argv[++i]);
     }
     if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
@@ -38,6 +40,46 @@ int main(int argc, char** argv) {
     e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
+
+    if (pfcache) {
+        // M6.5 gate: turn-2 resume must produce identical tokens to a cold run
+        if (!spec) e.build_spec_graphs();
+        std::vector<int> A, B;
+        for (int i = 0; i < 600; i++) A.push_back(toks[i % toks.size()]);
+        B = A;
+        for (int i = 0; i < 64; i++) B.push_back(toks[(i + 3) % toks.size()]);
+        auto timed = [&](const std::vector<int>& p, std::vector<int>& out) {
+            auto t0 = std::chrono::steady_clock::now();
+            double ttft = 0;
+            bool first = true;
+            e.generate(p, 16, -1, [&](int id) {
+                if (first) {
+                    ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                               .count();
+                    first = false;
+                }
+                out.push_back(id);
+                return true;
+            });
+            return ttft;
+        };
+        std::vector<int> o1, warm, cold;
+        double t1 = timed(A, o1);                       // turn 1 (cold, saves snapshot)
+        double tw = timed(B, warm);                     // turn 2 (resume from prefix)
+        e.have_snap = false;
+        double tc = timed(B, cold);                     // turn 2 cold rerun
+        printf("turn1 TTFT %.3fs | turn2 warm TTFT %.3fs | turn2 cold TTFT %.3fs "
+               "(warm speedup %.1fx)\n", t1, tw, tc, tc / tw);
+        printf("warm vs cold continuations: %s\n",
+               warm == cold ? "IDENTICAL -- gate PASS" : "MISMATCH -- gate FAIL");
+        if (warm != cold) {
+            printf("cold: "); for (int t : cold) printf("%d ", t);
+            printf("\nwarm: "); for (int t : warm) printf("%d ", t);
+            printf("\n");
+            return 1;
+        }
+        return 0;
+    }
 
     if (pfdbg_n == 1) { // --pfdbg 1: stage diff, layer 0, token 0
         int tok0 = toks[0];

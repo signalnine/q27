@@ -2,6 +2,7 @@
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -78,6 +79,15 @@ struct Engine {
     float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
     float* pf_scratch;
     q27k::XQuant xqT;
+
+    // ---- prefix cache (M6.5): snapshot of GDN state + conv rings taken right
+    // after prefill (perm==0), keyed by the prompt tokens it covers. Attention
+    // and MTP KV rows are append-only during generation, so prefix rows stay
+    // valid; only the recurrent state needs snapshot/restore.
+    float* S_snap[N_LAYER] = {};
+    float* ring_snap[N_LAYER] = {};
+    std::vector<int> snap_toks;
+    bool have_snap = false;
     int perm = 0;
     cudaGraphExec_t spec_graph[3] = {nullptr, nullptr, nullptr};
     float* SBuf(int il, int role) {
@@ -181,6 +191,12 @@ struct Engine {
         xmtpT = fal((size_t)PF_T * N_EMBD);
         pf_scratch = fal((size_t)PF_SB * N_HEAD * max_ctx);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN);
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMalloc((void**)&S_snap[il],
+                                      (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
+                CUDA_CHECK(cudaMalloc((void**)&ring_snap[il], 3 * GDN_CH * 4));
+            }
 
         int cache_slot = 0;
         for (int il = 0; il < N_LAYER; il++) {
@@ -652,6 +668,32 @@ struct Engine {
         q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm);
     }
 
+    void snap_save(const std::vector<int>& prompt) {
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(S_snap[il], S[il],
+                                           (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4,
+                                           cudaMemcpyDeviceToDevice, stm));
+                CUDA_CHECK(cudaMemcpyAsync(ring_snap[il], conv_ring[il], 3 * GDN_CH * 4,
+                                           cudaMemcpyDeviceToDevice, stm));
+            }
+        snap_toks.assign(prompt.begin(), prompt.end() - 1);
+        have_snap = true;
+    }
+
+    void snap_restore() {
+        for (int il = 0; il < N_LAYER; il++)
+            if (!attn_layer[il]) {
+                CUDA_CHECK(cudaMemcpyAsync(S[il], S_snap[il],
+                                           (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4,
+                                           cudaMemcpyDeviceToDevice, stm));
+                CUDA_CHECK(cudaMemcpyAsync(conv_ring[il], ring_snap[il], 3 * GDN_CH * 4,
+                                           cudaMemcpyDeviceToDevice, stm));
+            }
+        perm = 0;
+        CUDA_CHECK(cudaMemset(d_P, 0, 4));
+    }
+
     // Reset all decode state for a fresh request (positions, GDN recurrent state,
     // conv rings, MTP KV). Weight buffers and captured graphs are unaffected.
     void reset() {
@@ -679,9 +721,20 @@ struct Engine {
     // path (requires build_spec_graphs()). MTP KV warmed during prompt.
     template <typename F>
     int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token) {
-        reset();
         int NP = (int)prompt.size();
         if (batched_prefill && NP >= 32) {
+            // prefix-cache hit: prompt extends the snapshotted prefix -> restore
+            // recurrent state and prefill only the new suffix
+            int base = 0;
+            if (have_snap && (int)snap_toks.size() <= NP - 1) {
+                size_t L = 0;
+                while (L < snap_toks.size() && snap_toks[L] == prompt[L]) L++;
+                if (L == snap_toks.size()) base = (int)L;
+            }
+            fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu\n", NP, base,
+                    snap_toks.size());
+            if (base > 0) snap_restore();
+            else reset();
             if (d_prompt_cap < NP) {
                 if (d_prompt) CUDA_CHECK(cudaFree(d_prompt));
                 CUDA_CHECK(cudaMalloc((void**)&d_prompt, (size_t)NP * 4));
@@ -690,17 +743,20 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_prompt, prompt.data(), (size_t)NP * 4,
                                        cudaMemcpyHostToDevice, stm));
             const DevTensor& onw = dm.get("output_norm.weight");
-            for (int c0 = 0; c0 < NP - 1; c0 += PF_T) {
+            for (int c0 = base; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
             }
+            snap_save(prompt);
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             step_with(prompt[NP - 1]);
         } else {
+            reset();
+            have_snap = false; // serial path resets state without re-snapshotting
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
                 if (i + 1 < prompt.size()) {
@@ -720,15 +776,23 @@ struct Engine {
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
         int emitted = 0;
+        auto g0 = std::chrono::steady_clock::now();
+        auto done = [&](const char* why) {
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
+                            .count();
+            fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
+                    emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
+        };
         while (emitted < n_max) {
             int em[3];
             int n = spec_round(em);
             for (int k = 0; k < n && emitted < n_max; k++) {
-                if (em[k] == eos) return emitted;
-                if (!on_token(em[k])) return emitted;
+                if (em[k] == eos) { done("eos"); return emitted; }
+                if (!on_token(em[k])) { done("client-stop"); return emitted; }
                 emitted++;
             }
         }
+        done("n_max");
         return emitted;
     }
 
