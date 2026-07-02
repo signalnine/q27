@@ -1,5 +1,6 @@
 // q27 CLI: bench / greedy / spec-decode harness.
 #include <chrono>
+#include <tuple>
 #include "engine.cuh"
 
 int main(int argc, char** argv) {
@@ -25,6 +26,7 @@ int main(int argc, char** argv) {
     bool mtp_stats = false, spec = false, fast = false;
     int pf_n = 0;
     bool pfcache = false;
+    int stats_n = 0;
     int pfdbg_n = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--mtp")) mtp_stats = true;
@@ -32,6 +34,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--fast-head")) fast = true;
         if (!strcmp(argv[i], "--pf") && i + 1 < argc) pf_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--pfcache")) pfcache = true;
+        if (!strcmp(argv[i], "--stats") && i + 1 < argc) stats_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--pfdbg") && i + 1 < argc) pfdbg_n = atoi(argv[++i]);
     }
     if (toks.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
@@ -40,6 +43,114 @@ int main(int argc, char** argv) {
     e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
+
+    if (stats_n > 0) {
+        // E3 instrumentation: draft acceptance vs margin, rank-2 capture,
+        // Q4-vs-Q8 draft-head agreement. Host-driven on the plain path.
+        int N = stats_n;
+        std::vector<float> l1(VOCAB), l2(VOCAB);
+        float* d_l2;
+        CUDA_CHECK(cudaMalloc((void**)&d_l2, (size_t)VOCAB * 4));
+        auto top2 = [&](const std::vector<float>& l) {
+            int b = 0; float bv = -1e30f, sv = -1e30f; int s = 0;
+            for (int i = 0; i < VOCAB; i++) {
+                if (l[i] > bv) { sv = bv; s = b; bv = l[i]; b = i; }
+                else if (l[i] > sv) { sv = l[i]; s = i; }
+            }
+            return std::tuple<int, int, float>(b, s, bv - sv);
+        };
+        // generate ground truth + probe drafts as we go
+        struct Pend { int pred = -1, pred_pos = -1; float margin = 0; int rank2 = -1; };
+        std::vector<int> seq = toks;
+        Pend p1, p2; // depth-1 and depth-2 pending predictions
+        long n1 = 0, n1ok = 0, n2 = 0, n2ok = 0, r2cap = 0, r2tot = 0;
+        long q48 = 0, q48ok = 0;
+        // margin-binned depth-2 stats: bins <0.5, 0.5-1, 1-2, 2-4, >4
+        long bn[5] = {0}, bok[5] = {0};
+        auto bin = [](float m) { return m < 0.5f ? 0 : m < 1 ? 1 : m < 2 ? 2 : m < 4 ? 3 : 4; };
+        std::vector<Pend> pend1(N + 8), pend2(N + 8);
+        for (int step = 0; step < N + (int)toks.size() - 1; step++) {
+            bool prompt_phase = step < (int)toks.size();
+            int tok = prompt_phase ? toks[step] : -1;
+            if (prompt_phase) e.step_with(tok);
+            else e.step_free();
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            int next_tok;
+            CUDA_CHECK(cudaMemcpy(&next_tok, e.d_token, 4, cudaMemcpyDeviceToHost));
+            if (!prompt_phase) seq.push_back(next_tok);
+            int pos = step; // hidden h(pos) just computed; next token = next_tok
+            // score pending predictions targeting this newly known token
+            int known_idx = (int)seq.size() - 1;
+            for (auto* pd : {&pend1[0], &pend2[0]}) (void)pd;
+            if (pend1[known_idx].pred >= 0) {
+                n1++;
+                bool ok = pend1[known_idx].pred == seq[known_idx];
+                if (ok) n1ok++;
+                else {
+                    r2tot++;
+                    if (pend1[known_idx].rank2 == seq[known_idx]) r2cap++;
+                }
+            }
+            if (pend2[known_idx].pred >= 0) {
+                n2++;
+                bool ok = pend2[known_idx].pred == seq[known_idx];
+                int b = bin(pend2[known_idx].margin);
+                bn[b]++;
+                if (ok) { n2ok++; bok[b]++; }
+            }
+            if (step >= N + (int)toks.size() - 2) break;
+            // MTP pass 1: draft seq[known_idx+1] from (h(pos), next_tok)
+            CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4,
+                                       cudaMemcpyDeviceToDevice, e.stm));
+            int mp = pos + 1;
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward();
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
+                                  cudaMemcpyDeviceToHost));
+            auto [d1, d1b, m1] = top2(l1);
+            if (known_idx + 1 < (int)pend1.size()) {
+                pend1[known_idx + 1] = {d1, pos + 2, m1, d1b};
+            }
+            // Q4 vs Q8 head agreement on the same hidden (xq still holds it)
+            if (e.dm.model_has("output_q4.weight")) {
+                e.mm(e.dm.get("output.weight"), e.x1, d_l2);
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                CUDA_CHECK(cudaMemcpy(l2.data(), d_l2, (size_t)VOCAB * 4,
+                                      cudaMemcpyDeviceToHost));
+                auto [q8b, q8s, q8m] = top2(l2);
+                (void)q8s; (void)q8m;
+                q48++;
+                if (q8b == d1) q48ok++;
+            }
+            // MTP pass 2: chain from pass-1 hidden, draft seq[known_idx+2]
+            int mp2 = pos + 2;
+            CUDA_CHECK(cudaMemcpyAsync(e.d_token, &d1, 4, cudaMemcpyHostToDevice, e.stm));
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp2, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward(e.x1, nullptr, nullptr, nullptr);
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
+                                  cudaMemcpyDeviceToHost));
+            auto [d2, d2b, m2] = top2(l1);
+            (void)d2b;
+            if (known_idx + 2 < (int)pend2.size()) pend2[known_idx + 2] = {d2, pos + 3, m2, -1};
+            // restore d_token for the next step_free
+            CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
+        }
+        printf("\nE3 stats over %ld draft-1 / %ld draft-2 evaluations:\n", n1, n2);
+        printf("  p(draft1)          = %.1f%%\n", 100.0 * n1ok / (n1 ? n1 : 1));
+        printf("  p(draft2 chained)  = %.1f%%\n", 100.0 * n2ok / (n2 ? n2 : 1));
+        printf("  rank-2 capture     = %.1f%% of %ld rejections (tree gate: need >8pt)\n",
+               100.0 * r2cap / (r2tot ? r2tot : 1), r2tot);
+        printf("  Q4-vs-Q8 head agree= %.1f%% of %ld (E7 gate: need >=97%%)\n",
+               100.0 * q48ok / (q48 ? q48 : 1), q48);
+        printf("  draft-2 acceptance by pass-2 margin (E6 gate: high-margin bin >=70%%):\n");
+        const char* bl[5] = {"<0.5", "0.5-1", "1-2", "2-4", ">4"};
+        for (int b = 0; b < 5; b++)
+            printf("    margin %-5s: %5.1f%% (n=%ld)\n", bl[b],
+                   100.0 * bok[b] / (bn[b] ? bn[b] : 1), bn[b]);
+        return 0;
+    }
 
     if (pfcache) {
         // M6.5 gate: turn-2 resume must produce identical tokens to a cold run
