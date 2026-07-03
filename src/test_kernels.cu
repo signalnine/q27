@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <random>
 #include <vector>
 
@@ -378,6 +379,59 @@ static void test_kv_fp8_store() {
     CUDA_CHECK(cudaFree(d_pos));
 }
 
+// P7: masked argmax -- argmax restricted to grammar-legal tokens via a
+// resident bitmask pool + per-slot mask ids. mask id -1 (or null pool) must
+// match plain argmax BITWISE (canonical gate depends on it).
+static void test_masked_argmax() {
+    const int N = 248320, WORDS = (N + 31) / 32;
+    std::vector<float> logits = rand_vec(N, 71);
+    std::vector<uint32_t> m0(WORDS, 0), m1(WORDS, 0);
+    std::mt19937 rng(72);
+    for (int i = 0; i < N; i++)
+        if (rng() % 100 == 0) m0[i >> 5] |= 1u << (i & 31);  // ~1% legal
+    int only = 123457;
+    m1[only >> 5] |= 1u << (only & 31);  // exactly one legal token
+    // CPU references
+    auto cpu_am = [&](const std::vector<uint32_t>* m) {
+        int bi = 0; float bv = -1e30f;
+        for (int i = 0; i < N; i++) {
+            if (m && !(((*m)[i >> 5] >> (i & 31)) & 1u)) continue;
+            if (logits[i] > bv) { bv = logits[i]; bi = i; }
+        }
+        return bi;
+    };
+    float* d_x; uint32_t* d_pool; int* d_ids; int* d_out;
+    unsigned long long* d_scr;
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)N * 4));
+    CUDA_CHECK(cudaMalloc(&d_pool, (size_t)2 * WORDS * 4));
+    CUDA_CHECK(cudaMalloc(&d_ids, 8 * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, 8));
+    CUDA_CHECK(cudaMemcpy(d_x, logits.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pool, m0.data(), (size_t)WORDS * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pool + WORDS, m1.data(), (size_t)WORDS * 4,
+                          cudaMemcpyHostToDevice));
+    int ids[8] = {0, 1, -1, 0, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpy(d_ids, ids, 32, cudaMemcpyHostToDevice));
+    auto run = [&](int slot, const uint32_t* pool) {
+        q27k::argmax_masked(d_x, N, pool, WORDS, d_ids, slot, d_out, d_scr, 0);
+        int out;
+        CUDA_CHECK(cudaMemcpy(&out, d_out, 4, cudaMemcpyDeviceToHost));
+        return out;
+    };
+    int plain;
+    q27k::argmax(d_x, N, d_out, d_scr, 0);
+    CUDA_CHECK(cudaMemcpy(&plain, d_out, 4, cudaMemcpyDeviceToHost));
+    check("masked argmax (~1% legal) vs CPU", std::fabs((double)(run(0, d_pool) - cpu_am(&m0))),
+          0.5);
+    check("masked argmax single-legal", std::fabs((double)(run(1, d_pool) - only)), 0.5);
+    check("masked argmax id=-1 == plain", std::fabs((double)(run(2, d_pool) - plain)), 0.5);
+    check("masked argmax null pool == plain", std::fabs((double)(run(0, nullptr) - plain)),
+          0.5);
+    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_pool)); CUDA_CHECK(cudaFree(d_ids));
+    CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_scr));
+}
+
 // P2: every E4M3 value is exactly representable in fp16, so the fp8 kernels
 // reading an fp8 cache must match the fp16 kernels reading the host-dequantized
 // cache BITWISE -- this isolates the load-conversion plumbing with no tolerance.
@@ -636,6 +690,7 @@ int main(int argc, char** argv) {
     test_attn_mma();
     test_attn_split();
     test_delta_split();
+    test_masked_argmax();
     test_kv_fp8_store();
     test_attn_fp8();
     test_rmsnorm(m);

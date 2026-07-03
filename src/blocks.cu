@@ -308,6 +308,46 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cu
     CUDA_CHECK(cudaGetLastError());
 }
 
+// P7: argmax over grammar-legal tokens only. mask_ids[slot] indexes a
+// device-resident bitmask pool (-1 = unconstrained); the ids buffer is
+// rewritten by the host between CUDA-graph launches while the pool pointer
+// stays fixed (graph-capture safe). Null pool or id -1 walks the exact same
+// comparison sequence as k_argmax -- bitwise-identical result, which the
+// canonical gate relies on.
+__global__ void k_argmax_masked(const float* __restrict__ x, int n,
+                                const unsigned* __restrict__ pool, int words,
+                                const int* __restrict__ mask_ids, int slot,
+                                unsigned long long* __restrict__ best) {
+    const unsigned* m = nullptr;
+    if (pool != nullptr && mask_ids != nullptr) {
+        int id = mask_ids[slot];
+        if (id >= 0) m = pool + (size_t)id * words;
+    }
+    float bv = -FLT_MAX;
+    int bi = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        if (m && !((m[i >> 5] >> (i & 31)) & 1u)) continue;
+        if (x[i] > bv) { bv = x[i]; bi = i; }
+    }
+    unsigned long long p = am_pack(bv, bi);
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = p;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(best, sh[0]);
+}
+
+void argmax_masked(const float* x, int n, const unsigned* pool, int words, const int* mask_ids,
+                   int slot, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
+    k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
+    k_argmax_masked<<<128, 256, 0, st>>>(x, n, pool, words, mask_ids, slot, d_scratch);
+    k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---------------- teacher-forced NLL (P0 quality gate) ----------------
 
 // nll[r] = logsumexp(logits[r, :]) - logits[r, tgt[r]] over a [nrows, vocab]

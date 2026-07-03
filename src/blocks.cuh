@@ -80,6 +80,10 @@ void nll_rows(const float* logits, const int* tgt, float* nll, int nrows, int64_
               cudaStream_t st = 0);
 
 // d_scratch: one u64 on device (caller-allocated; no allocation during graph capture).
+// P7: constrained variant -- argmax over tokens whose bit is set in
+// pool[mask_ids[slot]]; id -1 or null pool = plain argmax (bitwise).
+void argmax_masked(const float* x, int n, const unsigned* pool, int words, const int* mask_ids,
+                   int slot, int* d_out, unsigned long long* d_scratch, cudaStream_t st = 0);
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
             cudaStream_t st = 0);
 
