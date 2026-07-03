@@ -446,9 +446,17 @@ input contracts before a tolerance FAIL means anything. Prefill cost order
    plugin 0.185 with zero writes executed), now fully recovered by the
    tolerant parser chain in api_common.h (17 recoveries in the final rerun,
    scores 0.782/0.899). Verdict: the quant is clean; tool-call discipline is
-   a SERVING-LAYER property. P7 constrained decoding makes the drift
-   unsampleable at the source (phases 1-2 landed: ToolGrammar + ToolMaskCache
-   + argmax_masked, 45faf91/38b6b39/911f2ea).
+   a SERVING-LAYER property. **P7 constrained decoding SHIPPED 2026-07-03**
+   (`--constrain-tools`): ToolGrammar + lazy mask cache + slot-0 masked
+   verify + in-grammar acceptance cap + pending-token mask staging. E2E
+   clean on time-tracker 0.84 / task-queue / collab 0.836 / plugin 0.903 --
+   zero disengages, zero fallbacks needed for wrapped calls. (An early
+   deterministic "0x65 rejected" disengage was root-caused to one-token-
+   lagged masks before on_pending staging existed -- stale masks FORCE
+   illegal tokens; gone since.) In-call throughput ~22 t/s (acceptance
+   capped at 1/round in-grammar; drafts are generated inside the round
+   graph and cannot be host-constrained -- split draft/verify graphs is the
+   known optimization if tool-span speed ever matters).
 2. **P8 -- DONE 2026-07-03: stable-prefix snapshot.** Root cause of the 7.9x
    eval wall-time: the snapshot included the volatile prompt tail
    (assistant-open + no-think prefill), which every re-rendering client
