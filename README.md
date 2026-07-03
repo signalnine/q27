@@ -40,6 +40,26 @@ Plain decode sits ~15% under the honest 85-90% ceiling; that tail is GDN
 recurrence + ~140 small-kernel launches/token, and three attempts on it
 (E4 launch geometry, E5 fusions, cp.async) all came back negative.
 
+### Decode methodology (canonical, 2026-07-02)
+
+Two numbers are reported and they are NOT interchangeable (~16% gap):
+
+- **Short bench** (SOTA-comparable): 128 tokens from the 5-token canonical
+  prompt, `--spec`. **STOCK clocks: 177.5 t/s** (depth-4, v1.4, 3-run spread
+  0.4); +3000 OC: 181.5. The community "160 on a 5090" numbers are stock
+  short-bench -- the honest comparison is **177.5 vs 160 (+11%)**. Note
+  depth-4 is a small LOSS on this bench vs the depth-3-era 183.1 stock
+  (acceptance only reaches 3.56 t/round at 128 tokens vs 4.36 on the soak;
+  the depth-4 round tax doesn't amortize) -- depth-4 was tuned on and pays on
+  long generations.
+- **2K soak** (long-generation number): 2000-token generation, **218.6 t/s at
+  +3000 OC** (4.36 t/round). Headline for agentic reply-length outputs.
+
+OC policy: headline + SOTA comparisons are reported STOCK (community numbers
+aren't OC'd; sidesteps the non-ECC tail-risk conversation). +3000 stays a
+supervised-bench option (+2.3% short-bench measured); the weight-checksum
+tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
+
 ## Design decisions
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF.
@@ -190,8 +210,10 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 
 ## Roadmap (reordered 2026-07-02 after external review)
 
-Context for the ordering: decode is in good shape (188.9 lossless = 1.86x the
-fork; three consecutive micro-opt attempts on the remaining tail came back
+Context for the ordering: decode is in good shape (see "Decode methodology"
+above for the canonical numbers -- 177.5 stock short-bench / 218.6 OC soak;
+the 188.9 in this section's history is the depth-3-era +4000 short bench;
+three consecutive micro-opt attempts on the remaining tail came back
 negative). The user-visible gaps are cold prefill (~8x behind the fork's
 tensor-core GEMM; 61s cold TTFT @26.7K, warm turns 1.3s via prefix cache) and
 two advertised claims with no measurement behind them. Cheapest-blocking-first:
@@ -386,6 +408,28 @@ l2-normalizes q/k per head before the scan (l2norm_heads_T), and with
 in-contract data the split matches to 5e-8. Test data must honor kernel
 input contracts before a tolerance FAIL means anything. Prefill cost order
 @26K is now Q4 GEMM ~46% / attention ~23% / delta_scan ~15%.
+
+**Next (post-P6, reordered 2026-07-02 after external review round 2):**
+1. **Task-level quality A/B (IN PROGRESS)** -- q27 v1.4 vs Q5_K_M (llama.cpp)
+   through Thunderdome, CRUSH harness, no-think, greedy both legs, n=3 x 21
+   tasks. PPL +3.05% is over the 3% bar and PPL is a weak proxy; this decides
+   whether the speed lead is bought with agentic-coding quality. Yesterday's
+   Q5_K_M reference sweep: mean composite ~0.72 (22 tasks, CRUSH no-think).
+2. **Periodic GDN state checkpoints** (upgrades the prefix-snapshot-pool
+   idea): snapshot S + conv rings every N tokens during prefill so a
+   mid-context divergence (edited file, changed tool result -- the normal
+   agentic case) restarts from the nearest checkpoint <= m instead of from
+   zero. LCP-from-the-front cannot help mid-document branching; this turns
+   most cache misses into partial hits. State is ~28 MB/layer-set snapshot.
+3. Sampling (temperature/top-p vs spec-verify acceptance).
+4. Depth-4 acceptance on REAL think-heavy generation: the 4.36 t/round was
+   measured on the soak corpus; Claude Code think-blocks are higher-entropy.
+   Measure acceptance there before trusting the depth-4 win in production;
+   entropy-gated adaptive depth is the robustness play (deferred twice now).
+5. Known stale claim: "128K prefill ~57s" (P5 note) does not reconcile with
+   the direct fp16-KV kvstats measurement (117.6s post-P6); the ~57s was a
+   P5-era extrapolation on what were likely fp8-KV runs. Re-measure 128K
+   under fp8 before using it in any cross-engine comparison.
 
 ## Risk register
 

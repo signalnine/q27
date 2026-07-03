@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "api_common.h"
 #include "tokenizer.h"
 
 int main(int argc, char** argv) {
@@ -40,6 +41,34 @@ int main(int argc, char** argv) {
     }
     printf("\nexact: %d/%d cases   token-prefix agreement: %d/%d = %.2f%%\n", pass, total,
            tok_match, tok_total, 100.0 * tok_match / (tok_total ? tok_total : 1));
+
+    // bare tool-call fallback: models sometimes drop the <tool_call> wrapper
+    // and emit the JSON as plain text (observed: Qwopus v1.4 no-think greedy
+    // on long write calls, with trailing junk like "</file>"). The server must
+    // recover the call, keep the prefix text, and drop trailing junk.
+    {
+        std::string pre, suf;
+        auto c1 = q27::parse_bare_tool_call(
+            "Let me write it.\n\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.ts\", "
+            "\"content\": \"x{y}\\\"z\\\"\"}}\n</file>", &pre, &suf);
+        bool ok1 = c1.ok && c1.name == "write" && c1.arguments.value("path", "") == "a.ts" &&
+                   pre == "Let me write it." && q27::strip_ws2(suf) == "</file>";
+        auto c2 = q27::parse_bare_tool_call("no tools here, just {braces} in prose", &pre, &suf);
+        auto c3 = q27::parse_bare_tool_call("{\"name\": \"x\"}", &pre, &suf); // no arguments
+        // observed failure mode: model emits the full call but never closes
+        // the JSON -- ends the string with tag junk instead of "}} . Repair
+        // must close framing without touching the payload.
+        auto c4 = q27::parse_bare_tool_call(
+            "Writing now.\n\n{\"name\": \"write\", \"arguments\": {\"file_path\": \"/w/s.ts\", "
+            "\"content\": \"export const x = {a: 1};\\nexport {y};\\n\n</file>", &pre, &suf);
+        bool ok4 = c4.ok && c4.name == "write" &&
+                   c4.arguments.value("content", "").find("export const x") == 0 &&
+                   c4.arguments.value("content", "").find("</file>") == std::string::npos &&
+                   pre == "Writing now.";
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4;
+        printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
 
     // added-token matching: encode() must map literal <think>/</think> text to
     // their single vocab ids (HF added-token semantics; BPE merges cannot form

@@ -94,4 +94,88 @@ inline std::string strip_ws2(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Fallback for models that drop the <tool_call> wrapper and emit the call
+// JSON as plain text (observed on long write calls under no-think greedy;
+// llama.cpp's chat parser has the same class of tolerance). Scans for the
+// first balanced {...} that parses as {"name":..., "arguments":...}. On
+// success: prefix = text before the JSON, suffix = text after it (typically
+// junk like "</file>" -- caller decides to drop it).
+inline ToolCall parse_bare_tool_call(const std::string& text, std::string* prefix,
+                                     std::string* suffix) {
+    ToolCall none;
+    for (size_t i = text.find('{'); i != std::string::npos; i = text.find('{', i + 1)) {
+        int depth = 0;
+        bool in_str = false, esc = false;
+        size_t end = std::string::npos;
+        for (size_t j = i; j < text.size(); j++) {
+            char ch = text[j];
+            if (esc) { esc = false; continue; }
+            if (in_str) {
+                if (ch == '\\') esc = true;
+                else if (ch == '"') in_str = false;
+                continue;
+            }
+            if (ch == '"') in_str = true;
+            else if (ch == '{') depth++;
+            else if (ch == '}' && --depth == 0) { end = j; break; }
+        }
+        if (end == std::string::npos) {
+            // Unbalanced to EOF. Second observed mode: the model emits the
+            // full call but never closes the JSON -- the argument string ends
+            // in tag junk ("</file>") instead of "}} . Repair FRAMING only:
+            // strip trailing junk tags, close the open string, close braces.
+            // Payload truncation is not repaired (and should stay penalized).
+            std::string cand = text.substr(i);
+            if (cand.rfind("{\"name\"", 0) != 0 &&
+                strip_ws2(cand).rfind("{\"name\"", 0) != 0)
+                break;
+            std::string r = cand;
+            while (true) {
+                size_t e2 = r.find_last_not_of(" \t\r\n");
+                if (e2 == std::string::npos) break;
+                r.resize(e2 + 1);
+                if (r.size() >= 7 && r.compare(r.size() - 7, 7, "</file>") == 0)
+                    r.resize(r.size() - 7);
+                else break;
+            }
+            int d2 = 0;
+            bool s2 = false, e2f = false;
+            for (char ch : r) {
+                if (e2f) { e2f = false; continue; }
+                if (s2) {
+                    if (ch == '\\') e2f = true;
+                    else if (ch == '"') s2 = false;
+                    continue;
+                }
+                if (ch == '"') s2 = true;
+                else if (ch == '{') d2++;
+                else if (ch == '}') d2--;
+            }
+            if (s2) r += '"';
+            for (; d2 > 0; d2--) r += '}';
+            try {
+                json j = json::parse(r);
+                if (!j.is_object() || !j.contains("name") || !j.contains("arguments")) break;
+            } catch (...) { break; }
+            ToolCall tc = parse_tool_call(r);
+            if (!tc.ok) break;
+            if (prefix) *prefix = strip_ws2(text.substr(0, i));
+            if (suffix) *suffix = "";
+            return tc;
+        }
+        std::string seg = text.substr(i, end - i + 1);
+        try {
+            json j = json::parse(seg);
+            if (!j.is_object() || !j.contains("name") || !j.contains("arguments")) continue;
+        } catch (...) { continue; }
+        ToolCall tc = parse_tool_call(seg);
+        if (!tc.ok) continue;
+        if (prefix) *prefix = strip_ws2(text.substr(0, i));
+        if (suffix) *suffix = text.substr(end + 1);
+        return tc;
+    }
+    return none;
+}
+
+
 } // namespace q27

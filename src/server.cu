@@ -288,6 +288,18 @@ int main(int argc, char** argv) {
                 any_call = true;
                 (void)ci;
             }
+            if (!any_call && tools.is_array() && !tools.empty()) {
+                // wrapper-less call recovery (see parse_bare_tool_call)
+                std::string pre, suf;
+                auto bc = q27::parse_bare_tool_call(tx, &pre, &suf);
+                if (bc.ok) {
+                    fprintf(stderr, "[tool-fallback] bare '%s' recovered (nonstream), "
+                            "%zu suffix bytes dropped\n", bc.name.c_str(), suf.size());
+                    tx = pre;
+                    calls.push_back(bc);
+                    any_call = true;
+                }
+            }
             if (!tx.empty() || (!any_call && th.empty()))
                 content.push_back({{"type", "text"}, {"text", tx}});
             for (auto& c : calls)
@@ -307,9 +319,10 @@ int main(int argc, char** argv) {
         }
 
         res.set_header("Content-Type", "text/event-stream");
+        const bool has_tools = tools.is_array() && !tools.empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, mid, rid](size_t, httplib::DataSink& sink) {
+            [&, prompt, n_max, mid, rid, has_tools](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
@@ -324,7 +337,7 @@ int main(int argc, char** argv) {
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
 
                 StreamSplitter sp;
-                std::string tool_buf;
+                std::string tool_buf, text_accum;
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
                 bool any = false;
@@ -353,6 +366,7 @@ int main(int argc, char** argv) {
                     tool_buf.clear();
                     if (!c.ok) { // malformed: surface as text so nothing is lost
                         open_block(0);
+                        text_accum += c.raw;
                         ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
                             {"delta", {{"type", "text_delta"}, {"text", c.raw}}}});
                         return;
@@ -380,6 +394,7 @@ int main(int argc, char** argv) {
                     // suppress pure-whitespace text before the first block or between blocks
                     if (chan == 0 && idx < 0 && q27::strip_ws2(t).empty()) return;
                     open_block(chan);
+                    if (chan == 0) text_accum += t;
                     if (chan == 1)
                         ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
                             {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
@@ -393,6 +408,31 @@ int main(int argc, char** argv) {
                 });
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
+                if (!any_call && has_tools) {
+                    // wrapper-less call recovery: text already streamed as
+                    // text_delta (cosmetic); the tool_use block still fires
+                    std::string pre, suf;
+                    auto bc = q27::parse_bare_tool_call(text_accum, &pre, &suf);
+                    if (bc.ok) {
+                        fprintf(stderr, "[tool-fallback] bare '%s' recovered (stream)\n",
+                                bc.name.c_str());
+                        any_call = true;
+                        any = true;
+                        close_block();
+                        int ti = block_counter++;
+                        std::string tid = "toolu_q27_" + std::to_string(rid) + "_" +
+                                          std::to_string(tool_counter++);
+                        ev("content_block_start",
+                           {{"type", "content_block_start"}, {"index", ti},
+                            {"content_block", {{"type", "tool_use"}, {"id", tid},
+                                               {"name", bc.name}, {"input", json::object()}}}});
+                        ev("content_block_delta",
+                           {{"type", "content_block_delta"}, {"index", ti},
+                            {"delta", {{"type", "input_json_delta"},
+                                       {"partial_json", bc.arguments.dump()}}}});
+                        ev("content_block_stop", {{"type", "content_block_stop"}, {"index", ti}});
+                    }
+                }
                 if (idx < 0 && !any) { // nothing at all: empty text block for validity
                     idx = block_counter++;
                     chan_open = 0;
