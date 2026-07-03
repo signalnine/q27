@@ -987,10 +987,8 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
 }
 
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
-                    int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                    cudaStream_t st, bool fp8) {
-    (void)scratch; (void)max_ctx;
+                    float* outT, int out_row, int base_pos, int t0, int SB, int n_q_heads,
+                    int n_kv_heads, int head_dim, float scale, cudaStream_t st, bool fp8) {
     if (fp8)
         attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, kc, vc, outT, out_row,
                                            base_pos, t0, SB, n_q_heads, n_kv_heads, head_dim,

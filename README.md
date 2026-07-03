@@ -6,7 +6,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~370K -- the advertised 262K native now fits** (allocates and runs; correctness validated to 64K, see risk 5)
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~355K (was ~370K before P3's 5th GDN buffer set) -- the advertised 262K native fits** (allocates and runs; correctness validated to 361K, see risk 5)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -134,6 +134,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | P1.5: fp16 tensor-core flash-attention prefill (m16n8k16) | cold 28.1K TTFT **35.7s -> 24.3s** (63.8s at day start, 2.63x total); prefill 1408 @600 / **1508** @4K; PPL 7.2139 (+0.006% vs exact); needle 3/3 @64K; kernel review: 0 confirmed bugs |
 | v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
 | P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
+| P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -292,15 +293,25 @@ this model, silent wrongness if reused elsewhere); Q fp16 saturation above
 65504 is theoretical for rmsnormed heads. Next long-ctx cost: delta_scan_T
 (~3.8s @28K), then GEMM tile tuning at short ctx.
 
-**P3 -- decode odds and ends (only after the above):**
-- E6 round-cost audit: round time rose 15% for depth-3 but only ~7% is
-  accounted for (3rd MTP pass ~4%, 4th verify lane ~2-3%); the rest is 4x
-  sequential argmax over 248320 logits + small-kernel launch count. Batch the
-  4 argmaxes into one kernel; nsys the rest.
-- Depth-4: measure first (extend --stats with a pass-4 chain, same method
-  that green-lit E6); build only if p(d4|chain-3) holds ~>=60%. Perm
-  machinery generalizes to mod-5.
-- Remove pf_scratch (dead: only consumer voids it; ~3 KB/token of ctx).
+**P3 -- DONE 2026-07-02: depth-4 speculation (2K soak 210.4 -> 218.6 t/s,
+28.5K-depth fp8 decode 117.2 -> 126.6 t/s).**
+- Round-cost audit (nsys, --cuda-graph-trace=node): the argmax hypothesis was
+  WRONG -- all 7 argmax chains total ~0.03 ms/round (0.2%); graphs already
+  amortize launch overhead. Real budget: 4-lane batch GEMVs ~65%, the 3
+  sequential MTP draft passes ~13% (of which ~1.1 ms = three 636 MB Q4
+  draft-head reads, bandwidth-irreducible per pass), delta_step ~5%,
+  small-kernel soup the rest. Argmax batching NOT built (measured pointless).
+- Depth-4 gate: --stats pass-4 chain measured p(d4|prefix-3) = 97.4% overall
+  (bar was ~60%), projecting +0.89 t/round ungated. BUILT: 5th lane (e),
+  batch-5 verify, 4-pass draft chain, 5 GDN state buffers with mod-5 perm,
+  5 captured graphs, ctx guard P+6. Soak: 4.36 t/round (was 3.67), 71% of
+  rounds accept all 5; round cost +14% (4th MTP pass + 5-lane scaling) ->
+  net +3.9% @2K, +8% @28.5K depth (rounds are weight-dominated there, so the
+  extra lane's KV sweep doesn't bite). Canonical n=128 md5 UNCHANGED --
+  greedy output stays bit-identical, as with E6. Cost: +610 MB (5th GDN
+  buffer set) -> fp8 ctx ceiling ~370K -> ~355K; 262K native still fits.
+- pf_scratch remnants removed (dead `scratch`/`max_ctx` params dropped from
+  attn_prefill_T; the allocation itself died in P1.5).
 
 ## Risk register
 

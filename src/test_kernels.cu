@@ -311,8 +311,8 @@ static void test_attn_mma() {
 
     auto run = [&](const char* mode, float* out) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, nullptr, BASE, 0, T, SEQ,
-                             NKV * GQA, NKV, HD, 1.0f / sqrtf((float)HD), 0);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, BASE, 0, T, NKV * GQA,
+                             NKV, HD, 1.0f / sqrtf((float)HD), 0);
         CUDA_CHECK(cudaDeviceSynchronize());
     };
     run("lite", d_oa);
@@ -421,10 +421,10 @@ static void test_attn_fp8() {
     const float scale = 1.0f / sqrtf((float)HD);
     for (const char* mode : {"lite", "mma"}) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
-                             SEQ, NKV * GQA, NKV, HD, scale, 0, true);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
-                             SEQ, NKV * GQA, NKV, HD, scale, 0, false);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, BASE, 0, T, NKV * GQA,
+                             NKV, HD, scale, 0, true);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, BASE, 0, T, NKV * GQA,
+                             NKV, HD, scale, 0, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         char label[80];
         snprintf(label, sizeof label, "fp8 attn prefill %s == fp16(deq) (bitwise)", mode);

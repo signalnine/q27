@@ -41,12 +41,12 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
                     int T, cudaStream_t st);
 void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st, bool fp8 = false);
-// Two-pass softmax attention for a sub-batch of SB tokens starting at (base_pos+t0).
-// scratch: [SB][n_heads][max_ctx] floats. Caches fp16, or fp8 E4M3 when fp8 (P2).
+// Flash-attention prefill for a sub-batch of SB tokens starting at (base_pos+t0);
+// online softmax, no position scratch. Caches fp16, or fp8 E4M3 when fp8 (P2).
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, float* scratch, int base_pos, int t0, int SB,
-                    int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                    cudaStream_t st, bool fp8 = false);
+                    float* outT, int out_row, int base_pos, int t0, int SB, int n_q_heads,
+                    int n_kv_heads, int head_dim, float scale, cudaStream_t st,
+                    bool fp8 = false);
 // Sequential gated delta rule over T tokens, S resident in shared memory.
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st);

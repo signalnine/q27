@@ -31,7 +31,7 @@ void gemv_q8(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64
              int64_t cols, cudaStream_t st = 0);
 
 // Batched: one weight pass, N quantized activation columns -> y[n][rows]
-// (y column-major by batch: y + n*rows). N in 2..4. The speculative-verify core.
+// (y column-major by batch: y + n*rows). N in 2..5. The speculative-verify core.
 // ys: per-column output pointers (ys[n][row]); no post-split copies needed.
 void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* xqs, int nbatch,
                float* const* ys, int64_t rows, int64_t cols, cudaStream_t st = 0);
@@ -52,11 +52,12 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 
 // Grid-merged multi-token variants for the speculative round: identical
 // per-token work distribution, tokens mapped to an extra grid dimension
-// (1 launch vs ntok). Structs hold up to 4 lanes; ntok in 1..4 selects how
-// many are live (brace inits with fewer entries leave the rest null, unread).
-struct P3 { float* p[4]; };
-struct CP3 { const float* p[4]; };
-struct XQ3 { XQuant q[4]; };
+// (1 launch vs ntok). Structs hold up to 5 lanes (depth-4 spec = t1 + 4
+// drafts); ntok in 1..5 selects how many are live (brace inits with fewer
+// entries leave the rest null, unread).
+struct P3 { float* p[5]; };
+struct CP3 { const float* p[5]; };
+struct XQ3 { XQuant q[5]; };
 
 void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0, int ntok = 3);
 void add3(P3 x, CP3 y, int n, cudaStream_t st = 0, int ntok = 3);

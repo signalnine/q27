@@ -56,6 +56,7 @@ struct Engine {
     float *S_spare[N_LAYER], *ring_spare[N_LAYER];
     float *S_spare2[N_LAYER], *ring_spare2[N_LAYER];
     float *S_spare3[N_LAYER], *ring_spare3[N_LAYER];
+    float *S_spare4[N_LAYER], *ring_spare4[N_LAYER];
     float *h_c, *x1_c, *y_c, *qg_c, *kbuf_c, *vbuf_c, *attnout_c;
     float *qkv_c, *convout_c, *z_c, *alpha_c, *betar_c, *g_c, *beta_c, *o_c, *og_c;
     float *ffn_g_c, *ffn_u_c;
@@ -69,13 +70,20 @@ struct Engine {
     float *h_next3;
     q27k::XQuant xqD;
     int *d_pos_d, *d_pos_m3, *d_draft3, *d_vd;
+    // depth-4 lane (e): 5th verify column + pass-4 draft chain (P3)
+    float *h_e, *x1_e, *y_e, *qg_e, *kbuf_e, *vbuf_e, *attnout_e;
+    float *qkv_e, *convout_e, *z_e, *alpha_e, *betar_e, *g_e, *beta_e, *o_e, *og_e;
+    float *ffn_g_e, *ffn_u_e;
+    float *h_next4;
+    q27k::XQuant xqE;
+    int *d_pos_e, *d_pos_m4, *d_draft4, *d_ve;
     int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
-    // GDN state as 4 physical buffers with a cyclic role permutation:
-    // role r (0=primary, 1=post-b, 2=post-c, 3=post-d) -> physical (r+perm)%4.
-    // accept n tokens -> perm += n-1 (mod 4). One captured graph per perm.
-    // Invariant: role 0 always holds the last-committed state.
+    // GDN state as 5 physical buffers with a cyclic role permutation:
+    // role r (0=primary, 1=post-b, 2=post-c, 3=post-d, 4=post-e) -> physical
+    // (r+perm)%5. accept n tokens -> perm += n-1 (mod 5). One captured graph
+    // per perm. Invariant: role 0 always holds the last-committed state.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     bool batched_prefill = true;
 
@@ -97,18 +105,22 @@ struct Engine {
     std::vector<int> snap_toks;
     bool have_snap = false;
     int perm = 0;
-    cudaGraphExec_t spec_graph[4] = {nullptr, nullptr, nullptr, nullptr};
+    cudaGraphExec_t spec_graph[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     float* SBuf(int il, int role) {
-        int ph = (role + perm) % 4;
-        return ph == 0 ? S[il] : ph == 1 ? S_spare[il] : ph == 2 ? S_spare2[il]
-                                                                 : S_spare3[il];
+        int ph = (role + perm) % 5;
+        return ph == 0 ? S[il]
+               : ph == 1 ? S_spare[il]
+               : ph == 2 ? S_spare2[il]
+               : ph == 3 ? S_spare3[il]
+                         : S_spare4[il];
     }
     float* RBuf(int il, int role) {
-        int ph = (role + perm) % 4;
+        int ph = (role + perm) % 5;
         return ph == 0 ? conv_ring[il]
                : ph == 1 ? ring_spare[il]
                : ph == 2 ? ring_spare2[il]
-                         : ring_spare3[il];
+               : ph == 3 ? ring_spare3[il]
+                         : ring_spare4[il];
     }
     q27k::XQuant xq;
     // layer state
@@ -145,9 +157,9 @@ struct Engine {
         A((void**)&kbuf, N_KV * HEAD_DIM * 4); A((void**)&vbuf, N_KV * HEAD_DIM * 4);
         A((void**)&attnout, N_HEAD * HEAD_DIM * 4);
         // flash-decode split-K partials: ntok * heads * FD_NS * FD_ST floats,
-        // independent of ctx (sized for 4 lanes; was 3*N_HEAD*max_ctx, which
+        // independent of ctx (sized for 5 lanes; was 3*N_HEAD*max_ctx, which
         // under-allocates whenever max_ctx < FD_NS*FD_ST = 4128)
-        A((void**)&scratch, 4 * (size_t)N_HEAD * q27k::FD_NS * q27k::FD_ST * 4);
+        A((void**)&scratch, 5 * (size_t)N_HEAD * q27k::FD_NS * q27k::FD_ST * 4);
         A((void**)&qkv, GDN_CH * 4); A((void**)&convout, GDN_CH * 4); A((void**)&z, GDN_V * 4);
         A((void**)&alpha, GDN_HEADS * 4); A((void**)&betar, GDN_HEADS * 4);
         A((void**)&g, GDN_HEADS * 4); A((void**)&beta, GDN_HEADS * 4);
@@ -172,7 +184,7 @@ struct Engine {
         A((void**)&g_b, GDN_HEADS * 4); A((void**)&beta_b, GDN_HEADS * 4);
         A((void**)&o_b, GDN_V * 4); A((void**)&og_b, GDN_V * 4);
         A((void**)&ffn_g_b, N_FFN * 4); A((void**)&ffn_u_b, N_FFN * 4);
-        A((void**)&logits2, 4 * (size_t)VOCAB * 4);
+        A((void**)&logits2, 5 * (size_t)VOCAB * 4);
         A((void**)&y2big, 2 * (size_t)N_FFN * 4);
         xq2[0] = q27k::xquant_alloc(N_FFN);
         xq2[1] = q27k::xquant_alloc(N_FFN);
@@ -206,6 +218,20 @@ struct Engine {
         xqD = q27k::xquant_alloc(N_FFN);
         A((void**)&d_pos_d, 4); A((void**)&d_pos_m3, 4); A((void**)&d_draft3, 4);
         A((void**)&d_vd, 4);
+        A((void**)&h_e, N_EMBD * 4); A((void**)&x1_e, N_EMBD * 4); A((void**)&y_e, N_EMBD * 4);
+        A((void**)&qg_e, 2 * N_HEAD * HEAD_DIM * 4);
+        A((void**)&kbuf_e, N_KV * HEAD_DIM * 4); A((void**)&vbuf_e, N_KV * HEAD_DIM * 4);
+        A((void**)&attnout_e, N_HEAD * HEAD_DIM * 4);
+        A((void**)&qkv_e, GDN_CH * 4); A((void**)&convout_e, GDN_CH * 4);
+        A((void**)&z_e, GDN_V * 4);
+        A((void**)&alpha_e, GDN_HEADS * 4); A((void**)&betar_e, GDN_HEADS * 4);
+        A((void**)&g_e, GDN_HEADS * 4); A((void**)&beta_e, GDN_HEADS * 4);
+        A((void**)&o_e, GDN_V * 4); A((void**)&og_e, GDN_V * 4);
+        A((void**)&ffn_g_e, N_FFN * 4); A((void**)&ffn_u_e, N_FFN * 4);
+        A((void**)&h_next4, N_EMBD * 4);
+        xqE = q27k::xquant_alloc(N_FFN);
+        A((void**)&d_pos_e, 4); A((void**)&d_pos_m4, 4); A((void**)&d_draft4, 4);
+        A((void**)&d_ve, 4);
         A((void**)&d_P, 4); A((void**)&d_outcome, 32);
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
@@ -254,6 +280,8 @@ struct Engine {
                 A((void**)&ring_spare2[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare3[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
                 A((void**)&ring_spare3[il], 3 * GDN_CH * 4);
+                A((void**)&S_spare4[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                A((void**)&ring_spare4[il], 3 * GDN_CH * 4);
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -406,157 +434,174 @@ struct Engine {
         q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
     }
 
-    void qx4(const float* xa, const float* xb, const float* xc, const float* xd, int cols) {
-        q27k::XQ3 q{{xq2[0], xq2[1], xqC, xqD}};
-        q27k::quantize3({{xa, xb, xc, xd}}, cols, q, stm, 4);
+    void qx5(const float* xa, const float* xb, const float* xc, const float* xd, const float* xe,
+             int cols) {
+        q27k::XQ3 q{{xq2[0], xq2[1], xqC, xqD, xqE}};
+        q27k::quantize3({{xa, xb, xc, xd, xe}}, cols, q, stm, 5);
     }
-    void mm4(const DevTensor& w, float* out_a, float* out_b, float* out_c, float* out_d) {
-        q27k::XQuant qs[4] = {xq2[0], xq2[1], xqC, xqD};
-        float* const ys[4] = {out_a, out_b, out_c, out_d};
+    void mm5(const DevTensor& w, float* out_a, float* out_b, float* out_c, float* out_d,
+             float* out_e) {
+        q27k::XQuant qs[5] = {xq2[0], xq2[1], xqC, xqD, xqE};
+        float* const ys[5] = {out_a, out_b, out_c, out_d, out_e};
         if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, 4, ys, w.rows,
+            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, 5, ys, w.rows,
                             w.cols, stm);
         else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, 4, ys, w.rows,
+            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, 5, ys, w.rows,
                             w.cols, stm);
     }
 
     void gdn_pair(int il) {
         const float eps = EPS;
-        qx4(x1, x1_b, x1_c, x1_d, N_EMBD);
-        mm4(T(il, "attn_qkv.weight"), qkv, qkv_b, qkv_c, qkv_d);
-        mm4(T(il, "attn_gate.weight"), z, z_b, z_c, z_d);
+        qx5(x1, x1_b, x1_c, x1_d, x1_e, N_EMBD);
+        mm5(T(il, "attn_qkv.weight"), qkv, qkv_b, qkv_c, qkv_d, qkv_e);
+        mm5(T(il, "attn_gate.weight"), z, z_b, z_c, z_d, z_e);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         {{x1, x1_b, x1_c, x1_d}}, {{alpha, alpha_b, alpha_c, alpha_d}},
-                         GDN_HEADS, N_EMBD, stm, 4);
+                         {{x1, x1_b, x1_c, x1_d, x1_e}},
+                         {{alpha, alpha_b, alpha_c, alpha_d, alpha_e}}, GDN_HEADS, N_EMBD, stm,
+                         5);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         {{x1, x1_b, x1_c, x1_d}}, {{betar, betar_b, betar_c, betar_d}},
-                         GDN_HEADS, N_EMBD, stm, 4);
+                         {{x1, x1_b, x1_c, x1_d, x1_e}},
+                         {{betar, betar_b, betar_c, betar_d, betar_e}}, GDN_HEADS, N_EMBD, stm,
+                         5);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates3({{alpha, alpha_b, alpha_c, alpha_d}},
-                         {{betar, betar_b, betar_c, betar_d}}, sa, sdt,
-                         {{g, g_b, g_c, g_d}}, {{beta, beta_b, beta_c, beta_d}}, GDN_HEADS, stm,
-                         4);
+        q27k::gdn_gates3({{alpha, alpha_b, alpha_c, alpha_d, alpha_e}},
+                         {{betar, betar_b, betar_c, betar_d, betar_e}}, sa, sdt,
+                         {{g, g_b, g_c, g_d, g_e}}, {{beta, beta_b, beta_c, beta_d, beta_e}},
+                         GDN_HEADS, stm, 5);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         q27k::conv_step(RBuf(il, 0), RBuf(il, 0), qkv, cw, convout, GDN_CH, stm);   // a
         q27k::conv_step(RBuf(il, 0), RBuf(il, 1), qkv_b, cw, convout_b, GDN_CH, stm); // b
         q27k::conv_step(RBuf(il, 1), RBuf(il, 2), qkv_c, cw, convout_c, GDN_CH, stm); // c
         q27k::conv_step(RBuf(il, 2), RBuf(il, 3), qkv_d, cw, convout_d, GDN_CH, stm); // d
+        q27k::conv_step(RBuf(il, 3), RBuf(il, 4), qkv_e, cw, convout_e, GDN_CH, stm); // e
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
-        q27k::l2norm3({{convout, convout_b, convout_c, convout_d}}, 32, GDN_DIM, eps, stm, 4);
+        q27k::l2norm3({{convout, convout_b, convout_c, convout_d, convout_e}}, 32, GDN_DIM, eps,
+                      stm, 5);
         q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm);          // a
         q27k::delta_step(SBuf(il, 0), SBuf(il, 1), convout_b, g_b, beta_b, o_b, stm);   // b
         q27k::delta_step(SBuf(il, 1), SBuf(il, 2), convout_c, g_c, beta_c, o_c, stm);   // c
         q27k::delta_step(SBuf(il, 2), SBuf(il, 3), convout_d, g_d, beta_d, o_d, stm);   // d
+        q27k::delta_step(SBuf(il, 3), SBuf(il, 4), convout_e, g_e, beta_e, o_e, stm);   // e
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm3({{o, o_b, o_c, o_d}}, nw, {{z, z_b, z_c, z_d}},
-                          {{og, og_b, og_c, og_d}}, GDN_HEADS, GDN_DIM, eps, stm, 4);
-        qx4(og, og_b, og_c, og_d, GDN_V);
-        mm4(T(il, "ssm_out.weight"), y, y_b, y_c, y_d);
+        q27k::gated_norm3({{o, o_b, o_c, o_d, o_e}}, nw, {{z, z_b, z_c, z_d, z_e}},
+                          {{og, og_b, og_c, og_d, og_e}}, GDN_HEADS, GDN_DIM, eps, stm, 5);
+        qx5(og, og_b, og_c, og_d, og_e, GDN_V);
+        mm5(T(il, "ssm_out.weight"), y, y_b, y_c, y_d, y_e);
     }
 
     void attn_pair(int il) {
         int ci = attn_cache_idx[il];
-        qx4(x1, x1_b, x1_c, x1_d, N_EMBD);
-        mm4(T(il, "attn_q.weight"), qg, qg_b, qg_c, qg_d);
+        qx5(x1, x1_b, x1_c, x1_d, x1_e, N_EMBD);
+        mm5(T(il, "attn_q.weight"), qg, qg_b, qg_c, qg_d, qg_e);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
         q27k::rmsnorm_heads(qg, qn, qg, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(qg_b, qn, qg_b, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(qg_c, qn, qg_c, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(qg_d, qn, qg_d, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm4(T(il, "attn_k.weight"), kbuf, kbuf_b, kbuf_c, kbuf_d);
+        q27k::rmsnorm_heads(qg_e, qn, qg_e, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
+        mm5(T(il, "attn_k.weight"), kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e);
         q27k::rmsnorm_heads(kbuf, kn, kbuf, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(kbuf_b, kn, kbuf_b, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(kbuf_c, kn, kbuf_c, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         q27k::rmsnorm_heads(kbuf_d, kn, kbuf_d, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm4(T(il, "attn_v.weight"), vbuf, vbuf_b, vbuf_c, vbuf_d);
-        q27k::IP3 P{{d_pos_a, d_pos_b, d_pos_c, d_pos_d}};
-        q27k::rope3({{qg, qg_b, qg_c, qg_d}}, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
-                    FREQ_BASE, stm, 4);
-        q27k::rope3({{kbuf, kbuf_b, kbuf_c, kbuf_d}}, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, P,
-                    FREQ_BASE, stm, 4);
+        q27k::rmsnorm_heads(kbuf_e, kn, kbuf_e, N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
+        mm5(T(il, "attn_v.weight"), vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e);
+        q27k::IP3 P{{d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e}};
+        q27k::rope3({{qg, qg_b, qg_c, qg_d, qg_e}}, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
+                    FREQ_BASE, stm, 5);
+        q27k::rope3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e}}, N_KV, HEAD_DIM, N_ROT, HEAD_DIM,
+                    P, FREQ_BASE, stm, 5);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
-        // store all 4 first (disjoint slots); each token's attention only reads
+        // store all 5 first (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
-        q27k::kv_store3({{kbuf, kbuf_b, kbuf_c, kbuf_d}}, {{vbuf, vbuf_b, vbuf_c, vbuf_d}},
-                        kcache[ci], vcache[ci], P, N_KV * HEAD_DIM, stm, 4, kv_fp8);
-        q27k::attn_decode3({{qg, qg_b, qg_c, qg_d}}, 2 * HEAD_DIM, kcache[ci], vcache[ci],
-                           {{attnout, attnout_b, attnout_c, attnout_d}}, scratch, P, max_ctx,
-                           N_HEAD, N_KV, HEAD_DIM, kq, stm, 4, kv_fp8);
-        q27k::sigmoid_gate3({{attnout, attnout_b, attnout_c, attnout_d}},
-                            {{qg, qg_b, qg_c, qg_d}}, N_HEAD, HEAD_DIM, stm, 4);
-        qx4(attnout, attnout_b, attnout_c, attnout_d, N_HEAD * HEAD_DIM);
-        mm4(T(il, "attn_output.weight"), y, y_b, y_c, y_d);
+        q27k::kv_store3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e}},
+                        {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e}}, kcache[ci], vcache[ci], P,
+                        N_KV * HEAD_DIM, stm, 5, kv_fp8);
+        q27k::attn_decode3({{qg, qg_b, qg_c, qg_d, qg_e}}, 2 * HEAD_DIM, kcache[ci], vcache[ci],
+                           {{attnout, attnout_b, attnout_c, attnout_d, attnout_e}}, scratch, P,
+                           max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, 5, kv_fp8);
+        q27k::sigmoid_gate3({{attnout, attnout_b, attnout_c, attnout_d, attnout_e}},
+                            {{qg, qg_b, qg_c, qg_d, qg_e}}, N_HEAD, HEAD_DIM, stm, 5);
+        qx5(attnout, attnout_b, attnout_c, attnout_d, attnout_e, N_HEAD * HEAD_DIM);
+        mm5(T(il, "attn_output.weight"), y, y_b, y_c, y_d, y_e);
     }
 
     void ffn_pair(int il) {
-        qx4(x1, x1_b, x1_c, x1_d, N_EMBD);
-        mm4(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b, ffn_g_c, ffn_g_d);
-        mm4(T(il, "ffn_up.weight"), ffn_u, ffn_u_b, ffn_u_c, ffn_u_d);
-        q27k::silu_mul3({{ffn_g, ffn_g_b, ffn_g_c, ffn_g_d}},
-                        {{ffn_u, ffn_u_b, ffn_u_c, ffn_u_d}}, N_FFN, stm, 4);
-        qx4(ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, N_FFN);
-        mm4(T(il, "ffn_down.weight"), y, y_b, y_c, y_d);
+        qx5(x1, x1_b, x1_c, x1_d, x1_e, N_EMBD);
+        mm5(T(il, "ffn_gate.weight"), ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e);
+        mm5(T(il, "ffn_up.weight"), ffn_u, ffn_u_b, ffn_u_c, ffn_u_d, ffn_u_e);
+        q27k::silu_mul3({{ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e}},
+                        {{ffn_u, ffn_u_b, ffn_u_c, ffn_u_d, ffn_u_e}}, N_FFN, stm, 5);
+        qx5(ffn_g, ffn_g_b, ffn_g_c, ffn_g_d, ffn_g_e, N_FFN);
+        mm5(T(il, "ffn_down.weight"), y, y_b, y_c, y_d, y_e);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
     // through device memory, pointers fixed for a given parity)
     void spec_round_launches() {
-        q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_m, d_pos_m2,
-                         d_pos_m3, d_outcome, stm);
+        q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e, d_pos_m,
+                         d_pos_m2, d_pos_m3, d_pos_m4, d_outcome, stm);
         // draft 1: (h_next, embed(t1)) at pos_m -> d_draft; MTP's own post-head-norm
-        // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2 and again into
-        // draft 3 at pos_m3 -> d_draft3 (each pass also fills its MTP KV row)
+        // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2, draft 3 at
+        // pos_m3 -> d_draft3, and draft 4 at pos_m4 -> d_draft4 (each pass
+        // also fills its MTP KV row)
         mtp_forward(h_next, d_token, d_draft, d_pos_m);
         CUDA_CHECK(cudaMemcpyAsync(h_next2, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2);
         CUDA_CHECK(cudaMemcpyAsync(h_next3, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         mtp_forward(h_next3, d_draft2, d_draft3, d_pos_m3);
+        CUDA_CHECK(cudaMemcpyAsync(h_next4, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
+        mtp_forward(h_next4, d_draft3, d_draft4, d_pos_m4);
 
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
-                     {{d_token, d_draft, d_draft2, d_draft3}}, N_EMBD, {{h, h_b, h_c, h_d}},
-                     stm, 4);
-        q27k::CP3 Hc{{h, h_b, h_c, h_d}}, Yc{{y, y_b, y_c, y_d}};
-        q27k::P3 Hm{{h, h_b, h_c, h_d}}, X1m{{x1, x1_b, x1_c, x1_d}};
+                     {{d_token, d_draft, d_draft2, d_draft3, d_draft4}}, N_EMBD,
+                     {{h, h_b, h_c, h_d, h_e}}, stm, 5);
+        q27k::CP3 Hc{{h, h_b, h_c, h_d, h_e}}, Yc{{y, y_b, y_c, y_d, y_e}};
+        q27k::P3 Hm{{h, h_b, h_c, h_d, h_e}}, X1m{{x1, x1_b, x1_c, x1_d, x1_e}};
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, 4);
+            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, 5);
             if (attn_layer[il]) attn_pair(il);
             else gdn_pair(il);
-            q27k::add3(Hm, Yc, N_EMBD, stm, 4);
+            q27k::add3(Hm, Yc, N_EMBD, stm, 5);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm, 4);
+            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm, 5);
             ffn_pair(il);
-            q27k::add3(Hm, Yc, N_EMBD, stm, 4);
+            q27k::add3(Hm, Yc, N_EMBD, stm, 5);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, 4);
-        qx4(x1, x1_b, x1_c, x1_d, N_EMBD);
+        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, 5);
+        qx5(x1, x1_b, x1_c, x1_d, x1_e, N_EMBD);
         const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                           : "output.weight";
-        mm4(dm.get(vh), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
-            logits2 + 3 * (size_t)VOCAB);
+        mm5(dm.get(vh), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
+            logits2 + 3 * (size_t)VOCAB, logits2 + 4 * (size_t)VOCAB);
         q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
         q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
         q27k::argmax(logits2 + 2 * (size_t)VOCAB, VOCAB, d_vc, d_amax, stm);
         q27k::argmax(logits2 + 3 * (size_t)VOCAB, VOCAB, d_vd, d_amax, stm);
-        q27k::finish_round(d_P, d_token, d_draft, d_draft2, d_draft3, d_va, d_vb, d_vc, d_vd,
-                           x1, x1_b, x1_c, x1_d, h_next, d_outcome, N_EMBD, stm);
+        q27k::argmax(logits2 + 4 * (size_t)VOCAB, VOCAB, d_ve, d_amax, stm);
+        q27k::finish_round(d_P, d_token, d_draft, d_draft2, d_draft3, d_draft4, d_va, d_vb,
+                           d_vc, d_vd, d_ve, x1, x1_b, x1_c, x1_d, x1_e, h_next, d_outcome,
+                           N_EMBD, stm);
     }
 
     void build_spec_graphs() {
         // one warm (executing) round to initialize lazy CUDA state, then reset
-        int z0 = 0, z1 = 1, z2 = 2, z3 = 3;
+        int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4;
         CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_b, &z1, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_c, &z2, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_d, &z3, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_e, &z4, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_pos_m3, &z2, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_m4, &z3, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_token, &z0, 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
         spec_round_launches();
@@ -572,11 +617,13 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
                 CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
+                CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
-        // capture all 4 cyclic permutations (capture records; does not execute)
-        for (int p = 0; p < 4; p++) {
+        // capture all 5 cyclic permutations (capture records; does not execute)
+        for (int p = 0; p < 5; p++) {
             perm = p;
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -586,22 +633,19 @@ struct Engine {
             CUDA_CHECK(cudaGraphDestroy(gr));
         }
         perm = 0;
-        fprintf(stderr, "spec graphs captured (4 perms, depth-3)\n");
+        fprintf(stderr, "spec graphs captured (5 perms, depth-4)\n");
     }
 
-    // one speculative round (depth 3); returns tokens emitted (1..4).
-    // All position math + acceptance runs on device; host reads 20 bytes.
+    // one speculative round (depth 4); returns tokens emitted (1..5).
+    // All position math + acceptance runs on device; host reads 24 bytes.
     int spec_round(int* emit) {
         CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
-        int oc[5];
-        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 20, cudaMemcpyDeviceToHost, stm));
+        int oc[6];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 24, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
-        emit[0] = oc[1];
-        if (n >= 2) emit[1] = oc[2];
-        if (n >= 3) emit[2] = oc[3];
-        if (n == 4) emit[3] = oc[4];
-        perm = (perm + (n - 1)) % 4;
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        perm = (perm + (n - 1)) % 5;
         return n;
     }
 
@@ -660,9 +704,9 @@ struct Engine {
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
         q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
-        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM,
-                             nullptr, base, 0, T, max_ctx, N_HEAD, N_KV, HEAD_DIM,
-                             1.0f / sqrtf((float)HEAD_DIM), stm, kv_fp8);
+        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, base, 0,
+                             T, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm,
+                             kv_fp8);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT(T2(il, "attn_output.weight"), attnT, yT, T);
@@ -769,10 +813,12 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
+                CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
+                CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
@@ -853,15 +899,15 @@ struct Engine {
             fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
                     emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
         };
-        // ctx guard: a round writes attention-KV rows P+1..P+4 (and MTP rows
-        // P+1..P+3); launching with P > max_ctx-5 would write past the caches
+        // ctx guard: a round writes attention-KV rows P+1..P+5 (and MTP rows
+        // P+1..P+4); launching with P > max_ctx-6 would write past the caches
         // and corrupt adjacent allocations (which the prefix cache would then
         // reuse). Stop instead -- a max-length response ends a few tokens
         // short of the absolute ceiling rather than corrupting state.
         int Ph = P;
         while (emitted < n_max) {
-            if (Ph + 5 > max_ctx) { done("ctx-guard"); return emitted; }
-            int em[4];
+            if (Ph + 6 > max_ctx) { done("ctx-guard"); return emitted; }
+            int em[5];
             int n = spec_round(em);
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {

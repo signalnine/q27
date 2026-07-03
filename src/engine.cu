@@ -87,6 +87,11 @@ int main(int argc, char** argv) {
         struct Pend3 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1; };
         std::vector<Pend3> pend3(N + 8);
         long c3n[5] = {0}, c3pre[5] = {0}, c3ok[5] = {0};
+        // P3 gate: depth-4 chain -- p(pass-4 draft | d1,d2,d3 all accepted).
+        // Build depth-4 only if p(d4|prefix-3) holds ~>=60%.
+        struct Pend4 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1, d3 = -1; };
+        std::vector<Pend4> pend4(N + 8);
+        long c4n[5] = {0}, c4pre[5] = {0}, c4ok[5] = {0};
         for (int step = 0; step < N + (int)toks.size() - 1; step++) {
             bool prompt_phase = step < (int)toks.size();
             int tok = prompt_phase ? toks[step] : -1;
@@ -123,6 +128,16 @@ int main(int argc, char** argv) {
                 if (p3.d1 == seq[known_idx - 2] && p3.d2 == seq[known_idx - 1]) {
                     c3pre[b]++;
                     if (p3.pred == seq[known_idx]) c3ok[b]++;
+                }
+            }
+            if (pend4[known_idx].pred >= 0 && known_idx >= 3) {
+                const Pend4& p4 = pend4[known_idx];
+                int b = bin(p4.margin2);
+                c4n[b]++;
+                if (p4.d1 == seq[known_idx - 3] && p4.d2 == seq[known_idx - 2] &&
+                    p4.d3 == seq[known_idx - 1]) {
+                    c4pre[b]++;
+                    if (p4.pred == seq[known_idx]) c4ok[b]++;
                 }
             }
             if (step >= N + (int)toks.size() - 2) break;
@@ -178,6 +193,18 @@ int main(int argc, char** argv) {
             auto [d3, d3b, m3] = top2(l1);
             (void)d3b; (void)m3;
             if (known_idx + 3 < (int)pend3.size()) pend3[known_idx + 3] = {d3, m2, d1, d2};
+            // MTP pass 4: chain from pass-3 hidden, draft seq[known_idx+4]
+            // (P3 depth-4 gate measurement; binned by pass-2 margin like E6)
+            int mp4 = pos + 4;
+            CUDA_CHECK(cudaMemcpyAsync(e.d_token, &d3, 4, cudaMemcpyHostToDevice, e.stm));
+            CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp4, 4, cudaMemcpyHostToDevice, e.stm));
+            e.mtp_forward(e.x1, nullptr, nullptr, nullptr);
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
+                                  cudaMemcpyDeviceToHost));
+            auto [d4, d4b, m4] = top2(l1);
+            (void)d4b; (void)m4;
+            if (known_idx + 4 < (int)pend4.size()) pend4[known_idx + 4] = {d4, m2, d1, d2, d3};
             // restore d_token for the next step_free
             CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
         }
@@ -199,6 +226,18 @@ int main(int argc, char** argv) {
             printf("    margin %-5s: n=%4ld  p(prefix)=%5.1f%%  p(d3|prefix)=%5.1f%%\n", bl[b],
                    c3n[b], 100.0 * c3pre[b] / (c3n[b] ? c3n[b] : 1),
                    100.0 * c3ok[b] / (c3pre[b] ? c3pre[b] : 1));
+        printf("  depth-4 chain by pass-2 margin (P3 gate: p(d4|prefix) >= ~60%%):\n");
+        long t4n = 0, t4pre = 0, t4ok = 0;
+        for (int b = 0; b < 5; b++) {
+            t4n += c4n[b]; t4pre += c4pre[b]; t4ok += c4ok[b];
+            printf("    margin %-5s: n=%4ld  p(prefix3)=%5.1f%%  p(d4|prefix3)=%5.1f%%\n",
+                   bl[b], c4n[b], 100.0 * c4pre[b] / (c4n[b] ? c4n[b] : 1),
+                   100.0 * c4ok[b] / (c4pre[b] ? c4pre[b] : 1));
+        }
+        printf("  depth-4 OVERALL: p(prefix3)=%.1f%%  p(d4|prefix3)=%.1f%%  "
+               "extra t/round ~= +%.3f (ungated)\n",
+               100.0 * t4pre / (t4n ? t4n : 1), 100.0 * t4ok / (t4pre ? t4pre : 1),
+               (double)t4ok / (t4n ? t4n : 1));
         // cumulative gate margin>=theta; extra tokens/round ~= f * p(prefix|gate)
         // * p(d3|prefix,gate). Caveat: per-POSITION sampling; live rounds sample
         // accepted spans, so f here slightly understates the gated fraction.
@@ -674,10 +713,10 @@ int main(int argc, char** argv) {
         std::vector<int> out;
         int P = (int)toks.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
-        int total_emitted = 0, rounds = 0, hist[4] = {0, 0, 0, 0};
+        int total_emitted = 0, rounds = 0, hist[5] = {0, 0, 0, 0, 0};
         while ((int)out.size() < n_gen) {
-            if (P + 5 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[4];
+            if (P + 6 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
+            int em[5];
             int n = e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
@@ -685,8 +724,8 @@ int main(int argc, char** argv) {
             hist[n - 1]++;
             P += n;
         }
-        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d\n", hist[0],
-                hist[1], hist[2], hist[3]);
+        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4]);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));
