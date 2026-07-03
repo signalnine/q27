@@ -80,6 +80,14 @@ struct Engine {
     int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
     int *d_pos_a, *d_pos_b, *d_va, *d_vb;
+    // P7 constrained tool decoding: resident mask pool + per-slot ids +
+    // acceptance cap. All -1/0 when inactive -> bitwise-identical decode.
+    unsigned* d_mask_pool = nullptr;
+    int* d_mask_ids = nullptr;
+    int* d_accept_cap = nullptr;
+    int mask_words = 0, mask_pool_used = 0;
+    int h_mask_id0 = -1, h_cap0 = 0; // async-copy sources (must outlive copy)
+    static constexpr int MASK_POOL_CAP = 512;
     // GDN state as 5 physical buffers with a cyclic role permutation:
     // role r (0=primary, 1=post-b, 2=post-c, 3=post-d, 4=post-e) -> physical
     // (r+perm)%5. accept n tokens -> perm += n-1 (mod 5). One captured graph
@@ -186,6 +194,12 @@ struct Engine {
         A((void**)&o_b, GDN_V * 4); A((void**)&og_b, GDN_V * 4);
         A((void**)&ffn_g_b, N_FFN * 4); A((void**)&ffn_u_b, N_FFN * 4);
         A((void**)&logits2, 5 * (size_t)VOCAB * 4);
+        mask_words = (VOCAB + 31) / 32;
+        A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
+        A((void**)&d_mask_ids, 8 * 4);
+        A((void**)&d_accept_cap, 4);
+        CUDA_CHECK(cudaMemset(d_mask_ids, 0xFF, 8 * 4)); // all -1 = unconstrained
+        CUDA_CHECK(cudaMemset(d_accept_cap, 0, 4));
         A((void**)&y2big, 2 * (size_t)N_FFN * 4);
         xq2[0] = q27k::xquant_alloc(N_FFN);
         xq2[1] = q27k::xquant_alloc(N_FFN);
@@ -582,14 +596,22 @@ struct Engine {
                                                                           : "output.weight";
         mm5(dm.get(vh), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
             logits2 + 3 * (size_t)VOCAB, logits2 + 4 * (size_t)VOCAB);
-        q27k::argmax(logits2, VOCAB, d_va, d_amax, stm);
-        q27k::argmax(logits2 + VOCAB, VOCAB, d_vb, d_amax, stm);
-        q27k::argmax(logits2 + 2 * (size_t)VOCAB, VOCAB, d_vc, d_amax, stm);
-        q27k::argmax(logits2 + 3 * (size_t)VOCAB, VOCAB, d_vd, d_amax, stm);
-        q27k::argmax(logits2 + 4 * (size_t)VOCAB, VOCAB, d_ve, d_amax, stm);
+        // P7: slot 0 (the post-pending lane) is the constrained one; slots
+        // 1-4 keep id -1 (v1 caps acceptance in-grammar instead of chasing
+        // draft-dependent states the host cannot know pre-launch)
+        q27k::argmax_masked(logits2, VOCAB, d_mask_pool, mask_words, d_mask_ids, 0, d_va,
+                            d_amax, stm);
+        q27k::argmax_masked(logits2 + VOCAB, VOCAB, d_mask_pool, mask_words, d_mask_ids, 1,
+                            d_vb, d_amax, stm);
+        q27k::argmax_masked(logits2 + 2 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
+                            d_mask_ids, 2, d_vc, d_amax, stm);
+        q27k::argmax_masked(logits2 + 3 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
+                            d_mask_ids, 3, d_vd, d_amax, stm);
+        q27k::argmax_masked(logits2 + 4 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
+                            d_mask_ids, 4, d_ve, d_amax, stm);
         q27k::finish_round(d_P, d_token, d_draft, d_draft2, d_draft3, d_draft4, d_va, d_vb,
                            d_vc, d_vd, d_ve, x1, x1_b, x1_c, x1_d, x1_e, h_next, d_outcome,
-                           N_EMBD, stm);
+                           N_EMBD, d_accept_cap, stm);
     }
 
     void build_spec_graphs() {
@@ -649,6 +671,24 @@ struct Engine {
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         perm = (perm + (n - 1)) % 5;
         return n;
+    }
+
+    // ---- P7 constrained tool decoding API ----
+    // Upload a vocab bitmask into the resident pool; returns its stable
+    // index (-1 if the pool is full -- caller falls back to unconstrained).
+    int mask_pool_add(const void* bits) {
+        if (mask_pool_used >= MASK_POOL_CAP) return -1;
+        CUDA_CHECK(cudaMemcpyAsync(d_mask_pool + (size_t)mask_pool_used * mask_words, bits,
+                                   (size_t)mask_words * 4, cudaMemcpyHostToDevice, stm));
+        return mask_pool_used++;
+    }
+    // Constrain slot 0 to pool[mask_id] and cap acceptance at 1/round
+    // (mask_id -1 = deactivate). Takes effect from the next spec round.
+    void set_tool_constraint(int mask_id) {
+        h_mask_id0 = mask_id;
+        h_cap0 = mask_id >= 0 ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, &h_mask_id0, 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
     }
 
     // ---- batched prefill (M6): T-token chunk versions of the blocks ----

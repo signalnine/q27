@@ -64,6 +64,7 @@ void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft
                   const int* d_draft3, const int* d_draft4, const int* va, const int* vb,
                   const int* vc, const int* vd, const int* ve, const float* x1a,
                   const float* x1b, const float* x1c, const float* x1d, const float* x1e,
-                  float* h_next, int* outcome, int n_embd, cudaStream_t st = 0);
+                  float* h_next, int* outcome, int n_embd, const int* cap,
+                  cudaStream_t st = 0);
 
 } // namespace q27k
