@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
                 any_call = true;
                 (void)ci;
             }
-            if (!any_call && tools.is_array() && !tools.empty()) {
+            if (tools.is_array() && !tools.empty()) {
                 // wrapper-less call recovery (see parse_bare_tool_calls)
                 std::string pre;
                 auto bcs = q27::parse_bare_tool_calls(tx, &pre);
@@ -408,7 +408,7 @@ int main(int argc, char** argv) {
                 });
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
-                if (!any_call && has_tools) {
+                if (has_tools) {
                     // wrapper-less call recovery: text already streamed as
                     // text_delta (cosmetic); the tool_use blocks still fire
                     std::string pre;

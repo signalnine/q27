@@ -145,24 +145,31 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         int depth = 0;
         bool in_str = false, esc = false;
         size_t end = std::string::npos;
+        std::string san;  // segment with raw in-string control chars escaped
         for (size_t j = i; j < text.size(); j++) {
             char ch = text[j];
-            if (esc) { esc = false; continue; }
+            if (esc) { esc = false; san += ch; continue; }
             if (in_str) {
-                if (ch == '\\') esc = true;
-                else if (ch == '"') in_str = false;
+                if (ch == '\\') { esc = true; san += ch; continue; }
+                if (ch == '"') { in_str = false; san += ch; continue; }
+                // fifth drift mode: literal newlines/tabs inside the string
+                if (ch == '\n') { san += "\\n"; continue; }
+                if (ch == '\r') { san += "\\r"; continue; }
+                if (ch == '\t') { san += "\\t"; continue; }
+                san += ch;
                 continue;
             }
+            san += ch;
             if (ch == '"') in_str = true;
             else if (ch == '{') depth++;
             else if (ch == '}' && --depth == 0) { end = j; break; }
         }
         if (end == std::string::npos) {
             // unbalanced to EOF: repair only a {"name" candidate (truncated
-            // final call); otherwise keep scanning inner objects
-            std::string cand = text.substr(i);
-            if (cand.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
-            std::string r = cand;
+            // final call); otherwise keep scanning inner objects. `san` holds
+            // the sanitized remainder (scan ran to EOF).
+            if (san.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
+            std::string r = san;
             while (true) {
                 size_t e2 = r.find_last_not_of(" \t\r\n");
                 if (e2 == std::string::npos) break;
@@ -200,7 +207,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             }
             break; // candidate consumed the rest of the text either way
         }
-        std::string seg = text.substr(i, end - i + 1);
+        const std::string& seg = san;
         bool shaped = false;
         try {
             json j = json::parse(seg);

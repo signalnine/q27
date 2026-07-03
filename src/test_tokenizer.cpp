@@ -89,7 +89,18 @@ int main(int argc, char** argv) {
         bool ok6 = v6.size() == 2 && v6[0].name == "ls" && v6[1].name == "view" &&
                    v6[1].arguments.value("file_path", "") == "/w/a.md" &&
                    pre == "Let me look.";
-        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6;
+        // fifth observed mode (the task-queue root cause): RAW newlines/tabs
+        // inside the content string -- the model writes literal multi-line
+        // code where JSON requires \n escapes. Strict json::parse rejects
+        // control chars; recovery must escape them in-string.
+        auto v7 = q27::parse_bare_tool_calls(
+            "{\"tool_call\":\n{\"name\": \"write\", \"arguments\": {\"content\": \"interface A {\n"
+            "  x: number;\n\ty: string;\n}\nexport {A};\n\", \"file_path\": \"/w/s.ts\"}}\n"
+            "</tool_call>", &pre);
+        bool ok7 = v7.size() == 1 && v7[0].name == "write" &&
+                   v7[0].arguments.value("file_path", "") == "/w/s.ts" &&
+                   v7[0].arguments.value("content", "").find("interface A {\n  x: number;") == 0;
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
