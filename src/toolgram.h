@@ -39,7 +39,9 @@ struct ToolGrammar {
     }
 
     // full call body consumed (outer object closed); trailing ws still legal
-    bool done() const { return !dead_ && st_ == DONE_; }
+    bool done() const { return !dead_ && (st_ == DONE_ || st_ == CLOSER_ || st_ == CLOSED_); }
+    // literal </tool_call> fully matched -- constraint can disengage
+    bool closed() const { return !dead_ && st_ == CLOSED_; }
 
     // would every byte of s be legal from the current state?
     bool token_ok(const std::string& s) const {
@@ -71,7 +73,9 @@ struct ToolGrammar {
         J_KEYCOLON,    // expect ':' after key
         J_AFTER_VAL,   // expect ',' or closer
         OBJ_CLOSE,     // expect final '}' of the outer call object
-        DONE_
+        DONE_,         // body complete; expect ws then the literal closer
+        CLOSER_,       // matching "</tool_call>" (model emits it as BPE text)
+        CLOSED_        // closer consumed; anything goes (host deactivates)
     };
 
     static bool is_ws(char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
@@ -236,7 +240,19 @@ struct ToolGrammar {
                 if (c == '}') { st_ = DONE_; return true; }
                 return false;
             case DONE_:
-                return is_ws(c); // only ws until the </tool_call> token
+                if (is_ws(c)) return true;
+                if (c == '<') { lit_word_ = "</tool_call>"; lit_ = 1; st_ = CLOSER_; return true; }
+                return false;
+            case CLOSER_:
+                if (lit_ < lit_word_.size()) {
+                    if (c != lit_word_[lit_]) return false;
+                    lit_++;
+                    if (lit_ == lit_word_.size()) st_ = CLOSED_;
+                    return true;
+                }
+                return false;
+            case CLOSED_:
+                return true; // constraint disengages host-side at closed()
         }
         return false;
     }

@@ -21,12 +21,120 @@
 #include "engine.cuh"
 #include "tokenizer.h"
 #include "api_common.h"
+#include "toolgram.h"
 #include "../third_party/httplib.h"
 #include "../third_party/json.hpp"
 
 using json = nlohmann::json;
 using q27::Msg;
 using q27::StreamSplitter;
+
+// P7: per-request constrained tool decoding. Watches emitted token ids;
+// on <tool_call> it activates the grammar and drives Engine slot-0 masks
+// per accepted token. The token already pending when <tool_call> appears was
+// decided unconstrained (spec-decode lag) -- if it or any entry-race token is
+// grammar-illegal, the constrainer DISENGAGES for that call and the parser
+// fallback recovers downstream (logged either way).
+struct ToolConstrainer {
+    Engine* eng = nullptr;
+    const q27::Tokenizer* tok = nullptr;
+    q27::ToolMaskCache* cache = nullptr;
+    std::vector<int>* host2dev = nullptr;
+    bool enabled = false, active = false;
+    q27::ToolGrammar tg;
+    std::vector<std::string> names;
+    std::string tail; // rolling decoded-text window for the opener trigger
+    long engaged = 0, disengaged = 0;
+
+    void begin(std::vector<std::string> n) {
+        active = false;
+        tail.clear();
+        names = std::move(n);
+    }
+    void apply(const q27::ToolGrammar& g) {
+        int ci = cache->get(g);
+        if ((int)host2dev->size() <= ci) host2dev->resize(ci + 1, -2);
+        int& slot = (*host2dev)[ci];
+        if (slot == -2) slot = eng->mask_pool_add(cache->mask(ci).data());
+        if (slot < 0) { drop("mask pool full"); return; }
+        eng->set_tool_constraint(slot);
+    }
+    // Stage next round's slot-0 mask: the constrained lane decides the token
+    // AFTER the pending one, so simulate the pending token on a copy first.
+    void on_pending(int id) {
+        if (!enabled || !active || id < 0) return;
+        q27::ToolGrammar peek = tg;
+        for (char c : tok->decode_one(id))
+            if (!peek.advance(c)) return; // entry-race pending; on_id will drop
+        if (peek.closed()) { eng->set_tool_constraint(-1); return; }
+        apply(peek);
+    }
+    void drop(const char* why) {
+        if (active) {
+            eng->set_tool_constraint(-1);
+            active = false;
+            disengaged++;
+            fprintf(stderr, "[toolgram] disengaged: %s\n", why);
+        }
+    }
+    // The model emits the <tool_call>/<\/tool_call> markers as plain BPE
+    // pieces (never the added token), so both trigger and closer are matched
+    // on decoded TEXT; the closer lives inside the grammar (CLOSER_ states).
+    void on_id(int id) {
+        if (!enabled || names.empty()) return;
+        std::string bytes = tok->decode_one(id);
+        if (!active) {
+            tail += bytes;
+            if (tail.size() > 64) tail.erase(0, tail.size() - 64);
+            size_t pos = tail.rfind("<tool_call>");
+            // engage only when the marker COMPLETES within this token; any
+            // remainder bytes after it already belong to the call body
+            if (pos != std::string::npos && pos + 11 > tail.size() - bytes.size()) {
+                std::string rem = tail.substr(pos + 11);
+                tg.reset(names);
+                active = true;
+                engaged++;
+                fprintf(stderr, "[toolgram] engaged (rem=%zu)\n", rem.size());
+                if (getenv("Q27_TG_TRACE")) {
+                    std::string t2 = tail;
+                    for (auto& ch : t2) if (ch == '\n') ch = '~';
+                    fprintf(stderr, "[tg-trace] tail at engage: %s\n", t2.c_str());
+                }
+                for (char c : rem)
+                    if (!tg.advance(c)) {
+                        char why[64];
+                        snprintf(why, sizeof why, "entry byte 0x%02x rejected", (unsigned char)c);
+                        drop(why);
+                        return;
+                    }
+                apply(tg);
+            }
+            return;
+        }
+        if (getenv("Q27_TG_TRACE")) {
+            std::string t2 = bytes;
+            for (auto& ch : t2) if (ch == '\n') ch = '~';
+            fprintf(stderr, "[tg-trace] feed: %s\n", t2.c_str());
+        }
+        for (char c : bytes)
+            if (!tg.advance(c)) {
+                char why[64];
+                snprintf(why, sizeof why, "byte 0x%02x rejected", (unsigned char)c);
+                drop(why);
+                return;
+            }
+        if (tg.closed()) {
+            eng->set_tool_constraint(-1);
+            active = false;
+            tail.clear();
+            fprintf(stderr, "[toolgram] call closed\n");
+            return;
+        }
+    }
+    void end() {
+        if (active) drop("generation ended in-grammar");
+    }
+};
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -38,12 +146,14 @@ int main(int argc, char** argv) {
     int port = 8080, ctx = 8192;
     bool fast = false;
     bool no_think_srv = false;
+    bool constrain_tools = false;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast-head")) fast = true;
         else if (!strcmp(argv[i], "--no-think")) no_think_srv = true;
+        else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
     }
     if (no_think_srv) fprintf(stderr, "no-think: empty-think prefill on all chat paths\n");
 
@@ -55,6 +165,14 @@ int main(int argc, char** argv) {
     eng.build_graph();
     eng.build_spec_graphs();
     const int EOS = tok.eos();
+    // P7 shared mask cache (guarded by the single-slot gpu mutex)
+    std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
+    q27::ToolMaskCache tool_mask_cache;
+    tool_mask_cache.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
+    std::vector<int> tool_mask_host2dev;
+    if (constrain_tools)
+        fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
+                tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
 
     std::mutex gpu; // single slot: serialize requests
     std::atomic<long> req_counter{0};
@@ -241,6 +359,11 @@ int main(int argc, char** argv) {
         int n_max = body.value("max_tokens", 1024);
         bool stream = body.value("stream", false);
         json tools = anthropic_tools(body);
+        std::vector<std::string> tool_names_v;
+        if (constrain_tools && tools.is_array())
+            for (auto& t : tools)
+                if (t.contains("function") && t["function"].contains("name"))
+                    tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
         std::string rendered =
             q27::chatml_prompt(anthropic_msgs(body), tools, !no_think_srv);
@@ -268,10 +391,19 @@ int main(int argc, char** argv) {
                 }
                 (ch == StreamSplitter::THINK ? think : text) += t;
             };
+            ToolConstrainer tc;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.host2dev = &tool_mask_host2dev;
+            tc.enabled = constrain_tools;
+            tc.begin(tool_names_v);
+            eng.on_pending = [&](int id) { tc.on_pending(id); };
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
+                tc.on_id(id);
                 for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
                 return true;
             });
+            tc.end();
+            eng.on_pending = nullptr;
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
                 calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
@@ -322,8 +454,14 @@ int main(int argc, char** argv) {
         const bool has_tools = tools.is_array() && !tools.empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, mid, rid, has_tools](size_t, httplib::DataSink& sink) {
+            [&, prompt, n_max, mid, rid, has_tools, tool_names_v](size_t,
+                                                                    httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
+                ToolConstrainer tc;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.host2dev = &tool_mask_host2dev;
+                tc.enabled = constrain_tools;
+                tc.begin(tool_names_v);
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 auto ev = [&](const char* name, const json& j) {
@@ -402,10 +540,14 @@ int main(int argc, char** argv) {
                         ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
                             {"delta", {{"type", "text_delta"}, {"text", t}}}});
                 };
+                eng.on_pending = [&](int id) { tc.on_pending(id); };
                 int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
+                    tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(tok.decode_one(id))) emit_seg(ch, t);
                     return true;
                 });
+                tc.end();
+                eng.on_pending = nullptr;
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
                 if (has_tools) {

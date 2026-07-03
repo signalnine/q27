@@ -3,6 +3,7 @@
 #pragma once
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -664,14 +665,20 @@ struct Engine {
     // All position math + acceptance runs on device; host reads 24 bytes.
     int spec_round(int* emit) {
         CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
-        int oc[6];
-        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 24, cudaMemcpyDeviceToHost, stm));
+        int oc[7];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        last_pending = oc[6];
         perm = (perm + (n - 1)) % 5;
         return n;
     }
+    int last_pending = -1;
+    // P7: called after each spec round with the NEW pending token so the
+    // host grammar can stage next round's slot-0 mask (state must include
+    // the pending token -- masks lag one token otherwise).
+    std::function<void(int)> on_pending;
 
     // ---- P7 constrained tool decoding API ----
     // Upload a vocab bitmask into the resident pool; returns its stable
@@ -957,6 +964,7 @@ struct Engine {
                 if (!on_token(em[k])) { done("client-stop"); return emitted; }
                 emitted++;
             }
+            if (on_pending) on_pending(last_pending);
         }
         done("n_max");
         return emitted;

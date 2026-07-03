@@ -171,8 +171,21 @@ int main(int argc, char** argv) {
         bool edge3 = g10.advance_str("{\"name\": \"write\", \"arguments\": {\"x\": 1}}") &&
                      g10.done() && g10.advance('\n') && !g10.advance('}');
 
+        // the closer arrives as TEXT (the model emits <tool_call> markers as
+        // plain BPE pieces, not the added token): after done(), the grammar
+        // must accept ws + the literal "</tool_call>" and then report
+        // closed(); a wrong char mid-closer is illegal
+        auto g11 = fresh();
+        bool closer_ok = g11.advance_str("{\"name\": \"ls\", \"arguments\": {}}") &&
+                         g11.done() && !g11.closed() &&
+                         g11.advance_str("\n</tool_call>") && g11.closed() &&
+                         g11.advance('x');  // post-close: anything goes
+        auto g12 = fresh();
+        bool closer_bad = g12.advance_str("{\"name\": \"ls\", \"arguments\": {}}\n</tool") &&
+                          !g12.advance('x');  // "</toolx" is not the closer
+
         bool ok = ok_legal && m5_reject && m3_reject && m4_reject && m6_reject &&
-                  m2_notdone && tok_ok && edge1 && edge2 && edge3;
+                  m2_notdone && tok_ok && edge1 && edge2 && edge3 && closer_ok && closer_bad;
         printf("toolgram drift modes: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }

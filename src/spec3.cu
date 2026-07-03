@@ -374,9 +374,11 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         h_next[i] = src[i];
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        *dtok = n == 5 ? ve : n == 4 ? vd : n == 3 ? vc : n == 2 ? vb : va;
+        int nt = n == 5 ? ve : n == 4 ? vd : n == 3 ? vc : n == 2 ? vb : va;
+        *dtok = nt;
         *dP += n;
         outcome[0] = n;
+        outcome[6] = nt; // new pending token (P7: host grammar needs it pre-round)
         outcome[2] = dr1;
         outcome[3] = dr2;
         outcome[4] = dr3;
