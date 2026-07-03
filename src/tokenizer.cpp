@@ -264,6 +264,13 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
     return out;
 }
 
+std::vector<std::string> Tokenizer::vocab_bytes() const {
+    std::vector<std::string> out(tokens_.size());
+    for (size_t i = 0; i < tokens_.size(); i++)
+        if (types_[i] != 3) out[i] = decode_one((int)i);
+    return out;
+}
+
 int Tokenizer::token_id(const std::string& s) const {
     for (size_t i = 0; i < tokens_.size(); i++)
         if (tokens_[i] == s) return (int)i;

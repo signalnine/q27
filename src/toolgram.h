@@ -9,7 +9,9 @@
 // token legality is checked by simulating a token's bytes on a copy
 // (token_ok). EOS/im_end must be masked upstream until done().
 #pragma once
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace q27 {
@@ -251,6 +253,73 @@ struct ToolGrammar {
     size_t lit_ = 0;
     St st_ = WS_OBJ_OPEN;
     bool dead_ = false;
+
+  public:
+    // state signature for mask caching: two states with equal signatures
+    // accept identical token sets (state enum + stack + literal progress +
+    // name prefix fully determine transitions)
+    std::string signature() const {
+        std::string s;
+        s += (char)('A' + (int)st_);
+        s += dead_ ? '!' : '.';
+        s.append(stack_.begin(), stack_.end());
+        s += '|';
+        s += std::to_string(lit_);
+        s += '|';
+        s += lit_word_;
+        s += '|';
+        s += name_pref_;
+        return s;
+    }
+};
+
+// Signature-hashed lazy cache of vocab legality bitmasks. Exact: a mask is
+// built by simulating every vocab token's bytes from the (copied) grammar
+// state. Masks are append-only (stable indices -> device-resident pool in
+// phase 2/3). Wiring rules encoded here: the </tool_call> closer id is legal
+// iff done(); EOS is never legal inside the grammar (enforcement disengages
+// after the closer, upstream).
+struct ToolMaskCache {
+    // vocab: decoded byte strings per token id (specials included verbatim)
+    void init(const std::vector<std::string>* vocab, int closer_id) {
+        vocab_ = vocab;
+        closer_id_ = closer_id;
+        words_ = ((int)vocab->size() + 31) / 32;
+    }
+
+    // returns stable mask index for the grammar's current state
+    int get(const ToolGrammar& g) {
+        std::string sig = g.signature();
+        auto it = index_.find(sig);
+        if (it != index_.end()) return it->second;
+        std::vector<uint32_t> m(words_, 0);
+        const auto& v = *vocab_;
+        for (size_t id = 0; id < v.size(); id++) {
+            bool ok;
+            if ((int)id == closer_id_)
+                ok = g.done();
+            else if (v[id].empty())
+                ok = false; // specials/EOS and empty entries: never legal in-grammar
+            else
+                ok = g.token_ok(v[id]);
+            if (ok) m[id >> 5] |= 1u << (id & 31);
+        }
+        int idx = (int)masks_.size();
+        masks_.push_back(std::move(m));
+        index_.emplace(std::move(sig), idx);
+        return idx;
+    }
+
+    const std::vector<uint32_t>& mask(int idx) const { return masks_[idx]; }
+    size_t size() const { return masks_.size(); }
+    int words() const { return words_; }
+
+  private:
+    const std::vector<std::string>* vocab_ = nullptr;
+    int closer_id_ = -1;
+    int words_ = 0;
+    std::unordered_map<std::string, int> index_;
+    std::vector<std::vector<uint32_t>> masks_;
 };
 
 } // namespace q27

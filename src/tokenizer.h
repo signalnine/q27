@@ -32,6 +32,12 @@ class Tokenizer {
     // controls only) does not cover.
     int token_id(const std::string& s) const;
 
+    // Decoded raw bytes per token id for grammar-mask construction (P7).
+    // Control tokens (type 3) come back EMPTY: they must never be legal
+    // inside a constrained region (their marker bytes would otherwise pass
+    // as string content -- e.g. <|im_end|> inside a JSON string).
+    std::vector<std::string> vocab_bytes() const;
+
   private:
     std::vector<std::string> tokens_;   // GPT-2 byte-encoded space
     std::vector<uint8_t> types_;

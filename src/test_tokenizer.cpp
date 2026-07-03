@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <chrono>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -174,6 +175,60 @@ int main(int argc, char** argv) {
                   m2_notdone && tok_ok && edge1 && edge2 && edge3;
         printf("toolgram drift modes: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
+    }
+
+    // P7: ToolMaskCache -- exact lazy vocab-legality bitmasks keyed by
+    // grammar-state signature. Synthetic vocab for logic; real vocab for a
+    // sweep-cost measurement (design viability: a miss must be low-ms).
+    {
+        std::vector<std::string> vocab = {"{",  "\"",   "name", "\": \"", "write",
+                                          "abc", "\n",  "}",    " ",      "</tool_call>",
+                                          ""};
+        const int CLOSER = 9, CTRL = 10;
+        q27::ToolMaskCache mc;
+        mc.init(&vocab, CLOSER);
+        q27::ToolGrammar g;
+        g.reset({"write", "view"});
+        auto bit = [&](int mi, int id) {
+            return (mc.mask(mi)[id >> 5] >> (id & 31)) & 1u;
+        };
+        int m0 = mc.get(g);
+        bool fresh_ok = bit(m0, 0) && bit(m0, 8) && !bit(m0, 5) && !bit(m0, CLOSER) &&
+                        !bit(m0, CTRL);
+        int m0b = mc.get(g);
+        bool cache_hit = (m0b == m0) && mc.size() == 1;
+        g.advance_str("{\"name\": \"write\", \"arguments\": {\"content\": \"");
+        int m1 = mc.get(g);
+        // in-string: text legal, raw newline token illegal, '{' legal as
+        // string CONTENT, closer still illegal
+        bool instr_ok = bit(m1, 5) && !bit(m1, 6) && bit(m1, 0) && !bit(m1, CLOSER) &&
+                        m1 != m0;
+        g.advance_str("x\"}}");
+        int m2 = mc.get(g);
+        bool done_ok = g.done() && bit(m2, CLOSER) && bit(m2, 8) && !bit(m2, 7);
+        bool ok = fresh_ok && cache_hit && instr_ok && done_ok;
+        printf("toolmask cache: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+    // real-vocab sweep cost (informational)
+    {
+        auto vb = tok.vocab_bytes();
+        int closer = tok.token_id("</tool_call>");
+        q27::ToolMaskCache mc;
+        mc.init(&vb, closer);
+        q27::ToolGrammar g;
+        g.reset({"write", "view", "ls", "bash", "grep", "glob", "edit"});
+        auto t0 = std::chrono::steady_clock::now();
+        int a = mc.get(g);
+        g.advance_str("{\"name\": \"write\", \"arguments\": {\"content\": \"");
+        int b = mc.get(g);
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 2;
+        long legal = 0;
+        for (uint32_t w : mc.mask(b)) legal += __builtin_popcount(w);
+        printf("  toolmask real vocab: %.1f ms/sweep, in-string legal tokens %ld/%zu "
+               "(closer id %d, masks %zu)\n", ms, legal, vb.size(), closer, mc.size());
+        (void)a;
     }
 
     // added-token matching: encode() must map literal <think>/</think> text to
