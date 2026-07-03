@@ -822,7 +822,7 @@ struct Engine {
         q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
     }
 
-    void snap_save(const std::vector<int>& prompt) {
+    void snap_save(const std::vector<int>& prompt, int upto = -1) {
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 CUDA_CHECK(cudaMemcpyAsync(S_snap[il], S[il],
@@ -831,7 +831,8 @@ struct Engine {
                 CUDA_CHECK(cudaMemcpyAsync(ring_snap[il], conv_ring[il], 3 * GDN_CH * 4,
                                            cudaMemcpyDeviceToDevice, stm));
             }
-        snap_toks.assign(prompt.begin(), prompt.end() - 1);
+        if (upto < 0) upto = (int)prompt.size() - 1;
+        snap_toks.assign(prompt.begin(), prompt.begin() + upto);
         have_snap = true;
     }
 
@@ -877,8 +878,13 @@ struct Engine {
     // Prompt + speculative generation. Calls on_token(id) for each generated
     // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
     // path (requires build_spec_graphs()). MTP KV warmed during prompt.
+    // stable_len (P8): token index of the stable-prefix boundary (end of the
+    // last input message). The GDN snapshot is taken THERE instead of at the
+    // prompt tail, so the next turn's re-rendered history prefix-matches and
+    // only the per-turn suffix re-prefills. -1 = legacy tail snapshot.
     template <typename F>
-    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token) {
+    int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
+                 int stable_len = -1) {
         int NP = (int)prompt.size();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -908,13 +914,21 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_prompt, prompt.data(), (size_t)NP * 4,
                                        cudaMemcpyHostToDevice, stm));
             const DevTensor& onw = dm.get("output_norm.weight");
-            for (int c0 = base; c0 < NP - 1; c0 += PF_T) {
+            const int snap_upto =
+                (stable_len > base && stable_len < NP) ? stable_len : NP - 1;
+            for (int c0 = base; c0 < snap_upto; c0 += PF_T) {
+                int Tc = std::min((int)PF_T, snap_upto - c0);
+                prefill_chunk(d_prompt + c0, c0, Tc);
+                q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
+                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+            }
+            snap_save(prompt, snap_upto);
+            for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);
                 prefill_chunk(d_prompt + c0, c0, Tc);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
             }
-            snap_save(prompt);
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));

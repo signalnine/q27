@@ -36,8 +36,11 @@ inline std::string tools_preamble(const json& tools) {
 // into the (first) system message per the template's merged_system behavior.
 // think=false appends the empty think block (enable_thinking=false
 // convention); the tokenizer matches <think>/</think> as single added tokens.
+// stable_off (P8): char offset where the trailing assistant-open begins.
+// Everything before it re-renders identically next turn (snapshot-safe);
+// everything after (assistant open + think prefill) is per-turn volatile.
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
-                                 bool think = true) {
+                                 bool think = true, size_t* stable_off = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -51,6 +54,7 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     }
     for (size_t i = start; i < msgs.size(); i++)
         p += "<|im_start|>" + msgs[i].role + "\n" + msgs[i].content + "<|im_end|>\n";
+    if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
     if (!think) p += "<think>\n\n</think>\n\n";
     return p;

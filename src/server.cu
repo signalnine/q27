@@ -365,10 +365,20 @@ int main(int argc, char** argv) {
                 if (t.contains("function") && t["function"].contains("name"))
                     tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
+        size_t stable_off = 0;
         std::string rendered =
-            q27::chatml_prompt(anthropic_msgs(body), tools, !no_think_srv);
+            q27::chatml_prompt(anthropic_msgs(body), tools, !no_think_srv, &stable_off);
         auto tk1 = std::chrono::steady_clock::now();
-        std::vector<int> prompt = tok.encode(rendered);
+        // P8: split-encode at the stable boundary. Both turns encode the
+        // shared history with the same split (the boundary always abuts the
+        // <|im_start|> special, so tokenization is split-invariant there),
+        // which is what makes the snapshot prefix-match next turn.
+        std::vector<int> prompt = tok.encode(rendered.substr(0, stable_off));
+        const int stable_len = (int)prompt.size();
+        {
+            std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
+            prompt.insert(prompt.end(), tailv.begin(), tailv.end());
+        }
         auto tk2 = std::chrono::steady_clock::now();
         fprintf(stderr, "[timing] render %.1fms encode %.1fms (%zu chars -> %zu toks)\n",
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
@@ -401,7 +411,7 @@ int main(int argc, char** argv) {
                 tc.on_id(id);
                 for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
                 return true;
-            });
+            }, stable_len);
             tc.end();
             eng.on_pending = nullptr;
             for (auto& [ch, t] : sp.flush()) route(ch, t);
@@ -454,8 +464,8 @@ int main(int argc, char** argv) {
         const bool has_tools = tools.is_array() && !tools.empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, mid, rid, has_tools, tool_names_v](size_t,
-                                                                    httplib::DataSink& sink) {
+            [&, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len](
+                size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
@@ -545,7 +555,7 @@ int main(int argc, char** argv) {
                     tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(tok.decode_one(id))) emit_seg(ch, t);
                     return true;
-                });
+                }, stable_len);
                 tc.end();
                 eng.on_pending = nullptr;
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);

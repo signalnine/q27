@@ -190,6 +190,28 @@ int main(int argc, char** argv) {
         if (!ok) return 1;
     }
 
+    // P8: stable-prefix boundary. chatml_prompt reports the char offset
+    // where the trailing assistant-open begins; everything before it is
+    // deterministic re-rendered history (snapshot-safe), everything after is
+    // per-turn volatile (assistant open + think prefill). The boundary sits
+    // right after "<|im_end|>\n" and right before "<|im_start|>assistant\n",
+    // and encoding the prefix substring must be deterministic.
+    {
+        std::vector<q27::Msg> msgs = {{"system", "S"}, {"user", "hi"},
+                                      {"assistant", "yo"}, {"user", "go"}};
+        size_t off = 0;
+        std::string r = q27::chatml_prompt(msgs, nlohmann::json::array(), false, &off);
+        bool ok = off > 0 && off < r.size() &&
+                  r.compare(off, 22, "<|im_start|>assistant\n") == 0 &&
+                  off >= 11 && r.compare(off - 11, 11, "<|im_end|>\n") == 0;
+        auto a1 = tok.encode(r.substr(0, off));
+        auto b1 = tok.encode(r.substr(off));
+        auto a2 = tok.encode(r.substr(0, off));
+        ok = ok && a1 == a2 && !b1.empty() && !a1.empty();
+        printf("chatml stable boundary: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
     // P7: ToolMaskCache -- exact lazy vocab-legality bitmasks keyed by
     // grammar-state signature. Synthetic vocab for logic; real vocab for a
     // sweep-cost measurement (design viability: a miss must be low-ms).
