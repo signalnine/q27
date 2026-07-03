@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
             "Let me write it.\n\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.ts\", "
             "\"content\": \"x{y}\\\"z\\\"\"}}\n</file>", &pre, &suf);
         bool ok1 = c1.ok && c1.name == "write" && c1.arguments.value("path", "") == "a.ts" &&
-                   pre == "Let me write it." && q27::strip_ws2(suf) == "</file>";
+                   pre == "Let me write it.";
         auto c2 = q27::parse_bare_tool_call("no tools here, just {braces} in prose", &pre, &suf);
         auto c3 = q27::parse_bare_tool_call("{\"name\": \"x\"}", &pre, &suf); // no arguments
         // observed failure mode: model emits the full call but never closes
@@ -76,7 +76,20 @@ int main(int argc, char** argv) {
         bool ok5 = c5.ok && c5.name == "write" &&
                    c5.arguments.value("file_path", "") == "/w/s.ts" &&
                    c5.arguments.value("content", "").find("const a = \"x\";") == 0;
-        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5;
+        // fourth observed mode (task-queue transcripts): literal {"tool_call":
+        // as the opener with </tool_call> as the closer, MULTIPLE calls per
+        // message. The outer object never closes (net +1 depth per blob), so
+        // the scanner must skip it and recover every inner {"name":...}
+        // object. This was missed by a scan bug: unbalanced non-{"name"
+        // candidates aborted the whole scan instead of trying the next '{'.
+        auto v6 = q27::parse_bare_tool_calls(
+            "Let me look.\n\n{\"tool_call\":\n{\"name\": \"ls\", \"arguments\": "
+            "{\"path\": \"/w\"}}\n</tool_call>\n{\"tool_call\":\n{\"name\": \"view\", "
+            "\"arguments\": {\"file_path\": \"/w/a.md\"}}\n</tool_call>", &pre);
+        bool ok6 = v6.size() == 2 && v6[0].name == "ls" && v6[1].name == "view" &&
+                   v6[1].arguments.value("file_path", "") == "/w/a.md" &&
+                   pre == "Let me look.";
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }

@@ -129,11 +129,19 @@ inline std::string escape_content_tags(const std::string& text) {
     return text.substr(0, a) + "\"" + esc + "\"" + text.substr(b + 10);
 }
 
-inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
-                                     std::string* suffix) {
-    ToolCall none;
+// Scan for ALL recoverable bare calls. Balanced {"name":...,"arguments":...}
+// objects anywhere in the text are collected (skipping unbalanced wrappers
+// like the literal {"tool_call": opener, which nets +1 depth per blob and
+// never closes); a trailing truncated {"name" candidate gets framing repair
+// (close open string, strip junk tags, close braces). prefix = text before
+// the first recovered call.
+inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
+                                                   std::string* prefix) {
+    std::vector<ToolCall> out;
     const std::string text = escape_content_tags(text_in);
-    for (size_t i = text.find('{'); i != std::string::npos; i = text.find('{', i + 1)) {
+    size_t first = std::string::npos;
+    size_t i = text.find('{');
+    while (i != std::string::npos) {
         int depth = 0;
         bool in_str = false, esc = false;
         size_t end = std::string::npos;
@@ -150,15 +158,10 @@ inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* pr
             else if (ch == '}' && --depth == 0) { end = j; break; }
         }
         if (end == std::string::npos) {
-            // Unbalanced to EOF. Second observed mode: the model emits the
-            // full call but never closes the JSON -- the argument string ends
-            // in tag junk ("</file>") instead of "}} . Repair FRAMING only:
-            // strip trailing junk tags, close the open string, close braces.
-            // Payload truncation is not repaired (and should stay penalized).
+            // unbalanced to EOF: repair only a {"name" candidate (truncated
+            // final call); otherwise keep scanning inner objects
             std::string cand = text.substr(i);
-            if (cand.rfind("{\"name\"", 0) != 0 &&
-                strip_ws2(cand).rfind("{\"name\"", 0) != 0)
-                break;
+            if (cand.rfind("{\"name\"", 0) != 0) { i = text.find('{', i + 1); continue; }
             std::string r = cand;
             while (true) {
                 size_t e2 = r.find_last_not_of(" \t\r\n");
@@ -183,28 +186,55 @@ inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* pr
             }
             if (s2) r += '"';
             for (; d2 > 0; d2--) r += '}';
+            bool shaped = false;
             try {
                 json j = json::parse(r);
-                if (!j.is_object() || !j.contains("name") || !j.contains("arguments")) break;
-            } catch (...) { break; }
-            ToolCall tc = parse_tool_call(r);
-            if (!tc.ok) break;
-            if (prefix) *prefix = strip_ws2(text.substr(0, i));
-            if (suffix) *suffix = "";
-            return tc;
+                shaped = j.is_object() && j.contains("name") && j.contains("arguments");
+            } catch (...) {}
+            if (shaped) {
+                ToolCall tc = parse_tool_call(r);
+                if (tc.ok) {
+                    if (first == std::string::npos) first = i;
+                    out.push_back(tc);
+                }
+            }
+            break; // candidate consumed the rest of the text either way
         }
         std::string seg = text.substr(i, end - i + 1);
+        bool shaped = false;
         try {
             json j = json::parse(seg);
-            if (!j.is_object() || !j.contains("name") || !j.contains("arguments")) continue;
-        } catch (...) { continue; }
-        ToolCall tc = parse_tool_call(seg);
-        if (!tc.ok) continue;
-        if (prefix) *prefix = strip_ws2(text.substr(0, i));
-        if (suffix) *suffix = text.substr(end + 1);
-        return tc;
+            shaped = j.is_object() && j.contains("name") && j.contains("arguments");
+        } catch (...) {}
+        if (shaped) {
+            ToolCall tc = parse_tool_call(seg);
+            if (tc.ok) {
+                if (first == std::string::npos) first = i;
+                out.push_back(tc);
+                i = text.find('{', end + 1);
+                continue;
+            }
+        }
+        i = text.find('{', i + 1);
     }
-    return none;
+    if (prefix) {
+        std::string p = first == std::string::npos ? "" : strip_ws2(text.substr(0, first));
+        // drop a dangling {"tool_call": opener fragment (mode-4 wrapper junk)
+        if (p.size() >= 13 && p.compare(p.size() - 13, 13, "{\"tool_call\":") == 0)
+            p = strip_ws2(p.substr(0, p.size() - 13));
+        *prefix = p;
+    }
+    return out;
+}
+
+// Single-call convenience wrapper (first recovered call). suffix retained for
+// callers that trim trailing junk; multi-call callers use the vector form.
+inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
+                                     std::string* suffix) {
+    auto v = parse_bare_tool_calls(text_in, prefix);
+    if (v.empty()) return ToolCall{};
+    if (suffix) *suffix = "";
+    return v.front();
 }
 
 

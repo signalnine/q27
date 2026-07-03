@@ -289,14 +289,14 @@ int main(int argc, char** argv) {
                 (void)ci;
             }
             if (!any_call && tools.is_array() && !tools.empty()) {
-                // wrapper-less call recovery (see parse_bare_tool_call)
-                std::string pre, suf;
-                auto bc = q27::parse_bare_tool_call(tx, &pre, &suf);
-                if (bc.ok) {
-                    fprintf(stderr, "[tool-fallback] bare '%s' recovered (nonstream), "
-                            "%zu suffix bytes dropped\n", bc.name.c_str(), suf.size());
+                // wrapper-less call recovery (see parse_bare_tool_calls)
+                std::string pre;
+                auto bcs = q27::parse_bare_tool_calls(tx, &pre);
+                if (!bcs.empty()) {
+                    fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (nonstream)\n",
+                            bcs.size());
                     tx = pre;
-                    calls.push_back(bc);
+                    for (auto& bc : bcs) calls.push_back(bc);
                     any_call = true;
                 }
             }
@@ -410,27 +410,31 @@ int main(int argc, char** argv) {
                 if (!tool_buf.empty()) emit_tool();
                 if (!any_call && has_tools) {
                     // wrapper-less call recovery: text already streamed as
-                    // text_delta (cosmetic); the tool_use block still fires
-                    std::string pre, suf;
-                    auto bc = q27::parse_bare_tool_call(text_accum, &pre, &suf);
-                    if (bc.ok) {
-                        fprintf(stderr, "[tool-fallback] bare '%s' recovered (stream)\n",
-                                bc.name.c_str());
+                    // text_delta (cosmetic); the tool_use blocks still fire
+                    std::string pre;
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre);
+                    if (!bcs.empty()) {
+                        fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (stream)\n",
+                                bcs.size());
                         any_call = true;
                         any = true;
                         close_block();
-                        int ti = block_counter++;
-                        std::string tid = "toolu_q27_" + std::to_string(rid) + "_" +
-                                          std::to_string(tool_counter++);
-                        ev("content_block_start",
-                           {{"type", "content_block_start"}, {"index", ti},
-                            {"content_block", {{"type", "tool_use"}, {"id", tid},
-                                               {"name", bc.name}, {"input", json::object()}}}});
-                        ev("content_block_delta",
-                           {{"type", "content_block_delta"}, {"index", ti},
-                            {"delta", {{"type", "input_json_delta"},
-                                       {"partial_json", bc.arguments.dump()}}}});
-                        ev("content_block_stop", {{"type", "content_block_stop"}, {"index", ti}});
+                        for (auto& bc : bcs) {
+                            int ti = block_counter++;
+                            std::string tid = "toolu_q27_" + std::to_string(rid) + "_" +
+                                              std::to_string(tool_counter++);
+                            ev("content_block_start",
+                               {{"type", "content_block_start"}, {"index", ti},
+                                {"content_block", {{"type", "tool_use"}, {"id", tid},
+                                                   {"name", bc.name},
+                                                   {"input", json::object()}}}});
+                            ev("content_block_delta",
+                               {{"type", "content_block_delta"}, {"index", ti},
+                                {"delta", {{"type", "input_json_delta"},
+                                           {"partial_json", bc.arguments.dump()}}}});
+                            ev("content_block_stop",
+                               {{"type", "content_block_stop"}, {"index", ti}});
+                        }
                     }
                 }
                 if (idx < 0 && !any) { // nothing at all: empty text block for validity
