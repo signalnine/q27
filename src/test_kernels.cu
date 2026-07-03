@@ -497,6 +497,125 @@ static void test_attn_split() {
     CUDA_CHECK(cudaFree(d_part)); CUDA_CHECK(cudaFree(d_k)); CUDA_CHECK(cudaFree(d_v));
 }
 
+// P6: column-split delta scan vs the exact one-block-per-head path. S columns
+// are independent (pred_j, dj, the rank-1 update and o_j touch only column j),
+// so the split only reorders the row reductions (4x32-serial -> NTILE x RPT)
+// -> tolerance gate like P4's attention split. Q27_DS_SPLIT=1 must route to
+// the untouched legacy kernel.
+static void test_delta_split() {
+    const int NH = 48, SK = 128, CH = 10240, T = 64;
+    const size_t SN = (size_t)NH * SK * SK, ON = (size_t)T * NH * SK;
+    std::vector<float> S0 = rand_vec(SN, 51), conv = rand_vec((size_t)T * CH, 52);
+    std::vector<float> g = rand_vec((size_t)T * NH, 53), beta = rand_vec((size_t)T * NH, 54);
+    // keep the recurrence in its real regime, matching the engine's input
+    // contract: decay = exp(g) <= 1, beta in (0,1), and q/k blocks of conv
+    // l2-normalized per head (l2norm_heads_T runs before delta_scan_T; with
+    // ||k|| ~ 11 instead of 1 the update is expansive and chaotically
+    // amplifies reduction-reorder noise into false FAILs)
+    for (auto& x : g) x = -std::fabs(x) * 0.1f;
+    for (auto& x : beta) x = 1.f / (1.f + std::exp(-x));
+    for (int t = 0; t < T; t++)
+        for (int hh = 0; hh < 32; hh++) {
+            float* p = conv.data() + (size_t)t * CH + hh * SK;  // q then k blocks
+            double n2 = 0;
+            for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
+            float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
+            for (int i = 0; i < SK; i++) p[i] *= inv;
+        }
+    float *d_S, *d_conv, *d_g, *d_beta, *d_o;
+    CUDA_CHECK(cudaMalloc(&d_S, SN * 4));
+    CUDA_CHECK(cudaMalloc(&d_conv, conv.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_g, g.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_beta, beta.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_o, ON * 4));
+    CUDA_CHECK(cudaMemcpy(d_conv, conv.data(), conv.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_g, g.data(), g.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_beta, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice));
+
+    setenv("Q27_DS_SPLIT", "1", 1);
+    check("ds nsplit env=1", std::fabs((double)q27k::delta_scan_nsplit(T) - 1), 0.5);
+    setenv("Q27_DS_SPLIT", "4", 1);
+    check("ds nsplit env=4", std::fabs((double)q27k::delta_scan_nsplit(T) - 4), 0.5);
+    unsetenv("Q27_DS_SPLIT");
+    int cs_auto = q27k::delta_scan_nsplit(T);
+    check("ds nsplit auto valid", (cs_auto == 1 || cs_auto == 2 || cs_auto == 4 || cs_auto == 8)
+                                      ? 0.0 : 1.0, 0.5);
+
+    std::vector<float> Sa(SN), oa(ON), Sb(SN), ob(ON);
+    // Tn=1 has no recurrence: any indexing/race bug shows undamped at ~0
+    // tolerance; Tn=64 then bounds the compounded reorder noise.
+    for (int Tn : {1, T}) {
+        setenv("Q27_DS_SPLIT", "1", 1);
+        CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
+        q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(Sa.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(oa.data(), d_o, (size_t)Tn * NH * SK * 4, cudaMemcpyDeviceToHost));
+        for (int cs : {2, 4, 8}) {
+            char v[4], label[64];
+            snprintf(v, sizeof v, "%d", cs);
+            setenv("Q27_DS_SPLIT", v, 1);
+            CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(Sb.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ob.data(), d_o, (size_t)Tn * NH * SK * 4,
+                                  cudaMemcpyDeviceToHost));
+            double mo = 0, ms = 0;
+            for (size_t i = 0; i < (size_t)Tn * NH * SK; i++)
+                mo = std::max(mo, (double)std::fabs(oa[i] - ob[i]) / (1.0 + std::fabs(oa[i])));
+            for (size_t i = 0; i < SN; i++)
+                ms = std::max(ms, (double)std::fabs(Sa[i] - Sb[i]) / (1.0 + std::fabs(Sa[i])));
+            double tol = Tn == 1 ? 1e-5 : 1e-3;
+            snprintf(label, sizeof label, "delta scan split=%d vs 1 (o, T=%d)", cs, Tn);
+            check(label, mo, tol);
+            snprintf(label, sizeof label, "delta scan split=%d vs 1 (S final, T=%d)", cs, Tn);
+            check(label, ms, tol);
+        }
+    }
+    // timing at the engine's chunk size (PF_T=256), informational only
+    {
+        const int TB = 256, REP = 50;
+        std::vector<float> cB = rand_vec((size_t)TB * CH, 55), gB = rand_vec((size_t)TB * NH, 56);
+        std::vector<float> bB = rand_vec((size_t)TB * NH, 57);
+        for (auto& x : gB) x = -std::fabs(x) * 0.1f;
+        for (auto& x : bB) x = 1.f / (1.f + std::exp(-x));
+        float *d_cB, *d_gB, *d_bB, *d_oB;
+        CUDA_CHECK(cudaMalloc(&d_cB, cB.size() * 4));
+        CUDA_CHECK(cudaMalloc(&d_gB, gB.size() * 4));
+        CUDA_CHECK(cudaMalloc(&d_bB, bB.size() * 4));
+        CUDA_CHECK(cudaMalloc(&d_oB, (size_t)TB * NH * SK * 4));
+        CUDA_CHECK(cudaMemcpy(d_cB, cB.data(), cB.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_gB, gB.data(), gB.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bB, bB.data(), bB.size() * 4, cudaMemcpyHostToDevice));
+        cudaEvent_t e0, e1;
+        CUDA_CHECK(cudaEventCreate(&e0));
+        CUDA_CHECK(cudaEventCreate(&e1));
+        for (int cs : {1, 2, 4, 8}) {
+            char v[4];
+            snprintf(v, sizeof v, "%d", cs);
+            setenv("Q27_DS_SPLIT", v, 1);
+            CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
+            for (int w = 0; w < 3; w++)
+                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0);
+            CUDA_CHECK(cudaEventRecord(e0));
+            for (int r = 0; r < REP; r++)
+                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0);
+            CUDA_CHECK(cudaEventRecord(e1));
+            CUDA_CHECK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("  delta scan T=256 split=%d: %.0f us/launch\n", cs, ms * 1000.f / REP);
+        }
+        CUDA_CHECK(cudaEventDestroy(e0)); CUDA_CHECK(cudaEventDestroy(e1));
+        CUDA_CHECK(cudaFree(d_cB)); CUDA_CHECK(cudaFree(d_gB));
+        CUDA_CHECK(cudaFree(d_bB)); CUDA_CHECK(cudaFree(d_oB));
+    }
+    unsetenv("Q27_DS_SPLIT");
+    CUDA_CHECK(cudaFree(d_S)); CUDA_CHECK(cudaFree(d_conv)); CUDA_CHECK(cudaFree(d_g));
+    CUDA_CHECK(cudaFree(d_beta)); CUDA_CHECK(cudaFree(d_o));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -516,6 +635,7 @@ int main(int argc, char** argv) {
     test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
     test_attn_mma();
     test_attn_split();
+    test_delta_split();
     test_kv_fp8_store();
     test_attn_fp8();
     test_rmsnorm(m);

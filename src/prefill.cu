@@ -1205,16 +1205,125 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
     for (int i = i0; i < i0 + 32; i++) Sgh[i * SK + j] = S[i * SK + j];
 }
 
+// P6: column-split scan. S columns are independent (pred_j, dj and o_j read
+// only column j), so slice the 128 v-columns of each head across gridDim.x
+// blocks and deepen row-parallelism per column: NTILE row tiles instead of 4,
+// shrinking the two serial 32-iteration row loops to RPT = NCOL/4. Same
+// 4-barriers-per-token structure (the legacy kernel's trailing barrier is
+// covered by the next token's sq/sk barrier: the out-reduce reads part/conv
+// only, never sq/sk). Row reductions change fp grouping vs k_delta_scan_T ->
+// tolerance-gated in test_delta_split; Q27_DS_SPLIT=1 is the exact path.
+// Slice index on blockIdx.x: blocks sharing a head reuse the same sq/sk rows
+// (L2), and x is scheduled fastest.
+template <int NCOL>
+__global__ void k_delta_scan_split(float* __restrict__ Sg, const float* __restrict__ convT,
+                                   const float* __restrict__ gT,
+                                   const float* __restrict__ betaT, float* __restrict__ oT,
+                                   int T) {
+    constexpr int SK = 128;
+    constexpr int GDN_CH = 10240;
+    constexpr int NH = 48;
+    constexpr int NTILE = 512 / NCOL;  // row tiles per column
+    constexpr int RPT = SK / NTILE;    // rows per thread
+    extern __shared__ float smem[];
+    float* S = smem;  // [SK][NCOL]
+    __shared__ float sq[SK], sk[SK], part[NTILE][NCOL + 1], dj[NCOL];
+    const int h = blockIdx.y;
+    const int c0 = blockIdx.x * NCOL;
+    const int tid = threadIdx.x;
+    const int j = tid % NCOL;
+    const int it = tid / NCOL;
+    const int i0 = it * RPT;
+    const int qk = h % 16;
+    const float scale = rsqrtf((float)SK);
+
+    float* Sgh = Sg + (size_t)h * SK * SK;
+    for (int i = i0; i < i0 + RPT; i++) S[i * NCOL + j] = Sgh[i * SK + c0 + j];
+
+    for (int t = 0; t < T; t++) {
+        const float* conv = convT + (size_t)t * GDN_CH;
+        if (tid < SK) {
+            sq[tid] = conv[qk * SK + tid] * scale;
+            sk[tid] = conv[2048 + qk * SK + tid];
+        }
+        __syncthreads();
+        const float decay = expf(gT[(size_t)t * NH + h]);
+        float pred = 0.f;
+#pragma unroll
+        for (int i = i0; i < i0 + RPT; i++) {
+            float s = S[i * NCOL + j] * decay;
+            S[i * NCOL + j] = s;
+            pred += sk[i] * s;
+        }
+        part[it][j] = pred;
+        __syncthreads();
+        if (tid < NCOL) {
+            float p = 0.f;
+#pragma unroll
+            for (int r = 0; r < NTILE; r++) p += part[r][tid];
+            float vj = conv[4096 + h * SK + c0 + tid];
+            dj[tid] = betaT[(size_t)t * NH + h] * (vj - p);
+        }
+        __syncthreads();
+        const float d = dj[j];
+        float acc = 0.f;
+#pragma unroll
+        for (int i = i0; i < i0 + RPT; i++) {
+            float s = S[i * NCOL + j] + sk[i] * d;
+            S[i * NCOL + j] = s;
+            acc += sq[i] * s;
+        }
+        part[it][j] = acc;
+        __syncthreads();
+        if (tid < NCOL) {
+            float p = 0.f;
+#pragma unroll
+            for (int r = 0; r < NTILE; r++) p += part[r][tid];
+            oT[(size_t)t * (NH * SK) + h * SK + c0 + tid] = p;
+        }
+    }
+
+    for (int i = i0; i < i0 + RPT; i++) Sgh[i * SK + c0 + j] = S[i * NCOL + j];
+}
+
+int delta_scan_nsplit(int T) {
+    (void)T;
+    // auto default 8: 384 blocks / 170 SMs. Measured T=256 launch: 748us
+    // exact, 428/456/413us at 2/4/8 (4 is reproducibly worst -- 192 blocks
+    // is the awkward wave count); 26K real prefill 15.02s -> 13.48s.
+    const char* e = getenv("Q27_DS_SPLIT");
+    int n = e ? atoi(e) : 8;
+    return n <= 1 ? 1 : n < 4 ? 2 : n < 8 ? 4 : 8;
+}
+
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        128 * 128 * 4));
-        attr_set = true;
+    const int cs = delta_scan_nsplit(T);
+    if (cs == 1) {
+        static bool attr_set = false;
+        if (!attr_set) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            128 * 128 * 4));
+            attr_set = true;
+        }
+        k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
-    k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+    dim3 grid(cs, 48);
+    const size_t sm = (size_t)128 * (128 / cs) * 4;
+    switch (cs) {
+        case 2:
+            k_delta_scan_split<64><<<grid, 512, sm, st>>>(S_global, convT, gT, betaT, oT, T);
+            break;
+        case 4:
+            k_delta_scan_split<32><<<grid, 512, sm, st>>>(S_global, convT, gT, betaT, oT, T);
+            break;
+        case 8:
+            k_delta_scan_split<16><<<grid, 512, sm, st>>>(S_global, convT, gT, betaT, oT, T);
+            break;
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

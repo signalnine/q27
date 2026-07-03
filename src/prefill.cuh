@@ -53,6 +53,11 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, co
                     int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
                     bool fp8 = false);
 // Sequential gated delta rule over T tokens, S resident in shared memory.
+// P6: the 128 S-columns per head are independent, so the launcher slices them
+// across delta_scan_nsplit() blocks per head (48 blocks alone starve 170 SMs).
+// Q27_DS_SPLIT forces the count (1/2/4/8; 1 = exact legacy kernel, split
+// paths reorder the row reductions -> tolerance-gated like attention splits).
+int delta_scan_nsplit(int T);
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st);
 

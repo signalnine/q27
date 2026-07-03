@@ -137,6 +137,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
 | P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
 | P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s**; 128K prefill ~78 -> ~57s; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
+| P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method); split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -357,6 +358,34 @@ GPU 22.2 -> 15.2s vs the pre-P4 morning baseline (1.46x today combined).
 unit errors byte-identical, canonical md5 exact, pf/pfcache IDENTICAL,
 soak 217.0 (decode untouched). Prefill cost order @26K is now
 delta_scan_T 25% / attention 21% / Q4 GEMM 41%.
+
+**P6 -- DONE 2026-07-02: column-split delta scan, kernel 1.81x, 26K prefill
+wall 15.0 -> 13.5s.** k_delta_scan_T was the same SM-starvation disease P4
+fixed for attention: 48 blocks (one per GDN head) on 170 SMs, 756us per
+256-token launch, 25% of prefill @26K. The 128 S-columns per head are
+independent (pred_j, dj and o_j read only column j), so
+k_delta_scan_split<NCOL> slices them across gridDim.x blocks and deepens
+row-parallelism per column (NTILE=512/NCOL row tiles instead of 4; the two
+serial 32-iteration row loops shrink to NCOL/4). Same 4-barriers-per-token
+structure -- the legacy kernel's 5th trailing barrier is provably covered by
+the next token's sq/sk barrier. Q27_DS_SPLIT forces 1/2/4/8; 1 = untouched
+legacy kernel; auto default 8 (measured 748 -> 428/456/413us for 2/4/8 --
+4 is reproducibly WORST: 192 blocks is the awkward wave count on 170 SMs;
+384 balances best). No combine kernel needed (unlike P4): the split is pure
+parallelism, only sq/sk staging duplicates (CS x 1KB/token from L2).
+Measured: 26K prefill 15.02 -> 13.48s (-10.3%), 28.5K 16.69 -> 14.96s, 128K
+125.5 -> 117.6s (all fp16-KV kvstats-method A/B, same binary; --kvstats now
+prints prefill wall time). Gates: split-vs-exact 5e-8 at T=1 AND T=64
+(tolerance-gated like P4 -- row reductions reorder), full-corpus PPL 7.1931
+vs 7.1928 (+0.004%), canonical md5 exact at split 1/4/8, --pf 200
+continuations IDENTICAL, --pfdbg maxdiffs same order as the split=1
+baseline. Test lesson worth keeping: the first unit-test run FAILED at 8e-2
+with raw-normal conv data -- the delta update S += beta*k(v - k'S) is
+chaotic when ||k||~11, amplifying legitimate 1e-7 reorder noise; the engine
+l2-normalizes q/k per head before the scan (l2norm_heads_T), and with
+in-contract data the split matches to 5e-8. Test data must honor kernel
+input contracts before a tolerance FAIL means anything. Prefill cost order
+@26K is now Q4 GEMM ~46% / attention ~23% / delta_scan ~15%.
 
 ## Risk register
 

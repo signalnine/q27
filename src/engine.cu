@@ -277,6 +277,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)N * 4));
         CUDA_CHECK(cudaMemcpy(d_toks, tk.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
         e.reset();
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        auto pf_t0 = std::chrono::steady_clock::now();
         const DevTensor& onw = e.dm.get("output_norm.weight");
         for (int c0 = 0; c0 < N; c0 += Engine::PF_T) {
             int T = std::min((int)Engine::PF_T, N - c0);
@@ -287,6 +289,9 @@ int main(int argc, char** argv) {
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        double pf_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_t0)
+                          .count();
+        fprintf(stderr, "kvstats prefill: %d tokens in %.2fs (%.1f t/s)\n", N, pf_s, N / pf_s);
         size_t n = (size_t)N * N_KV * HEAD_DIM;
         std::vector<__half> hb(n);
         auto scan = [&](const char* tag, int layer, const __half* dev) {
