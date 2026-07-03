@@ -410,11 +410,26 @@ input contracts before a tolerance FAIL means anything. Prefill cost order
 @26K is now Q4 GEMM ~46% / attention ~23% / delta_scan ~15%.
 
 **Next (post-P6, reordered 2026-07-02 after external review round 2):**
-1. **Task-level quality A/B (IN PROGRESS)** -- q27 v1.4 vs Q5_K_M (llama.cpp)
-   through Thunderdome, CRUSH harness, no-think, greedy both legs, n=3 x 21
-   tasks. PPL +3.05% is over the 3% bar and PPL is a weak proxy; this decides
-   whether the speed lead is bought with agentic-coding quality. Yesterday's
-   Q5_K_M reference sweep: mean composite ~0.72 (22 tasks, CRUSH no-think).
+1. **Task-level quality A/B -- DONE 2026-07-03.** q27 v1.4 4-bit vs Q5_K_M
+   (llama.cpp + MTP), Thunderdome standard suite T1-T10, CRUSH harness,
+   no-think + greedy both legs, n=3 per task:
+   **overall 0.786 vs 0.786 -- DEAD EVEN (30 trials/leg).**
+   Per-task deltas: collab-server +0.103 (q27), fts +0.023, task-queue
+   +0.022, plugin/ecommerce/monorepo/ssg within +-0.002, time-tracker -0.016,
+   phantom-invoice -0.063, analytics -0.073 (bimodal 0.48/0.83 on BOTH legs
+   -- task variance, not quant). Greedy determinism made n=3 near-zero
+   variance on most tasks. **The +3.05% PPL does not appear in agentic
+   coding.** What DID appear: five tool-format drift modes under no-think
+   greedy (dropped <tool_call> wrapper; unterminated JSON w/ </file> junk;
+   <content>-tagged raw values; {"tool_call": JSON-keyed opener; raw control
+   chars inside JSON strings) -- structurally masked on the llama leg by
+   grammar-constrained decoding, initially FATAL on q27 (task-queue 0.000,
+   plugin 0.185 with zero writes executed), now fully recovered by the
+   tolerant parser chain in api_common.h (17 recoveries in the final rerun,
+   scores 0.782/0.899). Verdict: the quant is clean; tool-call discipline is
+   a SERVING-LAYER property. P7 constrained decoding makes the drift
+   unsampleable at the source (phases 1-2 landed: ToolGrammar + ToolMaskCache
+   + argmax_masked, 45faf91/38b6b39/911f2ea).
 2. **Periodic GDN state checkpoints** (upgrades the prefix-snapshot-pool
    idea): snapshot S + conv rings every N tokens during prefill so a
    mid-context divergence (edited file, changed tool result -- the normal
