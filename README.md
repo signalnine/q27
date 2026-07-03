@@ -135,6 +135,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | v1.4 quant policy (ssm_out + attn_output -> Q8, +0.98 GB) | PPL **7.1928** (-0.29%); decode **+3.3%** on 2000-tok soak (acceptance 3.47 -> 3.67 t/round -- cleaner residual writers agree better with the MTP draft head); all gates re-derived |
 | P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
 | P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
+| P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
@@ -312,6 +313,26 @@ this model, silent wrongness if reused elsewhere); Q fp16 saturation above
   buffer set) -> fp8 ctx ceiling ~370K -> ~355K; 262K native still fits.
 - pf_scratch remnants removed (dead `scratch`/`max_ctx` params dropped from
   attn_prefill_T; the allocation itself died in P1.5).
+
+**P4 -- DONE 2026-07-02: split-position FA prefill (long-ctx prefill ~2x;
+cold 361.5K request 1324s -> 764s).** nsys on a pure 26.6K prefill showed
+attention at 27% and climbing quadratically (~85% at 361K), and the cause was
+SM starvation, not bandwidth: grid (4 kv heads, chunk/16 tiles) = 64 blocks
+of 6 warps on a 170-SM part, ~20 TFLOPS sustained (~10% of fp16 MMA peak).
+Fix: gridDim.z splits each tile's causal position range into PP-aligned
+slices; each split emits an unnormalized {m, l, O[256]} partial per (q-head,
+row) and k_attn_pf_combine merges (flash-decode's trick applied to prefill).
+nsplit auto-scales with depth ((base+SB)/4096, capped 8, Q27_PF_SPLIT
+overrides; 1 = bit-identical pre-split path, always used at short ctx).
+Partials scratch 51 MB; combine cost 0.1%. Measured: attention kernel
+6.01s -> 3.12s @26.6K (1.93x); 128K prefill wall ~153s -> ~78s (1.96x); cold
+28.5K TTFT 24.7s -> 21.4s (attention is only ~27% there); cold 361.5K
+1324s -> 764s (1.73x, ~12.6 min) with the deep needle still retrieving
+exactly. Gates: unit split=5-vs-1 at 1.9e-5 (empty tail slices exercised),
+fp8==fp16(deq) bitwise identities hold under splits, canonical md5 exact,
+pf/pfcache IDENTICAL, nll-long 32K split-on/off equal to the 4th decimal,
+needle 3/3 @55K with verbatim-identical answers. Remaining long-ctx costs:
+delta_scan_T (~50s @361K), GEMM tile tuning at short ctx.
 
 ## Risk register
 

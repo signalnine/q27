@@ -42,10 +42,15 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
 void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st, bool fp8 = false);
 // Flash-attention prefill for a sub-batch of SB tokens starting at (base_pos+t0);
-// online softmax, no position scratch. Caches fp16, or fp8 E4M3 when fp8 (P2).
+// online softmax. Caches fp16, or fp8 E4M3 when fp8 (P2). At deep base_pos the
+// MMA path splits positions across gridDim.z blocks (P4, SM starvation fix)
+// and merges {m,l,O} partials in a combine kernel; `part` must then hold
+// n_q_heads * SB_rounded_to_16 * PF_SPLIT_MAX * 258 floats. part == nullptr
+// disables splitting (exact pre-split path).
+constexpr int PF_SPLIT_MAX = 8;
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, int base_pos, int t0, int SB, int n_q_heads,
-                    int n_kv_heads, int head_dim, float scale, cudaStream_t st,
+                    float* outT, int out_row, float* part, int base_pos, int t0, int SB,
+                    int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
                     bool fp8 = false);
 // Sequential gated delta rule over T tokens, S resident in shared memory.
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,

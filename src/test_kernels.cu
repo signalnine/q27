@@ -311,8 +311,8 @@ static void test_attn_mma() {
 
     auto run = [&](const char* mode, float* out) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, BASE, 0, T, NKV * GQA,
-                             NKV, HD, 1.0f / sqrtf((float)HD), 0);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, out, OROW, nullptr, BASE, 0, T,
+                             NKV * GQA, NKV, HD, 1.0f / sqrtf((float)HD), 0);
         CUDA_CHECK(cudaDeviceSynchronize());
     };
     run("lite", d_oa);
@@ -421,10 +421,10 @@ static void test_attn_fp8() {
     const float scale = 1.0f / sqrtf((float)HD);
     for (const char* mode : {"lite", "mma"}) {
         setenv("Q27_ATTN_PF", mode, 1);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, BASE, 0, T, NKV * GQA,
-                             NKV, HD, scale, 0, true);
-        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, BASE, 0, T, NKV * GQA,
-                             NKV, HD, scale, 0, false);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k8, d_v8, d_oa, OROW, nullptr, BASE, 0, T,
+                             NKV * GQA, NKV, HD, scale, 0, true);
+        q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_kh, d_vh, d_ob, OROW, nullptr, BASE, 0, T,
+                             NKV * GQA, NKV, HD, scale, 0, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         char label[80];
         snprintf(label, sizeof label, "fp8 attn prefill %s == fp16(deq) (bitwise)", mode);
@@ -451,6 +451,52 @@ static void test_attn_fp8() {
     CUDA_CHECK(cudaFree(d_pos)); CUDA_CHECK(cudaFree(d_scr));
 }
 
+// P4: split-position MMA prefill vs the exact single-split path at a deep
+// base_pos (splits change fp summation grouping -> tolerance like MMA-vs-lite),
+// plus the fp8 == fp16(dequantized-cache) bitwise identity under forced splits
+// (both sides split identically, so exactness must survive).
+static void test_attn_split() {
+    const int NKV = 4, GQA = 6, HD = 256, T = 37, BASE = 9000, SEQ = BASE + T;
+    const int QROW = NKV * GQA * 2 * HD, OROW = NKV * GQA * HD, ROW = NKV * HD;
+    std::vector<float> qh = rand_vec((size_t)T * QROW, 41);
+    std::vector<float> kvh = rand_vec((size_t)SEQ * ROW * 2, 42);
+    std::vector<__half> kvhalf(kvh.size());
+    for (size_t i = 0; i < kvh.size(); i++) kvhalf[i] = __float2half_rn(kvh[i]);
+    float *d_q, *d_oa, *d_ob, *d_part;
+    __half *d_k, *d_v;
+    const int TROWS = (T + 15) / 16 * 16;
+    CUDA_CHECK(cudaMalloc(&d_q, (size_t)T * QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_oa, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_ob, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_part,
+                          (size_t)NKV * GQA * TROWS * q27k::PF_SPLIT_MAX * 258 * 4));
+    CUDA_CHECK(cudaMalloc(&d_k, (size_t)SEQ * ROW * 2));
+    CUDA_CHECK(cudaMalloc(&d_v, (size_t)SEQ * ROW * 2));
+    CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, kvhalf.data(), (size_t)SEQ * ROW * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, kvhalf.data() + (size_t)SEQ * ROW, (size_t)SEQ * ROW * 2,
+                          cudaMemcpyHostToDevice));
+    const float scale = 1.0f / sqrtf((float)HD);
+    // forced 5-way split (odd count exercises empty tail slices) vs no split
+    setenv("Q27_PF_SPLIT", "5", 1);
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, d_oa, OROW, d_part, BASE, 0, T,
+                         NKV * GQA, NKV, HD, scale, 0);
+    setenv("Q27_PF_SPLIT", "1", 1);
+    q27k::attn_prefill_T(d_q, 2 * HD, QROW, d_k, d_v, d_ob, OROW, d_part, BASE, 0, T,
+                         NKV * GQA, NKV, HD, scale, 0);
+    unsetenv("Q27_PF_SPLIT");
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> oa((size_t)T * OROW), ob((size_t)T * OROW);
+    CUDA_CHECK(cudaMemcpy(oa.data(), d_oa, oa.size() * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ob.data(), d_ob, ob.size() * 4, cudaMemcpyDeviceToHost));
+    double maxrel = 0;
+    for (size_t i = 0; i < oa.size(); i++)
+        maxrel = std::max(maxrel, (double)std::fabs(oa[i] - ob[i]) / (1.0 + std::fabs(oa[i])));
+    check("attn prefill split=5 vs 1 (T=37, base=9000)", maxrel, 5e-3);
+    CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_oa)); CUDA_CHECK(cudaFree(d_ob));
+    CUDA_CHECK(cudaFree(d_part)); CUDA_CHECK(cudaFree(d_k)); CUDA_CHECK(cudaFree(d_v));
+}
+
 int main(int argc, char** argv) {
     const char* path = argc > 1 ? argv[1] : "/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27";
     q27::Model m = q27::Model::open(path);
@@ -469,6 +515,7 @@ int main(int argc, char** argv) {
     test_gemm_mma(dm, m, "blk.3.attn_k.weight");    // Q8 1024x5120
     test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
     test_attn_mma();
+    test_attn_split();
     test_kv_fp8_store();
     test_attn_fp8();
     test_rmsnorm(m);

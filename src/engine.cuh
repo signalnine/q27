@@ -94,6 +94,7 @@ struct Engine {
     int d_prompt_cap = 0;
     float *hT, *x1T, *yT, *qkvT, *convT, *zT, *oT, *ogT, *qgT, *kT, *vT, *attnT;
     float *alphaT, *betarT, *gT, *betaT, *ffnGT, *ffnUT, *embT, *ehnT, *xmtpT;
+    float* pf_part; // P4 split-attention partials: [24 heads][PF_T][SPLIT_MAX][258]
     q27k::XQuant xqT;
 
     // ---- prefix cache (M6.5): snapshot of GDN state + conv rings taken right
@@ -252,6 +253,7 @@ struct Engine {
         ffnGT = fal((size_t)PF_T * N_FFN); ffnUT = fal((size_t)PF_T * N_FFN);
         embT = fal((size_t)PF_T * N_EMBD); ehnT = fal((size_t)PF_T * 2 * N_EMBD);
         xmtpT = fal((size_t)PF_T * N_EMBD);
+        pf_part = fal((size_t)N_HEAD * PF_T * q27k::PF_SPLIT_MAX * 258);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN);
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
@@ -704,9 +706,9 @@ struct Engine {
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
         q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
-        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, base, 0,
-                             T, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm,
-                             kv_fp8);
+        q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, pf_part,
+                             base, 0, T, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM),
+                             stm, kv_fp8);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT(T2(il, "attn_output.weight"), attnT, yT, T);

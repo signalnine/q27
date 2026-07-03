@@ -687,17 +687,49 @@ static __device__ __forceinline__ uint32_t h2u(__half2 h) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// Split-position partials (P4): with gridDim.z = S > 1, split s covers a
+// PP-aligned slice of the tile's causal range and writes an UNNORMALIZED
+// partial {m, l, O[256]} per (q-head, token row) to `part`; a combine kernel
+// merges the S slices. S == 1 writes normalized output directly (the
+// pre-split path, bit-identical). Splits exist because grid (4 kv heads,
+// T/16 tiles) is only 64 blocks per 256-token chunk on a 170-SM part -- at
+// long context the attention wall is SM starvation, not bandwidth.
+constexpr int PF_PART_STRIDE = 258; // m, l, O[256]
+
 template <typename CT>
 __global__ void __launch_bounds__(192, 1)
 k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
                    const CT* __restrict__ kc, const CT* __restrict__ vc,
-                   float* __restrict__ outT, int out_row, int base_pos, int tile_t0, int T,
-                   int n_kv_heads, int head_dim, float scale) {
+                   float* __restrict__ outT, int out_row, float* __restrict__ part,
+                   int base_pos, int tile_t0, int T, int n_kv_heads, int head_dim,
+                   float scale) {
     constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8; // padded smem rows (halfs)
     const int kvh = blockIdx.x;
     const int t0 = tile_t0 + blockIdx.y * TT;
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     const int gid = lane >> 2, tg = lane & 3;
+    const int nsp = gridDim.z, sp = blockIdx.z;
+    const int trows = gridDim.y * TT;
+    const int qh = kvh * 6 + warp;
+
+    const int tile_last = min(t0 + TT, T) - 1;            // last live token in tile
+    const int tile_max = base_pos + tile_last + 1;        // positions the tile needs
+    if (tile_last < t0) return;                           // whole tile past T
+
+    // this split's PP-aligned position slice
+    const int chunk = nsp > 1 ? ((tile_max + nsp - 1) / nsp + PP - 1) / PP * PP : tile_max;
+    const int p_lo = sp * chunk, p_hi = min(tile_max, p_lo + chunk);
+    if (nsp > 1 && p_lo >= tile_max) {
+        // empty split (per-tile ranges are shorter than the grid allows for):
+        // stamp sentinel partials so the combine skips this slice
+        if (tg == 0) {
+            size_t b0 = ((size_t)(qh * trows + t0 + gid) * nsp + sp) * PF_PART_STRIDE;
+            size_t b1 = ((size_t)(qh * trows + t0 + gid + 8) * nsp + sp) * PF_PART_STRIDE;
+            part[b0] = -FLT_MAX; part[b0 + 1] = 0.f;
+            part[b1] = -FLT_MAX; part[b1 + 1] = 0.f;
+        }
+        return;
+    }
 
     extern __shared__ __half s_h[];
     __half* s_q = s_h;                    // [6][TT][LDH]
@@ -706,7 +738,6 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
 
     // stage Q (fp32 -> fp16) once: warp w stages its own head's 16 tokens
     {
-        const int qh = kvh * 6 + warp;
         for (int idx = lane; idx < TT * HD; idx += 32) {
             int tt = idx / HD, d = idx % HD;
             int t = t0 + tt;
@@ -724,12 +755,8 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
         for (int e = 0; e < 4; e++) o[i][e] = 0.f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
 
-    const int tile_last = min(t0 + TT, T) - 1;            // last live token in tile
-    const int tile_max = base_pos + tile_last + 1;        // positions the tile needs
-    if (tile_last < t0) return;                           // whole tile past T
-
-    for (int p0 = 0; p0 < tile_max; p0 += PP) {
-        const int np = min(PP, tile_max - p0);
+    for (int p0 = p_lo; p0 < p_hi; p0 += PP) {
+        const int np = min(PP, p_hi - p0);
         __syncthreads();
         for (int idx = threadIdx.x; idx < PP * HD; idx += blockDim.x) {
             int pp = idx / HD, d = idx % HD;
@@ -847,11 +874,29 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
         }
     }
 
+    const int tr0 = t0 + gid, tr1 = t0 + gid + 8;
+    if (nsp > 1) {
+        // write UNNORMALIZED partials {m, l, O} for the combine pass; row
+        // stats are quad-uniform after the shfl reductions, so tg==0 writes
+        size_t b0 = ((size_t)(qh * trows + tr0) * nsp + sp) * PF_PART_STRIDE;
+        size_t b1 = ((size_t)(qh * trows + tr1) * nsp + sp) * PF_PART_STRIDE;
+        if (tg == 0) {
+            part[b0] = m0; part[b0 + 1] = l0;
+            part[b1] = m1; part[b1 + 1] = l1;
+        }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int d0 = n * 8 + tg * 2;
+            part[b0 + 2 + d0] = o[n][0];
+            part[b0 + 2 + d0 + 1] = o[n][1];
+            part[b1 + 2 + d0] = o[n][2];
+            part[b1 + 2 + d0 + 1] = o[n][3];
+        }
+        return;
+    }
     // normalize + write: thread's O elements are (rows gid/gid+8, cols
     // n*8 + tg*2, +1) of the 16x256 tile
-    const int qh = kvh * 6 + warp;
     const float inv0 = l0 > 0.f ? 1.0f / l0 : 0.f, inv1 = l1 > 0.f ? 1.0f / l1 : 0.f;
-    const int tr0 = t0 + gid, tr1 = t0 + gid + 8;
 #pragma unroll
     for (int n = 0; n < 32; n++) {
         const int d0 = n * 8 + tg * 2;
@@ -863,6 +908,36 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
             outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0] = o[n][2] * inv1;
             outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0 + 1] = o[n][3] * inv1;
         }
+    }
+}
+
+// merge S split partials for one (token, q-head): m* = max m_s,
+// O = sum O_s * exp(m_s - m*), out = O / (sum l_s * exp(m_s - m*))
+__global__ void k_attn_pf_combine(const float* __restrict__ part, float* __restrict__ outT,
+                                  int out_row, int head_dim, int trows, int nsp) {
+    const int t = blockIdx.x, qh = blockIdx.y;
+    const float* pp = part + (size_t)(qh * trows + t) * nsp * PF_PART_STRIDE;
+    __shared__ float s_m, s_l;
+    if (threadIdx.x == 0) {
+        float mg = -FLT_MAX;
+        for (int s = 0; s < nsp; s++) mg = fmaxf(mg, pp[(size_t)s * PF_PART_STRIDE]);
+        float lg = 0.f;
+        for (int s = 0; s < nsp; s++) {
+            float ms = pp[(size_t)s * PF_PART_STRIDE];
+            if (ms != -FLT_MAX) lg += pp[(size_t)s * PF_PART_STRIDE + 1] * expf(ms - mg);
+        }
+        s_m = mg;
+        s_l = lg;
+    }
+    __syncthreads();
+    const float mg = s_m, inv = s_l > 0.f ? 1.0f / s_l : 0.f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < nsp; s++) {
+            float ms = pp[(size_t)s * PF_PART_STRIDE];
+            if (ms != -FLT_MAX) a += pp[(size_t)s * PF_PART_STRIDE + 2 + d] * expf(ms - mg);
+        }
+        outT[(size_t)t * out_row + (size_t)qh * head_dim + d] = a * inv;
     }
 }
 
@@ -948,9 +1023,9 @@ __global__ void k_attn_prefill_T(const float* __restrict__ qT, int q_stride, int
 
 template <typename CT>
 static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const void* kc,
-                                const void* vc, float* outT, int out_row, int base_pos, int t0,
-                                int SB, int n_q_heads, int n_kv_heads, int head_dim,
-                                float scale, cudaStream_t st) {
+                                const void* vc, float* outT, int out_row, float* part,
+                                int base_pos, int t0, int SB, int n_q_heads, int n_kv_heads,
+                                int head_dim, float scale, cudaStream_t st) {
     const char* e = getenv("Q27_ATTN_PF");
     const bool use_mma =
         !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads;
@@ -963,11 +1038,28 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
             attr2 = true;
         }
-        dim3 grid(n_kv_heads, (SB + TT - 1) / TT);
+        // position splits (P4): grid (4 kvh, <=16 tiles) alone starves the
+        // SMs; add splits once the context is deep enough to amortize the
+        // combine. Q27_PF_SPLIT=N forces N (1 = pre-split behavior).
+        int nsplit = 1;
+        if (part) {
+            const char* se = getenv("Q27_PF_SPLIT");
+            nsplit = se ? atoi(se) : (base_pos + t0 + SB) / 4096;
+            nsplit = nsplit < 1 ? 1 : nsplit > PF_SPLIT_MAX ? PF_SPLIT_MAX : nsplit;
+        }
+        const int tiles = (SB + TT - 1) / TT;
+        dim3 grid(n_kv_heads, tiles, nsplit);
         k_attn_prefill_mma<CT><<<grid, 192, SM, st>>>(qT, q_stride, q_row, (const CT*)kc,
-                                                      (const CT*)vc, outT, out_row, base_pos,
-                                                      t0, t0 + SB, n_kv_heads, head_dim, scale);
+                                                      (const CT*)vc, outT, out_row, part,
+                                                      base_pos, t0, t0 + SB, n_kv_heads,
+                                                      head_dim, scale);
         CUDA_CHECK(cudaGetLastError());
+        if (nsplit > 1) {
+            dim3 g2(SB, n_q_heads);
+            k_attn_pf_combine<<<g2, 256, 0, st>>>(part, outT, out_row, head_dim, tiles * TT,
+                                                  nsplit);
+            CUDA_CHECK(cudaGetLastError());
+        }
         return;
     }
     constexpr int TT = 8, PP = 32;
@@ -987,15 +1079,16 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
 }
 
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
-                    float* outT, int out_row, int base_pos, int t0, int SB, int n_q_heads,
-                    int n_kv_heads, int head_dim, float scale, cudaStream_t st, bool fp8) {
+                    float* outT, int out_row, float* part, int base_pos, int t0, int SB,
+                    int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
+                    bool fp8) {
     if (fp8)
-        attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, kc, vc, outT, out_row,
+        attn_prefill_launch<__nv_fp8_e4m3>(qT, q_stride, q_row, kc, vc, outT, out_row, part,
                                            base_pos, t0, SB, n_q_heads, n_kv_heads, head_dim,
                                            scale, st);
     else
-        attn_prefill_launch<__half>(qT, q_stride, q_row, kc, vc, outT, out_row, base_pos, t0,
-                                    SB, n_q_heads, n_kv_heads, head_dim, scale, st);
+        attn_prefill_launch<__half>(qT, q_stride, q_row, kc, vc, outT, out_row, part, base_pos,
+                                    t0, SB, n_q_heads, n_kv_heads, head_dim, scale, st);
 }
 
 // Sequential delta rule over the chunk: S tile lives in dynamic shared memory
