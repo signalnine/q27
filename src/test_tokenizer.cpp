@@ -1,6 +1,7 @@
 // Gate the C++ tokenizer against a reference id-list produced by llama-tokenize.
 // Usage: test_tokenizer q27.tok cases.txt
 // cases.txt: alternating lines — text line, then space-separated reference ids.
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -39,5 +40,23 @@ int main(int argc, char** argv) {
     }
     printf("\nexact: %d/%d cases   token-prefix agreement: %d/%d = %.2f%%\n", pass, total,
            tok_match, tok_total, 100.0 * tok_match / (tok_total ? tok_total : 1));
+
+    // chat-template no-think: think=false must append the empty think block
+    // exactly like the Qwen3-family template with enable_thinking=false, and
+    // it must use the SINGLE added-token ids (BPE renders "<think>" as 3
+    // ordinary tokens, which the model does not treat as a think block)
+    {
+        std::vector<std::pair<std::string, std::string>> msgs = {{"user", "hi"}};
+        auto ta = tok.apply_chat_template(msgs);
+        auto tb = tok.apply_chat_template(msgs, false);
+        std::string a = tok.decode(ta), b = tok.decode(tb);
+        int t1 = tok.token_id("<think>"), t2 = tok.token_id("</think>");
+        bool ids_ok = t1 >= 0 && t2 >= 0 && tb.size() > ta.size() &&
+                      std::find(tb.begin(), tb.end(), t1) != tb.end() &&
+                      std::find(tb.begin(), tb.end(), t2) != tb.end();
+        bool ok = b == a + "<think>\n\n</think>\n\n" && ids_ok;
+        printf("chat nothink suffix (single-token ids): %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
     return pass == total ? 0 : 1;
 }

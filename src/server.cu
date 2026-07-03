@@ -96,7 +96,12 @@ int main(int argc, char** argv) {
                         if (part.value("type", "") == "text") content += part.value("text", "");
                 msgs.push_back({role, content});
             }
-            return tok.apply_chat_template(msgs);
+            // enable_thinking=false: top-level (Qwen-style clients) or nested
+            // chat_template_kwargs (llama.cpp/GLM-style) -> empty-think prefill
+            bool think = body.value("enable_thinking", true);
+            if (body.contains("chat_template_kwargs"))
+                think = body["chat_template_kwargs"].value("enable_thinking", think);
+            return tok.apply_chat_template(msgs, think);
         }
         return tok.encode(body.value("prompt", std::string()));
     };

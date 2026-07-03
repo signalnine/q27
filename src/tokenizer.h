@@ -20,9 +20,17 @@ class Tokenizer {
     int bos() const { return bos_; }
     int eos() const { return eos_; }
 
-    // ChatML wrapper: messages as {role, content} pairs -> prompt token ids
+    // ChatML wrapper: messages as {role, content} pairs -> prompt token ids.
+    // think=false appends the empty think block (Qwen3-family
+    // enable_thinking=false convention) so the model answers directly.
     std::vector<int> apply_chat_template(
-        const std::vector<std::pair<std::string, std::string>>& messages) const;
+        const std::vector<std::pair<std::string, std::string>>& messages,
+        bool think = true) const;
+
+    // Exact-string vocab lookup (-1 if absent). Needed for added tokens like
+    // <think> that BPE merges cannot form and the special-matcher (type-3
+    // controls only) does not cover.
+    int token_id(const std::string& s) const;
 
   private:
     std::vector<std::string> tokens_;   // GPT-2 byte-encoded space

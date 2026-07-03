@@ -256,13 +256,36 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
     return out;
 }
 
+int Tokenizer::token_id(const std::string& s) const {
+    for (size_t i = 0; i < tokens_.size(); i++)
+        if (tokens_[i] == s) return (int)i;
+    return -1;
+}
+
 std::vector<int> Tokenizer::apply_chat_template(
-    const std::vector<std::pair<std::string, std::string>>& messages) const {
+    const std::vector<std::pair<std::string, std::string>>& messages, bool think) const {
     std::string p;
     for (auto& [role, content] : messages)
         p += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
     p += "<|im_start|>assistant\n";
-    return encode(p);
+    std::vector<int> ids = encode(p);
+    if (!think) {
+        // <think>/</think> are added tokens BPE cannot form from text --
+        // append their ids directly (string fallback if a future vocab
+        // lacks them)
+        int t1 = token_id("<think>"), t2 = token_id("</think>");
+        std::vector<int> nn = encode("\n\n");
+        if (t1 >= 0 && t2 >= 0) {
+            ids.push_back(t1);
+            ids.insert(ids.end(), nn.begin(), nn.end());
+            ids.push_back(t2);
+            ids.insert(ids.end(), nn.begin(), nn.end());
+        } else {
+            std::vector<int> s = encode("<think>\n\n</think>\n\n");
+            ids.insert(ids.end(), s.begin(), s.end());
+        }
+    }
+    return ids;
 }
 
 } // namespace q27
