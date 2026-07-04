@@ -1,6 +1,6 @@
 // Grid-merged multi-token variants for the speculative round. Same per-token
 // work distribution as the single-token kernels; tokens ride an extra grid dim
-// (ntok in 1..7 live lanes; struct slots beyond ntok are never read).
+// (ntok in 1..4 live lanes; struct slots beyond ntok are never read).
 #pragma once
 #include <cuda_runtime.h>
 
@@ -8,7 +8,7 @@
 
 namespace q27k {
 
-struct IP3 { const int* p[7]; };
+struct IP3 { const int* p[5]; };
 
 // L2 norm over contiguous heads, ntok tokens. (q||k are contiguous: pass 32 heads.)
 void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0, int ntok = 3);
@@ -54,19 +54,17 @@ void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cud
             int ntok = 3);
 
 // Device-side round bookkeeping: prep derives all positions from *d_P and
-// snapshots t1; finish decides acceptance over the depth-6 draft chain,
+// snapshots t1; finish decides acceptance over the depth-4 draft chain,
 // selects next token + h_next, bumps *d_P, and writes
-// outcome = {n, t1, dr1, dr2, dr3, dr4, dr5, dr6} for a single small readback.
+// outcome = {n, t1, dr1, dr2, dr3, dr4} for a single small readback.
 void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
-                int* pos_d, int* pos_e, int* pos_f, int* pos_g, int* pos_m, int* pos_m2,
-                int* pos_m3, int* pos_m4, int* pos_m5, int* pos_m6, int* outcome,
-                cudaStream_t st = 0);
+                int* pos_d, int* pos_e, int* pos_m, int* pos_m2, int* pos_m3, int* pos_m4,
+                int* outcome, cudaStream_t st = 0);
 void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
-                  const int* d_draft3, const int* d_draft4, const int* d_draft5,
-                  const int* d_draft6, const int* va, const int* vb, const int* vc,
-                  const int* vd, const int* ve, const int* vf, const int* vg, const float* x1a,
+                  const int* d_draft3, const int* d_draft4, const int* va, const int* vb,
+                  const int* vc, const int* vd, const int* ve, const float* x1a,
                   const float* x1b, const float* x1c, const float* x1d, const float* x1e,
-                  const float* x1f, const float* x1g, float* h_next, int* outcome, int n_embd,
-                  const int* cap, cudaStream_t st = 0);
+                  float* h_next, int* outcome, int n_embd, const int* cap,
+                  cudaStream_t st = 0);
 
 } // namespace q27k

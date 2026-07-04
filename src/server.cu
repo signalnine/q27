@@ -63,20 +63,20 @@ struct ToolConstrainer {
     void apply(const q27::ToolGrammar& g) {
         int slot = mask_id(g);
         if (slot < 0) { drop("mask pool full"); return; }
-        staged_state = g; // P11: on_drafts advances from here for lanes 1-6
+        staged_state = g; // P11: on_drafts advances from here for lanes 1-4
         eng->set_tool_constraint(slot);
     }
-    // P11: mid-round, given the 6 draft tokens, stage per-lane masks. Lane 0 =
+    // P11: mid-round, given the 4 draft tokens, stage per-lane masks. Lane 0 =
     // staged_state (the pending position, legal set already correct); lane k =
     // that state advanced over drafts d1..dk. If a draft is grammar-illegal,
     // remaining lanes reuse the last legal mask -- moot, since acceptance
     // breaks at that lane anyway (its verify argmax is legal != the draft).
     void on_drafts(const int* dr) {
-        int ids[7];
+        int ids[5];
         q27::ToolGrammar c = staged_state;
         ids[0] = mask_id(c);
         bool alive = true;
-        for (int k = 1; k <= 6; k++) {
+        for (int k = 1; k <= 4; k++) {
             if (alive)
                 for (char ch : tok->decode_one(dr[k - 1]))
                     if (!c.advance(ch)) { alive = false; break; }

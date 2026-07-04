@@ -792,10 +792,10 @@ int main(int argc, char** argv) {
         std::vector<int> out;
         int P = (int)toks.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
-        int total_emitted = 0, rounds = 0, hist[7] = {0, 0, 0, 0, 0, 0, 0};
+        int total_emitted = 0, rounds = 0, hist[5] = {0, 0, 0, 0, 0};
         while ((int)out.size() < n_gen) {
-            if (P + 8 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[7];
+            if (P + 6 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
+            int em[5];
             int n = e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
             rounds++;
@@ -803,9 +803,8 @@ int main(int argc, char** argv) {
             hist[n - 1]++;
             P += n;
         }
-        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, "
-                "6-tok %d, 7-tok %d\n",
-                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6]);
+        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4]);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

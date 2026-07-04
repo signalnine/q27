@@ -52,12 +52,12 @@ void embed_row_q8(const int8_t* W, const __half* S, const int* d_token, int64_t 
 
 // Grid-merged multi-token variants for the speculative round: identical
 // per-token work distribution, tokens mapped to an extra grid dimension
-// (1 launch vs ntok). Structs hold up to 7 lanes (depth-6 spec = t1 + 6
-// drafts); ntok in 1..7 selects how many are live (brace inits with fewer
+// (1 launch vs ntok). Structs hold up to 5 lanes (depth-4 spec = t1 + 4
+// drafts); ntok in 1..5 selects how many are live (brace inits with fewer
 // entries leave the rest null, unread).
-struct P3 { float* p[7]; };
-struct CP3 { const float* p[7]; };
-struct XQ3 { XQuant q[7]; };
+struct P3 { float* p[5]; };
+struct CP3 { const float* p[5]; };
+struct XQ3 { XQuant q[5]; };
 
 void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0, int ntok = 3);
 void add3(P3 x, CP3 y, int n, cudaStream_t st = 0, int ntok = 3);
