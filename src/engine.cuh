@@ -1066,6 +1066,16 @@ struct Engine {
         CUDA_CHECK(cudaStreamSynchronize(stm));
     }
 
+    // R0 telemetry: filled by every generate() call, read by the server's
+    // [req] log line. Host-side bookkeeping only -- no device work, no syncs.
+    struct GenStats {
+        int prompt = 0, hit = 0, ckpt = -1, pf = 0; // tokens
+        double pf_ms = 0, dec_ms = 0, cb_ms = 0;    // cb = time inside on_token
+        int dec = 0, rounds = 0;
+        const char* end = "";
+    };
+    GenStats gs;
+
     // Prompt + speculative generation. Calls on_token(id) for each generated
     // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
     // path (requires build_spec_graphs()). MTP KV warmed during prompt.
@@ -1077,11 +1087,15 @@ struct Engine {
     int generate(const std::vector<int>& prompt, int n_max, int eos, F&& on_token,
                  int stable_len = -1) {
         int NP = (int)prompt.size();
+        gs = GenStats{};
+        gs.prompt = NP;
+        auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
         // instead of corrupting adjacent buffers
         if (NP > max_ctx) {
             fprintf(stderr, "[gen] prompt %d exceeds ctx %d -- refusing\n", NP, max_ctx);
+            gs.end = "refused";
             return 0;
         }
         if (batched_prefill && NP >= 32) {
@@ -1100,6 +1114,9 @@ struct Engine {
             }
             fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d\n", NP, base,
                     snap_toks.size(), ck);
+            gs.hit = base;
+            gs.ckpt = ck;
+            gs.pf = NP - base;
             if (ck >= 0) ckpt_restore(ck);
             else if (base > 0) snap_restore();
             else { reset(); ckpt_clear(); }
@@ -1142,6 +1159,7 @@ struct Engine {
         } else {
             reset();
             have_snap = false; // serial path resets state without re-snapshotting
+            gs.pf = NP;
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
                 if (i + 1 < prompt.size()) {
@@ -1157,14 +1175,21 @@ struct Engine {
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(stm));
+        gs.pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                             t_in)
+                       .count();
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
-        int emitted = 0;
+        int emitted = 0, rounds = 0;
         auto g0 = std::chrono::steady_clock::now();
         auto done = [&](const char* why) {
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
                             .count();
+            gs.dec = emitted;
+            gs.dec_ms = dt * 1000.0;
+            gs.rounds = rounds;
+            gs.end = why;
             fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
                     emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
         };
@@ -1178,10 +1203,16 @@ struct Engine {
             if (Ph + 6 > max_ctx) { done("ctx-guard"); return emitted; }
             int em[5];
             int n = spec_round(em);
+            rounds++;
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {
                 if (em[k] == eos) { done("eos"); return emitted; }
-                if (!on_token(em[k])) { done("client-stop"); return emitted; }
+                auto c0 = std::chrono::steady_clock::now();
+                bool cont = on_token(em[k]);
+                gs.cb_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - c0)
+                                .count();
+                if (!cont) { done("client-stop"); return emitted; }
                 emitted++;
             }
             if (on_pending) on_pending(last_pending);

@@ -223,6 +223,73 @@ int main(int argc, char** argv) {
     std::mutex gpu; // single slot: serialize requests
     std::atomic<long> req_counter{0};
 
+    // R0 telemetry: one [req] stderr line per generation request, self-contained
+    // so real-work anatomy (queue wait, tokenize, prefill reuse, decode, client
+    // write time, conversation interleave) is measurable from the log alone.
+    // conv = fnv1a64 over system text + first user text: stable across the turns
+    // of one conversation, distinct across conversations (main thread, subagents,
+    // and background utility calls differ in system and/or first user message).
+    auto fnv1a = [](const std::string& s, unsigned long long h = 1469598103934665603ULL) {
+        for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+        return h;
+    };
+    auto text_of = [](const json& v) -> std::string {
+        if (v.is_string()) return v.get<std::string>();
+        std::string out;
+        if (v.is_array())
+            for (auto& p : v) {
+                std::string ty = p.value("type", "");
+                if (ty == "text" || ty == "input_text" || ty == "output_text")
+                    out += p.value("text", "");
+            }
+        return out;
+    };
+    auto conv_fp = [&](const json& body) -> unsigned long long {
+        std::string sys, fu;
+        if (body.contains("system")) sys = text_of(body["system"]);
+        else if (body.contains("instructions") && body["instructions"].is_string())
+            sys = body["instructions"].get<std::string>();
+        const char* lk = body.contains("messages") && body["messages"].is_array() ? "messages"
+                         : body.contains("input") && body["input"].is_array()    ? "input"
+                                                                                 : nullptr;
+        if (lk) {
+            for (auto& m : body[lk]) {
+                if (!m.is_object() || !m.contains("content")) continue;
+                std::string role = m.value("role", "");
+                if (sys.empty() && role == "system") sys = text_of(m["content"]);
+                if (fu.empty() && role == "user") fu = text_of(m["content"]);
+                if (!sys.empty() && !fu.empty()) break;
+            }
+        } else if (body.contains("input") && body["input"].is_string()) {
+            fu = body["input"].get<std::string>();
+        } else if (body.contains("prompt") && body["prompt"].is_string()) {
+            fu = body["prompt"].get<std::string>();
+        }
+        return fnv1a(fu, fnv1a(sys) ^ 0x9e3779b97f4a7c15ULL);
+    };
+    struct ReqTrace {
+        long rid;
+        const char* api;
+        unsigned long long conv;
+        std::chrono::steady_clock::time_point t0; // stamped after tokenize
+        double tok_ms;                            // render + encode
+    };
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
+            .count();
+    };
+    auto req_log = [&](const ReqTrace& rt, double qw_ms) {
+        const auto& g = eng.gs;
+        double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
+        fprintf(stderr,
+                "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
+                "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
+                "end=%s\n",
+                rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
+                g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
+                (g.end && g.end[0]) ? g.end : "?");
+    };
+
     httplib::Server srv;
     srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
         fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(),
@@ -280,7 +347,10 @@ int main(int argc, char** argv) {
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
         int n_max = body.value("max_tokens", 256);
         bool stream = body.value("stream", false);
+        auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt = build_prompt(body);
+        ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
+                    std::chrono::steady_clock::now(), ms_since(tk0)};
         if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
         long created = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -291,9 +361,11 @@ int main(int argc, char** argv) {
 
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
+            double qw = ms_since(rt.t0);
             std::string text;
             int n = eng.generate(prompt, n_max, EOS,
                                  [&](int id) { text += tok.decode_one(id); return true; });
+            req_log(rt, qw);
             json choice;
             if (chat)
                 choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
@@ -313,8 +385,9 @@ int main(int argc, char** argv) {
         res.set_header("Content-Type", "text/event-stream");
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, created, chat, obj, objd](size_t, httplib::DataSink& sink) {
+            [&, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
+                double qw = ms_since(rt.t0);
                 auto send = [&](const json& j) {
                     std::string s = "data: " + j.dump() + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -329,6 +402,7 @@ int main(int argc, char** argv) {
                                   {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})}};
                     return send(chunk);
                 });
+                req_log(rt, qw);
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
@@ -433,9 +507,12 @@ int main(int argc, char** argv) {
         if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
         long rid = req_counter++;
         std::string mid = "msg_q27_" + std::to_string(rid);
+        ReqTrace rt{rid, "anth", conv_fp(body), std::chrono::steady_clock::now(),
+                    std::chrono::duration<double, std::milli>(tk2 - tk0).count()};
 
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
+            double qw = ms_since(rt.t0);
             StreamSplitter sp;
             std::string think, text, tool_buf;
             std::vector<q27::ToolCall> calls;
@@ -462,6 +539,7 @@ int main(int argc, char** argv) {
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
+            req_log(rt, qw);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
                 calls.push_back(q27::parse_tool_call(q27::strip_ws2(tool_buf)));
@@ -512,9 +590,10 @@ int main(int argc, char** argv) {
         const bool has_tools = tools.is_array() && !tools.empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len](
+            [&, prompt, n_max, mid, rid, has_tools, tool_names_v, stable_len, rt](
                 size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
+                double qw = ms_since(rt.t0);
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &tool_mask_host2dev;
@@ -608,6 +687,7 @@ int main(int argc, char** argv) {
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
+                req_log(rt, qw);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
                 if (has_tools) {
@@ -762,8 +842,11 @@ int main(int argc, char** argv) {
         }
 
         int n_max = body.value("max_output_tokens", 4096);
+        auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt =
             tok.encode(q27::chatml_prompt(merged, tools, !no_think_srv));
+        ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
+                    ms_since(tk0)};
         if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
         if (n_max <= 0) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
@@ -833,6 +916,7 @@ int main(int argc, char** argv) {
 
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
+            double qw = ms_since(rt.t0);
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
@@ -856,6 +940,7 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
                 return true;
             });
+            req_log(rt, qw);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) flush_tool();
             flush_think();
@@ -872,8 +957,9 @@ int main(int argc, char** argv) {
         res.set_header("Content-Type", "text/event-stream");
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt, n_max, resp_id, rid, custom_names](size_t, httplib::DataSink& sink) {
+            [&, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
+                double qw = ms_since(rt.t0);
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
@@ -957,6 +1043,7 @@ int main(int argc, char** argv) {
                     for (auto& [ch, t] : sp.feed(tok.decode_one(id))) route(ch, t);
                     return true;
                 });
+                req_log(rt, qw);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) flush_tool();
                 flush_think();
