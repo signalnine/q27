@@ -19,9 +19,16 @@ struct XQuant {
     uint2* eo = nullptr;     // [cols/8]: .x = bytes {x0,x2,x4,x6}, .y = {x1,x3,x5,x7}
     float* scale = nullptr;  // [cols/32]
     int* isum = nullptr;     // [cols/32] sum of quantized values per block
+    // group-64 requantization (prefill MMA GEMM only; matches the Q4_G64
+    // weight group so two K=32 mma steps share one fp dequant step). Distinct
+    // VALUES from nat (amax over 64), not a re-scaling -- decode lanes leave
+    // these null and are untouched.
+    int8_t* nat64 = nullptr; // [cols]
+    float* s64 = nullptr;    // [cols/64]
 };
-XQuant xquant_alloc(int64_t max_cols);
+XQuant xquant_alloc(int64_t max_cols, bool g64 = false);
 void quantize_x(const float* x, int64_t cols, const XQuant& xq, cudaStream_t st = 0);
+void quantize_x_g64(const float* x, int64_t cols, const XQuant& xq, cudaStream_t st = 0);
 
 // y[r] = sum_c W[r,c] * x[c].  W quantized row-major, reduction along contiguous axis.
 // Q4/Q8 use dp4a against the pre-quantized activation vector.

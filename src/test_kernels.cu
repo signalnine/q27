@@ -260,6 +260,8 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
 
     auto run = [&](const char* mode, float* y) {
         setenv("Q27_PREFILL", mode, 1);
+        setenv("Q27_PF_XG", "32", 1); // exact-path leg (dp4a is g32; also the
+                                      // null-nat64 XQuant would force it)
         if (t.dtype == DType::Q4_G64)
             q27k::gemm_q4_T((const uint8_t*)d.data, (const __half*)d.scales, xq, y, rows, cols,
                             T, 0);
@@ -271,6 +273,7 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
     run("dp4a", d_ya);
     run("mma", d_yb);
     unsetenv("Q27_PREFILL");
+    unsetenv("Q27_PF_XG");
     std::vector<float> ya((size_t)T * rows), yb((size_t)T * rows);
     CUDA_CHECK(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(yb.data(), d_yb, yb.size() * 4, cudaMemcpyDeviceToHost));
@@ -279,6 +282,90 @@ static void test_gemm_mma(q27::DeviceModel& dm, const q27::Model& m, const char*
         maxrel = std::max(maxrel, (double)std::fabs(ya[i] - yb[i]) / (1.0 + std::fabs(ya[i])));
     char label[128];
     snprintf(label, sizeof label, "gemm MMA vs dp4a %s", name);
+    check(label, maxrel, 1e-4);
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_ya));
+    CUDA_CHECK(cudaFree(d_yb));
+}
+
+// Regroup gate: MMA g64 path vs the dp4a exact path fed the SAME g64
+// quantization expanded to g32 form (nat = nat64, both 32-halves of each
+// 64-group share its s64 scale, isum/eo rebuilt from nat64). Integer dots
+// identical by construction; only fp accumulation grouping differs (per-64
+// with int32 chaining vs per-32), so the bound is rounding noise -- an
+// indexing/fragment bug in the g64 kernel shows as O(1). This test + PPL +
+// canonical REPLACE the serial-vs-batched identity gate for the g64 default
+// (policy sign-off 2026-07-04).
+static void test_gemm_mma_g64(q27::DeviceModel& dm, const q27::Model& m, const char* name) {
+    const q27::Tensor& t = m.get(name);
+    const q27::DevTensor& d = dm.upload(name);
+    int64_t rows = t.rows(), cols = t.cols();
+    const int T = 33;
+
+    std::vector<float> x = rand_vec((size_t)T * cols, 13);
+    float *d_x, *d_ya, *d_yb;
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)T * cols * 4));
+    CUDA_CHECK(cudaMalloc(&d_ya, (size_t)T * rows * 4));
+    CUDA_CHECK(cudaMalloc(&d_yb, (size_t)T * rows * 4));
+    CUDA_CHECK(cudaMemcpy(d_x, x.data(), (size_t)T * cols * 4, cudaMemcpyHostToDevice));
+    const int Tpad = (T + 31) & ~31;
+    q27k::XQuant xq = q27k::xquant_alloc((size_t)Tpad * cols, /*g64=*/true);
+    q27k::quantize_x_g64(d_x, (size_t)T * cols, xq);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // pull (nat64, s64) to host and expand into the reference XQuant's g32 form
+    const size_t n = (size_t)T * cols, nb32 = n / 32, ng64 = n / 64;
+    std::vector<int8_t> h_nat(n);
+    std::vector<float> h_s64(ng64);
+    CUDA_CHECK(cudaMemcpy(h_nat.data(), xq.nat64, n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_s64.data(), xq.s64, ng64 * 4, cudaMemcpyDeviceToHost));
+    std::vector<float> h_scale(nb32);
+    std::vector<int> h_isum(nb32);
+    std::vector<uint2> h_eo(n / 8);
+    for (size_t b = 0; b < nb32; b++) {
+        h_scale[b] = h_s64[b / 2];
+        int s = 0;
+        for (int i = 0; i < 32; i++) s += h_nat[b * 32 + i];
+        h_isum[b] = s;
+        for (int u = 0; u < 4; u++) { // elements u*8..u*8+7: even bytes in .x, odd in .y
+            const int8_t* p = &h_nat[b * 32 + u * 8];
+            uint32_t e = 0, o = 0;
+            for (int k = 0; k < 4; k++) {
+                e |= (uint32_t)(uint8_t)p[2 * k] << (8 * k);
+                o |= (uint32_t)(uint8_t)p[2 * k + 1] << (8 * k);
+            }
+            h_eo[b * 4 + u] = make_uint2(e, o);
+        }
+    }
+    q27k::XQuant xqr = q27k::xquant_alloc((size_t)Tpad * cols);
+    CUDA_CHECK(cudaMemcpy(xqr.nat, h_nat.data(), n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(xqr.scale, h_scale.data(), nb32 * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(xqr.isum, h_isum.data(), nb32 * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(xqr.eo, h_eo.data(), n / 8 * sizeof(uint2), cudaMemcpyHostToDevice));
+
+    auto run = [&](const char* mode, const char* xg, const q27k::XQuant& q, float* y) {
+        setenv("Q27_PREFILL", mode, 1);
+        setenv("Q27_PF_XG", xg, 1);
+        if (t.dtype == DType::Q4_G64)
+            q27k::gemm_q4_T((const uint8_t*)d.data, (const __half*)d.scales, q, y, rows, cols,
+                            T, 0);
+        else
+            q27k::gemm_q8_T((const int8_t*)d.data, (const __half*)d.scales, q, y, rows, cols,
+                            T, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    };
+    run("mma", "64", xq, d_ya);
+    run("dp4a", "32", xqr, d_yb);
+    unsetenv("Q27_PREFILL");
+    unsetenv("Q27_PF_XG");
+    std::vector<float> ya((size_t)T * rows), yb((size_t)T * rows);
+    CUDA_CHECK(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(yb.data(), d_yb, yb.size() * 4, cudaMemcpyDeviceToHost));
+    double maxrel = 0;
+    for (size_t i = 0; i < ya.size(); i++)
+        maxrel = std::max(maxrel, (double)std::fabs(ya[i] - yb[i]) / (1.0 + std::fabs(ya[i])));
+    char label[128];
+    snprintf(label, sizeof label, "gemm MMA g64 vs exact %s", name);
     check(label, maxrel, 1e-4);
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_ya));
@@ -838,6 +925,10 @@ int main(int argc, char** argv) {
     test_gemm_mma(dm, m, "blk.0.ffn_down.weight");  // Q4 5120x17408 (K tail shapes)
     test_gemm_mma(dm, m, "blk.3.attn_k.weight");    // Q8 1024x5120
     test_gemm_mma(dm, m, "output.weight");          // Q8 248320x5120 (big-rows)
+    test_gemm_mma_g64(dm, m, "blk.0.attn_qkv.weight");
+    test_gemm_mma_g64(dm, m, "blk.0.ffn_down.weight");
+    test_gemm_mma_g64(dm, m, "blk.3.attn_k.weight");
+    test_gemm_mma_g64(dm, m, "output.weight");
     test_attn_mma();
     test_attn_split();
     test_delta_split();

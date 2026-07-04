@@ -336,3 +336,34 @@ basin writes 26% fewer output chars across 6 turns vs our 8 -- same model,
 quant numerics pick the basin). Open: delta-WY tiling, activation regroup
 32->64 (breaks the serial-vs-batched identity gate BY DESIGN -- policy
 decision), basin lottery for the last stretch.
+
+## 2026-07-04 (later) -- both open prefill levers landed; 16K wall 2556 -> 3180 t/s
+
+- Delta-WY warp tiling (60deb75): k_delta_wy 2.51 -> 0.55 ms/call (4.5x).
+  Warp-tiled register GEMMs for all three scalar phases, smem-A blocked
+  forward substitution (8-row diagonal blocks in registers), QKt.R fold
+  pre-substitution, shuffle-scan log-lambda. wy path 2913 t/s @16K vs seq
+  2560 back-to-back. Rejected with numbers: 512-thread fat blocks (no gain,
+  per-block latency chain dominates), L1 prefetch hints. Next lever if ever
+  needed: cp.async K/Q panels (~3100 ceiling with subst zeroed).
+- g64 activation regroup (this commit, `Q27_PF_XG`, DEFAULT ON): batched-
+  prefill activations requantized per-64 (matches the Q4_G64 weight group) on
+  xqT only; two K=32 mma.sync steps chain in int32 (new accumulating form)
+  before ONE fp dequant step per 64 -- the fp chain was ~22% of GEMM cost.
+  Q4 kernel regs 252 -> 174, zero spills. 16K kvstats A/B same binary:
+  2556.3 (Q27_PF_XG=32 exact path) -> 2780.8 t/s (+8.8%); with wy on top,
+  3179.6 t/s. PPL 7.1931 -> 7.1921 (noise). GATE POLICY CHANGE (Gabe
+  sign-off 2026-07-04): per-64 amax changes int8 values vs the decode path's
+  per-32, so serial-vs-batched identity CANNOT hold on the default path --
+  replaced by test_kernels g64-vs-exact (g64 quantization pushed through the
+  dp4a exact path via duplicated-scale expansion: same integer dots, fp
+  grouping only; passed at 6e-7..6e-6 vs 1e-4), corpus PPL, canonical md5
+  (canonical CLI prefills serially -- still bitwise, verified both modes),
+  and a thunderdome spot-check. `--pf` enforces identity only under
+  Q27_PF_XG=32 (verified IDENTICAL); on the g64 default it reports mismatch
+  as expected-not-fatal (this probe happened to stay IDENTICAL at 8K).
+  Decode lanes untouched: canonical md5 58b6ae85... exact in both modes.
+
+Stack state after both: 16K prefill 3179.6 t/s (was 2556-2634 band same-day),
+with Q27_DS_MODE=wy still opt-in pending the time-tracker rerun; flip to
+default if the n=3 rerun holds. Remaining vs llama: decode gap + basin.

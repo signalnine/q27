@@ -299,7 +299,7 @@ struct Engine {
         embT = fal((size_t)PF_T * N_EMBD); ehnT = fal((size_t)PF_T * 2 * N_EMBD);
         xmtpT = fal((size_t)PF_T * N_EMBD);
         pf_part = fal((size_t)N_HEAD * PF_T * q27k::PF_SPLIT_MAX * 258);
-        xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN);
+        xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN, /*g64=*/true);
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 CUDA_CHECK(cudaMalloc((void**)&S_snap[il],
@@ -806,7 +806,13 @@ struct Engine {
     }
 
     // ---- batched prefill (M6): T-token chunk versions of the blocks ----
-    void qxT(const float* x, int cols, int T) { q27k::quantize_x(x, (int64_t)T * cols, xqT, stm); }
+    void qxT(const float* x, int cols, int T) {
+        q27k::quantize_x(x, (int64_t)T * cols, xqT, stm);
+        // g64 requant for the MMA GEMM (unconditional: the kernel is noise
+        // next to the GEMMs and keeping nat64 always-fresh means every
+        // dispatch choice downstream is safe)
+        q27k::quantize_x_g64(x, (int64_t)T * cols, xqT, stm);
+    }
     void mmT(const DevTensor& w, const float* xT, float* yout, int T) {
         switch (w.dtype) {
             case DType::Q4_G64:

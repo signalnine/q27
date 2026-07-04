@@ -98,13 +98,47 @@ __global__ void k_quantize_x(const float* __restrict__ x, int8_t* __restrict__ n
     if (lane < 4) eo[b * 4 + lane] = make_uint2(e, o);
 }
 
-XQuant xquant_alloc(int64_t max_cols) {
+// Group-64 variant: warp per 64-element group, lane owns elements g*64+lane
+// and g*64+32+lane (both loads and stores coalesced). Emits nat64 + s64 only
+// (no eo/isum -- the MMA path needs neither).
+__global__ void k_quantize_x_g64(const float* __restrict__ x, int8_t* __restrict__ nat64,
+                                 float* __restrict__ s64, int ngroups) {
+    int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (g >= ngroups) return;
+    int lane = threadIdx.x & 31;
+    float v0 = x[g * 64 + lane];
+    float v1 = x[g * 64 + 32 + lane];
+    float amax = fmaxf(fabsf(v0), fabsf(v1));
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    float s = amax / 127.f;
+    float inv = s > 0.f ? 1.f / s : 0.f;
+    int q0 = max(-127, min(127, __float2int_rn(v0 * inv)));
+    int q1 = max(-127, min(127, __float2int_rn(v1 * inv)));
+    nat64[g * 64 + lane] = (int8_t)q0;
+    nat64[g * 64 + 32 + lane] = (int8_t)q1;
+    if (lane == 0) s64[g] = s;
+}
+
+XQuant xquant_alloc(int64_t max_cols, bool g64) {
     XQuant xq;
     CUDA_CHECK(cudaMalloc((void**)&xq.nat, max_cols));
     CUDA_CHECK(cudaMalloc((void**)&xq.eo, max_cols / 8 * sizeof(uint2)));
     CUDA_CHECK(cudaMalloc((void**)&xq.scale, max_cols / 32 * 4));
     CUDA_CHECK(cudaMalloc((void**)&xq.isum, max_cols / 32 * 4));
+    if (g64) {
+        CUDA_CHECK(cudaMalloc((void**)&xq.nat64, max_cols));
+        CUDA_CHECK(cudaMalloc((void**)&xq.s64, max_cols / 64 * 4));
+    }
     return xq;
+}
+
+void quantize_x_g64(const float* x, int64_t cols, const XQuant& xq, cudaStream_t st) {
+    int ngroups = (int)(cols / 64);
+    int warps = 8;
+    k_quantize_x_g64<<<(ngroups + warps - 1) / warps, warps * 32, 0, st>>>(x, xq.nat64, xq.s64,
+                                                                           ngroups);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void quantize_x(const float* x, int64_t cols, const XQuant& xq, cudaStream_t st) {
