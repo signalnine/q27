@@ -1,45 +1,51 @@
 #!/usr/bin/env bash
-# reqlog_gate.sh -- server-level gate for the [req] per-request telemetry line.
+# reqlog_gate.sh -- server-level gate for [req] telemetry + multi-slot routing.
 #
-# Starts a real q27-server on a test port, drives the OpenAI + Anthropic APIs
-# with curl, then asserts on the server's stderr log:
-#   C1 exactly one [req] line per generation request
-#   C2 all fields parse (rid api conv qw_ms tok_ms prompt hit ckpt pf pf_ms
-#      dec dec_ms cb_ms rounds tps end)
-#   C3 rid strictly increasing
-#   C4 conv fingerprint stable within a conversation, distinct across systems
-#   C5 Anthropic turn 2 warm-hits the stable-prefix snapshot (hit>0)
-#   C6 cold request: hit==0, pf==prompt
-#   C7 timing sanity (pf_ms/dec_ms/rounds/tps positive on a normal gen)
-#   C8 api tag matches endpoint (oai vs anth)
-#   C9 prompt>ctx refused cleanly: end=refused, server stays healthy
+# Phase 1 (default single-slot server):
+#   C1 exactly one [req] line per generation request (all APIs, stream+non)
+#   C2 all fields parse; C3 rid increasing; C4 conv fingerprint semantics
+#   C5 Anthropic turn-2 warm-hits the stable-prefix snapshot
+#   C6 cold request hit=0/pf=prompt; C7 timing sanity; C8 api tags
+#   C9 prompt>ctx refused cleanly, server stays healthy
+# Phase 2 (--slots 2 --slot1-ctx 4096): R1 interleave-warm routing
+#   C12 A1,B1,A2,B2 interleaved -> A2.hit>0 AND B2.hit>0
+#   C13 slot affinity: A1.slot==A2.slot, B1.slot==B2.slot, A.slot!=B.slot
+#   C15 oversize prompt -> end=refused, healthy
 #
 # Usage: bash tools/reqlog_gate.sh [BIN [PORT]]
 # Env:   MODEL, TOK override model/tokenizer paths.
-# Needs the GPU free (~20 GB at --ctx 8192): stop any resident q27-server first.
+# Needs the GPU free (~25 GB peak in phase 2): stop any resident server first.
 
 set -u
 BIN=${1:-build/q27-server}
 PORT=${2:-8199}
 MODEL=${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}
 TOK=${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}
-LOG=$(mktemp /tmp/reqlog_gate.XXXXXX.log)
+SRV=""
 
-echo "[gate] server: $BIN port $PORT log $LOG"
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
-  "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 8192 --no-think >"$LOG" 2>&1 &
-SRV=$!
-trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
+start_server() { # args: logfile, extra flags...
+    local log=$1; shift
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} \
+      "$BIN" "$MODEL" "$TOK" --port "$PORT" --ctx 8192 --no-think "$@" >"$log" 2>&1 &
+    SRV=$!
+    for i in $(seq 1 120); do
+        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+        kill -0 $SRV 2>/dev/null || { echo "[gate] FAIL: server died at startup"; tail -5 "$log"; return 1; }
+        sleep 2
+    done
+    echo "[gate] FAIL: no health after 240s"; return 1
+}
+stop_server() {
+    [ -n "$SRV" ] && kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; SRV=""
+}
+trap 'stop_server' EXIT
 
-for i in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 $SRV 2>/dev/null || { echo "[gate] FAIL: server died at startup"; tail -5 "$LOG"; exit 1; }
-    sleep 2
-done
-curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "[gate] FAIL: no health after 240s"; exit 1; }
-echo "[gate] server healthy, driving requests"
+# ---------------- Phase 1: single slot, R0 battery ----------------
+LOG1=$(mktemp /tmp/reqlog_gate1.XXXXXX.log)
+echo "[gate] phase 1 (single slot): log $LOG1"
+start_server "$LOG1" || exit 1
 
-PORT=$PORT LOG=$LOG python3 - <<'PYEOF'
+PORT=$PORT LOG=$LOG1 python3 - <<'PYEOF'
 import json, os, re, sys, urllib.request
 
 port, log = os.environ["PORT"], os.environ["LOG"]
@@ -65,29 +71,22 @@ SYS_B = ("You are a verbose poetry tutor who explains meter and rhyme with "
 U1 = "Which aisle holds the packaging film, and what is restricted in aisle nine?"
 U2 = "And which compliance rule covers that caged section?"
 
-# T1 anth cold
 r1 = json.loads(post("/v1/messages", {"model": "q27", "max_tokens": 48,
     "system": SYS_A, "messages": [{"role": "user", "content": U1}]}))
 reply = "".join(b.get("text", "") for b in r1["content"] if b.get("type") == "text")
-# T2 anth warm turn 2 (history + real turn-1 reply)
 post("/v1/messages", {"model": "q27", "max_tokens": 48, "system": SYS_A,
     "messages": [{"role": "user", "content": U1},
                  {"role": "assistant", "content": reply or "Aisle seven."},
                  {"role": "user", "content": U2}]})
-# T3 anth different conversation
 post("/v1/messages", {"model": "q27", "max_tokens": 32, "system": SYS_B,
     "messages": [{"role": "user", "content": "Comment on: the sea, the sea."}]})
-# T4 openai chat
 post("/v1/chat/completions", {"model": "q27", "max_tokens": 8,
     "messages": [{"role": "system", "content": SYS_A},
                  {"role": "user", "content": "Say OK."}]})
-# T5 anth streaming
 post("/v1/messages", {"model": "q27", "max_tokens": 24, "stream": True,
     "system": SYS_A, "messages": [{"role": "user", "content": U1}]})
-# T6 prompt > ctx (8192): must refuse cleanly
 post("/v1/messages", {"model": "q27", "max_tokens": 16,
     "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
-# server still alive?
 with urllib.request.urlopen(base + "/health", timeout=10) as r:
     assert json.loads(r.read())["status"] == "ok", "server unhealthy after T6"
 
@@ -131,8 +130,95 @@ if len(recs) == 6:
     ok &= chk(t6["end"] == "refused", f"C9 oversize end=refused (got {t6['end']})")
 sys.exit(0 if ok else 1)
 PYEOF
-RC=$?
-kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; trap - EXIT
-if [ $RC -eq 0 ]; then echo "[gate] reqlog gate PASS"; else
-    echo "[gate] reqlog gate FAIL (log kept: $LOG)"; fi
-exit $RC
+RC1=$?
+stop_server
+if [ $RC1 -ne 0 ]; then echo "[gate] phase 1 FAIL (log kept: $LOG1)"; exit 1; fi
+echo "[gate] phase 1 PASS"
+
+# ---------------- Phase 2: --slots 2, interleave-warm routing ----------------
+sleep 10  # VRAM teardown before the second, larger instance
+LOG2=$(mktemp /tmp/reqlog_gate2.XXXXXX.log)
+echo "[gate] phase 2 (--slots 2): log $LOG2"
+start_server "$LOG2" --slots 2 --slot1-ctx 4096 || exit 1
+
+PORT=$PORT LOG=$LOG2 python3 - <<'PYEOF'
+import json, os, re, sys, urllib.request
+
+port, log = os.environ["PORT"], os.environ["LOG"]
+base = f"http://127.0.0.1:{port}"
+
+def post(path, body, timeout=300):
+    req = urllib.request.Request(base + path, json.dumps(body).encode(),
+                                 {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode()
+
+SYS_A = ("You are a terse assistant for a warehouse inventory system. Rules: "
+         "answer in one short sentence, never apologize, prefer metric units, "
+         "cite item codes verbatim, and treat every question as being about "
+         "the Fremont warehouse unless another site is named. The Fremont "
+         "site stores fasteners, adhesives, abrasives, and packaging film in "
+         "aisles one through nine, with hazardous storage restricted to the "
+         "caged section of aisle nine under compliance rule seventeen.")
+SYS_B = ("You are a verbose poetry tutor who explains meter and rhyme with "
+         "long florid examples drawn from nineteenth century verse, always "
+         "quoting at least two lines and naming the poet and the year of "
+         "publication before giving any judgement about the student's work.")
+UA = "Which aisle holds the packaging film, and what is restricted in aisle nine?"
+UB = "Comment on the line: the sea, the sea, the ever-rolling sea."
+
+ra = json.loads(post("/v1/messages", {"model": "q27", "max_tokens": 48,
+    "system": SYS_A, "messages": [{"role": "user", "content": UA}]}))
+reply_a = "".join(b.get("text", "") for b in ra["content"] if b.get("type") == "text")
+rb = json.loads(post("/v1/messages", {"model": "q27", "max_tokens": 48,
+    "system": SYS_B, "messages": [{"role": "user", "content": UB}]}))
+reply_b = "".join(b.get("text", "") for b in rb["content"] if b.get("type") == "text")
+post("/v1/messages", {"model": "q27", "max_tokens": 48, "system": SYS_A,
+    "messages": [{"role": "user", "content": UA},
+                 {"role": "assistant", "content": reply_a or "Aisle seven."},
+                 {"role": "user", "content": "And which compliance rule applies?"}]})
+post("/v1/messages", {"model": "q27", "max_tokens": 48, "system": SYS_B,
+    "messages": [{"role": "user", "content": UB},
+                 {"role": "assistant", "content": reply_b or "A fine anapest."},
+                 {"role": "user", "content": "Name the poet you quoted."}]})
+post("/v1/messages", {"model": "q27", "max_tokens": 16,
+    "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+with urllib.request.urlopen(base + "/health", timeout=10) as r:
+    assert json.loads(r.read())["status"] == "ok", "server unhealthy after oversize"
+
+hitp = re.compile(r"\[req\] rid=(\d+) .*? hit=(\d+) .*? end=([\w-]+)")
+slotp = re.compile(r" slot=(\d+)")
+recs = []
+for l in open(log):
+    if "[req]" not in l:
+        continue
+    m = hitp.search(l)
+    assert m, f"unparseable [req] line: {l!r}"
+    s = slotp.search(l)
+    recs.append(dict(rid=int(m.group(1)), hit=int(m.group(2)), end=m.group(3),
+                     slot=int(s.group(1)) if s else None))
+
+def chk(cond, name):
+    print(("PASS " if cond else "FAIL ") + name)
+    return cond
+
+ok = True
+ok &= chk(len(recs) == 5, f"C1' five [req] lines (got {len(recs)})")
+if len(recs) == 5:
+    a1, b1, a2, b2, ov = recs
+    ok &= chk(a2["hit"] > 0, f"C12a interleaved A2 warm (hit={a2['hit']})")
+    ok &= chk(b2["hit"] > 0, f"C12b interleaved B2 warm (hit={b2['hit']})")
+    ok &= chk(all(r["slot"] is not None for r in recs), "C13a slot= present")
+    if all(r["slot"] is not None for r in recs):
+        ok &= chk(a1["slot"] == a2["slot"], "C13b A sticky slot")
+        ok &= chk(b1["slot"] == b2["slot"], "C13c B sticky slot")
+        ok &= chk(a1["slot"] != b1["slot"], "C13d A,B on different slots")
+    ok &= chk(ov["end"] == "refused", f"C15 oversize refused (got {ov['end']})")
+sys.exit(0 if ok else 1)
+PYEOF
+RC2=$?
+stop_server
+trap - EXIT
+if [ $RC2 -eq 0 ]; then echo "[gate] reqlog gate PASS (both phases)"; else
+    echo "[gate] phase 2 FAIL (log kept: $LOG2)"; fi
+exit $RC2

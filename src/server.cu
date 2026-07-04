@@ -7,7 +7,7 @@
 //   POST /v1/responses                                (OpenAI Responses, Codex CLI)
 //
 // usage: q27-server model.q27 model.tok [--port 8080] [--host 0.0.0.0]
-//                   [--ctx 8192] [--fast-head]
+//                   [--ctx 8192] [--fast-head] [--slots N] [--slot1-ctx M]
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
     }
     std::string model = argv[1], tokpath = argv[2], host = "0.0.0.0";
     int port = 8080, ctx = 8192;
+    int n_slots = 1, slot1_ctx = 32768;
     bool fast = false;
     bool no_think_srv = false;
     bool kv_fp16 = false;
@@ -179,6 +180,8 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) slot1_ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast-head")) fast = true;
         else if (!strcmp(argv[i], "--no-think")) no_think_srv = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
@@ -206,16 +209,50 @@ int main(int argc, char** argv) {
     shared_dm.upload_all();
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
-    Engine eng(shared_model, shared_dm, ctx);
-    eng.fast_head = fast;
-    eng.build_graph();
-    eng.build_spec_graphs();
+    // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
+    // gets --ctx; slots 1+ get --slot1-ctx (subagent/background conversations
+    // measured 11-18K in R0). Rounds stay serialized behind the gpu mutex --
+    // the win is per-slot GDN snapshot + ckpt ring + KV, so an interleaved
+    // second conversation no longer destroys the first one's prefix cache
+    // (R0: that re-prefill class alone was 25% of a Claude Code session).
+    struct Slot {
+        std::unique_ptr<Engine> eng;
+        long last_used = 0;
+        int id = 0;
+        std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
+    };
+    n_slots = std::max(1, std::min(4, n_slots));
+    std::vector<Slot> slots;
+    for (int si = 0; si < n_slots; si++) {
+        int sctx = si == 0 ? ctx : slot1_ctx;
+        if (si > 0) {
+            // coarse per-slot floor: 5 GDN buffer sets (~3 GB) + KV + MTP KV
+            // + slack; skip extra slots rather than abort on cudaMalloc
+            size_t freeb = 0, totalb = 0;
+            cudaMemGetInfo(&freeb, &totalb);
+            const char* kve = getenv("Q27_KV");
+            size_t kvb = (size_t)sctx * 68 * 1024 / ((kve && !strcmp(kve, "fp16")) ? 1 : 2);
+            size_t need = (3500ull << 20) + kvb + (kvb >> 3) + (512ull << 20);
+            if (freeb < need) {
+                fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
+                        freeb / 1e9, need / 1e9);
+                break;
+            }
+        }
+        Slot s;
+        s.id = si;
+        s.eng = std::make_unique<Engine>(shared_model, shared_dm, sctx);
+        s.eng->fast_head = fast;
+        s.eng->build_graph();
+        s.eng->build_spec_graphs();
+        slots.push_back(std::move(s));
+        fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
+    }
     const int EOS = tok.eos();
-    // P7 shared mask cache (guarded by the single-slot gpu mutex)
+    // P7 shared mask cache (guarded by the gpu mutex; pool ids are per-slot)
     std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
     q27::ToolMaskCache tool_mask_cache;
     tool_mask_cache.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
-    std::vector<int> tool_mask_host2dev;
     if (constrain_tools)
         fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
                 tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
@@ -282,16 +319,44 @@ int main(int argc, char** argv) {
     // inter-request GPU idle -- tool execution, client think time -- is
     // recoverable from the log alone: idle = t[n]-(qw+pf_ms+dec_ms)[n] - t[n-1].
     const auto srv_t0 = std::chrono::steady_clock::now();
-    auto req_log = [&](const ReqTrace& rt, double qw_ms) {
-        const auto& g = eng.gs;
+    auto req_log = [&](const ReqTrace& rt, double qw_ms, const Engine& e, int slot_id) {
+        const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s t=%.0f\n",
+                "end=%s slot=%d t=%.0f\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
-                (g.end && g.end[0]) ? g.end : "?", ms_since(srv_t0));
+                (g.end && g.end[0]) ? g.end : "?", slot_id, ms_since(srv_t0));
+    };
+    // R1 routing (call under the gpu lock). Tiers: a slot whose snapshot the
+    // prompt EXTENDS wins (longest snapshot on ties) > an empty slot (never
+    // evict a live conversation when a free slot exists) > LRU eviction.
+    // Slots too small for the prompt are ineligible; if none fits, slot 0
+    // takes it and generate() refuses cleanly past max_ctx.
+    long slot_use_counter = 0;
+    auto pick_slot = [&](const std::vector<int>& prompt) -> Slot& {
+        Slot* best = nullptr;
+        int best_tier = -1;
+        size_t best_key = 0;
+        for (auto& s : slots) {
+            if ((int)prompt.size() + 64 > s.eng->max_ctx) continue;
+            const auto& st = s.eng->snap_toks;
+            size_t L = 0, n = std::min(st.size(), prompt.size());
+            while (L < n && st[L] == prompt[L]) L++;
+            int tier = (!st.empty() && L == st.size()) ? 2 : st.empty() ? 1 : 0;
+            size_t key = tier == 2 ? st.size() : 0;
+            bool better;
+            if (!best) better = true;
+            else if (tier != best_tier) better = tier > best_tier;
+            else if (tier == 2) better = key > best_key;
+            else better = s.last_used < best->last_used;
+            if (better) { best = &s; best_tier = tier; best_key = key; }
+        }
+        if (!best) best = &slots[0];
+        best->last_used = ++slot_use_counter;
+        return *best;
     };
     // Serialize with invalid-UTF-8 replacement: json::dump's strict default
     // throws type_error.316, and an uncaught throw here is std::terminate.
@@ -311,7 +376,7 @@ int main(int argc, char** argv) {
         // /health?verify=1 recomputes the resident-weight checksums (~20 ms;
         // safe concurrently with generation -- read-only, separate stream).
         if (req.has_param("verify")) {
-            int bad = eng.dm.checksum_verify(true);
+            int bad = shared_dm.checksum_verify(true);
             res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +
                                 "\",\"weight_mismatches\":" + std::to_string(bad) + "}",
                             "application/json");
@@ -373,6 +438,8 @@ int main(int argc, char** argv) {
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
             double qw = ms_since(rt.t0);
+            Slot& sl = pick_slot(prompt);
+            Engine& eng = *sl.eng;
             std::string text;
             q27::Utf8Gate ugate;
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
@@ -380,7 +447,7 @@ int main(int argc, char** argv) {
                 return true;
             });
             text += ugate.flush();
-            req_log(rt, qw);
+            req_log(rt, qw, eng, sl.id);
             json choice;
             if (chat)
                 choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
@@ -403,6 +470,8 @@ int main(int argc, char** argv) {
             [&, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
                 double qw = ms_since(rt.t0);
+                Slot& sl = pick_slot(prompt);
+                Engine& eng = *sl.eng;
                 auto send = [&](const json& j) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -423,7 +492,7 @@ int main(int argc, char** argv) {
                 });
                 std::string tailp = ugate.flush();
                 if (!tailp.empty()) send(piece_chunk(tailp));
-                req_log(rt, qw);
+                req_log(rt, qw, eng, sl.id);
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
@@ -534,6 +603,8 @@ int main(int argc, char** argv) {
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
             double qw = ms_since(rt.t0);
+            Slot& sl = pick_slot(prompt);
+            Engine& eng = *sl.eng;
             StreamSplitter sp;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -548,7 +619,7 @@ int main(int argc, char** argv) {
             };
             ToolConstrainer tc;
             tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
-            tc.host2dev = &tool_mask_host2dev;
+            tc.host2dev = &sl.tool_mask_host2dev;
             tc.enabled = constrain_tools;
             tc.begin(tool_names_v);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
@@ -561,7 +632,7 @@ int main(int argc, char** argv) {
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
-            req_log(rt, qw);
+            req_log(rt, qw, eng, sl.id);
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
@@ -617,9 +688,11 @@ int main(int argc, char** argv) {
                 size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
                 double qw = ms_since(rt.t0);
+                Slot& sl = pick_slot(prompt);
+                Engine& eng = *sl.eng;
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
-                tc.host2dev = &tool_mask_host2dev;
+                tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools;
                 tc.begin(tool_names_v);
                 int block_counter = 0, tool_counter = 0;
@@ -711,7 +784,7 @@ int main(int argc, char** argv) {
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
-                req_log(rt, qw);
+                req_log(rt, qw, eng, sl.id);
                 for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
@@ -942,6 +1015,8 @@ int main(int argc, char** argv) {
         if (!stream) {
             std::lock_guard<std::mutex> lk(gpu);
             double qw = ms_since(rt.t0);
+            Slot& sl = pick_slot(prompt);
+            Engine& eng = *sl.eng;
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
@@ -966,7 +1041,7 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                 return true;
             });
-            req_log(rt, qw);
+            req_log(rt, qw, eng, sl.id);
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) flush_tool();
@@ -987,6 +1062,8 @@ int main(int argc, char** argv) {
             [&, prompt, n_max, resp_id, rid, custom_names, rt](size_t, httplib::DataSink& sink) {
                 std::lock_guard<std::mutex> lk(gpu);
                 double qw = ms_since(rt.t0);
+                Slot& sl = pick_slot(prompt);
+                Engine& eng = *sl.eng;
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
@@ -1071,7 +1148,7 @@ int main(int argc, char** argv) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                     return true;
                 });
-                req_log(rt, qw);
+                req_log(rt, qw, eng, sl.id);
                 for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) flush_tool();
