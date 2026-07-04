@@ -367,3 +367,34 @@ decision), basin lottery for the last stretch.
 Stack state after both: 16K prefill 3179.6 t/s (was 2556-2634 band same-day),
 with Q27_DS_MODE=wy still opt-in pending the time-tracker rerun; flip to
 default if the n=3 rerun holds. Remaining vs llama: decode gap + basin.
+
+## 2026-07-04 (evening) -- burst-depth measured DEAD; deep acceptance is NOT the constraint
+
+`--burst-stats` rig added (chain 10 MTP draft passes per free-region
+position on the serial path, CSV dump of drafts + top1-top2 margins;
+production-faithful: prompt phase does actual-next-token MTP KV warmup,
+free region chains from the accepted token). Run: 2489 positions of code
+continuation (time-tracker task.md + src + tests as 4.7K-token prompt,
+no-think, greedy).
+
+Result: the chain barely decays -- p(d_k|prefix k-1) = 92-94% FLAT to
+depth 10 on code; mean chain 7.62; p(chain>=10) = 54%. The model would
+happily accept 10-deep drafts half the time.
+
+Economics kill it anyway. Round simulation on the actual trajectory
+(faithful rejection clustering): t/round 4.51 (d4) -> 7.80 (d10) -- only
++73% tokens for +150% depth, because rounds restart at rejection points.
+Cost slope MEASURED at serving conditions (fp8 KV, 16K depth, same
+prompt, wall/rounds): d4 27.44 ms/round, d5 (871c852 build) 33.94 --
+**+6.5 ms/depth, same as fp16's +6.75** (slope is draft-pass + verify-GEMV
+dominated; fp8 attention savings are noise). At +6.5: fixed d6/d8/d10 =
+-5/-13/-18%, best gated config (full-accept ramp) = -7%. Breakeven slope
+~3.5 ms/depth = the engine would need to nearly halve per-depth cost
+(ffn verify GEMVs add ~16% of the nb5 cost PER LANE past 5 -- gemv10
+micro ratio 0.91 -- and each sequential draft pass is ~1.5 ms).
+
+Verdict: no depth increase wins at the current engine structure, gated or
+not, despite outstanding deep acceptance. The acceptance data is the
+durable asset: if drafting were ~free (parallel draft backbone a la
+DSpark -- needs training, not portable), the ceiling is large. Decode
+stays at the d4 local optimum. Rig kept (--burst-stats N / --burst-out).

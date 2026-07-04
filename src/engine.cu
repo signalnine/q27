@@ -26,7 +26,8 @@ int main(int argc, char** argv) {
     bool mtp_stats = false, spec = false, fast = false;
     int pf_n = 0;
     bool pfcache = false;
-    int stats_n = 0;
+    int stats_n = 0, burst_n = 0;
+    const char* burst_out = "burst_stats.csv";
     int pfdbg_n = 0;
     std::string nll_path;
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
@@ -38,6 +39,8 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--pf") && i + 1 < argc) pf_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--pfcache")) pfcache = true;
         if (!strcmp(argv[i], "--stats") && i + 1 < argc) stats_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--burst-stats") && i + 1 < argc) burst_n = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--burst-out") && i + 1 < argc) burst_out = argv[++i];
         if (!strcmp(argv[i], "--pfdbg") && i + 1 < argc) pfdbg_n = atoi(argv[++i]);
         if (!strcmp(argv[i], "--nll") && i + 1 < argc) nll_path = argv[++i];
         if (!strcmp(argv[i], "--nll-chunk") && i + 1 < argc) nll_chunk = atoi(argv[++i]);
@@ -53,6 +56,93 @@ int main(int argc, char** argv) {
     e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
+
+    if (burst_n > 0) {
+        // Burst-depth gate rig (2026-07-04, path-1 decision): chain SD MTP
+        // draft passes per FREE-region position on the plain serial path and
+        // dump drafts + top1-top2 margins to CSV for offline gate analysis
+        // (chain-length distribution, full-accept trigger, margin thresholds
+        // -- decides whether gated deep bursts (d8-10) get built). Prompt
+        // phase mirrors production MTP KV warmup: pair h(i) with the ACTUAL
+        // next prompt token. Free-region drafting matches production exactly
+        // (chain from the accepted token), so no stats-vs-live prompt skew;
+        // the P3 per-position-vs-round discount still applies to projections.
+        constexpr int SD = 10;
+        std::vector<float> l1(VOCAB);
+        auto top2 = [&](const std::vector<float>& l) {
+            int b = 0; float bv = -1e30f, sv = -1e30f;
+            for (int i = 0; i < VOCAB; i++) {
+                if (l[i] > bv) { sv = bv; bv = l[i]; b = i; }
+                else if (l[i] > sv) sv = l[i];
+            }
+            return std::pair<int, float>(b, bv - sv);
+        };
+        std::vector<int> seq = toks;
+        FILE* out = fopen(burst_out, "w");
+        if (!out) { fprintf(stderr, "burst-stats: cannot open %s\n", burst_out); return 1; }
+        fprintf(out, "q");
+        for (int k = 0; k < SD; k++) fprintf(out, ",d%d,m%d", k + 1, k + 1);
+        fprintf(out, "\n");
+        for (int step = 0; step < burst_n + (int)toks.size() - 1; step++) {
+            bool prompt_phase = step < (int)toks.size();
+            if (prompt_phase) e.step_with(toks[step]);
+            else e.step_free();
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            int next_tok;
+            CUDA_CHECK(cudaMemcpy(&next_tok, e.d_token, 4, cudaMemcpyDeviceToHost));
+            if (!prompt_phase) seq.push_back(next_tok);
+            int pos = step;
+            if (prompt_phase) {
+                // MTP KV warmup with the actual next prompt token
+                if (step + 1 < (int)toks.size()) {
+                    CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4,
+                                               cudaMemcpyDeviceToDevice, e.stm));
+                    int wt = toks[step + 1], mp = pos + 1;
+                    CUDA_CHECK(cudaMemcpyAsync(e.d_token, &wt, 4, cudaMemcpyHostToDevice,
+                                               e.stm));
+                    CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp, 4, cudaMemcpyHostToDevice,
+                                               e.stm));
+                    e.mtp_forward();
+                    CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                    CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
+                }
+                continue;
+            }
+            if (step >= burst_n + (int)toks.size() - 2) break;
+            // free region: chain SD draft passes from (h(pos), accepted tok)
+            int q = (int)seq.size() - 1; // index of next_tok in seq
+            int D[SD]; float M[SD];
+            CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                       e.stm));
+            for (int k = 0; k < SD; k++) {
+                int mp = pos + 1 + k;
+                if (k > 0)
+                    CUDA_CHECK(cudaMemcpyAsync(e.d_token, &D[k - 1], 4, cudaMemcpyHostToDevice,
+                                               e.stm));
+                CUDA_CHECK(cudaMemcpyAsync(e.d_pos_m, &mp, 4, cudaMemcpyHostToDevice, e.stm));
+                if (k == 0) e.mtp_forward();
+                else e.mtp_forward(e.x1, nullptr, nullptr, nullptr);
+                CUDA_CHECK(cudaStreamSynchronize(e.stm));
+                CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
+                                      cudaMemcpyDeviceToHost));
+                auto [d, m] = top2(l1);
+                D[k] = d; M[k] = m;
+            }
+            fprintf(out, "%d", q);
+            for (int k = 0; k < SD; k++) fprintf(out, ",%d,%.4f", D[k], M[k]);
+            fprintf(out, "\n");
+            CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
+        }
+        fclose(out);
+        std::string seqp = std::string(burst_out) + ".seq";
+        FILE* sf = fopen(seqp.c_str(), "w");
+        for (size_t i = 0; i < seq.size(); i++)
+            fprintf(sf, "%d%c", seq[i], i + 1 < seq.size() ? ' ' : '\n');
+        fclose(sf);
+        printf("burst-stats: %d free positions x %d-deep chains -> %s (+.seq)\n", burst_n, SD,
+               burst_out);
+        return 0;
+    }
 
     if (stats_n > 0) {
         // E3 instrumentation: draft acceptance vs margin, rank-2 capture,
