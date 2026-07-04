@@ -749,9 +749,19 @@ struct Engine {
     void set_tool_constraint(int mask_id) {
         h_mask_id0 = mask_id;
         // P11 split path is OPT-IN (Q27_TOOL_SPLIT=1): it 4.2x's in-call decode
-        // but has a correctness bug at real multi-turn/long-ctx state that the
-        // short-context gates missed (drifts to <content>, disengages, spews
-        // garbage). Default = the safe capped path until the bug is fixed.
+        // (49 -> 204 t/s) but has a FLAKY memory-corruption/race bug that faults
+        // (CUDA illegal access -> exit 1) after accumulated multi-request state
+        // at large ctx. Debug findings (2026-07-04): memcheck-CLEAN (so it's a
+        // race / host-side / alloc-layout-dependent, NOT a plain OOB); does NOT
+        // reproduce with 1-2 requests -- needs the state a real CRUSH session
+        // builds (mask-pool growth + checkpoint saves + prefix-cache hits over
+        // many turns). The split ALGORITHM is proven correct (split==capped
+        // token-identical gate passed); this is an orchestration hazard in the
+        // mid-round host readback + async mask staging, not the masking logic.
+        // To resume: reproduce under CRUSH load with compute-sanitizer --tool
+        // racecheck AND initcheck (memcheck won't catch it); suspect the async
+        // d_mask_ids/d_mask_pool staging ordering vs the verify graph launch.
+        // Default = the safe capped path until fixed.
         static const bool split_ok = getenv("Q27_TOOL_SPLIT") != nullptr;
         tool_split_active = (mask_id >= 0) && (bool)on_drafts && split_ok;
         // cap only when constraining WITHOUT the split path (P7 v1 fallback)
