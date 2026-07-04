@@ -10,7 +10,8 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
 - Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30 trials/leg);
   the +3.05% PPL gap does not appear in agentic coding
-- Agentic wall time: **~3-4x** llama.cpp, down from 7.9x -- five-mode tool-drift
+- Agentic wall time: **~3-4x** llama.cpp, down from 7.9x (P11 restored full
+  spec speed inside tool calls, 49 -> 204 t/s) -- five-mode tool-drift
   catalog closed by P7 constrained decoding + tolerant parser recovery; warm
   turns via P8 stable-prefix + P9 same-session checkpoint caches
 - Server defaults: fp8 KV (opt out `--kv-fp16`); `--constrain-tools` available
@@ -281,7 +282,6 @@ docs/sampling-design.md.
 - depth-5: nets ~+2-4% @2K for ~+12-14% round cost (measurement in the build
   log below); precondition for ANY depth change = think-heavy/high-entropy
   acceptance measurement
-- split draft/verify graphs (lifts the ~22 t/s in-grammar tool-span cap, P7)
 - chunked-WY delta scan
 - cross-session checkpoint pool (P9 covers same-session)
 - importance-weighted scales, AWQ-style (only path left on the +3.05% PPL

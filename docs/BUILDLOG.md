@@ -239,7 +239,10 @@ lagged masks before on_pending staging existed -- stale masks FORCE
 illegal tokens; gone since.) In-call throughput ~22 t/s (acceptance
 capped at 1/round in-grammar; drafts are generated inside the round
 graph and cannot be host-constrained -- split draft/verify graphs is the
-known optimization if tool-span speed ever matters).
+known optimization if tool-span speed ever matters). [P11 SHIPPED
+2026-07-03: split draft/verify graphs -- host reads the 4 drafts back and
+stages per-lane masks, verify uncapped; in-call 49 -> 204 t/s (4.2x),
+token-identical to the capped path.]
 
 **P8 -- DONE 2026-07-03: stable-prefix snapshot.** Root cause of the 7.9x
 eval wall-time: the snapshot included the volatile prompt tail
