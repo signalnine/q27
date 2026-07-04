@@ -748,6 +748,15 @@ static __device__ __forceinline__ uint32_t h2u(__half2 h) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// transposed 8x8 b16 fragment loads for the PV phase: one x2 per (n, h)
+// replaces 4 scalar smem loads + 2 packs, same bits into the mma.
+static __device__ __forceinline__ void ldm_x2_trans(uint32_t& r0, uint32_t& r1, const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
 // Split-position partials (P4): with gridDim.z = S > 1, split s covers a
 // PP-aligned slice of the tile's causal range and writes an UNNORMALIZED
 // partial {m, l, O[256]} per (q-head, token row) to `part`; a combine kernel
@@ -819,12 +828,30 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
     for (int p0 = p_lo; p0 < p_hi; p0 += PP) {
         const int np = min(PP, p_hi - p0);
         __syncthreads();
-        for (int idx = threadIdx.x; idx < PP * HD; idx += blockDim.x) {
-            int pp = idx / HD, d = idx % HD;
-            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d;
+        // vectorized staging: 8 KV elements per load (uint2 for fp8, uint4
+        // for fp16), same converted bits as the old elementwise path
+        for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
+            int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
             bool ok = pp < np;
-            s_k[pp * LDH + d] = ok ? kv2h(kc[off]) : __float2half_rn(0.f);
-            s_v[pp * LDH + d] = ok ? kv2h(vc[off]) : __float2half_rn(0.f);
+            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+            CT kraw[8], vraw[8];
+            __half2* kd = (__half2*)(s_k + pp * LDH + d8);
+            __half2* vd = (__half2*)(s_v + pp * LDH + d8);
+            if (ok) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) { kraw[j] = kc[off + j]; vraw[j] = vc[off + j]; }
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    kd[j] = __halves2half2(kv2h(kraw[2 * j]), kv2h(kraw[2 * j + 1]));
+                    vd[j] = __halves2half2(kv2h(vraw[2 * j]), kv2h(vraw[2 * j + 1]));
+                }
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    kd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                    vd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                }
+            }
         }
         __syncthreads();
 
@@ -921,14 +948,12 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
         }
 #pragma unroll
         for (int n = 0; n < 32; n++) {
-            const int d0 = n * 8 + gid;
+            const int d0 = n * 8;
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-                const int kp = h * 16 + tg * 2;
-                uint32_t b0 =
-                    h2u(__halves2half2(s_v[kp * LDH + d0], s_v[(kp + 1) * LDH + d0]));
-                uint32_t b1 =
-                    h2u(__halves2half2(s_v[(kp + 8) * LDH + d0], s_v[(kp + 9) * LDH + d0]));
+                const int kp0 = h * 16;
+                uint32_t b0, b1;
+                ldm_x2_trans(b0, b1, s_v + (kp0 + (lane & 15)) * LDH + d0);
                 mma_f16(o[n][0], o[n][1], o[n][2], o[n][3], pa[h][0], pa[h][1], pa[h][2],
                         pa[h][3], b0, b1, o[n][0], o[n][1], o[n][2], o[n][3]);
             }
