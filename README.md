@@ -2,6 +2,21 @@
 
 A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
+## State of the engine (2026-07-03)
+
+- Decode: **177.5 t/s** stock short-bench / **213.2** stock 2K soak / **218.6**
+  at +3000 OC soak (labels defined in "Decode methodology" -- not interchangeable)
+- Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start)
+- Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
+- Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30 trials/leg);
+  the +3.05% PPL gap does not appear in agentic coding
+- Agentic wall time: **~3-4x** llama.cpp, down from 7.9x -- five-mode tool-drift
+  catalog closed by P7 constrained decoding + tolerant parser recovery; warm
+  turns via P8 stable-prefix + P9 same-session checkpoint caches
+- Server defaults: fp8 KV (opt out `--kv-fp16`); `--constrain-tools` available
+- Active: P10-A fused 2-slot serving, decided 2026-07-03
+  (docs/P10-decision.md), staged behind an A0 go/no-go microbench
+
 ## Why this model is a good target
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
@@ -25,6 +40,9 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 | MTP | 1 nextn layer: eh_proj [10240->5120] combines (embedding, hidden) -> full attn + FFN -> shared lm_head |
 | context | 262144 native |
 
+Per-layer forward-pass semantics (extracted from llama.cpp source, not from
+summaries): docs/SPEC.md.
+
 ## Performance model
 
 5090 GDDR7 ~1.79 TB/s. Single-stream decode is weight-read-bound.
@@ -34,7 +52,7 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 | llama.cpp Q5_K_M (62% BW eff) | 18.2 GB | 61.6 t/s measured | 106-127 t/s measured |
 | q27 Q5-class, 85-90% eff | ~18 GB | ~88 t/s | ~165 |
 | q27 custom 4-bit at 85-90% eff | ~14.8 GB | ~103-109 t/s | ~200-225 |
-| q27 4-bit **measured** (2026-07-02, +4000 OC) | ~15.5 GB/step | **91.0 t/s plain** (~75% eff) | **188.9** (depth-3 spec, 2.07x) |
+| q27 4-bit **measured** (2026-07-02, +4000 OC) | ~15.5 GB/step | **91.0 t/s plain** (~75% eff) | **188.9** (depth-3 spec, 2.07x) [superseded -- see Decode methodology] |
 
 The original "~120 t/s ceiling" row implied ~99% BW efficiency and is retired.
 Plain decode sits ~15% under the honest 85-90% ceiling; that tail is GDN
@@ -82,10 +100,10 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
 
 ## Design decisions
 
-- **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF.
+- **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF (container spec: docs/FORMAT.md).
 - **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships opt-in via `Q27_KV=fp8` (P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
-- **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline repack tool is Python (runs once).
+- **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline tools are Python: tools/repack.py (runs once; docs/FORMAT.md) and tools/gguf_to_hf.py (certified GGUF -> HF inversion, 866/866 tensors byte-exact, for cross-engine reference runs).
 - **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
 
 ## Milestones
@@ -105,7 +123,8 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
   = 83.7% offline (docs/E6-design.md), so the round always drafts 3 and
   batch-4-verifies {pending, d1, d2, d3}. 4 GDN buffers under a mod-4 role
   permutation, 4 captured graphs. 3.12 tok/round, **188.9 t/s** @2k
-  (204.8 long-gen); 8000-token output bit-identical to depth-2. Also fixed
+  (204.8 long-gen) [superseded -- P3 depth-4; see Decode methodology];
+  8000-token output bit-identical to depth-2. Also fixed
   two latent bugs found en route: flash-decode scratch under-allocation at
   ctx<4128, and missing ctx guard letting spec rounds write KV rows past
   max_ctx (silent corruption the prefix cache could then reuse).
@@ -142,10 +161,15 @@ wire_api = "responses"
 Model tool protocol: tools rendered as JSON in the system `<tools>` block per
 the qwen35 chat template; `<tool_call>` output parsed by a streaming splitter
 (src/stream_split.h) that also routes `<think>`. Single slot (spec decode is
-single-stream), greedy sampling. `--fast-head` trades output exactness for
+single-stream; multi-slot is the active P10-A item, docs/P10-decision.md).
+Greedy sampling only; sampled decode is designed but not built
+(docs/sampling-design.md). `--fast-head` trades output exactness for
 ~7% more t/s.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
+
+Chronological -- each row supersedes the previous. Current canonical numbers
+live in "Decode methodology" above.
 
 | change | t/s |
 |---|---|
@@ -176,7 +200,7 @@ single-stream), greedy sampling. `--fast-head` trades output exactness for
 | P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
 | P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
 | P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
-| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s**; 128K prefill ~78 -> ~57s; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
+| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [does not reconcile with P6's fp16-KV 117.6s -- see roadmap open verification]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
 | P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method); split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
@@ -215,9 +239,11 @@ sub-batches; MTP warm skips attention/FFN (only the K/V stores matter).
 **Prefix cache (M6.5)**: GDN state + conv rings snapshotted after prefill
 (attention/MTP KV rows are append-only, so prefix rows stay valid); next
 request LCP-matches the snapshot and prefills only the suffix. Claude Code
-turn 2 on a 26.7k-token context: **1.3s** (26,670/26,693 tokens reused).
-Unconditionally correct: any mismatch falls back to full prefill; warm-vs-cold
-continuations gated identical.
+turn 2 on a 26.7k-token context: **1.3s** (26,670/26,693 tokens reused)
+[superseded -- see P8: this gate replayed raw tokens, a flow no real client
+takes; re-rendering clients missed the cache 100% of the time until the P8
+stable-prefix snapshot]. Unconditionally correct: any mismatch falls back to
+full prefill; warm-vs-cold continuations gated identical.
 
 Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 | | TTFT |
@@ -227,6 +253,9 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 | + coalesced attention prefill | 90s |
 | + GEMM tuning + FA-lite attention | 61s |
 | turn 2+ with prefix cache | **1.3s** |
+
+[historical -- cold 28.5K TTFT is ~15.0s after P1-P6; the warm-turn number
+required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap (reordered 2026-07-02 after external review)
 

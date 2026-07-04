@@ -379,6 +379,91 @@ static void test_kv_fp8_store() {
     CUDA_CHECK(cudaFree(d_pos));
 }
 
+// P10-A0 go/no-go: does the n-lane GEMV scale to 10 lanes, or do registers/
+// BW break it? Compare t(N=10) vs 2x t(N=5) on (a) the Q8 verify head
+// (248320x5120, 1.27GB -- streams past L2) and (b) Q4 ffn_gate ROTATING over
+// 4 distinct layers (a single 45MB tensor sits hot in the 96MB L2 and lies
+// about weight streaming -- paid-for lesson). Ratio <= ~1.3 => fusion pays.
+static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
+    const int REPS = 30;
+    q27k::XQuant qs[10];
+    float* ys[10];
+    const int64_t cols = 5120;
+    std::vector<float> x = rand_vec(cols, 91);
+    float* d_x;
+    CUDA_CHECK(cudaMalloc(&d_x, cols * 4));
+    CUDA_CHECK(cudaMemcpy(d_x, x.data(), cols * 4, cudaMemcpyHostToDevice));
+    for (int i = 0; i < 10; i++) {
+        qs[i] = q27k::xquant_alloc(cols);
+        q27k::quantize_x(d_x, cols, qs[i]);
+        CUDA_CHECK(cudaMalloc(&ys[i], 248320 * 4));
+    }
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaEventCreate(&e0));
+    CUDA_CHECK(cudaEventCreate(&e1));
+    auto timeit = [&](auto&& fn) {
+        fn(); // warm
+        CUDA_CHECK(cudaEventRecord(e0));
+        for (int r = 0; r < REPS; r++) fn();
+        CUDA_CHECK(cudaEventRecord(e1));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+        return (double)ms / REPS;
+    };
+    // (a) Q8 verify head
+    const q27::DevTensor& hd = dm.upload("output.weight");
+    const q27::Tensor& ht = m.get("output.weight");
+    double h5 = timeit([&] {
+        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 5, ys,
+                        ht.rows(), cols, 0);
+        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs + 5, 5, ys + 5,
+                        ht.rows(), cols, 0);
+    });
+    double h10 = timeit([&] {
+        q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 10, ys,
+                        ht.rows(), cols, 0);
+    });
+    printf("  gemv10 head Q8: 2x5=%.3fms 1x10=%.3fms ratio(10 vs 2x5)=%.2f\n", h5, h10,
+           h10 / h5);
+    // (b) Q4 ffn_gate rotating 4 layers
+    const char* names[4] = {"blk.0.ffn_gate.weight", "blk.1.ffn_gate.weight",
+                            "blk.2.ffn_gate.weight", "blk.4.ffn_gate.weight"};
+    const q27::DevTensor* fd[4];
+    for (int i = 0; i < 4; i++) fd[i] = &dm.upload(names[i]);
+    const q27::Tensor& ft = m.get(names[0]);
+    int rot5 = 0, rot10 = 0;
+    double f5 = timeit([&] {
+        const q27::DevTensor* t = fd[rot5++ & 3];
+        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 5, ys,
+                        ft.rows(), cols, 0);
+        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs + 5, 5, ys + 5,
+                        ft.rows(), cols, 0);
+    });
+    double f10 = timeit([&] {
+        const q27::DevTensor* t = fd[rot10++ & 3];
+        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, 10, ys,
+                        ft.rows(), cols, 0);
+    });
+    printf("  gemv10 ffn Q4 (L2-rotated): 2x5=%.3fms 1x10=%.3fms ratio=%.2f\n", f5, f10,
+           f10 / f5);
+    // correctness: lane 7 of a fresh 10-lane HEAD run == a plain 1-lane gemv
+    // (must re-run the head here -- the ffn bench above overwrote ys[])
+    q27k::gemv_q8_n((const int8_t*)hd.data, (const __half*)hd.scales, qs, 10, ys, ht.rows(),
+                    cols, 0);
+    std::vector<float> got(128), ref(128);
+    CUDA_CHECK(cudaMemcpy(got.data(), ys[7], 128 * 4, cudaMemcpyDeviceToHost));
+    q27k::gemv_q8((const int8_t*)hd.data, (const __half*)hd.scales, qs[7], ys[0], ht.rows(),
+                  cols, 0);
+    CUDA_CHECK(cudaMemcpy(ref.data(), ys[0], 128 * 4, cudaMemcpyDeviceToHost));
+    double maxd = 0;
+    for (int i = 0; i < 128; i++) maxd = std::max(maxd, (double)std::fabs(got[i] - ref[i]));
+    check("gemv10 lane7 == single-lane gemv (bitwise)", maxd, 1e-30);
+    for (int i = 0; i < 10; i++) CUDA_CHECK(cudaFree(ys[i]));
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaEventDestroy(e0)); CUDA_CHECK(cudaEventDestroy(e1));
+}
+
 // P7: masked argmax -- argmax restricted to grammar-legal tokens via a
 // resident bitmask pool + per-slot mask ids. mask id -1 (or null pool) must
 // match plain argmax BITWISE (canonical gate depends on it).
@@ -691,6 +776,7 @@ int main(int argc, char** argv) {
     test_attn_split();
     test_delta_split();
     test_masked_argmax();
+    test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();
     test_rmsnorm(m);
