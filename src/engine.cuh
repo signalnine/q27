@@ -748,8 +748,12 @@ struct Engine {
     // staged mid-round, so activate the split path instead of capping.
     void set_tool_constraint(int mask_id) {
         h_mask_id0 = mask_id;
-        static const bool nosplit = getenv("Q27_TOOL_NOSPLIT") != nullptr; // gate A/B
-        tool_split_active = (mask_id >= 0) && (bool)on_drafts && !nosplit;
+        // P11 split path is OPT-IN (Q27_TOOL_SPLIT=1): it 4.2x's in-call decode
+        // but has a correctness bug at real multi-turn/long-ctx state that the
+        // short-context gates missed (drifts to <content>, disengages, spews
+        // garbage). Default = the safe capped path until the bug is fixed.
+        static const bool split_ok = getenv("Q27_TOOL_SPLIT") != nullptr;
+        tool_split_active = (mask_id >= 0) && (bool)on_drafts && split_ok;
         // cap only when constraining WITHOUT the split path (P7 v1 fallback)
         h_cap0 = (mask_id >= 0 && !tool_split_active) ? 1 : 0;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, &h_mask_id0, 4, cudaMemcpyHostToDevice, stm));
