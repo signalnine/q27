@@ -1013,6 +1013,29 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_P, 0, 4));
     }
 
+    // Router-facing reuse probe: length of the prompt prefix this engine can
+    // restore without re-prefill -- the stable snapshot when the prompt
+    // STRICTLY extends it (same predicate as generate(): have_snap and
+    // snap_toks.size() <= NP-1), else the best P9 checkpoint whose covered
+    // prefix matches. 0 = nothing reusable. Must stay in lockstep with
+    // generate()'s hit logic; the multi-slot server routes on this.
+    int reuse_len(const std::vector<int>& prompt) const {
+        int NP = (int)prompt.size();
+        if (have_snap && (int)snap_toks.size() <= NP - 1 &&
+            std::equal(snap_toks.begin(), snap_toks.end(), prompt.begin()))
+            return (int)snap_toks.size();
+        int ck = ckpt_best(prompt);
+        return ck >= 0 ? (int)ckpts[ck].toks.size() : 0;
+    }
+    // True when this engine holds no conversation state worth preserving
+    // (fresh slot, or last request took the serial path which clears both).
+    bool cache_empty() const {
+        if (have_snap || !snap_toks.empty()) return false;
+        for (auto& c : ckpts)
+            if (!c.toks.empty()) return false;
+        return true;
+    }
+
     void snap_save(const std::vector<int>& prompt, int upto = -1) {
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
@@ -1158,7 +1181,15 @@ struct Engine {
             step_with(prompt[NP - 1]);
         } else {
             reset();
-            have_snap = false; // serial path resets state without re-snapshotting
+            // Serial path leaves no reusable cache: clear the snapshot AND the
+            // checkpoint ring (Ckpt contract: the KV rows under a checkpoint
+            // must still describe its conversation -- this prefill overwrites
+            // them). Stale snap_toks/ckpts here let multi-slot routing send an
+            // old conversation back to a dead slot and ckpt_restore over
+            // foreign KV rows (R1 review finding).
+            have_snap = false;
+            snap_toks.clear();
+            ckpt_clear();
             gs.pf = NP;
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);

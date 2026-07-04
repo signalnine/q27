@@ -29,6 +29,15 @@ using json = nlohmann::json;
 using q27::Msg;
 using q27::StreamSplitter;
 
+// Serialize with invalid-UTF-8 replacement: json::dump's strict default
+// throws type_error.316, and an uncaught throw in a handler or streaming
+// lambda is std::terminate. The Utf8Gate on every generation pipeline keeps
+// split characters intact; this is the backstop for everything else.
+// File-scope on purpose -- helpers with explicit capture lists use it too.
+static std::string jdump(const json& j) {
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
 // P7: per-request constrained tool decoding. Watches emitted token ids;
 // on <tool_call> it activates the grammar and drives Engine slot-0 masks
 // per accepted token. The token already pending when <tool_call> appears was
@@ -230,8 +239,9 @@ int main(int argc, char** argv) {
             // + slack; skip extra slots rather than abort on cudaMalloc
             size_t freeb = 0, totalb = 0;
             cudaMemGetInfo(&freeb, &totalb);
-            const char* kve = getenv("Q27_KV");
-            size_t kvb = (size_t)sctx * 68 * 1024 / ((kve && !strcmp(kve, "fp16")) ? 1 : 2);
+            // KV bytes/token from the engine's own sizing (34 KB at 1-byte
+            // elements, 68 KB fp16) -- slots[0] is always constructed first
+            size_t kvb = (size_t)sctx * 34 * 1024 * slots[0].eng->kv_esz();
             size_t need = (3500ull << 20) + kvb + (kvb >> 3) + (512ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
@@ -248,6 +258,9 @@ int main(int argc, char** argv) {
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
     }
+    // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
+    int max_slot_ctx = 0;
+    for (auto& s : slots) max_slot_ctx = std::max(max_slot_ctx, s.eng->max_ctx);
     const int EOS = tok.eos();
     // P7 shared mask cache (guarded by the gpu mutex; pool ids are per-slot)
     std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
@@ -330,40 +343,36 @@ int main(int argc, char** argv) {
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", slot_id, ms_since(srv_t0));
     };
-    // R1 routing (call under the gpu lock). Tiers: a slot whose snapshot the
-    // prompt EXTENDS wins (longest snapshot on ties) > an empty slot (never
-    // evict a live conversation when a free slot exists) > LRU eviction.
-    // Slots too small for the prompt are ineligible; if none fits, slot 0
-    // takes it and generate() refuses cleanly past max_ctx.
+    // R1 routing (call under the gpu lock). Tiers: a slot that can actually
+    // restore a prefix of this prompt (Engine::reuse_len -- snapshot extension
+    // or a P9 checkpoint, the same predicate generate() honors) > an empty
+    // slot (never evict a live conversation when a free one exists) > LRU
+    // eviction. Slots that cannot hold the prompt are ineligible; if none
+    // fits, the LARGEST slot takes it -- generate() refuses NP > max_ctx
+    // cleanly with state untouched, so no LRU stamp for that case.
     long slot_use_counter = 0;
     auto pick_slot = [&](const std::vector<int>& prompt) -> Slot& {
         Slot* best = nullptr;
-        int best_tier = -1;
-        size_t best_key = 0;
+        int best_tier = -1, best_key = 0;
         for (auto& s : slots) {
-            if ((int)prompt.size() + 64 > s.eng->max_ctx) continue;
-            const auto& st = s.eng->snap_toks;
-            size_t L = 0, n = std::min(st.size(), prompt.size());
-            while (L < n && st[L] == prompt[L]) L++;
-            int tier = (!st.empty() && L == st.size()) ? 2 : st.empty() ? 1 : 0;
-            size_t key = tier == 2 ? st.size() : 0;
+            if ((int)prompt.size() > s.eng->max_ctx) continue;
+            int rl = s.eng->reuse_len(prompt);
+            int tier = rl > 0 ? 2 : s.eng->cache_empty() ? 1 : 0;
             bool better;
             if (!best) better = true;
             else if (tier != best_tier) better = tier > best_tier;
-            else if (tier == 2) better = key > best_key;
+            else if (tier == 2) better = rl > best_key;
             else better = s.last_used < best->last_used;
-            if (better) { best = &s; best_tier = tier; best_key = key; }
+            if (better) { best = &s; best_tier = tier; best_key = rl; }
         }
-        if (!best) best = &slots[0];
+        if (!best) {
+            Slot* big = &slots[0];
+            for (auto& s : slots)
+                if (s.eng->max_ctx > big->eng->max_ctx) big = &s;
+            return *big;
+        }
         best->last_used = ++slot_use_counter;
         return *best;
-    };
-    // Serialize with invalid-UTF-8 replacement: json::dump's strict default
-    // throws type_error.316, and an uncaught throw here is std::terminate.
-    // The Utf8Gate on every generation pipeline keeps split characters intact;
-    // this is the backstop for anything else.
-    auto jdump = [](const json& j) {
-        return j.dump(-1, ' ', false, json::error_handler_t::replace);
     };
 
     httplib::Server srv;
@@ -427,7 +436,8 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = build_prompt(body);
         ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
                     std::chrono::steady_clock::now(), ms_since(tk0)};
-        if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
+        if ((int)prompt.size() + n_max > max_slot_ctx)
+            n_max = max_slot_ctx - (int)prompt.size();
         long created = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
                            .count();
@@ -440,6 +450,8 @@ int main(int argc, char** argv) {
             double qw = ms_since(rt.t0);
             Slot& sl = pick_slot(prompt);
             Engine& eng = *sl.eng;
+            // re-clamp to the routed slot (rows P+1..P+6 must stay in ctx)
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             std::string text;
             q27::Utf8Gate ugate;
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
@@ -472,6 +484,8 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 Slot& sl = pick_slot(prompt);
                 Engine& eng = *sl.eng;
+                const int nm =
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 auto send = [&](const json& j) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -485,10 +499,10 @@ int main(int argc, char** argv) {
                     return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
                                 {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})}};
                 };
-                eng.generate(prompt, n_max, EOS, [&](int id) {
-                    std::string piece = ugate.feed(tok.decode_one(id));
-                    if (piece.empty()) return true;
-                    return send(piece_chunk(piece));
+                eng.generate(prompt, nm, EOS, [&](int id) {
+                    // empty pieces (control tokens, gate holdbacks) still probe
+                    // the socket so a disconnected client stops generation
+                    return send(piece_chunk(ugate.feed(tok.decode_one(id))));
                 });
                 std::string tailp = ugate.flush();
                 if (!tailp.empty()) send(piece_chunk(tailp));
@@ -594,7 +608,8 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
                 std::chrono::duration<double, std::milli>(tk2 - tk1).count(),
                 rendered.size(), prompt.size());
-        if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
+        if ((int)prompt.size() + n_max > max_slot_ctx)
+            n_max = max_slot_ctx - (int)prompt.size();
         long rid = req_counter++;
         std::string mid = "msg_q27_" + std::to_string(rid);
         ReqTrace rt{rid, "anth", conv_fp(body), std::chrono::steady_clock::now(),
@@ -605,6 +620,7 @@ int main(int argc, char** argv) {
             double qw = ms_since(rt.t0);
             Slot& sl = pick_slot(prompt);
             Engine& eng = *sl.eng;
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             StreamSplitter sp;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -690,6 +706,8 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 Slot& sl = pick_slot(prompt);
                 Engine& eng = *sl.eng;
+                const int nm =
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
@@ -755,7 +773,7 @@ int main(int argc, char** argv) {
                     ev("content_block_delta",
                        {{"type", "content_block_delta"}, {"index", ti},
                         {"delta", {{"type", "input_json_delta"},
-                                   {"partial_json", c.arguments.dump()}}}});
+                                   {"partial_json", jdump(c.arguments)}}}});
                     ev("content_block_stop", {{"type", "content_block_stop"}, {"index", ti}});
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
@@ -776,7 +794,7 @@ int main(int argc, char** argv) {
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
-                int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
+                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
                     return true;
@@ -811,7 +829,7 @@ int main(int argc, char** argv) {
                             ev("content_block_delta",
                                {{"type", "content_block_delta"}, {"index", ti},
                                 {"delta", {{"type", "input_json_delta"},
-                                           {"partial_json", bc.arguments.dump()}}}});
+                                           {"partial_json", jdump(bc.arguments)}}}});
                             ev("content_block_stop",
                                {{"type", "content_block_stop"}, {"index", ti}});
                         }
@@ -825,7 +843,7 @@ int main(int argc, char** argv) {
                 }
                 close_block();
                 const char* sr = any_call ? "tool_use"
-                                          : (produced >= n_max ? "max_tokens" : "end_turn");
+                                          : (produced >= nm ? "max_tokens" : "end_turn");
                 ev("message_delta", {{"type", "message_delta"},
                                      {"delta", {{"stop_reason", sr}, {"stop_sequence", nullptr}}},
                                      {"usage", {{"output_tokens", produced}}}});
@@ -886,17 +904,7 @@ int main(int argc, char** argv) {
         std::vector<Msg> msgs;
         if (body.contains("instructions") && body["instructions"].is_string())
             msgs.push_back({"system", body["instructions"]});
-        auto part_text = [](const json& content) {
-            std::string out;
-            if (content.is_string()) return content.get<std::string>();
-            if (content.is_array())
-                for (auto& p : content) {
-                    std::string pt = p.value("type", "");
-                    if (pt == "input_text" || pt == "output_text" || pt == "text")
-                        out += p.value("text", "");
-                }
-            return out;
-        };
+        // content flattening shared with conv_fp (text_of above)
         if (body.contains("input")) {
             if (body["input"].is_string()) {
                 msgs.push_back({"user", body["input"]});
@@ -906,7 +914,7 @@ int main(int argc, char** argv) {
                     if (ty == "message") {
                         std::string role = it.value("role", "user");
                         if (role == "developer") role = "system";
-                        msgs.push_back({role, part_text(it["content"])});
+                        msgs.push_back({role, text_of(it["content"])});
                     } else if (ty == "function_call" || ty == "custom_tool_call") {
                         json args;
                         if (ty == "function_call") {
@@ -921,7 +929,7 @@ int main(int argc, char** argv) {
                         std::string out;
                         if (it.contains("output")) {
                             if (it["output"].is_string()) out = it["output"];
-                            else out = part_text(it["output"]);
+                            else out = text_of(it["output"]);
                         }
                         msgs.push_back({"user", q27::tool_response_text(out)});
                     }
@@ -945,7 +953,8 @@ int main(int argc, char** argv) {
             tok.encode(q27::chatml_prompt(merged, tools, !no_think_srv));
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
-        if ((int)prompt.size() + n_max > ctx) n_max = ctx - (int)prompt.size();
+        if ((int)prompt.size() + n_max > max_slot_ctx)
+            n_max = max_slot_ctx - (int)prompt.size();
         if (n_max <= 0) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
             res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}",
@@ -999,12 +1008,12 @@ int main(int argc, char** argv) {
                     std::string input = c.arguments.is_object() && c.arguments.contains("input") &&
                                                 c.arguments["input"].is_string()
                                             ? c.arguments["input"].get<std::string>()
-                                            : c.arguments.dump();
+                                            : jdump(c.arguments);
                     it = {{"type", "custom_tool_call"}, {"call_id", cid}, {"name", c.name},
                           {"input", input}};
                 } else {
                     it = {{"type", "function_call"}, {"call_id", cid}, {"name", c.name},
-                          {"arguments", c.arguments.dump()}};
+                          {"arguments", jdump(c.arguments)}};
                 }
                 items.push_back(it);
                 return it;
@@ -1017,6 +1026,7 @@ int main(int argc, char** argv) {
             double qw = ms_since(rt.t0);
             Slot& sl = pick_slot(prompt);
             Engine& eng = *sl.eng;
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
@@ -1064,6 +1074,8 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 Slot& sl = pick_slot(prompt);
                 Engine& eng = *sl.eng;
+                const int nm =
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
@@ -1119,12 +1131,12 @@ int main(int argc, char** argv) {
                             c.arguments.is_object() && c.arguments.contains("input") &&
                                     c.arguments["input"].is_string()
                                 ? c.arguments["input"].get<std::string>()
-                                : c.arguments.dump();
+                                : jdump(c.arguments);
                         item_done({{"type", "custom_tool_call"}, {"call_id", cid},
                                    {"name", c.name}, {"input", input}});
                     } else {
                         item_done({{"type", "function_call"}, {"call_id", cid}, {"name", c.name},
-                                   {"arguments", c.arguments.dump()}});
+                                   {"arguments", jdump(c.arguments)}});
                     }
                 };
                 auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
@@ -1144,7 +1156,7 @@ int main(int argc, char** argv) {
                 };
                 StreamSplitter sp;
                 q27::Utf8Gate ugate;
-                int produced = eng.generate(prompt, n_max, EOS, [&](int id) {
+                int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
                     return true;
                 });

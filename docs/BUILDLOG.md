@@ -406,7 +406,7 @@ Code + subagents, long CRUSH tasks), not the bench-time-tracker sprint. R0 =
 instrument, measure, rank levers. Codex-suggested improvements evaluated
 against measurements below.
 
-**Shipped (commits 8b73164, 1f5480e-region, 60bc172):**
+**Shipped (commits 8b73164, 6960d83, 60bc172):**
 - `[req]` per-request stderr line, all six API call sites: conv fingerprint
   (fnv1a64 system+first-user), qw_ms queue wait, tok_ms render+encode,
   prompt/hit/ckpt/pf tokens, pf_ms, dec/dec_ms, cb_ms (client-write time
