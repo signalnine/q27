@@ -15,14 +15,16 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   turns via P8 stable-prefix + P9 same-session checkpoint caches
 - Server defaults: fp8 KV (opt out `--kv-fp16`); `--constrain-tools` available
 - Active: P10-A fused 2-slot serving, decided 2026-07-03
-  (docs/P10-decision.md), staged behind an A0 go/no-go microbench
+  (docs/P10-decision.md). A0 go/no-go PASSED same day: 10-lane verify-head
+  GEMV costs 0.52x of 2x5 -- the weight stream fully amortizes across slots.
+  Next: A1 per-slot state + interleaved scheduler, then A2 fusion
 
 ## Why this model is a good target
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
 - Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~355K (was ~370K before P3's 5th GDN buffer set) -- the advertised 262K native fits** (allocates and runs; correctness validated to 361K, see risk 5)
-- The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see roadmap)
+- The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
 - Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
 
 ## Architecture facts (ground truth from GGUF metadata)
@@ -219,8 +221,8 @@ explanation that fits. **Resolution: the daily offset is now +3000
 183.1 stock. The marginal band above +3000 bought ~0.4% and produced the
 soft error.** +4000 only for short supervised benches. A device-side
 weight-checksum tool (verify after load, recheck on demand) is on the
-roadmap as the detection mechanism. Offset is volatile -- reapply after
-reboot.
+roadmap as the detection mechanism [shipped in P1.5: `--verify-weights` /
+`/health?verify=1`]. Offset is volatile -- reapply after reboot.
 
 ## Prefill (M6)
 
@@ -257,15 +259,50 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 [historical -- cold 28.5K TTFT is ~15.0s after P1-P6; the warm-turn number
 required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
-## Roadmap (reordered 2026-07-02 after external review)
+## Roadmap
 
-Context for the ordering: decode is in good shape (see "Decode methodology"
-above for the canonical numbers -- 177.5 stock short-bench / 218.6 OC soak;
-the 188.9 in this section's history is the depth-3-era +4000 short bench;
-three consecutive micro-opt attempts on the remaining tail came back
-negative). The user-visible gaps are cold prefill (~8x behind the fork's
-tensor-core GEMM; 61s cold TTFT @26.7K, warm turns 1.3s via prefix cache) and
-two advertised claims with no measurement behind them. Cheapest-blocking-first:
+**Active: P10-A -- fused 2-slot batch-10 serving.** Decided 2026-07-03; the
+A/B/C analysis (fused vs vLLM-routing vs interleaved-only, all measured
+comparisons) is docs/P10-decision.md. Staged, with a measured gate at each
+step:
+- A0 go/no-go microbench: does one weight stream feed 10 verify lanes at
+  ~2x aggregate? Kill the plan if the 5 -> 10 lane scaling doesn't hold
+  (the 4 -> 5 step cost +14% round tax, P3).
+- A1 per-slot state + interleaved scheduling -- useful alone for agentic
+  tool-wait overlap, and a prerequisite for fusion either way.
+- A2 fused batch-10 verify (graph indirection + 10-lane GEMVs + per-lane KV).
+Prerequisite already shipped: server defaults to fp8 KV (2026-07-03).
+
+**Next up: sampling** -- temperature/top-p with rejection-sampled spec
+acceptance; the greedy path stays bitwise untouched. Design:
+docs/sampling-design.md.
+
+**Measured and parked:**
+- depth-5: nets ~+2-4% @2K for ~+12-14% round cost (measurement in the build
+  log below); precondition for ANY depth change = think-heavy/high-entropy
+  acceptance measurement
+- split draft/verify graphs (lifts the ~22 t/s in-grammar tool-span cap, P7)
+- chunked-WY delta scan
+- cross-session checkpoint pool (P9 covers same-session)
+- importance-weighted scales, AWQ-style (only path left on the +3.05% PPL
+  gap -- see risk 2; Thunderdome says the gap doesn't bite on agentic coding)
+
+**Open verification:** the P5-era "128K prefill ~57s" does not reconcile with
+P6's direct fp16-KV measurement (117.6s); the ~57s was likely extrapolated
+from fp8-KV runs. Re-measure 128K under fp8 before using it in any
+cross-engine comparison.
+
+## Build log (chronological)
+
+Context for the 2026-07-02 reordering: decode is in good shape (see "Decode
+methodology" above for the canonical numbers -- 177.5 stock short-bench /
+218.6 OC soak; the 188.9 in this section's history is the depth-3-era +4000
+short bench; three consecutive micro-opt attempts on the remaining tail came
+back negative). The user-visible gaps are cold prefill (~8x behind the fork's
+tensor-core GEMM; 61s cold TTFT @26.7K, warm turns 1.3s via prefix cache
+[superseded -- P1-P6 cut cold 28.5K TTFT to ~15.0s; P8 fixed the warm-turn
+cache]) and two advertised claims with no measurement behind them.
+Cheapest-blocking-first:
 
 **P0 -- claims gates: DONE 2026-07-02.**
 - Long-context: validated to 64K (risk 5: flat NLL-by-position, +2.0%
@@ -344,8 +381,8 @@ noise); `--nll-long 65536` buckets flat and within 0.3% of fp16; needle 3/3
 @55K through the server; logit A/B @512-tok prompt: cosine 0.9995, top-1
 exact, KL 3.4e-5; pf/pfcache identical under fp8; acceptance 3.64 vs 3.67
 t/round (-1% @2K soak). Wins: decode @28.5K ctx 105.7 -> 117.2 t/s (+11%),
-alloc ceiling ~180K -> ~370K (262K native allocates and runs; cold TTFT
-unchanged). Risk-6 tolerance-gate machinery now exists for future fp paths.
+alloc ceiling ~180K -> ~370K [superseded -- P3's 5th GDN buffer set: ~355K]
+(262K native allocates and runs; cold TTFT unchanged). Risk-6 tolerance-gate machinery now exists for future fp paths.
 Correctness then validated to the new ceiling (see risk 5): fp16-vs-fp8 NLL
 A/B flat to 160K (+-0.06% per bucket), fp8 NLL flat to 370K on a 783K-token
 corpus, needle 6/6 on a 361.5K-token haystack including two placements
@@ -398,7 +435,9 @@ row) and k_attn_pf_combine merges (flash-decode's trick applied to prefill).
 nsplit auto-scales with depth ((base+SB)/4096, capped 8, Q27_PF_SPLIT
 overrides; 1 = bit-identical pre-split path, always used at short ctx).
 Partials scratch 51 MB; combine cost 0.1%. Measured: attention kernel
-6.01s -> 3.12s @26.6K (1.93x); 128K prefill wall ~153s -> ~78s (1.96x); cold
+6.01s -> 3.12s @26.6K (1.93x); 128K prefill wall ~153s -> ~78s (1.96x)
+[method differs from P6's fp16-KV kvstats numbers -- see roadmap open
+verification]; cold
 28.5K TTFT 24.7s -> 21.4s (attention is only ~27% there); cold 361.5K
 1324s -> 764s (1.73x, ~12.6 min) with the deep needle still retrieving
 exactly. Gates: unit split=5-vs-1 at 1.9e-5 (empty tail slices exercised),
@@ -408,7 +447,8 @@ needle 3/3 @55K with verbatim-identical answers. Remaining long-ctx costs:
 delta_scan_T (~50s @361K), GEMM tile tuning at short ctx.
 
 **P5 -- DONE 2026-07-02: GEMM tile tuning (prefill GEMM -36%/-48%, cold
-28.5K TTFT 21.4s -> 16.8s, short-prompt prefill 1388 -> 1790 t/s).**
+28.5K TTFT 21.4s -> 16.8s [superseded -- P6: 15.0s], short-prompt prefill
+1388 -> 1790 t/s).**
 Ladder, each step measured on an ffn_gate micro (17408x5120, T=256):
 1. Grid swap (token blocks on blockIdx.x): the old row-major schedule
    re-read weights from DRAM once per 32-token block (8x traffic at T=256);
@@ -425,7 +465,9 @@ Negatives (local optimum, do not retry): __launch_bounds__ 3 blocks/SM
 (spills, 254), double-buffered smem at NT=64 (225) and NT=32 (237).
 In-engine @26.6K: Q4 GEMM 9.78 -> 6.26s, Q8 1.44 -> 0.75s; whole prefill
 GPU 22.2 -> 15.2s vs the pre-P4 morning baseline (1.46x today combined).
-128K prefill wall ~78 -> ~57s (prefill-only). All arithmetic unchanged --
+128K prefill wall ~78 -> ~57s (prefill-only) [does not reconcile with P6's
+fp16-KV 117.6s -- likely fp8-KV runs; see roadmap open verification]. All
+arithmetic unchanged --
 unit errors byte-identical, canonical md5 exact, pf/pfcache IDENTICAL,
 soak 217.0 (decode untouched). Prefill cost order @26K is now
 delta_scan_T 25% / attention 21% / Q4 GEMM 41%.
@@ -458,78 +500,83 @@ in-contract data the split matches to 5e-8. Test data must honor kernel
 input contracts before a tolerance FAIL means anything. Prefill cost order
 @26K is now Q4 GEMM ~46% / attention ~23% / delta_scan ~15%.
 
-**Next (post-P6, reordered 2026-07-02 after external review round 2):**
-1. **Task-level quality A/B -- DONE 2026-07-03.** q27 v1.4 4-bit vs Q5_K_M
-   (llama.cpp + MTP), Thunderdome standard suite T1-T10, CRUSH harness,
-   no-think + greedy both legs, n=3 per task:
-   **overall 0.786 vs 0.786 -- DEAD EVEN (30 trials/leg).**
-   Per-task deltas: collab-server +0.103 (q27), fts +0.023, task-queue
-   +0.022, plugin/ecommerce/monorepo/ssg within +-0.002, time-tracker -0.016,
-   phantom-invoice -0.063, analytics -0.073 (bimodal 0.48/0.83 on BOTH legs
-   -- task variance, not quant). Greedy determinism made n=3 near-zero
-   variance on most tasks. **The +3.05% PPL does not appear in agentic
-   coding.** What DID appear: five tool-format drift modes under no-think
-   greedy (dropped <tool_call> wrapper; unterminated JSON w/ </file> junk;
-   <content>-tagged raw values; {"tool_call": JSON-keyed opener; raw control
-   chars inside JSON strings) -- structurally masked on the llama leg by
-   grammar-constrained decoding, initially FATAL on q27 (task-queue 0.000,
-   plugin 0.185 with zero writes executed), now fully recovered by the
-   tolerant parser chain in api_common.h (17 recoveries in the final rerun,
-   scores 0.782/0.899). Verdict: the quant is clean; tool-call discipline is
-   a SERVING-LAYER property. **P7 constrained decoding SHIPPED 2026-07-03**
-   (`--constrain-tools`): ToolGrammar + lazy mask cache + slot-0 masked
-   verify + in-grammar acceptance cap + pending-token mask staging. E2E
-   clean on time-tracker 0.84 / task-queue / collab 0.836 / plugin 0.903 --
-   zero disengages, zero fallbacks needed for wrapped calls. (An early
-   deterministic "0x65 rejected" disengage was root-caused to one-token-
-   lagged masks before on_pending staging existed -- stale masks FORCE
-   illegal tokens; gone since.) In-call throughput ~22 t/s (acceptance
-   capped at 1/round in-grammar; drafts are generated inside the round
-   graph and cannot be host-constrained -- split draft/verify graphs is the
-   known optimization if tool-span speed ever matters).
-2. **P8 -- DONE 2026-07-03: stable-prefix snapshot.** Root cause of the 7.9x
-   eval wall-time: the snapshot included the volatile prompt tail
-   (assistant-open + no-think prefill), which every re-rendering client
-   replaces next turn -- divergence ~6 tokens before snapshot end, voided by
-   the all-or-nothing check -> full re-prefill EVERY turn. The old --pfcache
-   gate appended raw tokens (a flow no real client takes) and hid it since
-   M6.5. Fix: chatml_prompt reports the boundary (end of last input message,
-   always abutting <|im_start|> so split-encoding is tokenization-invariant),
-   generate() prefills in two stages and snapshots at the boundary. Gate v2
-   uses a tail-divergent turn 2: warm restore, continuations IDENTICAL.
-   Measured: collab-server trial 2434s -> 536s (4.5x), score unchanged
-   (0.836), prefix_hit=54-58K logged turn over turn -- the first real-traffic
-   cache hits this server has ever had. Wall-time refresh on the full
-   P7+P8+P9 stack (2026-07-03, worst two remaining tasks, n=3):
-   analytics-dashboard 1954s -> 667s AND score 0.641 -> 0.820 (constraint
-   fixed drift that was costing points, now beats the Q5 leg's 0.715);
-   ecommerce-backend 1025s -> 199s (score 0.518 unchanged). The 13-19x
-   pathological multipliers are now a uniform ~3-4x vs llama.cpp; the
-   residual is per-turn suffix prefill + the in-call constraint cap. Remaining for TRUE mid-history edits
-   (client compaction, edited files): periodic GDN checkpoints -- snapshot S
-   + conv rings every N tokens, restart from nearest checkpoint <= divergence
-   (llama.cpp PR #24785 / commit b9180 n_rs_seq is the reference design).
-   State is ~28 MB/layer-set snapshot.
-3. Sampling (temperature/top-p vs spec-verify acceptance).
-4. Depth-5 MEASURED (pass-5 stats rig, 2026-07-03): **p(d5|prefix4) = 96.8%**,
-   p(prefix4) = 89.0%, +0.862 t/round ungated per-position. Applying the
-   stats-vs-live discount P3 exhibited (+0.890 projected -> +3.9% live),
-   depth-5 nets **~+2-4% @2K** against ~+12-14% round cost (5th sequential
-   MTP head pass + 6-lane verify) and a 6th GDN buffer set (-610MB fp8 ctx
-   ceiling). Real but modest -- build only if decode t/s becomes the
-   priority again. Margin-gating buys little on the soak (ungated chains
-   already clean); the think-heavy/high-entropy acceptance measurement
-   remains the open question before ANY depth change ships.
-5. Known stale claim: "128K prefill ~57s" (P5 note) does not reconcile with
-   the direct fp16-KV kvstats measurement (117.6s post-P6); the ~57s was a
-   P5-era extrapolation on what were likely fp8-KV runs. Re-measure 128K
-   under fp8 before using it in any cross-engine comparison.
+**Task-level quality A/B + P7 constrained decoding -- DONE 2026-07-03.**
+q27 v1.4 4-bit vs Q5_K_M (llama.cpp + MTP), Thunderdome standard suite
+T1-T10, CRUSH harness, no-think + greedy both legs, n=3 per task:
+**overall 0.786 vs 0.786 -- DEAD EVEN (30 trials/leg).**
+Per-task deltas: collab-server +0.103 (q27), fts +0.023, task-queue
++0.022, plugin/ecommerce/monorepo/ssg within +-0.002, time-tracker -0.016,
+phantom-invoice -0.063, analytics -0.073 (bimodal 0.48/0.83 on BOTH legs
+-- task variance, not quant). Greedy determinism made n=3 near-zero
+variance on most tasks. **The +3.05% PPL does not appear in agentic
+coding.** What DID appear: five tool-format drift modes under no-think
+greedy (dropped <tool_call> wrapper; unterminated JSON w/ </file> junk;
+<content>-tagged raw values; {"tool_call": JSON-keyed opener; raw control
+chars inside JSON strings) -- structurally masked on the llama leg by
+grammar-constrained decoding, initially FATAL on q27 (task-queue 0.000,
+plugin 0.185 with zero writes executed), now fully recovered by the
+tolerant parser chain in api_common.h (17 recoveries in the final rerun,
+scores 0.782/0.899). Verdict: the quant is clean; tool-call discipline is
+a SERVING-LAYER property. **P7 constrained decoding SHIPPED 2026-07-03**
+(`--constrain-tools`): ToolGrammar + lazy mask cache + slot-0 masked
+verify + in-grammar acceptance cap + pending-token mask staging. E2E
+clean on time-tracker 0.84 / task-queue / collab 0.836 / plugin 0.903 --
+zero disengages, zero fallbacks needed for wrapped calls. (An early
+deterministic "0x65 rejected" disengage was root-caused to one-token-
+lagged masks before on_pending staging existed -- stale masks FORCE
+illegal tokens; gone since.) In-call throughput ~22 t/s (acceptance
+capped at 1/round in-grammar; drafts are generated inside the round
+graph and cannot be host-constrained -- split draft/verify graphs is the
+known optimization if tool-span speed ever matters).
+
+**P8 -- DONE 2026-07-03: stable-prefix snapshot.** Root cause of the 7.9x
+eval wall-time: the snapshot included the volatile prompt tail
+(assistant-open + no-think prefill), which every re-rendering client
+replaces next turn -- divergence ~6 tokens before snapshot end, voided by
+the all-or-nothing check -> full re-prefill EVERY turn. The old --pfcache
+gate appended raw tokens (a flow no real client takes) and hid it since
+M6.5. Fix: chatml_prompt reports the boundary (end of last input message,
+always abutting <|im_start|> so split-encoding is tokenization-invariant),
+generate() prefills in two stages and snapshots at the boundary. Gate v2
+uses a tail-divergent turn 2: warm restore, continuations IDENTICAL.
+Measured: collab-server trial 2434s -> 536s (4.5x), score unchanged
+(0.836), prefix_hit=54-58K logged turn over turn -- the first real-traffic
+cache hits this server has ever had. Wall-time refresh on the full
+P7+P8+P9 stack (2026-07-03, worst two remaining tasks, n=3):
+analytics-dashboard 1954s -> 667s AND score 0.641 -> 0.820 (constraint
+fixed drift that was costing points, now beats the Q5 leg's 0.715);
+ecommerce-backend 1025s -> 199s (score 0.518 unchanged). The 13-19x
+pathological multipliers are now a uniform ~3-4x vs llama.cpp; the
+residual is per-turn suffix prefill + the in-call constraint cap.
+Remaining for TRUE mid-history edits (client compaction, edited files):
+periodic GDN checkpoints -- snapshot S + conv rings every N tokens,
+restart from nearest checkpoint <= divergence (llama.cpp PR #24785 /
+commit b9180 n_rs_seq is the reference design). State is ~28 MB/layer-set
+snapshot. [superseded -- P9 shipped the same-session checkpoint ring,
+below; the cross-session pool stays parked]
+
+**P9 -- DONE 2026-07-03: same-session GDN checkpoint ring.** Host-pinned
+snapshots on a ring; mid-history divergence restores from the nearest
+checkpoint <= the divergence point instead of a cold re-prefill (the P8
+note's design, built). Gate: pfcache v3, warm == cold continuations
+IDENTICAL. Cross-session checkpoint pool remains parked (see roadmap).
+
+**Depth-5 gate -- MEASURED 2026-07-03, parked (pass-5 stats rig).**
+**p(d5|prefix4) = 96.8%**, p(prefix4) = 89.0%, +0.862 t/round ungated
+per-position. Applying the
+stats-vs-live discount P3 exhibited (+0.890 projected -> +3.9% live),
+depth-5 nets **~+2-4% @2K** against ~+12-14% round cost (5th sequential
+MTP head pass + 6-lane verify) and a 6th GDN buffer set (-610MB fp8 ctx
+ceiling). Real but modest -- build only if decode t/s becomes the
+priority again. Margin-gating buys little on the soak (ungated chains
+already clean); the think-heavy/high-entropy acceptance measurement
+remains the open question before ANY depth change ships.
 
 ## Risk register
 
 1. **Gated DeltaNet decode kernel** is the new risk center (was "simple dense" until we read the GGUF). llama.cpp's implementation is the semantic reference; validate per-layer.
-2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED + MITIGATED 2026-07-02** -- v1.3 measured +3.35% vs Q5_K_M (7.2135 vs 6.9797, identical tokens/protocol via `--nll`); v1.4 policy (residual writers to Q8, chosen by a 6-candidate sensitivity study -- see roadmap P0.5) lands at **7.1928 = +3.05%**, and decode got faster (+3.3%, acceptance-coupled). Still marginally over the 3% bar; the study shows uniform promotion cannot close the rest at acceptable cost (ffn_down ceiling probe: 29% of gap for +2.76 GB) -- importance-weighted scales are the documented path if ever needed. The t/s comparison remains bit-width-assisted (15.8 GB reads vs 18.2).
+2. 4-bit quality on a 27B: keep sensitive tensors high-bit, add importance-weighted scaling if PPL regresses > ~3% vs Q5_K_M. **STATUS: MEASURED + MITIGATED 2026-07-02** -- v1.3 measured +3.35% vs Q5_K_M (7.2135 vs 6.9797, identical tokens/protocol via `--nll`); v1.4 policy (residual writers to Q8, chosen by a 6-candidate sensitivity study -- see build log P0.5) lands at **7.1928 = +3.05%**, and decode got faster (+3.3%, acceptance-coupled). Still marginally over the 3% bar; the study shows uniform promotion cannot close the rest at acceptable cost (ffn_down ceiling probe: 29% of gap for +2.76 GB) -- importance-weighted scales are the documented path if ever needed. The t/s comparison remains bit-width-assisted (15.8 GB reads vs 18.2).
 3. M-RoPE sections must match exactly or long-context quality silently degrades.
 4. MTP acceptance rate must survive quantization (draft and verify disagreeing more = less speedup). STATUS: measured -- Q4 vs Q8 draft-head argmax agreement 98.1% (E3); depth-3 runtime acceptance 85.7%.
-5. **Long-context correctness: VALIDATED to 361K (2026-07-02, fp8 KV).** Original 64K validation: (a) `--nll-long 65536` flat buckets; (b) cross-engine vs llama-perplexity +2.0% at [32K,64K) (smaller than the short-context delta, so no length-dependent divergence); (c) needle 3/3 @55K. Extended after P2 with a 783K-token corpus (War and Peace, tokenized with the model's own vocab; `--nll-long` buckets now reach 320K+): (d) fp16-vs-fp8 NLL A/B at 163840, bucket deltas within +-0.06% at ALL depths (fp8 cost does not grow with position); (e) fp8 `--nll-long 370000` single pass: buckets flat 7.2-7.6 to 256K, then a graceful +3% drift beyond the native 262K (7.89 at 256-320K, 7.69 at 320K+) -- no blowup even in RoPE-extrapolation territory; (f) needle retrieval **6/6 on a 361.5K-token haystack** (depths 35K/124K/213K/248K within native + 276K/337K BEYOND native, all exact, think traces naming surrounding chapters); (g) `--kvstats 131072`: K amax 21.7 / V amax 128.4, zero E4M3 saturation at depth. Decode at 361K depth: 19.1 t/s (fp8, spec). Caveat: each distinct long prompt is a full cold prefill (~22 min @361K) -- the GDN recurrent snapshot makes the prefix cache all-or-nothing, so mid-document divergence cannot reuse state. Risk 3 is covered to 64K by (a)+(b).
-6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the roadmap's int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). **RESOLVED for fp8 KV (P2, 2026-07-02):** the tolerance-gate machinery now exists and passed -- logit A/B vs the fp16 path (cosine 0.9995, top-1 exact, KL 3.4e-5 @512-tok prompt), corpus PPL delta -0.05%, needle 3/3 -- and fp8 ships opt-in (`Q27_KV=fp8`) with the fp16 default still bitwise-canonical. The same gate recipe applies to any future fp16/fp8 MMA decode path.
+5. **Long-context correctness: VALIDATED to 361K (2026-07-02, fp8 KV).** Original 64K validation: (a) `--nll-long 65536` flat buckets; (b) cross-engine vs llama-perplexity +2.0% at [32K,64K) (smaller than the short-context delta, so no length-dependent divergence); (c) needle 3/3 @55K. Extended after P2 with a 783K-token corpus (War and Peace, tokenized with the model's own vocab; `--nll-long` buckets now reach 320K+): (d) fp16-vs-fp8 NLL A/B at 163840, bucket deltas within +-0.06% at ALL depths (fp8 cost does not grow with position); (e) fp8 `--nll-long 370000` single pass: buckets flat 7.2-7.6 to 256K, then a graceful +3% drift beyond the native 262K (7.89 at 256-320K, 7.69 at 320K+) -- no blowup even in RoPE-extrapolation territory; (f) needle retrieval **6/6 on a 361.5K-token haystack** (depths 35K/124K/213K/248K within native + 276K/337K BEYOND native, all exact, think traces naming surrounding chapters); (g) `--kvstats 131072`: K amax 21.7 / V amax 128.4, zero E4M3 saturation at depth. Decode at 361K depth: 19.1 t/s (fp8, spec). Caveat: each distinct long prompt is a full cold prefill (~22 min @361K) -- the GDN recurrent snapshot makes the prefix cache all-or-nothing, so mid-document divergence cannot reuse state [mitigated same-session by P9's checkpoint ring -- restore from nearest checkpoint <= divergence; cross-session pool still parked]. Risk 3 is covered to 64K by (a)+(b).
+6. **fp-precision paths break the bitwise gate.** Batched prefill is currently bit-identical to serial because dp4a's int32 block sums are order-independent and the per-group fp scale-and-add matches serial order. RESOLVED for prefill: the int8 mma.sync path keeps int32 accumulation, so the bitwise gate survives tensor-core prefill (P1). **RESOLVED for fp8 KV (P2, 2026-07-02):** the tolerance-gate machinery now exists and passed -- logit A/B vs the fp16 path (cosine 0.9995, top-1 exact, KL 3.4e-5 @512-tok prompt), corpus PPL delta -0.05%, needle 3/3 -- and fp8 ships opt-in (`Q27_KV=fp8`) with the fp16 default still bitwise-canonical. The same gate recipe applies to any future fp16/fp8 MMA decode path.
