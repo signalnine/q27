@@ -808,3 +808,81 @@ llama-q5km-eval` (transient units log their full bash -c in the journal --
 easier than BUILDLOG archaeology). Disk / now at 80% (Gabe reclaimed old
 runs). Servers swapped sequentially (both do not fit 32GB); q27-eval
 restored and healthy after the llama leg.
+
+## 2026-07-05 (later) -- red-team pass on the README: five claims audited, two retracted, one refuted back
+
+External red-team review of the README's public claims; every item verified
+against trial data / server logs / code before acting. Outcomes:
+
+**1. "analytics WINS outright" RETRACTED.** Pooled analytics draws this week:
+q27 {0.490, 0.600, 0.799, 0.825, 0.830, 0.831, 0.834, 0.847}, llama {0.478,
+0.481, 0.483, 0.830, 0.831} -- bimodal on BOTH engines (q27 drew its own low
+basin twice on 07-03 morning), and the 30-trial A/B scored analytics -0.073
+AGAINST q27. llama's two low-basin days are ~2 draws at its ~3/5 empirical
+low rate; Fisher exact on the pooled high/low split is p~0.24. One greedy
+draw per leg separates nothing. README reframed: "llama sampled its low
+basin, q27 didn't"; the analytics wall win (180 vs 190s) marked
+basin-confounded. The 1.92x collab line also now states its DIRECTION (q27
+slower) -- it read as a win.
+
+**2. llama leg VERIFIED NOT HANDICAPPED (the load-bearing one).** The A/B
+llama build is mainline b9857 (2026-07-01, includes the n_rs_seq machinery
+P9 was modeled on; n_rs_seq auto-set to draft n_max=6). Its server log
+(llama-q5km-eval.log; the M.SS.mmm.uuu-prefixed 7m23s instance starting
+~23:51 PDT IS the A/B) shows hybrid context checkpoints active (212-278 MiB
+creates + rotation during collab) and, through the analytics leg at 62-65K
+ctx, "selected slot by LCP similarity ... f_keep = 0.99x" with per-turn
+prompt evals of only 179-1260 tokens (suffix-only, zero re-prefill) and
+draft-mtp mean chain 4.8-7.0. The collab volume story survives the
+strongest-available-opponent test on this build; the README now says so
+where the claim lives. Community-config sweep (draft depth, p_min; reported
+"mean 140.7 @ Q6 patched" unreproduced) stays open before headline claims.
+
+**3. constrain-tools honesty.** README no longer lists the flag as bare
+"available": off in eval serving (engage-lag hole, 07-04 entry), in-grammar
+cap 1/round = ~22 t/s in call bodies, 0.786 tie parser-carried (17
+rescues), strict-parser rerun = open gate blocked on the engage-lag fix,
+Anthropic-path-only wiring.
+
+**4. Single-prompt short bench RETIRED as a benchmark; suite shipped.**
+tools/shortbench_suite.sh: 5 fixed genre-diverse prompts (ids baked from
+llama-tokenize --no-bos on the source GGUF) x 128 tok, stock, greedy
+--spec, canonical prompt kept as leading bitwise gate. First run (fd2,
+stock, offset verified 0): canonical md5 EXACT at 159.6 t/s; suite 157.2 /
+174.7 / 158.5 / 190.8 / 165.6 = mean 169.4 t/s, t/round 3.20-3.88. The
++-10% per-prompt spread on trajectory alone is the point: the old single
+number (177.5/160.2 tie lottery) sat inside its own noise band next to the
+community's ~160; 169.4-over-5 is the number that can face a rerun.
+
+**5. Constrained-decoding state audit (multi-slot x interleave x restore x
+prefill-continuation).** The reviewer's specific fear -- P9 restore
+resuming with a desynced grammar automaton -- is REFUTED in code:
+ckpt_restore/snap_restore/reset touch only S/conv rings/positions/perm
+(engine.cuh), grammar is per-request (ToolConstrainer local per handler)
+and engages only on decoded output; no gate needed there. The audit found
+three REAL latent cells instead, now queued as gates in the README roadmap:
+(a) the R1-deferred split-brain is precisely located -- mask bytes+identity
+in the process-global tool_mask_cache (server.cu:275) vs per-slot host2dev
+map (server.cu:238) vs per-engine device pool (engine.cuh:96-101), coherent
+only because nothing ever resets host2dev/mask_pool_used -- an unenforced
+invariant, no assert; (b) pool-full divergence: per-engine pool caps at 512
+while the shared cache is unbounded, and a full pool silently drop()s the
+constraint on that slot only; (c) cross-request leak: d_mask_ids/
+d_accept_cap are cleared only via tc.end() -- a non-CUDA throw between
+generate() and tc.end() leaves the NEXT request on that slot decoding under
+a stale lane-0 mask + accept-cap-1 (cheap fix when constrain-tools work
+resumes: clear device constraint at request claim). R1b interleaving itself
+is clean for the default capped path (all cache-touching callbacks precede
+the round_gap yield; per-engine buffers drained at handover); Q27_TOOL_SPLIT
+stays forbidden under --slots (P11 race, engine.cuh:789-803). Assistant-
+prefill continuations ending mid-tool-call decode unconstrained by design.
+
+**6. sampling-design.md gained an exit criterion:** quality A/B + drift
+catalog re-run under the production sampling config before sampling
+defaults on anywhere -- every quality number today is greedy-no-think
+scoped, and temperature moves acceptance and drift together.
+
+Strategic read accepted: the defensible claim is "fastest agentic wall
+clock at depth with quality parity" (prefix cache + depth-4 + fd2 +
+interleaving), not "fastest short-context decode" -- items 1-3 above are
+what stood between that claim and being airtight.

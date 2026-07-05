@@ -136,6 +136,14 @@ the t/s-vs-temp curve.
 - **Phase 3 -- constrained + sampled**: -inf mask pre-softmax, single-sample
   cap path; gate = zero grammar violations over N sampled tool calls plus
   chi-square vs a masked-renormalized HF reference.
+- **Exit criterion (before sampling defaults on anywhere)**: re-run the
+  Thunderdome quality A/B and the tool-format drift catalog under the
+  production sampling config. Every quality number backing the engine
+  today (the 0.786 tie, the five drift modes, acceptance 4.32-4.36
+  t/round, the depth-4 gate p(d4|prefix-3)=97.4%) is greedy-no-think
+  scoped; temperature moves acceptance AND drift behavior simultaneously,
+  so the greedy numbers do not transfer by argument. This is an exit gate
+  for the feature, not a follow-up.
 
 ## Open questions
 

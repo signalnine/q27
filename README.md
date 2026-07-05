@@ -9,26 +9,46 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   trials to 74K ctx** (was 103-113). attn-fd2 register-accumulator
   flash-decode fixed the third SM-starvation/occupancy disease: attention
   was 99% of the depth cost at 5% DRAM BW, now 45%
-- Decode short-ctx: **160.2 t/s** short-bench / **209.2** stock 2K soak
-  (4.32 t/round). Short-bench dropped from 177.5 on a canonical-prompt
-  argmax-tie re-roll (t/round 3.56 -> 3.25); per-round cost is +1.3% -- see
-  Decode methodology and the fd2 build-log entry before reading it as a
-  regression
+- Decode short-ctx: **169.4 t/s** short-bench suite mean (5 fixed prompts,
+  `tools/shortbench_suite.sh`; per-prompt spread 157-191 on trajectory
+  alone) / **209.2** stock 2K soak (4.32 t/round). The old single-prompt
+  short-bench number is retired as a benchmark -- it re-rolled 177.5 ->
+  160.2 on one argmax tie while per-round cost moved +1.3%; it survives
+  only as the bitwise gate (see Decode methodology)
 - Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start)
 - Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
 - Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30
   trials/leg, 2026-07-03); same-day spot A/B 2026-07-05 (n=1/task):
-  collab q27 0.847 vs llama 0.843, analytics q27 **0.825 vs 0.478** (llama's
-  analytics basin failed hidden tests two days running)
-- Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab **1.92x**
-  at equal score; analytics **q27 WINS outright** (180s vs 190s at +0.35
-  score). Decode RATE now beats llama's late-leg samples (161-164 vs
-  109-154 t/s); the residual collab gap is OUTPUT VOLUME (q27's basin wrote
-  22K tokens vs llama's ~11K) -- a prompt/sampling lever, not an engine one
+  collab q27 0.847 vs llama 0.843, analytics q27 0.825 vs llama 0.478.
+  Do NOT read the analytics delta as an engine win: analytics is bimodal on
+  BOTH engines (this week's greedy draws -- q27 {0.49, 0.60, then 0.79-0.85
+  x6}, llama {0.478-0.483 x3, 0.83 x2}; the 30-trial A/B scored the task a
+  variance wash, delta -0.073 AGAINST q27). One draw per leg cannot
+  separate the engines; llama sampled its low basin that day, q27 didn't
+- Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab q27 230s
+  vs llama 120s -- q27 **1.92x slower** at equal score (0.847 vs 0.843);
+  analytics q27 180s vs llama 190s, but the llama leg sat in its low-score
+  basin, so that wall win is basin-confounded (a high-basin llama plausibly
+  takes it). The engine-true claims are narrower: decode RATE at depth now
+  beats llama's late-leg samples (161-164 vs 109-154 t/s), and the collab
+  wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
+  llama's ~11K) -- a prompt/sampling lever, not an engine one. The llama
+  leg was NOT handicapped: mainline b9857 with hybrid context checkpoints
+  active -- its A/B server log shows LCP prefix reuse with f_keep ~0.99 at
+  62-65K ctx (per-turn prompt evals of only ~0.2-1.3K tokens) and draft-mtp
+  mean chain 4.8-7.0
 - Serving: multi-slot (`--slots N`) with R1b round-granularity GPU
   time-slicing (FIFO gate + engine yield hooks; queue-wait class dead,
   outputs byte-identical solo vs interleaved); server defaults fp8 KV
-  (opt out `--kv-fp16`); `--constrain-tools` available
+  (opt out `--kv-fp16`). `--constrain-tools` exists but is OFF in eval
+  serving: the capped grammar has a measured engage-lag hole (first
+  post-engage token samples unmasked, so a hallucinated tool name
+  greedy-loops to score 0 -- build log 2026-07-04) and in-grammar
+  acceptance is capped 1/round (~22 t/s inside tool-call bodies). The
+  0.786 tie was earned by the tolerant PARSER chain (17 recoveries in the
+  final rerun), not the grammar; a strict-parser rerun with the grammar on
+  (zero rescues, both legs) is an open gate, blocked on the engage-lag fix.
+  Constraint is wired on the Anthropic `/v1/messages` path only
 - P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
   attributed and fixed (fd2, 2026-07-05). Next: sampling
   (docs/sampling-design.md); A2 fusion / light utility slots only if
@@ -40,7 +60,13 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
 - Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~355K (was ~370K before P3's 5th GDN buffer set) -- the advertised 262K native fits** (allocates and runs; correctness validated to 361K, see risk 5)
 - The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
-- Measured baseline to beat: llama.cpp (MTP-TurboQuant fork) at 106-127 t/s single-stream
+- Measured baseline to beat: llama.cpp mainline (b9857, `--spec-type
+  draft-mtp`, Q5_K_M, greedy) at 106-127 t/s single-stream on this box;
+  its late-leg A/B samples at 62-65K ctx reach 109-162 t/s. Community
+  configs report higher (~140 t/s class on lighter quants, e.g. unsloth's
+  UD-Q2_K_XL figure; a "mean 140.7 at Q6, patched" config is reported but
+  not reproduced here) -- a strongest-opponent sweep (draft depth, p_min)
+  on this box is an open item before any headline cross-engine claim
 
 ## Architecture facts (ground truth from GGUF metadata)
 
@@ -96,14 +122,19 @@ speculation) -- there is no third lever at batch 1.
 
 ### Decode methodology (canonical, 2026-07-02)
 
-Two numbers are reported and they are NOT interchangeable (~16% gap):
+These numbers are NOT interchangeable -- each answers a different question:
 
-- **Short bench** (SOTA-comparable): 128 tokens from the 5-token canonical
-  prompt, `--spec`. **STOCK clocks, fd2 era: 160.2 t/s** (3.25 t/round).
-  The fd2-era drop from 177.5 is an argmax-tie re-roll on this degenerate
-  prompt (t/round 3.56 -> 3.25; per-ROUND cost changed only +1.3%) --
-  `Q27_FD=v1` reproduces the old 177.5/3.56 bit-for-bit. Depth-4 pays on
-  long generations, not here.
+- **Short-bench suite** (SOTA-comparable): 5 fixed genre-diverse short
+  prompts x 128 tokens, `--spec`, STOCK clocks -- `tools/shortbench_suite.sh`.
+  **fd2 era: 169.4 t/s mean** (157.2-190.8 per prompt, t/round 3.20-3.88).
+  The per-prompt spread is trajectory/acceptance variance, which is exactly
+  why no single short prompt may carry a cross-engine number.
+- **Canonical prompt** (bitwise gate, NOT a benchmark): 128 tokens from the
+  5-token canonical prompt. fd2 era 160.2 t/s / 3.25 t/round; `Q27_FD=v1`
+  reproduces the pre-fd2 177.5/3.56 bit-for-bit. That 10% swing is one
+  argmax tie re-rolling on a degenerate prompt (per-ROUND cost moved +1.3%)
+  -- tie-lottery sensitivity is why it gates bitwise identity and nothing
+  else. Depth-4 pays on long generations, not here.
 - **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
   STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
   short-ctx split tax). Headline for agentic reply-length outputs.
@@ -294,7 +325,29 @@ Prerequisite already shipped: server defaults to fp8 KV (2026-07-03).
 
 **Next up: sampling** -- temperature/top-p with rejection-sampled spec
 acceptance; the greedy path stays bitwise untouched. Design:
-docs/sampling-design.md.
+docs/sampling-design.md. Exit criterion (in the design doc): the quality
+A/B and drift catalog re-run under the production sampling config --
+every quality number in this README is greedy-no-think scoped.
+
+**Open quality gates (red-team pass 2026-07-05):**
+- strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,
+  zero rescues required -- the proof that the 0.786 tie is engine-true
+  rather than harness-carried. Blocked on the engage-lag fix
+- constraint-cost soak: one agentic soak with `--constrain-tools` on vs
+  off (in-grammar acceptance cap 1/round is ~22 t/s inside call bodies;
+  measure what that does to depth-heavy wall time before it defaults on)
+- constrain-tools x serving-state gate before the flag ever defaults on
+  under `--slots`: assert the global-mask-cache / per-slot host2dev /
+  per-engine pool mapping stays coherent (the R1-deferred split-brain);
+  define pool-full behavior (a full 512-mask pool today silently
+  disengages constraint on that slot only); clear the device constraint
+  at request claim (a non-CUDA throw before `tc.end()` leaks a stale
+  lane-0 mask + accept-cap-1 into the next request on that slot); keep
+  `Q27_TOOL_SPLIT` off under `--slots` (P11 race). Checkpoint-restore x
+  grammar needs NO gate: audited 2026-07-05, restore touches only GDN
+  state/conv rings/positions and grammar is per-request, engaging only on
+  decoded output. Assistant-prefill continuations that end mid-tool-call
+  decode unconstrained by design (parser recovery is the net)
 
 **Measured and parked:**
 - depth-5: nets ~+2-4% @2K for ~+12-14% round cost (measurement in the build
