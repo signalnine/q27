@@ -62,13 +62,20 @@ int delta_scan_nsplit(int T);
 // k_delta_wy_kk and read by k_delta_wy on the caller's stream with no
 // cross-stream ordering, so each engine must pass its own instance (R1b
 // prerequisite -- a shared set races once two engines' prefills are in
-// flight, and regrow would free panels another stream still reads). The
-// seq path leaves it untouched.
+// flight, and regrow would free panels another stream still reads). A
+// WyScratch is also pinned to ONE stream for its lifetime: regrow drains
+// only the caller's stream before freeing. The seq path leaves it untouched.
 struct WyScratch {
     float* kkt = nullptr;
     float* qkt = nullptr;
     int cap_nch = 0;
 };
+// Pre-size the panels for prompts chunked at <= T_max (engine: PF_T) so the
+// serving path never regrows mid-flight -- a regrow there is a stream drain
+// plus cudaFree/cudaMalloc under the global allocator lock while a sibling
+// engine may be decoding. delta_scan_T keeps the lazy grow as a fallback for
+// callers that skip this.
+void wy_scratch_reserve(WyScratch* wy, int T_max);
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
                   float* oT, int T, cudaStream_t st, WyScratch* wy);
 

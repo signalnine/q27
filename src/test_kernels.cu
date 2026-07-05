@@ -724,6 +724,21 @@ static void test_attn_split() {
     CUDA_CHECK(cudaFree(d_part)); CUDA_CHECK(cudaFree(d_k)); CUDA_CHECK(cudaFree(d_v));
 }
 
+// q/k blocks of conv l2-normalized per head, matching the engine's input
+// contract (l2norm_heads_T runs before delta_scan_T; with ||k|| ~ 11 instead
+// of 1 the delta update is expansive and chaotically amplifies
+// reduction-reorder noise into false FAILs). Shared by all delta tests.
+static void l2norm_qk_host(std::vector<float>& conv, int T, int CH, int SK) {
+    for (int t = 0; t < T; t++)
+        for (int hh = 0; hh < 32; hh++) {
+            float* p = conv.data() + (size_t)t * CH + hh * SK;
+            double n2 = 0;
+            for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
+            float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
+            for (int i = 0; i < SK; i++) p[i] *= inv;
+        }
+}
+
 // P6: column-split delta scan vs the exact one-block-per-head path. S columns
 // are independent (pred_j, dj, the rank-1 update and o_j touch only column j),
 // so the split only reorders the row reductions (4x32-serial -> NTILE x RPT)
@@ -735,14 +750,7 @@ static void test_delta_wy() {
     std::vector<float> S0 = rand_vec(SN, 61), conv = rand_vec((size_t)T * CH, 62);
     std::vector<float> g = rand_vec((size_t)T * NH, 63), beta = rand_vec((size_t)T * NH, 64);
     for (auto& x : beta) x = 1.f / (1.f + std::exp(-x));
-    for (int t = 0; t < T; t++)
-        for (int hh = 0; hh < 32; hh++) {
-            float* p = conv.data() + (size_t)t * CH + hh * SK;
-            double n2 = 0;
-            for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
-            float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
-            for (int i = 0; i < SK; i++) p[i] *= inv;
-        }
+    l2norm_qk_host(conv, T, CH, SK);
     float *d_S, *d_conv, *d_g, *d_beta, *d_o;
     CUDA_CHECK(cudaMalloc(&d_S, SN * 4));
     CUDA_CHECK(cudaMalloc(&d_conv, conv.size() * 4));
@@ -793,7 +801,7 @@ static void test_delta_wy() {
             check(label, ms, tol);
         }
     }
-    if (ws.kkt) { cudaFree(ws.kkt); cudaFree(ws.qkt); }
+    cudaFree(ws.kkt); cudaFree(ws.qkt); // cudaFree(nullptr) is a no-op
     cudaFree(d_S); cudaFree(d_conv); cudaFree(d_g); cudaFree(d_beta); cudaFree(d_o);
 }
 
@@ -803,20 +811,11 @@ static void test_delta_split() {
     std::vector<float> S0 = rand_vec(SN, 51), conv = rand_vec((size_t)T * CH, 52);
     std::vector<float> g = rand_vec((size_t)T * NH, 53), beta = rand_vec((size_t)T * NH, 54);
     // keep the recurrence in its real regime, matching the engine's input
-    // contract: decay = exp(g) <= 1, beta in (0,1), and q/k blocks of conv
-    // l2-normalized per head (l2norm_heads_T runs before delta_scan_T; with
-    // ||k|| ~ 11 instead of 1 the update is expansive and chaotically
-    // amplifies reduction-reorder noise into false FAILs)
+    // contract: decay = exp(g) <= 1, beta in (0,1), q/k l2-normalized
+    // (rationale at l2norm_qk_host)
     for (auto& x : g) x = -std::fabs(x) * 0.1f;
     for (auto& x : beta) x = 1.f / (1.f + std::exp(-x));
-    for (int t = 0; t < T; t++)
-        for (int hh = 0; hh < 32; hh++) {
-            float* p = conv.data() + (size_t)t * CH + hh * SK;  // q then k blocks
-            double n2 = 0;
-            for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
-            float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
-            for (int i = 0; i < SK; i++) p[i] *= inv;
-        }
+    l2norm_qk_host(conv, T, CH, SK);
     float *d_S, *d_conv, *d_g, *d_beta, *d_o;
     CUDA_CHECK(cudaMalloc(&d_S, SN * 4));
     CUDA_CHECK(cudaMalloc(&d_conv, conv.size() * 4));
@@ -934,8 +933,7 @@ static void test_wy_stream_isolation() {
         std::vector<float> S0, S_ref, o_ref;
         q27k::WyScratch ws; // per-context, the per-engine model
     };
-    Ctx ctx[2] = {{512, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, {}},
-                  {1024, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, {}}};
+    Ctx ctx[2] = {{512}, {1024}}; // aggregate: pointers null, ws default
     for (int c = 0; c < 2; c++) {
         Ctx& x = ctx[c];
         const size_t ON = (size_t)x.T * NH * SK;
@@ -943,18 +941,10 @@ static void test_wy_stream_isolation() {
         std::vector<float> conv = rand_vec((size_t)x.T * CH, 72 + 10 * c);
         std::vector<float> g = rand_vec((size_t)x.T * NH, 73 + 10 * c);
         std::vector<float> beta = rand_vec((size_t)x.T * NH, 74 + 10 * c);
-        // input contract as in test_delta_split: decay <= 1, beta in (0,1),
-        // q/k l2-normalized per head
+        // input contract: decay <= 1, beta in (0,1), q/k l2-normalized
         for (auto& v : g) v = -std::fabs(v) * 0.1f;
         for (auto& v : beta) v = 1.f / (1.f + std::exp(-v));
-        for (int t = 0; t < x.T; t++)
-            for (int hh = 0; hh < 32; hh++) {
-                float* p = conv.data() + (size_t)t * CH + hh * SK;
-                double n2 = 0;
-                for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
-                float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
-                for (int i = 0; i < SK; i++) p[i] *= inv;
-            }
+        l2norm_qk_host(conv, x.T, CH, SK);
         CUDA_CHECK(cudaMalloc(&x.d_S, SN * 4));
         CUDA_CHECK(cudaMalloc(&x.d_conv, conv.size() * 4));
         CUDA_CHECK(cudaMalloc(&x.d_g, g.size() * 4));
@@ -991,9 +981,8 @@ static void test_wy_stream_isolation() {
         std::vector<float> S(SN), o(ON);
         CUDA_CHECK(cudaMemcpy(S.data(), x.d_S, SN * 4, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(o.data(), x.d_o, ON * 4, cudaMemcpyDeviceToHost));
-        size_t bad = 0;
-        for (size_t i = 0; i < SN; i++) bad += memcmp(&S[i], &x.S_ref[i], 4) != 0;
-        for (size_t i = 0; i < ON; i++) bad += memcmp(&o[i], &x.o_ref[i], 4) != 0;
+        const int bad = (memcmp(S.data(), x.S_ref.data(), SN * 4) != 0) +
+                        (memcmp(o.data(), x.o_ref.data(), ON * 4) != 0);
         char label[64];
         snprintf(label, sizeof label, "wy stream isolation (ctx %c, T=%d)", 'A' + c, x.T);
         check(label, (double)bad, 0.5);

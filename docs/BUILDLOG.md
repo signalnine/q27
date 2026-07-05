@@ -556,3 +556,43 @@ Gates: test_kernels ALL PASS, canonical n=128 md5 58b6ae85 EXACT (177.3 t/s
 short bench, in family), --pf 200 seq+32 IDENTICAL (batched 1575 t/s),
 q27-eval recreated on the new binary (--slots 2 config, health checked).
 R1b round-granularity interleaving is now unblocked on the prefill side.
+
+Review hardening (8-angle finder pass + adversarial verify, second commit):
+
+(1) CONFIRMED pre-existing uninit read: k_delta_wy's QKt fold reads the
+strict-upper triangle k_delta_wy_kk never writes (skip at ~1451: `ss > tt`
+guards both stores; fold at ~1630 runs the full row range), neutralized only
+by R == 0 at those positions -- 0 * NaN/Inf from recycled cudaMalloc pages is
+NaN, poisoning live oT rows (S itself is safe: state update reads only
+rhat/K; KKt reads all producer-guarded). The kernel zeroes rhat for exactly
+this hazard class but missed the global-memory operand; a 0xFF-memset buffer
+in engine init is an in-process NaN source for recycled pages. Fix: panels
+cudaMemsetAsync'd to zero once per allocation in wy_grow -- no kernel stores
+those entries, so zeros persist; 0 * 0 keeps the exact-zero semantics bitwise
+(canonical unchanged, verified). Predates this work; per-engine allocation
+merely widened fresh-page exposure.
+
+(2) Eager reserve (3 finders converged): serving T is chunk-capped at
+PF_T=1024 (engine.cuh prefill loops), so panels are a fixed 8 MiB/engine;
+wy_scratch_reserve(PF_T) now runs at Engine init next to the other fal
+buffers, making the lazy regrow unreachable in serving -- previously a short
+first prompt (< 1024 tok) sized panels low and the first long prompt then
+regrew MID-SERVING (stream drain + cudaFree/cudaMalloc under the global
+allocator lock, hiccuping the sibling slot; also capture-unsafe if R1b ever
+re-captures a slot while another serves). Lazy grow retained as the fallback
+for callers that skip reserve (tests). WyScratch contract doc now states the
+one-stream pin explicitly (regrow drains only the caller's stream).
+
+(3) Test cleanups: shared l2norm_qk_host helper (contract block was
+triplicated across test_delta_split/test_delta_wy/isolation; chaos rationale
+now lives once), Ctx aggregate init de-noised, whole-buffer memcmp, unified
+teardown idiom. Accepted residuals, documented: WyScratch* is required
+non-null even on seq-pinned paths (do NOT normalize nullptr-passing -- wy is
+the default mode, a null deref there is a mid-prefill segfault); regrow
+branch has no in-flight-work test coverage (it is now test-only surface;
+a deterministic UAF test would be timing-flaky); Engine still never frees
+device buffers (house lifetime model, panels included, 8 MiB/engine).
+
+Hardening gates: test_kernels ALL PASS (isolation bitwise both ctx),
+canonical md5 58b6ae85 EXACT, --pf 200 seq+32 IDENTICAL, q27-eval recreated,
+health ok.

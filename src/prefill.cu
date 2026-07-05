@@ -1746,23 +1746,39 @@ k_delta_wy(float* __restrict__ Sg, const float* __restrict__ convT,
         Sgh[(i / NCOLW) * SK + j0 + i % NCOLW] = S[i];
 }
 
+static void wy_grow(WyScratch* wy, int nch, cudaStream_t st) {
+    // Regrow syncs the owning stream before freeing: earlier chunks of this
+    // engine's own prefill may still be reading the old panels. A WyScratch
+    // is pinned to one stream, so draining st is sufficient.
+    if (nch <= wy->cap_nch) return;
+    if (wy->kkt) {
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        CUDA_CHECK(cudaFree(wy->kkt));
+        CUDA_CHECK(cudaFree(wy->qkt));
+    }
+    const size_t bytes = (size_t)16 * nch * WY_C * WY_C * 4;
+    CUDA_CHECK(cudaMalloc(&wy->kkt, bytes));
+    CUDA_CHECK(cudaMalloc(&wy->qkt, bytes));
+    // zero once per allocation: k_delta_wy's QKt fold reads the strict-upper
+    // triangle the producer never writes, neutralized only by R == 0 there --
+    // and 0 * NaN/Inf from recycled pages is NaN, poisoning live oT rows.
+    // Zeros persist (no kernel stores those entries), so the reads are
+    // defined and 0 * 0 keeps the exact-zero semantics bitwise. KKt reads
+    // are all producer-guarded; zeroed for symmetry.
+    CUDA_CHECK(cudaMemsetAsync(wy->kkt, 0, bytes, st));
+    CUDA_CHECK(cudaMemsetAsync(wy->qkt, 0, bytes, st));
+    wy->cap_nch = nch;
+}
+
+void wy_scratch_reserve(WyScratch* wy, int T_max) {
+    wy_grow(wy, (T_max + WY_C - 1) / WY_C, 0);
+}
+
 static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
                           const float* betaT, float* oT, int T, cudaStream_t st,
                           WyScratch* wy) {
     const int nch = (T + WY_C - 1) / WY_C;
-    // caller-owned KKt/QKt panels, lazily sized for the largest T this engine
-    // has seen. Regrow syncs the owning stream before freeing: earlier chunks
-    // of this engine's own prefill may still be reading the old panels.
-    if (nch > wy->cap_nch) {
-        if (wy->kkt) {
-            CUDA_CHECK(cudaStreamSynchronize(st));
-            CUDA_CHECK(cudaFree(wy->kkt));
-            CUDA_CHECK(cudaFree(wy->qkt));
-        }
-        CUDA_CHECK(cudaMalloc(&wy->kkt, (size_t)16 * nch * WY_C * WY_C * 4));
-        CUDA_CHECK(cudaMalloc(&wy->qkt, (size_t)16 * nch * WY_C * WY_C * 4));
-        wy->cap_nch = nch;
-    }
+    wy_grow(wy, nch, st); // no-op for engines: wy_scratch_reserve pre-sized
     {
         dim3 g(nch, 16);
         const size_t sma = (size_t)2 * WY_C * 128 * 4;

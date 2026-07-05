@@ -301,6 +301,7 @@ struct Engine {
         xmtpT = fal((size_t)PF_T * N_EMBD);
         pf_part = fal((size_t)N_HEAD * PF_T * q27k::PF_SPLIT_MAX * 258);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN, /*g64=*/true);
+        q27k::wy_scratch_reserve(&wy_scratch, PF_T); // fixed cap: no mid-serving regrow
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 CUDA_CHECK(cudaMalloc((void**)&S_snap[il],
