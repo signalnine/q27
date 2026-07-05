@@ -58,9 +58,12 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   billing-header normalization (2026-07-05) -- without it Claude Code's
   mutating prompt head forces a full re-prefill every turn
 - P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
-  attributed and fixed (fd2, 2026-07-05). Next: sampling
-  (docs/sampling-design.md); A2 fusion / light utility slots only if
-  telemetry shows engine-claim waits dominating
+  attributed and fixed (fd2, 2026-07-05). Claude-Code robustness shipped
+  (`/v1/messages/count_tokens` + context-limit error shape, 2026-07-05).
+  Sampling Phase 1 shipped (plain-path top-p + Gumbel-max, greedy bitwise;
+  docs/sampling-design.md) -- Phase 2 (spec rejection sampling) is next, to
+  bring sampled decode up to spec speed. A2 fusion / light utility slots only
+  if telemetry shows engine-claim waits dominating
 
 ## Why this model is a good target
 
@@ -200,7 +203,11 @@ Three API shapes on one server:
 - **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)
 - **Anthropic**: `/v1/messages` -- native Messages API with thinking blocks
   (Qwopus `<think>` mapped to thinking/signature blocks), tool_use/tool_result,
-  input_json_delta streaming. Claude Code-compatible:
+  input_json_delta streaming. Also `/v1/messages/count_tokens` (exact,
+  == usage.input_tokens) and an anthropic-shaped context-limit error
+  (`prompt is too long: N tokens > M maximum`, 400) so Claude Code compacts
+  instead of retry-looping; plus cch billing-header normalization that keeps
+  the prefix cache warm across CC turns. Claude Code-compatible:
   `ANTHROPIC_BASE_URL=http://host:8080 claude`
 - **OpenAI Responses**: `/v1/responses` -- Codex CLI-compatible: function
   tools, `custom` freeform tools (apply_patch bridged through a
@@ -220,11 +227,13 @@ wire_api = "responses"
 
 Model tool protocol: tools rendered as JSON in the system `<tools>` block per
 the qwen35 chat template; `<tool_call>` output parsed by a streaming splitter
-(src/stream_split.h) that also routes `<think>`. Single slot (spec decode is
-single-stream; multi-slot is the active P10-A item, docs/P10-decision.md).
-Greedy sampling only; sampled decode is designed but not built
-(docs/sampling-design.md). `--fast-head` trades output exactness for
-~7% more t/s.
+(src/stream_split.h) that also routes `<think>`. Multi-slot (`--slots N`) with
+R1b round-granularity GPU time-slicing (FIFO gate + yield hooks; byte-identical
+solo vs interleaved). Greedy (spec decode) by default; `temperature>0` routes
+to a sampled plain path -- top-p nucleus + Gumbel-max, seeded and reproducible,
+with greedy left bitwise-unchanged (docs/sampling-design.md Phase 1). That path
+has no MTP yet, so sampled decode is slow; Phase 2 (spec rejection sampling)
+restores spec speed. `--fast-head` trades output exactness for ~7% more t/s.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
