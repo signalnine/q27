@@ -921,3 +921,74 @@ Ops note: the failed leg also showed CC driving the T2 conversation to
 126K+ tokens (slot-0 ctx is 131072) -- watch end= reasons near the ctx
 ceiling on the rerun; CC's own compaction assumptions target Anthropic
 model context windows, not ours.
+
+## 2026-07-05 (late) -- Claude-Code-harness A/B: q27+CC vs llama+CC, native Anthropic both legs
+
+First same-HARNESS cross-engine A/B: Claude Code (2.1.119, thunderdome
+claude-code image) against q27 (port 8081, native /v1/messages) and llama
+b9857 (port 8080, its own native /v1/messages -- no proxy either leg). New
+adapters claude-code-q27-haight / claude-code-q5km-haight (byte-identical
+modulo port/model alias) + thunderdome.yaml entries; thunderdome tree left
+uncommitted with the rest of the eval scaffolding. Greedy + no-think parity:
+q27 --no-think (greedy-only by construction); llama --temp 0 verified
+effective via /slots after a real CC request (temperature 0.0 -- CC sends
+no temperature field) + --chat-template-kwargs '{"enable_thinking":false}'
+because --reasoning-budget 0 is a SILENT NO-OP for the qwen35 template
+(thinking blocks still emitted; llama-leg gotcha #1). Gotcha #2: CC's
+Workflow tool schema (maxLength 524288 on `script`) makes llama's
+json-schema-to-grammar fail at sampler init ("failed to parse grammar") --
+EVERY CC request 400s; bisected via a request tap + per-tool probes;
+upstream-reportable. Workaround: --disallowed-tools Workflow on BOTH legs
+(CC never invokes it un-prompted; tool block must stay byte-identical).
+
+Results (same-day, n=1/task, matched 27-tool block unless noted):
+
+| leg                        | T2 collab                  | T8 analytics                |
+|----------------------------|----------------------------|-----------------------------|
+| q27+CC (28-tool, pre-parity)| 374s @ 0.840 (43.0K dec tok)| 577s @ 0.292 CRASHED        |
+| q27+CC (matched)           | 8s @ 0.00 one-shot-quit    | **167s @ 0.82**             |
+| llama+CC (matched)         | **95s @ 0.85**             | 222s @ 0.50 (low basin)     |
+| q27+CRUSH (same morning)   | 230s @ 0.847               | 180s @ 0.825                |
+| llama+CRUSH (same morning) | 120s @ 0.843               | 190s @ 0.478                |
+
+T8 head-to-head (both legs did real agentic work): q27 FASTER AND HIGHER
+(167s@0.82 vs 222s@0.50). q27 T8 anatomy: 53 reqs, 16.6K decode tok (105s),
+84K suffix prefill (41s), 2.47M tokens CACHE-HIT (the cch fix saved ~20 min
+of re-prefill on this single trial), ONE P9 checkpoint-ring restore -- the
+first real-client (Claude Code) restore sighting -- max ctx 63K, all eos.
+Decode at depth 182-215 t/s. R1b interleaving live on CC's background
+calls (gw/yields nonzero, slot 1 concurrent with slot 0).
+
+T2 has NO matched-basin pair: q27's 27-tool T2 basin is a one-shot-quit
+(model answers the task prompt conversationally, 184 tok, zero tool calls,
+CC exits; retry 4s -- DETERMINISTIC same-day, the cache-hit replay proves
+byte-identical prompts, so "retry normal" does NOT apply when nothing
+perturbs the bytes). The 28-tool T2 run (374s @ 0.840, 43K output tokens)
+proves the quit is basin, not structure: one extra tool schema in the
+system block rerolled a full agentic run. llama's T2 basin was terse and
+excellent (95s@0.85). Volume basin still owns the T2 wall story: q27 43K
+output tokens vs llama ~13K (llama total across BOTH tasks: 29.6K dec in
+210s, 327K prefill in 132s -- llama re-prefills 4x more than q27 post-fix
+but rides a lean trajectory).
+
+The pre-parity q27 T8 crash was a compound engine-adjacent failure worth
+its own list of levers: (a) a single greedy generation blew past CC's
+32000-output-token cap (mega-generation pathology; second live greedy
+exhibit after one-shot-quit -- both are sampling's case); (b) the
+conversation passed slot-0 ctx (131072) and q27 answered end=refused,
+which CC treats as retryable rather than compact-now -- an
+anthropic-shaped context-limit error would let CC recover; (c) q27 has NO
+/v1/messages/count_tokens (404 in-log) so CC's compaction timing flies
+blind -- llama implements it. (a) is model/sampling; (b)+(c) are cheap
+server work, queued.
+
+Verdict, stated carefully (this morning's red-team rules apply to our own
+numbers): score comparisons at n=1/day are basin draws -- today q27 drew
+{T2-quit, T8-high}, llama drew {T2-high, T8-low}; neither separates the
+engines on quality. What the experiment DID establish: (1) q27 serves
+Claude Code end-to-end at full cache efficiency (the cch fix was
+load-bearing; hit=0 -> 97%+), (2) P8/P9/R1b all fired for a real CC
+client, (3) on the one matched-basin pair (T8), q27+CC beat llama+CC on
+wall AND score, (4) four concrete engine gaps now have names and owners.
+Claude Code as a harness is VIABLE on q27 today; the wall story at depth
+remains rate-won, volume-bound.
