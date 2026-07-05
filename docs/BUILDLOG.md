@@ -660,3 +660,56 @@ Ops: acceptance legs ran claude -p with ANTHROPIC_BASE_URL at a local
 server on 8082; leg driver + workspace seed rebuildable in minutes (tinylog
 package, 8 logger tests + 6 RFC3339 contract tests incl. millis rounding
 carry). q27-eval recreated on the new binary after the GPU window.
+
+## 2026-07-04 (night) -- decode-at-depth ATTRIBUTED: k_attn_fd is 99% of the depth cost, latency-hiding-bound
+
+Methodology: Q27_PROF_DECODE=1 brackets the decode loop with a cudaProfiler
+range (engine.cuh; done() is the exit funnel) so `nsys profile
+--cuda-graph-trace=node --capture-range=cudaProfilerApi` records ONLY the
+decode slice from the SERVER (batched prefill, fp8 default) -- the CLI
+--tokens serial-prefill trap is bypassed entirely. CAVEAT measured: node
+tracing inflates round WALL ~2.3x at 16K (+34ms/round host overhead) but
+kernel-execution sums stay honest (kern_sum @16K = 26.5ms vs 27.3 true);
+attribution uses ground-truth anchors (no nsys) + per-kernel deltas between
+depths, which cancel the per-node overhead (same node count per round at
+both depths). Workload: wikitext continuation, /v1/completions, 600 tok.
+
+**Ground truth (no nsys): 16K = 27.3ms/round (108.2 t/s; matches the known
+27.4), 61K = 47.2ms/round (78.0 t/s). Depth cost = +19.9ms/round over +44K
+ctx (~0.45ms per 1K).** Per-kernel delta/round (nsys, 188/60 rounds):
+k_attn_fd +19.92ms (7.59 -> 27.51, 20 inst/round both depths) = 99% OF THE
+DELTA; k_gemv_q4_n +0.10 (10.7 -> 10.8 -- the verify GEMVs are DEPTH-FLAT);
+everything else <=0.02. Kernel-sum delta 20.1 vs wall delta 19.9 (closes
+within 1%). **The P10/roadmap "batch-verify tensor-core GEMV vs
+quant-for-acceptance" fork is MEASURED-DEAD for the depth bucket: both
+target weight-stream cost, which does not grow with depth.**
+
+**k_attn_fd efficiency: ~91 GB/s effective KV read = 5% of DRAM peak, at
+BOTH depths** (61K: 125MB/instance in 1.375ms avg). Probe 1 -- FD_NS 16->64
+(4x block count; starvation hypothesis): 61K 47.2 -> 45.5ms/round only.
+NOT grid-bound. (First attempt measured the OLD binary -- spec3.cuh is
+missing from the Makefile dep lists, numbers identical to 0.1 t/s was the
+tell; touch spec3.cu forced it. Dep-line fix proposed to Gabe separately.)
+Probe 2 -- NW 8->4 @128 threads + FD_NS=64 (smem 55->30KB, resident warps
+8 -> 12/SM): 61K 42.5ms/round (-10% wall, attn ~-17%), 16K 25.8. More
+resident warps = directly faster with 12 still far under the 48-64 cap:
+**latency-hiding-bound, occupancy capped by the 55KB smem accumulator**
+(per warp: 6 heads x 256-float acc RMW in smem per position + 12 expf + 16
+byte-granular K/V loads).
+
+Fix design (next work item, kernel rewrite): (1) accumulator to REGISTERS
+-- each lane owns acc[lane+32u], 48 regs/lane, smem drops to the 6KB q
+tile, warps/SM 8 -> ~20+; (2) vectorized fp8 K/V loads (int2/int4, 16
+byte-loads -> 2-4); (3) FD_NS then re-tuned for grid fill (composes).
+Ceiling: attn at 30-50% DRAM BW = 3-6ms/round -> 61K round ~24-27ms =
+**~120-140 t/s at depth** (from 78; llama late-leg samples 104-153).
+Numerics: any split/warp-shape change reorders fp merges -- observed
+trajectory tie-flips (16K leg: eos@177 vs n_max@600 across probe builds;
+also warm-vs-cold at 61K diverged 163 vs 188 rounds via the 16K request's
+PARTIAL last chunk changing WY chunk width -- same argmax-tie class as the
+--pf 64 finding, first time seen serving-side). The rewrite therefore
+lands with re-derived canonicals + PPL + needle + acceptance-rate gates
+(g64 gate-policy precedent), not bitwise identity.
+
+Probes REVERTED (spec3.* clean); shipped this session: the env-gated
+profiler range only (canonical md5 EXACT, off-path zero-cost).

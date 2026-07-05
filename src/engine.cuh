@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_profiler_api.h>
+
 #include "blocks.cuh"
 #include "spec3.cuh"
 #include "prefill.cuh"
@@ -1246,7 +1248,22 @@ struct Engine {
         // (prefill parks belong to pf_ms; mixing them over-corrects t/s)
         const double gw_pf = gs.gw_ms;
         const int yields_pf = gs.yields;
+        // Q27_PROF_DECODE=1: bracket the decode loop with a cudaProfiler
+        // range so `nsys --capture-range=cudaProfilerApi` records ONLY the
+        // decode slice -- prefill otherwise floods the trace (the CLI
+        // --tokens path walks the prompt serially; see BUILDLOG nsys notes).
+        // No-op without a profiler attached; done() below is the single
+        // exit funnel, so every decode exit path closes the range.
+        const bool prof_decode = getenv("Q27_PROF_DECODE") != nullptr;
+        if (prof_decode) {
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            (void)cudaProfilerStart();
+        }
         auto done = [&](const char* why) {
+            if (prof_decode) {
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+                (void)cudaProfilerStop();
+            }
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
                             .count();
             gs.dec = emitted;
