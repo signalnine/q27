@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -752,6 +753,7 @@ static void test_delta_wy() {
     CUDA_CHECK(cudaMemcpy(d_beta, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice));
 
     std::vector<float> Sa(SN), oa(ON), Sb(SN), ob(ON);
+    q27k::WyScratch ws; // wy-leg panels, freed below
     // mild decay (engine-typical) and strong decay (lambda underflows f32 over
     // a 64-chunk -- exercises the log-space ratio path; absolute-tol check
     // because outputs themselves shrink toward 0 there)
@@ -765,14 +767,14 @@ static void test_delta_wy() {
             setenv("Q27_DS_MODE", "seq", 1); // wy is default since 2026-07-04
             setenv("Q27_DS_SPLIT", "1", 1);
             CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
-            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0, &ws);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(Sa.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(oa.data(), d_o, (size_t)Tn * NH * SK * 4,
                                   cudaMemcpyDeviceToHost));
             setenv("Q27_DS_MODE", "wy", 1);
             CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
-            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0, &ws);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(Sb.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(ob.data(), d_o, (size_t)Tn * NH * SK * 4,
@@ -791,6 +793,7 @@ static void test_delta_wy() {
             check(label, ms, tol);
         }
     }
+    if (ws.kkt) { cudaFree(ws.kkt); cudaFree(ws.qkt); }
     cudaFree(d_S); cudaFree(d_conv); cudaFree(d_g); cudaFree(d_beta); cudaFree(d_o);
 }
 
@@ -837,12 +840,13 @@ static void test_delta_split() {
                                       ? 0.0 : 1.0, 0.5);
 
     std::vector<float> Sa(SN), oa(ON), Sb(SN), ob(ON);
+    q27k::WyScratch ws; // unused on the seq-pinned path, signature requires it
     // Tn=1 has no recurrence: any indexing/race bug shows undamped at ~0
     // tolerance; Tn=64 then bounds the compounded reorder noise.
     for (int Tn : {1, T}) {
         setenv("Q27_DS_SPLIT", "1", 1);
         CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
-        q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+        q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0, &ws);
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(Sa.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(oa.data(), d_o, (size_t)Tn * NH * SK * 4, cudaMemcpyDeviceToHost));
@@ -851,7 +855,7 @@ static void test_delta_split() {
             snprintf(v, sizeof v, "%d", cs);
             setenv("Q27_DS_SPLIT", v, 1);
             CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
-            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0);
+            q27k::delta_scan_T(d_S, d_conv, d_g, d_beta, d_o, Tn, 0, &ws);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(Sb.data(), d_S, SN * 4, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(ob.data(), d_o, (size_t)Tn * NH * SK * 4,
@@ -892,10 +896,10 @@ static void test_delta_split() {
             setenv("Q27_DS_SPLIT", v, 1);
             CUDA_CHECK(cudaMemcpy(d_S, S0.data(), SN * 4, cudaMemcpyHostToDevice));
             for (int w = 0; w < 3; w++)
-                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0);
+                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0, &ws);
             CUDA_CHECK(cudaEventRecord(e0));
             for (int r = 0; r < REP; r++)
-                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0);
+                q27k::delta_scan_T(d_S, d_cB, d_gB, d_bB, d_oB, TB, 0, &ws);
             CUDA_CHECK(cudaEventRecord(e1));
             CUDA_CHECK(cudaEventSynchronize(e1));
             float ms = 0;
@@ -910,6 +914,97 @@ static void test_delta_split() {
     unsetenv("Q27_DS_MODE");
     CUDA_CHECK(cudaFree(d_S)); CUDA_CHECK(cudaFree(d_conv)); CUDA_CHECK(cudaFree(d_g));
     CUDA_CHECK(cudaFree(d_beta)); CUDA_CHECK(cudaFree(d_o));
+}
+
+// R1b prerequisite: multi-slot engines run batched prefill on their own
+// streams. The wy KKt/QKt panels are written by k_delta_wy_kk and read by
+// k_delta_wy with no cross-stream ordering, so they must be per-engine
+// state: a shared set races once two engines' chunks are in flight, and the
+// lazy regrow cudaFrees panels the other stream's queued kernels still
+// reference. Contract: two contexts, chained scans interleaved across two
+// streams with no host sync, match their isolated serial runs BITWISE (same
+// kernels, same data, same launch config -- only scratch sharing can differ).
+static void test_wy_stream_isolation() {
+    const int NH = 48, SK = 128, CH = 10240, ITERS = 48;
+    const size_t SN = (size_t)NH * SK * SK;
+    setenv("Q27_DS_MODE", "wy", 1); // the scratch under test is wy-only
+    struct Ctx {
+        int T;
+        float *d_S, *d_conv, *d_g, *d_beta, *d_o;
+        std::vector<float> S0, S_ref, o_ref;
+        q27k::WyScratch ws; // per-context, the per-engine model
+    };
+    Ctx ctx[2] = {{512, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, {}},
+                  {1024, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, {}}};
+    for (int c = 0; c < 2; c++) {
+        Ctx& x = ctx[c];
+        const size_t ON = (size_t)x.T * NH * SK;
+        x.S0 = rand_vec(SN, 71 + 10 * c);
+        std::vector<float> conv = rand_vec((size_t)x.T * CH, 72 + 10 * c);
+        std::vector<float> g = rand_vec((size_t)x.T * NH, 73 + 10 * c);
+        std::vector<float> beta = rand_vec((size_t)x.T * NH, 74 + 10 * c);
+        // input contract as in test_delta_split: decay <= 1, beta in (0,1),
+        // q/k l2-normalized per head
+        for (auto& v : g) v = -std::fabs(v) * 0.1f;
+        for (auto& v : beta) v = 1.f / (1.f + std::exp(-v));
+        for (int t = 0; t < x.T; t++)
+            for (int hh = 0; hh < 32; hh++) {
+                float* p = conv.data() + (size_t)t * CH + hh * SK;
+                double n2 = 0;
+                for (int i = 0; i < SK; i++) n2 += (double)p[i] * p[i];
+                float inv = 1.f / std::sqrt((float)n2 + 1e-6f);
+                for (int i = 0; i < SK; i++) p[i] *= inv;
+            }
+        CUDA_CHECK(cudaMalloc(&x.d_S, SN * 4));
+        CUDA_CHECK(cudaMalloc(&x.d_conv, conv.size() * 4));
+        CUDA_CHECK(cudaMalloc(&x.d_g, g.size() * 4));
+        CUDA_CHECK(cudaMalloc(&x.d_beta, beta.size() * 4));
+        CUDA_CHECK(cudaMalloc(&x.d_o, ON * 4));
+        CUDA_CHECK(cudaMemcpy(x.d_conv, conv.data(), conv.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(x.d_g, g.data(), g.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(x.d_beta, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice));
+        // isolated serial reference: ITERS chained scans, fully synced
+        CUDA_CHECK(cudaMemcpy(x.d_S, x.S0.data(), SN * 4, cudaMemcpyHostToDevice));
+        for (int i = 0; i < ITERS; i++)
+            q27k::delta_scan_T(x.d_S, x.d_conv, x.d_g, x.d_beta, x.d_o, x.T, 0, &x.ws);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        x.S_ref.resize(SN);
+        x.o_ref.resize(ON);
+        CUDA_CHECK(cudaMemcpy(x.S_ref.data(), x.d_S, SN * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(x.o_ref.data(), x.d_o, ON * 4, cudaMemcpyDeviceToHost));
+    }
+    // interleaved: both contexts chained on their own streams, no host sync
+    cudaStream_t st[2];
+    CUDA_CHECK(cudaStreamCreate(&st[0]));
+    CUDA_CHECK(cudaStreamCreate(&st[1]));
+    for (int c = 0; c < 2; c++)
+        CUDA_CHECK(cudaMemcpyAsync(ctx[c].d_S, ctx[c].S0.data(), SN * 4,
+                                   cudaMemcpyHostToDevice, st[c]));
+    for (int i = 0; i < ITERS; i++)
+        for (int c = 0; c < 2; c++)
+            q27k::delta_scan_T(ctx[c].d_S, ctx[c].d_conv, ctx[c].d_g, ctx[c].d_beta,
+                               ctx[c].d_o, ctx[c].T, st[c], &ctx[c].ws);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int c = 0; c < 2; c++) {
+        Ctx& x = ctx[c];
+        const size_t ON = (size_t)x.T * NH * SK;
+        std::vector<float> S(SN), o(ON);
+        CUDA_CHECK(cudaMemcpy(S.data(), x.d_S, SN * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(o.data(), x.d_o, ON * 4, cudaMemcpyDeviceToHost));
+        size_t bad = 0;
+        for (size_t i = 0; i < SN; i++) bad += memcmp(&S[i], &x.S_ref[i], 4) != 0;
+        for (size_t i = 0; i < ON; i++) bad += memcmp(&o[i], &x.o_ref[i], 4) != 0;
+        char label[64];
+        snprintf(label, sizeof label, "wy stream isolation (ctx %c, T=%d)", 'A' + c, x.T);
+        check(label, (double)bad, 0.5);
+        CUDA_CHECK(cudaFree(x.d_S)); CUDA_CHECK(cudaFree(x.d_conv));
+        CUDA_CHECK(cudaFree(x.d_g)); CUDA_CHECK(cudaFree(x.d_beta));
+        CUDA_CHECK(cudaFree(x.d_o));
+        CUDA_CHECK(cudaFree(x.ws.kkt)); CUDA_CHECK(cudaFree(x.ws.qkt));
+    }
+    CUDA_CHECK(cudaStreamDestroy(st[0]));
+    CUDA_CHECK(cudaStreamDestroy(st[1]));
+    unsetenv("Q27_DS_MODE");
 }
 
 int main(int argc, char** argv) {
@@ -937,6 +1032,7 @@ int main(int argc, char** argv) {
     test_attn_split();
     test_delta_split();
     test_delta_wy();
+    test_wy_stream_isolation();
     test_masked_argmax();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();

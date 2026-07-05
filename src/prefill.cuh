@@ -58,7 +58,18 @@ void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, co
 // Q27_DS_SPLIT forces the count (1/2/4/8; 1 = exact legacy kernel, split
 // paths reorder the row reductions -> tolerance-gated like attention splits).
 int delta_scan_nsplit(int T);
+// Caller-owned scratch for the WY scan's KKt/QKt chunk panels: written by
+// k_delta_wy_kk and read by k_delta_wy on the caller's stream with no
+// cross-stream ordering, so each engine must pass its own instance (R1b
+// prerequisite -- a shared set races once two engines' prefills are in
+// flight, and regrow would free panels another stream still reads). The
+// seq path leaves it untouched.
+struct WyScratch {
+    float* kkt = nullptr;
+    float* qkt = nullptr;
+    int cap_nch = 0;
+};
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
-                  float* oT, int T, cudaStream_t st);
+                  float* oT, int T, cudaStream_t st, WyScratch* wy);
 
 } // namespace q27k

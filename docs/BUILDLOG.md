@@ -530,3 +530,29 @@ if telemetry shows it).
 Gates at HEAD: reqlog two-phase PASS (interleave-warm C12 a/b hit=115/74),
 canonical md5 58b6ae85 EXACT, --pf 200 seq+32 IDENTICAL, test_kernels ALL
 PASS, utf8 self-test PASS.
+
+## 2026-07-04 (post-R1) -- R1b prereq: WY scratch per-engine
+
+delta_scan_wy's KKt/QKt panels were process-global statics (prefill.cu:1749)
+-- fine while the gpu mutex serializes whole prefills, fatal for R1b's
+interleaved rounds: two engines with chunks in flight would race one panel
+set across streams (k_delta_wy_kk writes what the other engine's k_delta_wy
+is still reading), and the lazy regrow cudaFrees panels the other stream's
+queued kernels still reference. Now caller-owned q27k::WyScratch (kkt/qkt/
+cap_nch), one per Engine (wy_scratch member), threaded through delta_scan_T;
+regrow syncs the owning stream before freeing, since this engine's own
+earlier chunks may still be reading the old panels. seq path ignores it.
+
+TDD red->green: new test_kernels case "wy stream isolation" -- two contexts
+(T=512/1024, different nch so each regrows its own panels), ITERS=48 chained
+scans interleaved across two streams with no host sync, compared BITWISE
+against isolated serial references (same kernels + data + launch config, so
+only scratch sharing can differ). RED against the shared statics: ctx A
+failed with 2.4e6 mismatched words (ctx B's kk pass stomps A's 8 panels; B
+passed on scheduling luck -- one context failing is the demonstration).
+GREEN with per-context scratch: both bitwise-exact, err 0.
+
+Gates: test_kernels ALL PASS, canonical n=128 md5 58b6ae85 EXACT (177.3 t/s
+short bench, in family), --pf 200 seq+32 IDENTICAL (batched 1575 t/s),
+q27-eval recreated on the new binary (--slots 2 config, health checked).
+R1b round-granularity interleaving is now unblocked on the prefill side.

@@ -1747,17 +1747,21 @@ k_delta_wy(float* __restrict__ Sg, const float* __restrict__ convT,
 }
 
 static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
-                          const float* betaT, float* oT, int T, cudaStream_t st) {
+                          const float* betaT, float* oT, int T, cudaStream_t st,
+                          WyScratch* wy) {
     const int nch = (T + WY_C - 1) / WY_C;
-    // scratch for KKt/QKt: lazily sized for the largest T seen (engine.cuh is
-    // off-limits to this path for now; static lifetime matches the process)
-    static float *d_kkt = nullptr, *d_qkt = nullptr;
-    static int cap_nch = 0;
-    if (nch > cap_nch) {
-        if (d_kkt) { cudaFree(d_kkt); cudaFree(d_qkt); }
-        CUDA_CHECK(cudaMalloc(&d_kkt, (size_t)16 * nch * WY_C * WY_C * 4));
-        CUDA_CHECK(cudaMalloc(&d_qkt, (size_t)16 * nch * WY_C * WY_C * 4));
-        cap_nch = nch;
+    // caller-owned KKt/QKt panels, lazily sized for the largest T this engine
+    // has seen. Regrow syncs the owning stream before freeing: earlier chunks
+    // of this engine's own prefill may still be reading the old panels.
+    if (nch > wy->cap_nch) {
+        if (wy->kkt) {
+            CUDA_CHECK(cudaStreamSynchronize(st));
+            CUDA_CHECK(cudaFree(wy->kkt));
+            CUDA_CHECK(cudaFree(wy->qkt));
+        }
+        CUDA_CHECK(cudaMalloc(&wy->kkt, (size_t)16 * nch * WY_C * WY_C * 4));
+        CUDA_CHECK(cudaMalloc(&wy->qkt, (size_t)16 * nch * WY_C * WY_C * 4));
+        wy->cap_nch = nch;
     }
     {
         dim3 g(nch, 16);
@@ -1768,7 +1772,7 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, sma));
             attra = true;
         }
-        k_delta_wy_kk<<<g, 256, sma, st>>>(convT, d_kkt, d_qkt, T, nch);
+        k_delta_wy_kk<<<g, 256, sma, st>>>(convT, wy->kkt, wy->qkt, T, nch);
         CUDA_CHECK(cudaGetLastError());
     }
     {
@@ -1782,13 +1786,14 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, sm));
             attr = true;
         }
-        k_delta_wy<<<g, 256, sm, st>>>(S_global, convT, gT, betaT, oT, d_kkt, d_qkt, T, nch);
+        k_delta_wy<<<g, 256, sm, st>>>(S_global, convT, gT, betaT, oT, wy->kkt, wy->qkt, T,
+                                       nch);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
 void delta_scan_T(float* S_global, const float* convT, const float* gT, const float* betaT,
-                  float* oT, int T, cudaStream_t st) {
+                  float* oT, int T, cudaStream_t st, WyScratch* wy) {
     // re-read per call (getenv is noise next to a launch) so tests can flip
     // paths in-process via setenv, same policy as prefill_use_mma.
     // wy DEFAULT since 2026-07-04 (2913 vs 2560 t/s @16K post-tiling; own
@@ -1797,7 +1802,7 @@ void delta_scan_T(float* S_global, const float* convT, const float* gT, const fl
     // Q27_DS_MODE=seq Q27_PF_XG=32.
     const char* mode = getenv("Q27_DS_MODE");
     if (!(mode && !strcmp(mode, "seq"))) {
-        delta_scan_wy(S_global, convT, gT, betaT, oT, T, st);
+        delta_scan_wy(S_global, convT, gT, betaT, oT, T, st, wy);
         return;
     }
     const int cs = delta_scan_nsplit(T);

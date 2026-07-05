@@ -45,6 +45,7 @@ struct Engine {
     bool attn_layer[N_LAYER + 1] = {false};
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
+    q27k::WyScratch wy_scratch; // per-engine WY prefill panels (R1b prereq)
 
     // activations (device)
     float *h, *x1, *y, *qg, *kbuf, *vbuf, *attnout, *scratch;
@@ -845,7 +846,7 @@ struct Engine {
                              stm);
         q27k::l2norm_heads_T(convT, 16, GDN_DIM, GDN_CH, T, EPS, stm);
         q27k::l2norm_heads_T(convT + 2048, 16, GDN_DIM, GDN_CH, T, EPS, stm);
-        q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm);
+        q27k::delta_scan_T(S[il], convT, gT, betaT, oT, T, stm, &wy_scratch);
         q27k::gated_norm_gdn_T(oT, (const float*)T2(il, "ssm_norm.weight").data, zT, ogT,
                                GDN_HEADS, GDN_DIM, T, EPS, stm);
         qxT(ogT, GDN_V, T);
