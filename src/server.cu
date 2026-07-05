@@ -592,77 +592,42 @@ int main(int argc, char** argv) {
     };
 
     // ---------------- Anthropic /v1/messages ----------------
+    // Request mapping (anthropic_msgs / anthropic_tools_json) lives in
+    // api_common.h so count_tokens and the CPU self-tests share it.
 
-    // Anthropic tools -> qwen tools json for the system preamble
-    auto anthropic_tools = [](const json& body) -> json {
-        json out = json::array();
-        if (body.contains("tools"))
-            for (auto& t : body["tools"]) {
-                if (!t.contains("name")) continue;
-                out.push_back({{"type", "function"},
-                               {"function", {{"name", t["name"]},
-                                             {"description", t.value("description", "")},
-                                             {"parameters", t.contains("input_schema")
-                                                                ? t["input_schema"]
-                                                                : json::object()}}}});
-            }
-        return out;
+    auto anthropic_400 = [](httplib::Response& res, const std::string& msg) {
+        res.status = 400;
+        res.set_content(q27::anthropic_error_json("invalid_request_error", msg),
+                        "application/json");
     };
 
-    // Anthropic messages -> Msg list (thinking + tool_use reconstructed to
-    // model markers, tool_result wrapped in <tool_response>)
-    auto anthropic_msgs = [](const json& body) -> std::vector<Msg> {
-        std::vector<Msg> msgs;
-        if (body.contains("system")) {
-            std::string sys;
-            if (body["system"].is_string()) sys = body["system"];
-            else if (body["system"].is_array())
-                for (auto& b : body["system"])
-                    if (b.value("type", "") == "text") sys += b.value("text", "");
-            if (!sys.empty()) {
-                q27::normalize_cc_billing_header(sys);
-                msgs.push_back({"system", sys});
-            }
+    // Claude Code calls this before compaction decisions; a 404 here means
+    // CC estimates context blind and only discovers overflow by erroring.
+    // Count = exactly what /v1/messages would prefill for the same body
+    // (usage.input_tokens), whole-string encode (split-invariant at the P8
+    // boundary, gated in test_tokenizer). CPU-only: no slot, no GPU gate.
+    srv.Post("/v1/messages/count_tokens",
+             [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (...) { anthropic_400(res, "invalid JSON body"); return; }
+        if (!body.contains("messages") || !body["messages"].is_array()) {
+            anthropic_400(res, "messages: Field required");
+            return;
         }
-        for (auto& m : body["messages"]) {
-            std::string role = m.value("role", "user"), think, content;
-            if (m["content"].is_string()) content = m["content"];
-            else if (m["content"].is_array())
-                for (auto& part : m["content"]) {
-                    std::string ty = part.value("type", "");
-                    if (ty == "text") content += part.value("text", "");
-                    else if (ty == "thinking") think += part.value("thinking", "");
-                    else if (ty == "tool_use") {
-                        if (!content.empty() && content.back() != '\n') content += "\n";
-                        content += q27::tool_call_text(part.value("name", ""),
-                                                       part.contains("input") ? part["input"]
-                                                                              : json::object());
-                    } else if (ty == "tool_result") {
-                        std::string rc;
-                        if (part.contains("content")) {
-                            if (part["content"].is_string()) rc = part["content"];
-                            else if (part["content"].is_array())
-                                for (auto& b : part["content"])
-                                    if (b.value("type", "") == "text") rc += b.value("text", "");
-                        }
-                        if (!content.empty() && content.back() != '\n') content += "\n";
-                        content += q27::tool_response_text(rc);
-                    }
-                }
-            if (role == "assistant" && !think.empty())
-                content = "<think>\n" + think + "\n</think>\n" + content;
-            msgs.push_back({role, content});
-        }
-        return msgs;
-    };
+        std::string rendered = q27::chatml_prompt(
+            q27::anthropic_msgs(body), q27::anthropic_tools_json(body), !no_think_srv);
+        json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
+        res.set_content(jdump(out), "application/json");
+    });
 
     srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
         json body;
         try { body = json::parse(req.body); }
-        catch (...) { res.status = 400; res.set_content("{\"type\":\"error\"}", "application/json"); return; }
+        catch (...) { anthropic_400(res, "invalid JSON body"); return; }
         int n_max = body.value("max_tokens", 1024);
         bool stream = body.value("stream", false);
-        json tools = anthropic_tools(body);
+        json tools = q27::anthropic_tools_json(body);
         std::vector<std::string> tool_names_v;
         if (constrain_tools && tools.is_array())
             for (auto& t : tools)
@@ -671,7 +636,7 @@ int main(int argc, char** argv) {
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
         std::string rendered =
-            q27::chatml_prompt(anthropic_msgs(body), tools, !no_think_srv, &stable_off);
+            q27::chatml_prompt(q27::anthropic_msgs(body), tools, !no_think_srv, &stable_off);
         auto tk1 = std::chrono::steady_clock::now();
         // P8: split-encode at the stable boundary. Both turns encode the
         // shared history with the same split (the boundary always abuts the
@@ -688,6 +653,19 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double, std::milli>(tk1 - tk0).count(),
                 std::chrono::duration<double, std::milli>(tk2 - tk1).count(),
                 rendered.size(), prompt.size());
+        // Anthropic-shaped context-limit refusal, BEFORE slot claim and the
+        // SSE provider: the old path (engine end=refused inside a 200) reads
+        // as retryable to Claude Code, which then loops the oversized prompt
+        // instead of compacting. "prompt is too long" is CC's compact-now
+        // signal. Ceiling is the largest slot minus decode headroom (n_max>=1
+        // plus spec rows P+1..P+6 -- the line-below clamps' combined floor).
+        const int max_prompt = max_slot_ctx - 7;
+        if ((int)prompt.size() > max_prompt) {
+            fprintf(stderr, "[ctx-limit] prompt=%zu max=%d -> 400\n", prompt.size(),
+                    max_prompt);
+            anthropic_400(res, q27::ctx_limit_error_message((int)prompt.size(), max_prompt));
+            return;
+        }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
         long rid = req_counter++;

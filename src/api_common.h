@@ -199,6 +199,92 @@ inline std::string tool_response_text(const std::string& out) {
     return "<tool_response>\n" + out + "\n</tool_response>";
 }
 
+// Anthropic error envelope, exactly the real API's shape: the SDK inside
+// Claude Code reads error.message from it, and CC's compact-vs-retry
+// decision substring-matches that message.
+inline std::string anthropic_error_json(const std::string& err_type,
+                                        const std::string& message) {
+    json e = {{"type", "error"},
+              {"error", {{"type", err_type}, {"message", message}}}};
+    return e.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+// The real API's context-limit message, byte-for-byte format. CC (2.1.x)
+// treats "prompt is too long" as compact-now; anything else (including our
+// old end=refused empty 200) is retried verbatim and loops.
+inline std::string ctx_limit_error_message(int n_prompt, int n_max_prompt) {
+    return "prompt is too long: " + std::to_string(n_prompt) + " tokens > " +
+           std::to_string(n_max_prompt) + " maximum";
+}
+
+// Anthropic tools -> qwen tools json for the system preamble (the
+// /v1/messages request mapping; count_tokens must count the same bytes).
+inline json anthropic_tools_json(const json& body) {
+    json out = json::array();
+    if (body.contains("tools"))
+        for (auto& t : body["tools"]) {
+            if (!t.contains("name")) continue;
+            out.push_back({{"type", "function"},
+                           {"function", {{"name", t["name"]},
+                                         {"description", t.value("description", "")},
+                                         {"parameters", t.contains("input_schema")
+                                                            ? t["input_schema"]
+                                                            : json::object()}}}});
+        }
+    return out;
+}
+
+// Anthropic messages -> Msg list (thinking + tool_use reconstructed to
+// model markers, tool_result wrapped in <tool_response>)
+inline std::vector<Msg> anthropic_msgs(const json& body) {
+    std::vector<Msg> msgs;
+    if (body.contains("system")) {
+        std::string sys;
+        if (body["system"].is_string()) sys = body["system"];
+        else if (body["system"].is_array())
+            for (auto& b : body["system"])
+                if (b.value("type", "") == "text") sys += b.value("text", "");
+        if (!sys.empty()) {
+            normalize_cc_billing_header(sys);
+            msgs.push_back({"system", sys});
+        }
+    }
+    if (!body.contains("messages")) return msgs;
+    for (auto& m : body["messages"]) {
+        std::string role = m.value("role", "user"), think, content;
+        // guard: const operator[] on a missing key is an abort (json.hpp
+        // assertion) -- a content-less message must not kill the server
+        if (!m.is_object() || !m.contains("content")) { msgs.push_back({role, content}); continue; }
+        if (m["content"].is_string()) content = m["content"];
+        else if (m["content"].is_array())
+            for (auto& part : m["content"]) {
+                std::string ty = part.value("type", "");
+                if (ty == "text") content += part.value("text", "");
+                else if (ty == "thinking") think += part.value("thinking", "");
+                else if (ty == "tool_use") {
+                    if (!content.empty() && content.back() != '\n') content += "\n";
+                    content += tool_call_text(part.value("name", ""),
+                                              part.contains("input") ? part["input"]
+                                                                     : json::object());
+                } else if (ty == "tool_result") {
+                    std::string rc;
+                    if (part.contains("content")) {
+                        if (part["content"].is_string()) rc = part["content"];
+                        else if (part["content"].is_array())
+                            for (auto& b : part["content"])
+                                if (b.value("type", "") == "text") rc += b.value("text", "");
+                    }
+                    if (!content.empty() && content.back() != '\n') content += "\n";
+                    content += tool_response_text(rc);
+                }
+            }
+        if (role == "assistant" && !think.empty())
+            content = "<think>\n" + think + "\n</think>\n" + content;
+        msgs.push_back({role, content});
+    }
+    return msgs;
+}
+
 // Parsed model tool call. `ok` false if the JSON was malformed (raw kept).
 struct ToolCall {
     bool ok = false;

@@ -161,9 +161,97 @@ static int gpu_gate_selftest() {
     return fail;
 }
 
+// Anthropic API shapes (count_tokens + ctx-limit error). Claude Code
+// substring-matches "prompt is too long" in error.message to trigger
+// compact-now instead of retrying; the envelope must be the real API's
+// {"type":"error","error":{"type":...,"message":...}} or the SDK surfaces
+// an empty error. anthropic_msgs/anthropic_tools_json are the /v1/messages
+// request mapping extracted from the server so count_tokens counts EXACTLY
+// what a generation request would prefill.
+static int anthropic_api_selftest() {
+    using nlohmann::json;
+    int fail = 0;
+    auto expect = [&](bool ok, const char* name) {
+        if (!ok) { printf("anthapi FAIL %s\n", name); fail++; }
+    };
+    {   // error envelope: exact real-API shape
+        json e = json::parse(q27::anthropic_error_json("invalid_request_error", "boom"));
+        expect(e.value("type", "") == "error", "envelope type");
+        expect(e.contains("error") && e["error"].value("type", "") == "invalid_request_error",
+               "inner type");
+        expect(e["error"].value("message", "") == "boom", "inner message");
+    }
+    {   // ctx-limit message: the byte string CC pattern-matches
+        expect(q27::ctx_limit_error_message(213538, 204698) ==
+                   "prompt is too long: 213538 tokens > 204698 maximum",
+               "ctx-limit message");
+    }
+    {   // request mapping parity with the served /v1/messages path
+        json body = json::parse(R"({
+            "system": [{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.119; cc_entrypoint=cli; cch=a5145;You are Claude Code."}],
+            "messages": [
+                {"role":"user","content":"hello"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"hmm"},
+                    {"type":"text","text":"I'll call a tool."},
+                    {"type":"tool_use","name":"ls","input":{"path":"/w"}}]},
+                {"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"a.md"}]}]}
+            ]})");
+        auto msgs = q27::anthropic_msgs(body);
+        expect(msgs.size() == 4, "msg count");
+        expect(msgs.size() == 4 && msgs[0].role == "system" &&
+                   msgs[0].content.find("cch=fffff;") != std::string::npos,
+               "system + cch normalized");
+        expect(msgs.size() == 4 && msgs[1].role == "user" && msgs[1].content == "hello",
+               "plain user");
+        expect(msgs.size() == 4 && msgs[2].role == "assistant" &&
+                   msgs[2].content == "<think>\nhmm\n</think>\nI'll call a tool.\n"
+                                      "<tool_call>\n{\"name\": \"ls\", \"arguments\": "
+                                      "{\"path\":\"/w\"}}\n</tool_call>",
+               "assistant think+text+tool_use");
+        expect(msgs.size() == 4 && msgs[3].role == "user" &&
+                   msgs[3].content == "<tool_response>\na.md\n</tool_response>",
+               "tool_result wrap");
+        // system as plain string
+        json b2 = {{"system", "S"}, {"messages", json::array()}};
+        auto m2 = q27::anthropic_msgs(b2);
+        expect(m2.size() == 1 && m2[0].role == "system" && m2[0].content == "S",
+               "system string form");
+        // missing messages key: no UB, system only
+        json b3 = {{"system", "S"}};
+        expect(q27::anthropic_msgs(b3).size() == 1, "missing messages tolerated");
+        // message without content: no UB, empty content kept (role preserved)
+        json b4 = json::parse(R"({"messages":[{"role":"user"}]})");
+        auto m4 = q27::anthropic_msgs(b4);
+        expect(m4.size() == 1 && m4[0].role == "user" && m4[0].content.empty(),
+               "missing content tolerated");
+    }
+    {   // tools mapping: anthropic input_schema -> qwen function shape
+        json body = json::parse(R"({"tools":[
+            {"name":"ls","description":"list","input_schema":{"type":"object"}},
+            {"description":"nameless skipped"},
+            {"name":"noschema"}]})");
+        json t = q27::anthropic_tools_json(body);
+        expect(t.is_array() && t.size() == 2, "nameless skipped");
+        expect(t.size() == 2 && t[0]["type"] == "function" &&
+                   t[0]["function"]["name"] == "ls" &&
+                   t[0]["function"]["description"] == "list" &&
+                   t[0]["function"]["parameters"]["type"] == "object",
+               "function shape");
+        expect(t.size() == 2 && t[1]["function"]["parameters"].is_object() &&
+                   t[1]["function"]["parameters"].empty() &&
+                   t[1]["function"]["description"] == "",
+               "schema/description defaults");
+        expect(q27::anthropic_tools_json(json::object()).is_array(), "no tools -> empty array");
+    }
+    printf("anthropic api shapes: %s\n", fail ? "FAIL" : "PASS");
+    return fail;
+}
+
 int main(int argc, char** argv) {
     if (utf8gate_selftest()) return 2;
     if (gpu_gate_selftest()) return 3;
+    if (anthropic_api_selftest()) return 4;
     if (argc != 3) { fprintf(stderr, "usage: %s q27.tok cases.txt\n", argv[0]); return 1; }
     q27::Tokenizer tok(argv[1]);
     std::ifstream in(argv[2]);
@@ -389,6 +477,30 @@ int main(int argc, char** argv) {
         q27::normalize_cc_billing_header(e);
         ok = ok && e.find("cch=ffffffffff;") != std::string::npos;
         printf("billing-header cch normalize: %s\n", ok ? "PASS" : "FAIL");
+        if (!ok) return 1;
+    }
+
+    // count_tokens equivalence: the count must equal what /v1/messages
+    // reports as usage.input_tokens for the same body. The served path
+    // split-encodes at the P8 stable boundary; count_tokens encodes the
+    // whole string. Equal only because the boundary abuts the <|im_start|>
+    // added token (split-invariant tokenization there) -- gate it.
+    {
+        nlohmann::json body = nlohmann::json::parse(R"({
+            "system": "You are terse.",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"yo"},
+                {"role":"user","content":"count something for me"}],
+            "tools": [{"name":"ls","description":"list files","input_schema":{"type":"object"}}]})");
+        size_t off = 0;
+        std::string whole = q27::chatml_prompt(q27::anthropic_msgs(body),
+                                               q27::anthropic_tools_json(body), false, &off);
+        auto w = tok.encode(whole);
+        auto a = tok.encode(whole.substr(0, off));
+        auto b = tok.encode(whole.substr(off));
+        bool ok = !w.empty() && w.size() == a.size() + b.size();
+        printf("count_tokens == split-encode input_tokens: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
 

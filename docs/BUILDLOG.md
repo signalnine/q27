@@ -992,3 +992,45 @@ client, (3) on the one matched-basin pair (T8), q27+CC beat llama+CC on
 wall AND score, (4) four concrete engine gaps now have names and owners.
 Claude Code as a harness is VIABLE on q27 today; the wall story at depth
 remains rate-won, volume-bound.
+
+## 2026-07-05 (night) -- CC-harness robustness pair: /v1/messages/count_tokens + anthropic-shaped ctx-limit 400
+
+Queue #1 from the A/B post-mortem, both halves of the compaction contract
+Claude Code expects from an Anthropic endpoint:
+
+count_tokens: POST /v1/messages/count_tokens now answers {"input_tokens": N}
+(was 404 -> CC compaction timing flew blind). N is EXACTLY what /v1/messages
+would report as usage.input_tokens for the same body: the request mapping
+(anthropic_msgs + anthropic_tools_json, cch normalization included) moved
+from server lambdas into api_common.h and both paths share it. count encodes
+the whole rendered string, the served path split-encodes at the P8 boundary;
+equal only because the boundary abuts the <|im_start|> added token --
+gated in test_tokenizer alongside new shape self-tests for the mapping
+(integration: count=186 == usage=186 on a tools+system body). CPU-only
+handler: no slot claim, no GPU gate, safe concurrent with generations.
+
+ctx-limit error: an over-ceiling prompt now 400s BEFORE slot claim / SSE
+with the real API's envelope and byte format Claude Code substring-matches
+for compact-now: {"type":"error","error":{"type":"invalid_request_error",
+"message":"prompt is too long: N tokens > M maximum"}}. The old path
+(engine end=refused inside an empty 200) read as retryable -- the T8
+pre-parity crash looped exactly there. M = max_slot_ctx - 7 (n_max>=1 plus
+spec rows P+1..P+6), so the refusal rule and the reported maximum agree by
+construction. Streamed requests get the same plain-JSON 400 (provider not
+yet started). Codex /v1/responses keeps its own context_length_exceeded.
+
+Bad-JSON 400s upgraded from bare {"type":"error"} to the full envelope
+(the SDK reads error.message; bare shape surfaced as empty errors).
+Latent crash fixed en route: a message without "content" aborted on
+nlohmann const operator[] assertion (json.hpp:21449, reproduced in test) --
+any garbage POST could kill the server; now guarded in anthropic_msgs.
+
+Verification: test_tokenizer all-PASS (new: anthropic api shapes 12 checks,
+count==split-encode gate); 10/10 integration matrix on a throwaway
+--ctx 4096 server (exact refusal string vs live count_tokens, stream and
+nonstream, regression on small requests); q27-eval recreated on the new
+binary, count_tokens live on 8081. Canonical gate not re-derived: no model
+change, 400 fires before generate(), decode path untouched.
+
+CC-level effect (compaction actually triggering instead of the retry loop)
+gets validated the next time a deep-context trial runs -- queue: sampling.
