@@ -664,7 +664,7 @@ static void test_attn_fp8() {
     float* d_scr;
     CUDA_CHECK(cudaMalloc(&d_pos, 4));
     CUDA_CHECK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)NKV * GQA * q27k::FD_NS * q27k::FD_ST * 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)NKV * GQA * q27k::FD_MAXNS * q27k::FD_ST * 4));
     q27k::attn_decode(d_q, 2 * HD, d_k8, d_v8, d_oa, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
                       scale, 0, true);
     q27k::attn_decode(d_q, 2 * HD, d_kh, d_vh, d_ob, d_scr, d_pos, SEQ, NKV * GQA, NKV, HD,
@@ -676,6 +676,218 @@ static void test_attn_fp8() {
     CUDA_CHECK(cudaFree(d_k8)); CUDA_CHECK(cudaFree(d_v8));
     CUDA_CHECK(cudaFree(d_kh)); CUDA_CHECK(cudaFree(d_vh));
     CUDA_CHECK(cudaFree(d_pos)); CUDA_CHECK(cudaFree(d_scr));
+}
+
+// attn-fd2 (docs/attn-fd2-design.md): register-accumulator flash-decode vs
+// the v1 kernel. Three properties: (1) the DEFAULT attn_decode3 dispatch
+// routes to fd2 (bitwise vs the explicit entry point); (2) fd2 matches v1
+// within reorder tolerance across depth x ntok x cache type (register
+// re-tiling changes fp accumulation order -- tolerance gate per the g64
+// precedent, NOT bitwise); (3) fd2 is run-to-run bitwise deterministic
+// (the cross-warp merge is barrier-serialized, no smem atomics -- the
+// transient-detection methodology needs repeat runs to be exact).
+static void test_attn_fd2() {
+    const int NKV = 4, GQA = 6, HD = 256, NH = NKV * GQA;
+    const int SEQMAX = 61440, ROW = NKV * HD;
+    const int QROW = NH * 2 * HD, OROW = NH * HD;
+    std::vector<float> kf = rand_vec((size_t)SEQMAX * ROW, 61),
+                       vf = rand_vec((size_t)SEQMAX * ROW, 62);
+    std::vector<float> qh = rand_vec((size_t)5 * QROW, 63);
+    std::vector<uint8_t> k8(kf.size()), v8(vf.size());
+    std::vector<__half> kh(kf.size()), vh(vf.size());
+    for (size_t i = 0; i < kf.size(); i++) {
+        __nv_fp8_e4m3 a(kf[i]), b(vf[i]);
+        k8[i] = a.__x; v8[i] = b.__x;
+        kh[i] = __float2half_rn(float(a)); vh[i] = __float2half_rn(float(b));
+    }
+    uint8_t *d_k8, *d_v8;
+    __half *d_kh, *d_vh;
+    float *d_q[5], *d_oa[5], *d_ob[5], *d_scr;
+    int* d_pos[5];
+    CUDA_CHECK(cudaMalloc(&d_k8, k8.size()));
+    CUDA_CHECK(cudaMalloc(&d_v8, v8.size()));
+    CUDA_CHECK(cudaMalloc(&d_kh, kh.size() * 2));
+    CUDA_CHECK(cudaMalloc(&d_vh, vh.size() * 2));
+    CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kh, kh.data(), kh.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vh, vh.data(), vh.size() * 2, cudaMemcpyHostToDevice));
+    for (int t = 0; t < 5; t++) {
+        CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)QROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_ob[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_pos[t], 4));
+        CUDA_CHECK(cudaMemcpy(d_q[t], qh.data() + (size_t)t * QROW, (size_t)QROW * 4,
+                              cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)5 * NH * q27k::FD_MAXNS * q27k::FD_ST * 4));
+    std::vector<float> oa(OROW), ob(OROW);
+    // metric: max |a-b| / RMS(b). Random q/k make true outputs statistically
+    // near zero, so per-element relative error is meaningless; indexing or
+    // algebra bugs show as O(RMS) deviations, reorder noise as <<1e-4.
+    auto cmp = [&](float* a, float* b, bool scaled) {
+        CUDA_CHECK(cudaMemcpy(oa.data(), a, (size_t)OROW * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ob.data(), b, (size_t)OROW * 4, cudaMemcpyDeviceToHost));
+        double m = 0, ss = 0;
+        for (int i = 0; i < OROW; i++) {
+            m = std::max(m, std::fabs((double)oa[i] - ob[i]));
+            ss += (double)ob[i] * ob[i];
+        }
+        return scaled ? m / (std::sqrt(ss / OROW) + 1e-12) : m;
+    };
+    // double-precision host reference (exact softmax over the DEQUANTIZED
+    // cache) -- arbitrates v1-vs-fd2 disagreements instead of assuming v1
+    auto host_ref = [&](int t, int p_t, bool fp8, std::vector<float>& out) {
+        out.assign(OROW, 0.f);
+        for (int hh = 0; hh < NH; hh++) {
+            int kvh = hh / GQA;
+            const float* qv = qh.data() + (size_t)t * QROW + (size_t)hh * 2 * HD;
+            std::vector<double> sc(p_t + 1);
+            double mx = -1e300;
+            for (int p = 0; p <= p_t; p++) {
+                double d = 0;
+                for (int i = 0; i < HD; i++) {
+                    size_t off = ((size_t)p * NKV + kvh) * HD + i;
+                    double kvv = fp8 ? (double)float(*(__nv_fp8_e4m3*)&k8[off])
+                                     : (double)__half2float(kh[off]);
+                    d += (double)qv[i] * kvv;
+                }
+                sc[p] = d / sqrt((double)HD);
+                mx = std::max(mx, sc[p]);
+            }
+            double lsum = 0;
+            for (int p = 0; p <= p_t; p++) { sc[p] = exp(sc[p] - mx); lsum += sc[p]; }
+            for (int p = 0; p <= p_t; p++) {
+                double w = sc[p] / lsum;
+                for (int i = 0; i < HD; i++) {
+                    size_t off = ((size_t)p * NKV + kvh) * HD + i;
+                    double vvv = fp8 ? (double)float(*(__nv_fp8_e4m3*)&v8[off])
+                                     : (double)__half2float(vh[off]);
+                    out[(size_t)hh * HD + i] += (float)(w * vvv);
+                }
+            }
+        }
+    };
+    const float scale = 1.0f / sqrtf((float)HD);
+    for (bool fp8 : {true, false}) {
+        const void* kc = fp8 ? (void*)d_k8 : (void*)d_kh;
+        const void* vc = fp8 ? (void*)d_v8 : (void*)d_vh;
+        for (int seq : {1, 47, 1024, 16384, SEQMAX}) {
+            for (int ntok : {1, 5}) {
+                q27k::CP3 q{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}};
+                q27k::P3 va{{d_oa[0], d_oa[1], d_oa[2], d_oa[3], d_oa[4]}};
+                q27k::P3 vb{{d_ob[0], d_ob[1], d_ob[2], d_ob[3], d_ob[4]}};
+                q27k::IP3 P{{d_pos[0], d_pos[1], d_pos[2], d_pos[3], d_pos[4]}};
+                // verify-shaped positions: lane t at pos seq-1-(ntok-1-t),
+                // clamped >= 0 (rows exist for all lanes; causal contract)
+                for (int t = 0; t < ntok; t++) {
+                    int p = std::max(0, seq - 1 - (ntok - 1 - t));
+                    CUDA_CHECK(cudaMemcpy(d_pos[t], &p, 4, cudaMemcpyHostToDevice));
+                }
+                char label[96];
+                // (2) fd2 vs v1, reorder tolerance (max-abs over RMS scale)
+                q27k::attn_decode3_fd2(q, 2 * HD, kc, vc, va, d_scr, P, SEQMAX, NH, NKV,
+                                       HD, scale, 0, ntok, fp8);
+                setenv("Q27_FD", "v1", 1);
+                q27k::attn_decode3(q, 2 * HD, kc, vc, vb, d_scr, P, SEQMAX, NH, NKV, HD,
+                                   scale, 0, ntok, fp8);
+                unsetenv("Q27_FD");
+                CUDA_CHECK(cudaDeviceSynchronize());
+                double worst = 0;
+                for (int t = 0; t < ntok; t++)
+                    worst = std::max(worst, cmp(d_oa[t], d_ob[t], true));
+                snprintf(label, sizeof label, "fd2 vs v1 %s seq=%d ntok=%d",
+                         fp8 ? "fp8" : "fp16", seq, ntok);
+                check(label, worst, 1e-4);
+                // (2b) both kernels vs the exact host reference (small seqs)
+                if (seq <= 1024) {
+                    std::vector<float> ref(OROW), got(OROW);
+                    for (int t = 0; t < ntok; t++) {
+                        int p_t;
+                        CUDA_CHECK(cudaMemcpy(&p_t, d_pos[t], 4, cudaMemcpyDeviceToHost));
+                        host_ref(t, p_t, fp8, ref);
+                        double ss = 0;
+                        for (int i = 0; i < OROW; i++) ss += (double)ref[i] * ref[i];
+                        double rms = std::sqrt(ss / OROW) + 1e-12;
+                        for (float* dev : {d_oa[t], d_ob[t]}) {
+                            CUDA_CHECK(cudaMemcpy(got.data(), dev, (size_t)OROW * 4,
+                                                  cudaMemcpyDeviceToHost));
+                            double mm = 0;
+                            for (int i = 0; i < OROW; i++)
+                                mm = std::max(mm,
+                                              std::fabs((double)got[i] - ref[i]) / rms);
+                            snprintf(label, sizeof label,
+                                     "%s vs host-ref %s seq=%d t=%d",
+                                     dev == d_oa[t] ? "fd2" : "v1 ",
+                                     fp8 ? "fp8" : "fp16", seq, t);
+                            check(label, mm, 1e-4);
+                        }
+                    }
+                }
+                // (3) run-to-run bitwise determinism of fd2
+                q27k::attn_decode3_fd2(q, 2 * HD, kc, vc, vb, d_scr, P, SEQMAX, NH, NKV,
+                                       HD, scale, 0, ntok, fp8);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                double dd = 0;
+                for (int t = 0; t < ntok; t++) dd = std::max(dd, cmp(d_oa[t], d_ob[t], false));
+                snprintf(label, sizeof label, "fd2 deterministic %s seq=%d ntok=%d",
+                         fp8 ? "fp8" : "fp16", seq, ntok);
+                check(label, dd, 1e-30);
+                // (1) default dispatch == fd2, bitwise
+                q27k::attn_decode3(q, 2 * HD, kc, vc, vb, d_scr, P, SEQMAX, NH, NKV, HD,
+                                   scale, 0, ntok, fp8);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                dd = 0;
+                for (int t = 0; t < ntok; t++) dd = std::max(dd, cmp(d_oa[t], d_ob[t], false));
+                snprintf(label, sizeof label, "default dispatch==fd2 %s seq=%d ntok=%d",
+                         fp8 ? "fp8" : "fp16", seq, ntok);
+                check(label, dd, 1e-30);
+            }
+        }
+    }
+    // informational micro timing at depth (in-graph occupancy differs; the
+    // serving ground truth is the perf gate, this is directional only)
+    {
+        cudaEvent_t e0, e1;
+        CUDA_CHECK(cudaEventCreate(&e0));
+        CUDA_CHECK(cudaEventCreate(&e1));
+        q27k::CP3 q{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}};
+        q27k::P3 va{{d_oa[0], d_oa[1], d_oa[2], d_oa[3], d_oa[4]}};
+        q27k::IP3 P{{d_pos[0], d_pos[1], d_pos[2], d_pos[3], d_pos[4]}};
+        int p = SEQMAX - 1;
+        CUDA_CHECK(cudaMemcpy(d_pos[0], &p, 4, cudaMemcpyHostToDevice));
+        for (const char* which : {"v1", "fd2"}) {
+            bool v1 = !strcmp(which, "v1");
+            auto run = [&] {
+                if (v1) {
+                    setenv("Q27_FD", "v1", 1);
+                    q27k::attn_decode3(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX, NH,
+                                       NKV, HD, scale, 0, 1, true);
+                    unsetenv("Q27_FD");
+                } else {
+                    q27k::attn_decode3_fd2(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX,
+                                           NH, NKV, HD, scale, 0, 1, true);
+                }
+            };
+            run(); // warm
+            CUDA_CHECK(cudaEventRecord(e0));
+            for (int i = 0; i < 50; i++) run();
+            CUDA_CHECK(cudaEventRecord(e1));
+            CUDA_CHECK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("  [info] attn %s fp8 seq=61440 ntok=1: %.3f ms/call\n", which, ms / 50);
+        }
+        CUDA_CHECK(cudaEventDestroy(e0));
+        CUDA_CHECK(cudaEventDestroy(e1));
+    }
+    CUDA_CHECK(cudaFree(d_k8)); CUDA_CHECK(cudaFree(d_v8));
+    CUDA_CHECK(cudaFree(d_kh)); CUDA_CHECK(cudaFree(d_vh));
+    for (int t = 0; t < 5; t++) {
+        CUDA_CHECK(cudaFree(d_q[t])); CUDA_CHECK(cudaFree(d_oa[t]));
+        CUDA_CHECK(cudaFree(d_ob[t])); CUDA_CHECK(cudaFree(d_pos[t]));
+    }
+    CUDA_CHECK(cudaFree(d_scr));
 }
 
 // P4: split-position MMA prefill vs the exact single-split path at a deep
@@ -1026,6 +1238,7 @@ int main(int argc, char** argv) {
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();
+    test_attn_fd2();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

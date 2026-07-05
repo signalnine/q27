@@ -36,18 +36,32 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
 void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st = 0,
                int ntok = 3, bool fp8 = false);
 
-// Flash-decode split-K partial layout: FD_NS position splits per (token, head)
+// Flash-decode split-K partial layout: NS position splits per (token, head)
 // pair, each partial = {m, l, acc[256]} = FD_ST floats. Every split writes its
 // full partial (even when its position range is empty), so scratch must hold
-// ntok * n_q_heads * FD_NS * FD_ST floats regardless of context length.
-static constexpr int FD_NS = 16;   // splits over positions
-static constexpr int FD_ST = 258;  // per-partial stride: m, l, acc[256]
+// ntok * n_q_heads * FD_MAXNS * FD_ST floats regardless of context length.
+// FD_NS stays 16 so Q27_FD=v1 reproduces the historical kernel bit-for-bit;
+// fd2 uses its own FD2_NS -- with register accumulators the block is cheap,
+// and the grid needs ~4-5 blocks per SM resident for latency hiding
+// (4 kv-heads x FD2_NS x ntok blocks; see docs/attn-fd2-design.md).
+static constexpr int FD_NS = 16;    // v1 splits over positions (frozen)
+static constexpr int FD2_NS = 128;  // fd2 splits (perf-swept, BUILDLOG)
+static constexpr int FD_MAXNS = FD2_NS > FD_NS ? FD2_NS : FD_NS;
+static constexpr int FD_ST = 258;   // per-partial stride: m, l, acc[256]
 
 // causal decode attention for ntok tokens; token t attends cache[0 .. *pos.p[t]].
 // scratch: [ntok][n_q_heads][FD_NS][FD_ST] floats (see above).
+// Default path = fd2 (register-accumulator kernel, docs/attn-fd2-design.md);
+// Q27_FD=v1 selects the original kernel. The env is read at LAUNCH time, so
+// graph capture bakes the choice per process.
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st = 0, int ntok = 3, bool fp8 = false);
+// explicit fd2 entry point (unit gate compares this against Q27_FD=v1)
+void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
+                      float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
+                      int head_dim, float scale, cudaStream_t st = 0, int ntok = 3,
+                      bool fp8 = false);
 
 // embedding row lookup for ntok device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,

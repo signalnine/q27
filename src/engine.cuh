@@ -200,7 +200,7 @@ struct Engine {
         // flash-decode split-K partials: ntok * heads * FD_NS * FD_ST floats,
         // independent of ctx (sized for 5 lanes; was 3*N_HEAD*max_ctx, which
         // under-allocates whenever max_ctx < FD_NS*FD_ST = 4128)
-        A((void**)&scratch, 5 * (size_t)N_HEAD * q27k::FD_NS * q27k::FD_ST * 4);
+        A((void**)&scratch, 5 * (size_t)N_HEAD * q27k::FD_MAXNS * q27k::FD_ST * 4);
         A((void**)&qkv, GDN_CH * 4); A((void**)&convout, GDN_CH * 4); A((void**)&z, GDN_V * 4);
         A((void**)&alpha, GDN_HEADS * 4); A((void**)&betar, GDN_HEADS * 4);
         A((void**)&g, GDN_HEADS * 4); A((void**)&beta, GDN_HEADS * 4);

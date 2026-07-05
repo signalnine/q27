@@ -713,3 +713,61 @@ lands with re-derived canonicals + PPL + needle + acceptance-rate gates
 
 Probes REVERTED (spec3.* clean); shipped this session: the env-gated
 profiler range only (canonical md5 EXACT, off-path zero-cost).
+
+## 2026-07-05 (early) -- attn-fd2 LANDED: register-accumulator flash-decode, +62% decode at 61K
+
+Design docs/attn-fd2-design.md; the fix for the decode-at-depth attribution
+(previous entry). k_attn_fd2: per-lane register accumulators (48/lane, lane
+owns dims {4l..4l+3, 128+4l..+3}), uchar4/uint2-vectorized K/V loads (16
+byte-loads -> 4 word loads), smem 55.3KB -> 12.3KB (occupancy stops being
+smem-capped), NW=4 x 128 threads, cross-warp merge barrier-SERIALIZED in
+warp order (smem atomics would break run-to-run bitwise determinism).
+FD2_NS=128 splits (own constant; FD_NS=16 frozen so Q27_FD=v1 reproduces
+the historical kernel BIT-FOR-BIT -- verified, old canonical 58b6ae85
+exact under the fallback). Empty splits early-return WITHOUT writing
+partials; the combine kernel derives the used-split count from pos and
+skips the rest (bitwise-identical for v1 -- skipped partials contributed
+exactly 0; kills the +2.4%/round empty-split tax at 2K, now +1.3%).
+Combine takes ns + pos at runtime. Scratch sized by FD_MAXNS (engine,
+tests). FD2_NS sweep: 128 (0.156ms/inst @61K micro) beats 256 (0.169) and
+16 (0.624); v1 = 0.768 -> 4.9x per instance, ~808 GB/s = 45% of DRAM peak
+(from 5%).
+
+**Serving ground truth (fp8, --fast-head, wikitext continuation): 61K
+47.2 -> 29.2 ms/round = 78.0 -> 126.2 t/s (+62%); 16K 27.3 -> 22.5
+ms/round (-18%, 166 t/s on this text). Acceptance parity exact: 163
+rounds / 3.68 t/round at 61K on BOTH kernels. 2K short bench 20.03 ->
+20.3 ms/round (+1.3%); printed tps 177.5 -> 160 is t/round lottery on the
+tie-riddled canonical prompt (3.56 -> 3.25), not kernel cost.** The
+depth slope of attention fell ~3x (0.45 -> ~0.15 ms/round per 1K ctx);
+decode-at-depth was 65-76% of long-task wall, so CRUSH-class tasks should
+gain ~25-40% wall. llama late-leg (104-153 t/s at depth) is now matched
+from below at 61K.
+
+TDD: RED on missing attn_decode3_fd2 symbol; unit gate = fd2 + v1 BOTH
+against an exact double-precision host softmax reference (arbitration --
+first fd2-vs-v1 comparison used per-element relative error on
+statistically-zero random-input outputs and false-failed at 4e-3; metric
+now max-abs/RMS), + run-to-run bitwise determinism, + default-dispatch==
+fd2 bitwise, across seq {1,47,1024,16384,61440} x ntok {1,5} x {fp8,fp16}.
+Numerics gates: --pf 200 seq+32 IDENTICAL; PPL fp16 7.1918 (bar 7.1928),
+fp8 7.1833 (bar 7.1889) -- both in noise, both better; --nll-long 160K
+fp8 BUCKET-IDENTICAL to 4dp vs v1 at all 8 depth buckets; interleave gate
+PASS both phases (fd2 x R1b interplay, byte-identical solo-vs-interleaved).
+
+**CANONICAL RE-DERIVED (gate policy per docs/attn-fd2-design.md, g64
+precedent): n=128 md5 = 4c4120c72056aba2bc2d2561471eafce (fd2 default,
+run-stable); 58b6ae856e8e10d10549878ac44417a4 remains valid ONLY under
+Q27_FD=v1. Recipe unchanged (grep '^generated:' | md5sum, -n 128 --spec).
+SOLVED EN ROUTE: 4c4120c7 is byte-identical to the 2026-07-04 "one-time
+canonical md5 flake" (1-of-10, never reproduced) -- the canonical prompt
+sits on an argmax tie whose two sides are the v1 and fd2 accumulation
+orders; the adaptive-agent's experimental build must have perturbed the
+same tie once. That flake is no longer unexplained; the P11 split crash
+remains the only open item in the flake-pattern class.**
+
+Stale-binary lesson AGAIN, new variant: after the Makefile dep fix, a
+target-scoped `make build/test_kernels` left build/q27-server old --
+measured a whole "fd2" server run on the pre-fd2 binary (identical
+numbers + identical trajectory = the tell, second time this session).
+Full `make`, always, no target names.

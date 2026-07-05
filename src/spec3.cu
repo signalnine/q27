@@ -1,4 +1,6 @@
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
 
 #include "cuda_common.h"
 #include "spec3.cuh"
@@ -238,16 +240,22 @@ __global__ void k_attn_fd(CP3 qp, int q_stride, const CT* __restrict__ kc,
 }
 
 __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n_heads,
-                                  int head_dim) {
+                                  int head_dim, int ns, IP3 pos) {
     const int h = blockIdx.x, t = blockIdx.y;
+    // splits at sp*chunk >= seq are empty; fd2 never writes them, and for
+    // v1 they hold {-FLT_MAX, 0, ...} which contribute exactly zero -- so
+    // skipping them is bitwise-identical for v1 and REQUIRED for fd2
+    const int seq = *pos.p[t] + 1;
+    const int chunk = (seq + ns - 1) / ns;
+    const int used = (seq + chunk - 1) / chunk;
     size_t pair = (size_t)t * n_heads + h;
-    const float* pp = part + pair * FD_NS * FD_ST;
+    const float* pp = part + pair * ns * FD_ST;
     __shared__ float s_m, s_l;
     if (threadIdx.x == 0) {
         float mg = -FLT_MAX;
-        for (int sp = 0; sp < FD_NS; sp++) mg = fmaxf(mg, pp[sp * FD_ST]);
+        for (int sp = 0; sp < used; sp++) mg = fmaxf(mg, pp[sp * FD_ST]);
         float lg = 0.f;
-        for (int sp = 0; sp < FD_NS; sp++)
+        for (int sp = 0; sp < used; sp++)
             if (pp[sp * FD_ST] != -FLT_MAX)
                 lg += pp[sp * FD_ST + 1] * expf(pp[sp * FD_ST] - mg);
         s_m = mg;
@@ -257,11 +265,149 @@ __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n
     const float mg = s_m, inv = 1.0f / s_l;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float a = 0.f;
-        for (int sp = 0; sp < FD_NS; sp++) {
+        for (int sp = 0; sp < used; sp++) {
             float ms = pp[sp * FD_ST];
             if (ms != -FLT_MAX) a += pp[sp * FD_ST + 2 + d] * expf(ms - mg);
         }
         outp.p[t][(size_t)h * head_dim + d] = a * inv;
+    }
+}
+
+// ---- attn-fd2 (docs/attn-fd2-design.md): register-accumulator flash-decode.
+// Same grid and partial layout as v1; the per-warp accumulator moves from a
+// 55KB smem array (which capped the SM at 1 block / 8 resident warps -- the
+// measured latency-hiding ceiling, BUILDLOG 2026-07-04 night) into 48
+// registers per lane. Lane owns dims D(l) = {4l..4l+3, 128+4l..128+4l+3},
+// chosen so K/V rows load as two 4-byte words per lane instead of 16 single
+// bytes. smem shrinks to s_q + a 6KB cross-warp merge buffer (~12.3KB).
+// The merge is barrier-SERIALIZED in warp order -- smem atomics would
+// reorder fp adds run-to-run and break the bitwise repeat-run determinism
+// the transient-detection methodology depends on.
+
+template <typename CT>
+__device__ __forceinline__ void fd2_ld8(const CT* __restrict__ row, int lane, float* o) {
+    if constexpr (sizeof(CT) == 1) {
+        // fp8 row = 256B, 4B-aligned at 4*lane
+        uint32_t a = *reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const uint8_t*>(row) + 4 * lane);
+        uint32_t b = *reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const uint8_t*>(row) + 128 + 4 * lane);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            __nv_fp8_e4m3 e;
+            e.__x = (a >> (8 * i)) & 0xFF;
+            o[i] = float(e);
+            e.__x = (b >> (8 * i)) & 0xFF;
+            o[4 + i] = float(e);
+        }
+    } else {
+        // half row = 512B, 8B-aligned at 8*lane
+        uint2 a = *reinterpret_cast<const uint2*>(row + 4 * lane);
+        uint2 b = *reinterpret_cast<const uint2*>(row + 128 + 4 * lane);
+        const __half* ha = reinterpret_cast<const __half*>(&a);
+        const __half* hb = reinterpret_cast<const __half*>(&b);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            o[i] = __half2float(ha[i]);
+            o[4 + i] = __half2float(hb[i]);
+        }
+    }
+}
+
+template <typename CT, int NW>
+__global__ void k_attn_fd2(CP3 qp, int q_stride, const CT* __restrict__ kc,
+                           const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
+                           int n_kv_heads, int gqa, int head_dim, float scale) {
+    const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    const int seq = *pos.p[t] + 1;
+    // empty split: no partial is written; the combine kernel derives the
+    // used-split count from pos and never reads these slots. Keeps high
+    // FD2_NS free at short ctx (measured +2.4%/round at 2K without this).
+    if (sp * ((seq + FD2_NS - 1) / FD2_NS) >= seq) return;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;              // [6][256]
+    float* s_mrg = smem + 6 * 256;  // [6][256] cross-warp accumulator merge
+    __shared__ float s_ml[NW][6][2];
+
+    for (int idx = threadIdx.x; idx < gqa * head_dim; idx += blockDim.x)
+        s_q[idx] = qp.p[t][(size_t)(kvh * gqa + idx / head_dim) * q_stride + idx % head_dim];
+    for (int idx = threadIdx.x; idx < 6 * 256; idx += blockDim.x) s_mrg[idx] = 0.f;
+    __syncthreads();
+
+    const int chunk = (seq + FD2_NS - 1) / FD2_NS;
+    const int p_lo = sp * chunk, p_hi = min(seq, p_lo + chunk);
+
+    float m[6], l[6], acc[6][8];
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        m[j] = -FLT_MAX;
+        l[j] = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[j][i] = 0.f;
+    }
+
+    for (int p = p_lo + warp; p < p_hi; p += NW) {
+        const CT* kp = kc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        const CT* vp = vc + ((size_t)p * n_kv_heads + kvh) * head_dim;
+        float kv[8], vv[8];
+        fd2_ld8(kp, lane, kv);
+        fd2_ld8(vp, lane, vv);
+#pragma unroll
+        for (int j = 0; j < 6; j++) {
+            const float4 qa = reinterpret_cast<const float4*>(s_q + j * 256)[lane];
+            const float4 qb = reinterpret_cast<const float4*>(s_q + j * 256 + 128)[lane];
+            float d = qa.x * kv[0] + qa.y * kv[1] + qa.z * kv[2] + qa.w * kv[3] +
+                      qb.x * kv[4] + qb.y * kv[5] + qb.z * kv[6] + qb.w * kv[7];
+            for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffff, d, off);
+            d = __shfl_sync(0xffffffff, d, 0) * scale;
+            float mn = fmaxf(m[j], d);
+            float so = expf(m[j] - mn), w = expf(d - mn);
+            l[j] = l[j] * so + w;
+            m[j] = mn;
+#pragma unroll
+            for (int i = 0; i < 8; i++) acc[j][i] = acc[j][i] * so + w * vv[i];
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 6; j++)
+        if (lane == 0) { s_ml[warp][j][0] = m[j]; s_ml[warp][j][1] = l[j]; }
+    __syncthreads();
+
+    // serialized rescale-add of each warp's register accumulator into s_mrg
+    // (fixed warp order 0..NW-1 => bitwise-deterministic across runs)
+    for (int w = 0; w < NW; w++) {
+        if (warp == w) {
+#pragma unroll
+            for (int j = 0; j < 6; j++) {
+                float mb = -FLT_MAX;
+#pragma unroll
+                for (int u = 0; u < NW; u++) mb = fmaxf(mb, s_ml[u][j][0]);
+                float scw = m[j] == -FLT_MAX ? 0.f : expf(m[j] - mb);
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    s_mrg[j * 256 + 4 * lane + i] += acc[j][i] * scw;
+                    s_mrg[j * 256 + 128 + 4 * lane + i] += acc[j][4 + i] * scw;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // per-head block {m, l} + merged acc -> partial (layout identical to v1;
+    // the combine kernel is untouched)
+    for (int j = warp; j < 6; j += NW) {
+        float mb = -FLT_MAX;
+        for (int u = 0; u < NW; u++) mb = fmaxf(mb, s_ml[u][j][0]);
+        float lb = 0.f;
+        for (int u = 0; u < NW; u++)
+            lb += s_ml[u][j][1] * (s_ml[u][j][0] == -FLT_MAX ? 0.f : expf(s_ml[u][j][0] - mb));
+        size_t pair = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
+        float* dst = part + (pair * FD2_NS + sp) * FD_ST;
+        if (lane == 0) { dst[0] = mb; dst[1] = lb; }
+        for (int d = lane; d < head_dim; d += 32) dst[2 + d] = s_mrg[j * 256 + d];
     }
 }
 
@@ -286,9 +432,41 @@ static void fd_launch(CP3 q, int q_stride, const void* kc, const void* vc, float
                                        n_kv_heads, gqa, head_dim, scale);
 }
 
+void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
+                      float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
+                      int head_dim, float scale, cudaStream_t st, int ntok, bool fp8) {
+    (void)max_ctx;
+    int gqa = n_q_heads / n_kv_heads;
+    // NW=4 (128 threads): probe-favored -- more blocks/SM for latency hiding.
+    // smem 12.3KB, under the 48KB default: no cudaFuncSetAttribute needed.
+    constexpr int NW2 = 4;
+    size_t sm = (size_t)(2 * 6) * 256 * sizeof(float);
+    dim3 g1(n_kv_heads, FD2_NS, ntok);
+    if (fp8)
+        k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
+            q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,
+            n_kv_heads, gqa, head_dim, scale);
+    else
+        k_attn_fd2<__half, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, (const __half*)kc,
+                                                          (const __half*)vc, scratch, pos,
+                                                          n_kv_heads, gqa, head_dim, scale);
+    dim3 g2(n_q_heads, ntok);
+    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD2_NS, pos);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st, int ntok, bool fp8) {
+    // fd2 is the default; Q27_FD=v1 keeps the original kernel (bit-for-bit
+    // old behavior, incl. the retired bitwise canonical). Read at launch
+    // time: graph capture bakes the choice for the process lifetime.
+    const char* fd = getenv("Q27_FD");
+    if (!fd || strcmp(fd, "v1") != 0) {
+        attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
+                         n_kv_heads, head_dim, scale, st, ntok, fp8);
+        return;
+    }
     (void)max_ctx;
     int gqa = n_q_heads / n_kv_heads;
     size_t sm = (size_t)(6 + 8 * 6) * 256 * sizeof(float);
@@ -299,7 +477,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
         fd_launch<__half>(q, q_stride, kc, vc, scratch, pos, n_kv_heads, gqa, head_dim, scale,
                           sm, ntok, st);
     dim3 g2(n_q_heads, ntok);
-    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim);
+    k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD_NS, pos);
     CUDA_CHECK(cudaGetLastError());
 }
 
