@@ -49,6 +49,14 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   final rerun), not the grammar; a strict-parser rerun with the grammar on
   (zero rescues, both legs) is an open gate, blocked on the engage-lag fix.
   Constraint is wired on the Anthropic `/v1/messages` path only
+- Claude Code as harness (same-day A/B 2026-07-05, native Anthropic BOTH
+  engines, no proxy either leg -- build log): T8 q27 **167s @ 0.82** vs
+  llama 222s @ 0.50, the day's only matched-basin pair; first real-client
+  P9 checkpoint restore; 2.47M tokens served from prefix cache in that one
+  trial. T2 drew a deterministic one-shot-quit greedy basin (byte-identical
+  retry cannot reroll it -- sampling's case). Load-bearing fix: cch
+  billing-header normalization (2026-07-05) -- without it Claude Code's
+  mutating prompt head forces a full re-prefill every turn
 - P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
   attributed and fixed (fd2, 2026-07-05). Next: sampling
   (docs/sampling-design.md); A2 fusion / light utility slots only if
@@ -62,11 +70,14 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
 - Measured baseline to beat: llama.cpp mainline (b9857, `--spec-type
   draft-mtp`, Q5_K_M, greedy) at 106-127 t/s single-stream on this box;
-  its late-leg A/B samples at 62-65K ctx reach 109-162 t/s. Community
-  configs report higher (~140 t/s class on lighter quants, e.g. unsloth's
-  UD-Q2_K_XL figure; a "mean 140.7 at Q6, patched" config is reported but
-  not reproduced here) -- a strongest-opponent sweep (draft depth, p_min)
-  on this box is an open item before any headline cross-engine claim
+  its late-leg A/B samples at 62-65K ctx reach 109-162 t/s. The strongest
+  community reference (r/LocalLLM, 2026-07-03: same GDN arch on a 5090,
+  llama.cpp with PR #24785 + b9180 n_rs_seq + the hybrid checkpoint-search
+  fixes -- all present in our b9857 build) reports **140.7 t/s mean over
+  20h of agentic use at Q6**, with draft=10 + p_min 0.5 beating draft=6 by
+  15-20 t/s despite lower acceptance. Our A/B legs ran draft=6 untuned --
+  the strongest-opponent sweep (draft depth, p_min) is an open item before
+  any headline cross-engine claim (roadmap, measurement debts)
 
 ## Architecture facts (ground truth from GGUF metadata)
 
@@ -309,25 +320,45 @@ required the P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Active: P10-A -- fused 2-slot batch-10 serving.** Decided 2026-07-03; the
-A/B/C analysis (fused vs vLLM-routing vs interleaved-only, all measured
-comparisons) is docs/P10-decision.md. Staged, with a measured gate at each
-step:
-- A0 go/no-go microbench: does one weight stream feed 10 verify lanes at
-  ~2x aggregate? Kill the plan if the 5 -> 10 lane scaling doesn't hold
-  (the 4 -> 5 step cost +14% round tax, P3).
-- A1 per-slot state + interleaved scheduling -- SHIPPED (R1 e8f71fd/c618c91
-  + R1b 3568823/c615d8f/0449131): whole-generation queue waits are gone;
-  the remaining head-of-line is engine-claim when conversations outnumber
-  --slots (light utility slots are the lever if telemetry demands it).
-- A2 fused batch-10 verify (graph indirection + 10-lane GEMVs + per-lane KV).
-Prerequisite already shipped: server defaults to fp8 KV (2026-07-03).
+**Now -- serve the Claude Code harness properly** (both surfaced by the
+CC-harness A/B, build log 2026-07-05; both cheap):
+- `/v1/messages/count_tokens`: not implemented (404s in the CC legs). CC
+  times its auto-compaction with it; without it CC flies blind on context
+  and runs into the ctx ceiling. llama.cpp implements it.
+- Anthropic-shaped context-limit error on ctx-ceiling refusal: today a
+  prompt past slot capacity gets `end=refused`, which CC treats as
+  retryable (it re-sends until it gives up) instead of compact-now.
 
-**Next up: sampling** -- temperature/top-p with rejection-sampled spec
+**P10-A status**: A0 PASSED, A1 SHIPPED (R1 multi-slot + R1b round
+interleaving; whole-generation queue waits gone; analysis in
+docs/P10-decision.md). A2 fused batch-10 verify stays CONDITIONAL: build
+only if engine-claim telemetry says conversations outnumber slots in real
+use (light no-spec utility slots are the smaller lever first).
+
+**Next: sampling** -- temperature/top-p with rejection-sampled spec
 acceptance; the greedy path stays bitwise untouched. Design:
 docs/sampling-design.md. Exit criterion (in the design doc): the quality
 A/B and drift catalog re-run under the production sampling config --
-every quality number in this README is greedy-no-think scoped.
+every quality number in this README is greedy-no-think scoped. Greedy
+pathology now has two live Claude-Code exhibits (build log 2026-07-05): a
+DETERMINISTIC one-shot-quit basin on T2 (model answers the task prompt
+conversationally, zero tool calls; retry is byte-identical so it cannot
+reroll) and a 32K-token mega-generation that blew CC's output cap. Both
+are sampling's case, as is the output-volume wall gap.
+
+**Measurement debts (before headline cross-engine claims):**
+- Strongest-opponent llama sweep: draft=10 + p_min 0.5 per the r/LocalLLM
+  reference config (see "Why this model"); our A/B legs ran draft=6
+  untuned.
+- Re-measure 128K prefill under fp8: the P5-era "~57s" does not reconcile
+  with P6's direct fp16-KV 117.6s (likely fp8-extrapolated).
+
+**Reopen candidate (post-sampling): confidence-gated depth>4.** The
+fixed-depth (P3), adaptive-depth, and burst-depth negatives all measured
+UNGATED or accept-count-gated schemes; the r/LocalLLM datum (draft=10 +
+p_min 0.5 beating draft=6 by 15-20 t/s despite lower acceptance) is a
+confidence-gated scheme none of those negatives cover. Gate measurement
+first: --stats margin bins on think-heavy traffic.
 
 **Open quality gates (red-team pass 2026-07-05):**
 - strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,
@@ -350,18 +381,15 @@ every quality number in this README is greedy-no-think scoped.
   decode unconstrained by design (parser recovery is the net)
 
 **Measured and parked:**
-- depth-5: nets ~+2-4% @2K for ~+12-14% round cost (measurement in the build
-  log below); precondition for ANY depth change = think-heavy/high-entropy
-  acceptance measurement
+- fixed depth-5 (+2-4% @2K for +12-14% round cost) and ungated burst depth
+  (see the reopen candidate above for the gated variant that is NOT covered)
 - chunked-WY delta scan
 - cross-session checkpoint pool (P9 covers same-session)
 - importance-weighted scales, AWQ-style (only path left on the +3.05% PPL
   gap -- see risk 2; Thunderdome says the gap doesn't bite on agentic coding)
-
-**Open verification:** the P5-era "128K prefill ~57s" does not reconcile with
-P6's direct fp16-KV measurement (117.6s); the ~57s was likely extrapolated
-from fp8-KV runs. Re-measure 128K under fp8 before using it in any
-cross-engine comparison.
+- P11 split-path (`Q27_TOOL_SPLIT`): unexplained crash under accumulated
+  multi-request state -- flake hunt required before any split/adaptive
+  path ships; keep OFF under `--slots`
 
 ## Build log
 
