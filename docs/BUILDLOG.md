@@ -771,3 +771,40 @@ target-scoped `make build/test_kernels` left build/q27-server old --
 measured a whole "fd2" server run on the pre-fd2 binary (identical
 numbers + identical trajectory = the tell, second time this session).
 Full `make`, always, no target names.
+
+## 2026-07-05 -- same-day CRUSH A/B: fd2 banked; decode rate now BEATS llama at depth; residual gap = output volume
+
+Both legs same day (basins reroll daily), n=1/task per the minimal-scope
+policy, identical harness (CRUSH no-think greedy, T2 collab + T8 analytics,
+greenfield/complex). q27 = fd2 serving stack (--slots 2, fp8, fast-head);
+llama = Q5_K_M + draft-mtp n_max 6, q8 KV (the standing config, recovered
+from the journal).
+
+| task | q27 (fd2) | llama Q5_K_M | read |
+|---|---|---|---|
+| T2 collab | 230s @ 0.847 | 120s @ 0.843 | 1.92x wall, equal score |
+| T8 analytics | 180s @ 0.825 | 190s @ 0.478 | q27 WINS wall AND score |
+
+Telemetry decomposition (q27-eval [req] aggregates): T2 = 59 reqs, 22039
+decode tokens at **161.3 t/s effective**, 137s decode + 47s prefill of 230s
+wall, ctx to 74.7K; T8 = 62 reqs, 21785 tokens at **164.0 t/s**, ctx to
+69.3K. Pre-fd2 the same trial class ran 103-113 t/s -- fd2 delivered +50%
+real-trial decode rate, and q27's rate now exceeds llama's own late-leg
+samples (108.8-153.9 t/s in its eval-time lines). The residual T2 wall gap
+is OUTPUT VOLUME: q27's basin wrote 22K tokens where llama's wrote ~11K --
+the R0 conclusion stands (not engine-actionable; terse-prompt / sampling
+lever). T8: llama's analytics basin failed hidden tests (0.040) for the
+second day running (0.481 on 07-04) -- q27 took both axes outright.
+
+Wall-history for the same tasks, q27 leg: collab 2434s (pre-P8, 07-02) ->
+223s (07-04) -> 230s today at DEEPER ctx (74.7K vs 30-83K band) and +50%
+decode rate -- today's basin simply wrote more context; cross-day walls are
+not comparable, which is why the A/B is same-day. README "State of the
+engine" refreshed to 2026-07-05 (fd2 depth numbers, 160.2/209.2 short-ctx
+labels, A/B row, sampling next).
+
+Ops: llama-q5km-eval recreate command recovered via `journalctl --user -u
+llama-q5km-eval` (transient units log their full bash -c in the journal --
+easier than BUILDLOG archaeology). Disk / now at 80% (Gabe reclaimed old
+runs). Servers swapped sequentially (both do not fit 32GB); q27-eval
+restored and healthy after the llama leg.

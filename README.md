@@ -2,28 +2,37 @@
 
 A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
 
-## State of the engine (2026-07-03)
+## State of the engine (2026-07-05)
 
-- Decode: **177.5 t/s** stock short-bench / **213.2** stock 2K soak / **218.6**
-  at +3000 OC soak (labels defined in "Decode methodology" -- not interchangeable)
+- Decode at depth (the metric that matters for agentic work): **126.2 t/s at
+  61K ctx** (was 78.0 pre-fd2), **156-164 t/s effective across real CRUSH
+  trials to 74K ctx** (was 103-113). attn-fd2 register-accumulator
+  flash-decode fixed the third SM-starvation/occupancy disease: attention
+  was 99% of the depth cost at 5% DRAM BW, now 45%
+- Decode short-ctx: **160.2 t/s** short-bench / **209.2** stock 2K soak
+  (4.32 t/round). Short-bench dropped from 177.5 on a canonical-prompt
+  argmax-tie re-roll (t/round 3.56 -> 3.25); per-round cost is +1.3% -- see
+  Decode methodology and the fd2 build-log entry before reading it as a
+  regression
 - Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start)
 - Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
-- Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30 trials/leg);
-  the +3.05% PPL gap does not appear in agentic coding
-- Agentic wall time: **~3-4x** llama.cpp, down from 7.9x (P11 restored full
-  spec speed inside tool calls, 49 -> 204 t/s) -- five-mode tool-drift
-  catalog closed by P7 constrained decoding + tolerant parser recovery; warm
-  turns via P8 stable-prefix + P9 same-session checkpoint caches
-- Server defaults: fp8 KV (opt out `--kv-fp16`); `--constrain-tools` available
-- Active: P10-A fused 2-slot serving, decided 2026-07-03
-  (docs/P10-decision.md). A0 go/no-go PASSED same day: 10-lane verify-head
-  GEMV costs 0.52x of 2x5 -- the weight stream fully amortizes across slots.
-  A1 SHIPPED in two stages: R1 per-slot state + routing (2026-07-04, real
-  Claude Code session 178.3 -> 118.3s), R1b round-granularity interleaved
-  scheduling (2026-07-04, docs/R1b-design.md: FIFO GPU gate + engine yield
-  hooks; same-day A/B on a claude-p + 2-subagent workload: queue-wait class
-  killed, 114.7s vs 129-142s controls, outputs byte-identical solo vs
-  interleaved). Next: A2 fusion
+- Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30
+  trials/leg, 2026-07-03); same-day spot A/B 2026-07-05 (n=1/task):
+  collab q27 0.847 vs llama 0.843, analytics q27 **0.825 vs 0.478** (llama's
+  analytics basin failed hidden tests two days running)
+- Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab **1.92x**
+  at equal score; analytics **q27 WINS outright** (180s vs 190s at +0.35
+  score). Decode RATE now beats llama's late-leg samples (161-164 vs
+  109-154 t/s); the residual collab gap is OUTPUT VOLUME (q27's basin wrote
+  22K tokens vs llama's ~11K) -- a prompt/sampling lever, not an engine one
+- Serving: multi-slot (`--slots N`) with R1b round-granularity GPU
+  time-slicing (FIFO gate + engine yield hooks; queue-wait class dead,
+  outputs byte-identical solo vs interleaved); server defaults fp8 KV
+  (opt out `--kv-fp16`); `--constrain-tools` available
+- P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
+  attributed and fixed (fd2, 2026-07-05). Next: sampling
+  (docs/sampling-design.md); A2 fusion / light utility slots only if
+  telemetry shows engine-claim waits dominating
 
 ## Why this model is a good target
 
@@ -90,16 +99,17 @@ speculation) -- there is no third lever at batch 1.
 Two numbers are reported and they are NOT interchangeable (~16% gap):
 
 - **Short bench** (SOTA-comparable): 128 tokens from the 5-token canonical
-  prompt, `--spec`. **STOCK clocks: 177.5 t/s** (depth-4, v1.4, 3-run spread
-  0.4); +3000 OC: 181.5. The community "160 on a 5090" numbers are stock
-  short-bench -- the honest comparison is **177.5 vs 160 (+11%)**. Note
-  depth-4 is a small LOSS on this bench vs the depth-3-era 183.1 stock
-  (acceptance only reaches 3.56 t/round at 128 tokens vs 4.36 on the soak;
-  the depth-4 round tax doesn't amortize) -- depth-4 was tuned on and pays on
-  long generations.
-- **2K soak** (long-generation number): 2000-token generation, **213.2 t/s
-  STOCK / 218.6 at +3000 OC** (4.36 t/round both). Headline for agentic
-  reply-length outputs.
+  prompt, `--spec`. **STOCK clocks, fd2 era: 160.2 t/s** (3.25 t/round).
+  The fd2-era drop from 177.5 is an argmax-tie re-roll on this degenerate
+  prompt (t/round 3.56 -> 3.25; per-ROUND cost changed only +1.3%) --
+  `Q27_FD=v1` reproduces the old 177.5/3.56 bit-for-bit. Depth-4 pays on
+  long generations, not here.
+- **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
+  STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
+  short-ctx split tax). Headline for agentic reply-length outputs.
+- **Depth numbers** (fd2, 2026-07-05): **126.2 t/s @61K** single-request
+  ground truth; **156-164 t/s effective** across real CRUSH trials to 74K.
+  These, not the 2K numbers, predict agentic wall time.
 
 OC policy: headline + SOTA comparisons are reported STOCK (community numbers
 aren't OC'd; sidesteps the non-ECC tail-risk conversation). +3000 stays a
