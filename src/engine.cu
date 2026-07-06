@@ -925,10 +925,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "sampling: T=%.3f top_p=%.3f seed=%llu path=%s\n", temp, top_p, seed,
                     plain_sample ? "plain" : "spec");
         }
-        int total_emitted = 0, rounds = 0, hist[5] = {0, 0, 0, 0, 0};
+        int total_emitted = 0, rounds = 0, hist[6] = {0, 0, 0, 0, 0, 0}; // P12b: up to 6-tok
         while ((int)out.size() < n_gen) {
-            if (P + 6 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[5];
+            if (P + 7 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
+            int em[6]; // P12b: depth-5 emits up to 6 tokens
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
@@ -937,8 +937,9 @@ int main(int argc, char** argv) {
             hist[n - 1]++;
             P += n;
         }
-        fprintf(stderr, "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d\n",
-                hist[0], hist[1], hist[2], hist[3], hist[4]);
+        fprintf(stderr,
+                "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, 6-tok %d\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));
