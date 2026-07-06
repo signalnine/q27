@@ -331,6 +331,7 @@ void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float
         case 3: k_gemv_q4_n<3><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 4: k_gemv_q4_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 5: k_gemv_q4_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 6: k_gemv_q4_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 10: k_gemv_q4_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
     }
@@ -351,6 +352,7 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float*
         case 3: k_gemv_q8_n<3><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 4: k_gemv_q8_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 5: k_gemv_q8_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 6: k_gemv_q8_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 10: k_gemv_q8_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
     }

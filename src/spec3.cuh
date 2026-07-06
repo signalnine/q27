@@ -8,7 +8,7 @@
 
 namespace q27k {
 
-struct IP3 { const int* p[5]; };
+struct IP3 { const int* p[6]; };
 
 // L2 norm over contiguous heads, ntok tokens. (q||k are contiguous: pass 32 heads.)
 void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0, int ntok = 3);
