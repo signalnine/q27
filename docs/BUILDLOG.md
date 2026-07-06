@@ -1218,4 +1218,43 @@ region). **Sampling cleared to default at T<=0.7 / top_p 0.95.** The T8 bimodali
 structurally-complete but behaviorally-imperfect code -- orthogonal to the serving gate and
 a separate thread. Residual un-rescued after all three fixes: a small non-fatal mode-6 tail.
 Tree UNCOMMITTED (P1/P2 + three fixes + docs). Harnesses: claude-code-q27-haight (mode-6
-exhibit), crush-q27-greedy-haight (the 0.786 baseline).
+exhibit), crush-q27-greedy-haight (the 0.786 baseline). [committed 3d60607; README 5a86007.]
+
+## 2026-07-06 (later) -- measurement gaps closed (128K prefill; strongest-llama sweep)
+
+Two open measurement debts, both resolved.
+
+**128K prefill re-measure.** The roadmap flagged P5's "~57s" vs P6's fp16-KV "117.6s" as
+un-reconcilable. Measured directly with `--kvstats 131072` (needs `--nll` int32 tokens;
+prefill timing is value-independent -- it is GEMM + attention over positions, not token
+content -- so a 140K synthetic-token file is faithful for TIMING; the fp8 refusal at the
+KV-scan is AFTER the timing print, so fp8 still yields the number). Four combos:
+
+    KV=fp8  g64-default  71.46s (1834 t/s)      <- production default, the honest number
+    KV=fp16 g64-default  76.55s (1712 t/s)
+    KV=fp8  Q27_PF_XG=32 75.47s (1737 t/s)      <- exact/identity path
+    KV=fp16 Q27_PF_XG=32 80.36s (1631 t/s)
+
+So current 128K prefill is **~71-80s** (KV format ~6%, g64-vs-exact ~6%). P6's 117.6s is
+STALE -- it predates the g64 activation regroup (+8.8%) and delta-WY warp tiling (both
+2026-07-04 later); P5's 57s was optimistic/extrapolated. (Gotcha: back-to-back CLI model
+loads with no sleep hit the VRAM-teardown OOM race -- two combos came back empty until
+re-run with a gap.)
+
+**Strongest-opponent llama sweep.** Our cross-engine A/B ran llama draft=6 untuned; the
+r/LocalLLM reference is draft=10 + p_min 0.5. Swept the 4 corners on llama-server (Q5_K_M
++ draft-mtp, single-stream greedy, ~2K ctx, decode t/s = `/completion` timings
+predicted_per_second; llama-CLI hung in conversation mode even with -no-cnv -- server is
+the reliable harness):
+
+    draft=6  p_min=0.0   102.4 t/s   <- our old A/B config
+    draft=6  p_min=0.5   116.6
+    draft=10 p_min=0.0   102.7
+    draft=10 p_min=0.5   117.9       <- r/LocalLLM ref
+
+The r/LocalLLM +15-20 t/s claim reproduces (+15%), BUT the lever is **p_min 0.5, not draft
+depth**: p_min gives +14 t/s at either depth; draft 6->10 buys ~0-1. So our A/B
+UNDER-STATED llama decode by ~15% -- the honest strongest-llama baseline is **~117 t/s @2K**
+(q27 @2K 169-209 still wins clearly). A depth-matched cross-engine run is still owed before
+any headline wall/rate claim. README measurement-debts section + progress-log P5/P6 rows
+updated; both numbers now honest.

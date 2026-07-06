@@ -97,9 +97,12 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
   llama.cpp with PR #24785 + b9180 n_rs_seq + the hybrid checkpoint-search
   fixes -- all present in our b9857 build) reports **140.7 t/s mean over
   20h of agentic use at Q6**, with draft=10 + p_min 0.5 beating draft=6 by
-  15-20 t/s despite lower acceptance. Our A/B legs ran draft=6 untuned --
-  the strongest-opponent sweep (draft depth, p_min) is an open item before
-  any headline cross-engine claim (roadmap, measurement debts)
+  15-20 t/s despite lower acceptance. **Sweep DONE 2026-07-06** (Q5_K_M @~2K,
+  single-stream greedy): the +15% win is `p_min 0.5` (+14 t/s), NOT draft depth
+  (6->10 buys ~0-1); draft=6/p_min0 (our old A/B config) 102.4 t/s vs
+  draft=10/p_min0.5 117.9. So the honest strongest-llama decode baseline is
+  **~117 t/s @2K**, and our earlier A/B UNDER-STATED llama by ~15%. Depth-matched
+  measurement still owed before any headline cross-engine wall/rate claim.
 
 ## Architecture facts (ground truth from GGUF metadata)
 
@@ -296,8 +299,8 @@ live in "Decode methodology" above.
 | P2: fp8 E4M3 KV cache (opt-in, `Q27_KV=fp8`) | decode @28.5K ctx **105.7 -> 117.2 t/s** (+11%); 2K soak 208.3 vs 210.4 (-1%, acceptance 3.64 vs 3.67); ctx ceiling **~180K -> ~370K** (262K native fits); PPL 7.1889 (-0.05%), needle 3/3 @55K, logit KL 3.4e-5 |
 | P3: depth-4 speculation (batch-5 verify, mod-5 perm) | 2K soak **210.4 -> 218.6 t/s** (4.36 t/round, 71% of rounds accept 5); 28.5K-depth fp8 **117.2 -> 126.6** (+8%; +19.8% vs pre-P2); canonical md5 unchanged (lossless); gate: p(d4\|prefix-3) measured 97.4% |
 | P4: split-position FA prefill (SM-starvation fix) | attention kernel **1.93x** @26.6K; 128K prefill **~1.96x** (153 -> 78s); cold 28.5K TTFT **24.7 -> 21.4s**; cold **361.5K request 1324 -> 764s** (~12.6 min, needle exact); split-vs-exact 1.9e-5, combine cost 0.1% |
-| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [does not reconcile with P6's fp16-KV 117.6s -- see roadmap open verification]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
-| P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method); split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
+| P5: GEMM tile tuning (grid swap + reg pipeline + vector unpack + NT=64) | Q4 GEMM **-36%** / Q8 **-48%** @26.6K; prefill **1388 -> 1790 t/s** @600; cold 28.5K TTFT **21.4 -> 16.8s** [superseded -- P6: 15.0s]; 128K prefill ~78 -> ~57s [re-measured 2026-07-06: current 128K prefill is ~71-80s (fp8 g64 71.5 / fp16 exact 80.4); both this 57s and P6's 117.6s superseded]; arithmetic bitwise-unchanged (canonical + pf IDENTICAL) |
+| P6: column-split delta scan (SM-starvation fix #2) | kernel **748 -> 413 us** @T=256 (1.81x, 48 -> 384 blocks); 26K prefill wall **15.0 -> 13.5s** (-10.3%); 28.5K **16.7 -> 15.0s**; 128K **125.5 -> 117.6s** (fp16-KV kvstats method) [superseded 2026-07-06: current 128K prefill ~71-80s after g64 regroup + delta-WY tiling]; split-vs-exact 5e-8, PPL 7.1931 (+0.0003 = fp reorder), canonical md5 exact, pf IDENTICAL |
 | fd2: register-accumulator flash-decode (SM-starvation/occupancy fix #3, attn was 99% of depth cost at 5% DRAM BW) | 61K depth **78.0 -> 126.2 t/s** (+62%, 47.2 -> 29.2 ms/round); 16K **-18%/round**; instance 0.768 -> 0.156 ms @61K (45% DRAM BW); 2K +1.3%/round; acceptance parity exact; PPL in noise both KV modes; nll-long 160K bucket-identical; CANONICAL RE-DERIVED 4c4120c7 (old 58b6ae85 under Q27_FD=v1) |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
@@ -379,12 +382,20 @@ drift and fixed at the PARSER -- not a sampling problem. The 32K-token
 mega-generation that blew CC's output cap remains a prompt/sampling lever, as is
 the output-volume wall gap.
 
-**Measurement debts (before headline cross-engine claims):**
-- Strongest-opponent llama sweep: draft=10 + p_min 0.5 per the r/LocalLLM
-  reference config (see "Why this model"); our A/B legs ran draft=6
-  untuned.
-- Re-measure 128K prefill under fp8: the P5-era "~57s" does not reconcile
-  with P6's direct fp16-KV 117.6s (likely fp8-extrapolated).
+**Measurement debts -- CLOSED (2026-07-06):**
+- Strongest-opponent llama sweep DONE: Q5_K_M + draft-mtp single-stream
+  greedy @~2K ctx -- draft=6/p_min0 (our A/B config) **102.4 t/s**,
+  draft=10/p_min0.5 (r/LocalLLM ref) **117.9**. The +15% win is `p_min 0.5`,
+  NOT draft depth (p_min gives +14 t/s at either depth; draft 6->10 buys
+  ~0-1). So our cross-engine A/B UNDER-STATED llama by ~15%; the honest
+  strongest-llama decode baseline is **~117 t/s @2K** (q27 @2K 169-209 still
+  wins clearly). Depth-matched cross-engine remains for any headline claim.
+- 128K prefill re-measured (`--kvstats 131072`, synthetic tokens -- prefill
+  time is value-independent): **fp8 g64-default 71.5s, fp16 g64 76.5s, fp8
+  exact(`Q27_PF_XG=32`) 75.5s, fp16 exact 80.4s** -- ~1700-1830 t/s. KV format
+  ~6%, g64-vs-exact ~6%. **P6's 117.6s is STALE** (predates the g64 regroup
+  +8.8% and delta-WY tiling); P5's ~57s was optimistic. Honest current
+  128K prefill: **~71-80s**.
 
 **Reopen candidate (post-sampling): confidence-gated depth>4.** The
 fixed-depth (P3), adaptive-depth, and burst-depth negatives all measured
