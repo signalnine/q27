@@ -44,10 +44,16 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab q27 230s
   vs llama 120s -- q27 **1.92x slower** at equal score (0.847 vs 0.843);
   analytics q27 180s vs llama 190s, but the llama leg sat in its low-score
-  basin, so that wall win is basin-confounded (a high-basin llama plausibly
-  takes it). The engine-true claims are narrower: decode RATE at depth now
-  beats llama's late-leg samples (161-164 vs 109-154 t/s), and the collab
-  wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
+  takes it). Decode RATE at depth -- DEPTH-MATCHED cross-engine run 2026-07-06
+  (~75.5K ctx, single-stream greedy, SAME prompt both engines): q27 145.6 t/s
+  (fp8, lossless head) BEATS untuned llama (139.5, draft6/pmin0) but the TUNED
+  opponent (llama draft10/pmin0.5) hits **190.3 t/s -- ~31% FASTER than q27 at
+  depth**. So the old "beats llama at depth" held only vs the UNTUNED opponent;
+  against the strongest llama, q27 LOSES decode rate at depth. p_min is worth
+  +36% for llama here (vs +15% at 2K) -- skipping the expensive deep-KV verify
+  on low-confidence positions -- which makes confidence-gated depth (roadmap)
+  q27's clear next decode win. q27 fast-head adds only ~7% (~156), still short.
+  The collab wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
   llama's ~11K) -- a prompt/sampling lever, not an engine one. The llama
   leg was NOT handicapped: mainline b9857 with hybrid context checkpoints
   active -- its A/B server log shows LCP prefix reuse with f_keep ~0.99 at
@@ -389,7 +395,15 @@ the output-volume wall gap.
   NOT draft depth (p_min gives +14 t/s at either depth; draft 6->10 buys
   ~0-1). So our cross-engine A/B UNDER-STATED llama by ~15%; the honest
   strongest-llama decode baseline is **~117 t/s @2K** (q27 @2K 169-209 still
-  wins clearly). Depth-matched cross-engine remains for any headline claim.
+  wins clearly at short ctx).
+- **Depth-matched cross-engine DONE (~75.5K ctx, single-stream greedy, SAME
+  prompt): q27 145.6 t/s (fp8, lossless head) vs llama tuned (draft10/pmin0.5)
+  190.3 -- the TUNED opponent is ~31% FASTER than q27 at depth**; q27 only beats
+  UNTUNED llama (139.5, draft6/pmin0). So the prior "beats llama at depth" was
+  vs the untuned opponent. p_min is worth +36% for llama at depth (vs +15% @2K)
+  -- skipping the expensive deep-KV verify on low-confidence positions. This is
+  the headline honest correction and it makes confidence-gated depth (below)
+  q27's clear next decode win.
 - 128K prefill re-measured (`--kvstats 131072`, synthetic tokens -- prefill
   time is value-independent): **fp8 g64-default 71.5s, fp16 g64 76.5s, fp8
   exact(`Q27_PF_XG=32`) 75.5s, fp16 exact 80.4s** -- ~1700-1830 t/s. KV format
@@ -397,12 +411,14 @@ the output-volume wall gap.
   +8.8% and delta-WY tiling); P5's ~57s was optimistic. Honest current
   128K prefill: **~71-80s**.
 
-**Reopen candidate (post-sampling): confidence-gated depth>4.** The
-fixed-depth (P3), adaptive-depth, and burst-depth negatives all measured
-UNGATED or accept-count-gated schemes; the r/LocalLLM datum (draft=10 +
-p_min 0.5 beating draft=6 by 15-20 t/s despite lower acceptance) is a
-confidence-gated scheme none of those negatives cover. Gate measurement
-first: --stats margin bins on think-heavy traffic.
+**Highest-value decode lever now -- confidence-gated depth (q27's `p_min`
+equivalent), empirically motivated by the 2026-07-06 depth-match.** llama's
+p_min 0.5 is worth **+36% at ~75K** (139.5 -> 190.3 t/s) and is exactly why the
+tuned llama BEATS q27 at depth -- gating the round (skip the expensive deep-KV
+verify when the draft head's margin is low) is the lever to close that gap. The
+fixed-depth (P3), adaptive-depth, and burst-depth negatives all measured UNGATED
+or accept-count-gated schemes; a confidence/margin-gated scheme is not covered by
+them. Gate measurement first: --stats margin bins on think-heavy traffic.
 
 **Open quality gates (red-team pass 2026-07-05):**
 - strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,

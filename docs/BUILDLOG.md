@@ -1258,3 +1258,27 @@ UNDER-STATED llama decode by ~15% -- the honest strongest-llama baseline is **~1
 (q27 @2K 169-209 still wins clearly). A depth-matched cross-engine run is still owed before
 any headline wall/rate claim. README measurement-debts section + progress-log P5/P6 rows
 updated; both numbers now honest.
+
+## 2026-07-06 (later still) -- depth-matched cross-engine: TUNED llama beats q27 at depth
+
+The owed depth-matched run. Both engines, single-stream greedy, the SAME ~75.5K-token prompt
+(230KB transcript slice; q27 tokenized 75533, llama 75528 -- matched), decode 256, read
+q27-server req_log `tps=` and llama-server /completion `predicted_per_second`:
+
+    q27  (fp8, greedy spec depth-4, LOSSLESS head)  145.6 t/s  (4.57 tok/round, 56 rounds)
+    llama tuned   (draft-mtp, n_max=10, p_min=0.5)  190.3 t/s  <- ~31% FASTER than q27
+    llama untuned (draft-mtp, n_max=6,  p_min=0.0)  139.5 t/s
+
+**Claim overturned:** the README's "decode rate at depth beats llama" held ONLY vs the untuned
+opponent (q27 145.6 > 139.5). Against the STRONGEST llama (p_min 0.5) q27 LOSES decode rate at
+depth by ~23%. p_min is worth +36% for llama here (139.5 -> 190.3) vs only +15% @2K -- at depth
+the deep-KV verify pass is expensive, so skipping it on low-confidence positions is a big win,
+and it grows with ctx. q27 fast-head would add only ~7% (~156), still well short of 190. (q27's
+145.6 @75.5K actually beats its own stale 126@61K headline -- q27 is healthy; the tuned opponent
+is just faster at depth.) Caveat: n=1 per config, but decode t/s is near-deterministic and the
+margin is large + mechanistically explained (a multi-prompt confirmation would firm it).
+
+Consequence: **confidence-gated depth (q27's p_min equivalent) is now the clear highest-value
+decode lever** -- the roadmap reopen candidate is empirically the way to close the depth gap.
+README State/Why-this-model/measurement-debts/roadmap all corrected to the honest depth-matched
+numbers; the "beats llama at depth" claim is retired.
