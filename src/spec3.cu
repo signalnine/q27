@@ -540,10 +540,14 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
                                const float* __restrict__ x1b, const float* __restrict__ x1c,
                                const float* __restrict__ x1d, const float* __restrict__ x1e,
                                float* __restrict__ h_next, int* __restrict__ outcome,
-                               int n_embd, const int* __restrict__ cap) {
+                               int n_embd, const int* __restrict__ cap, int max_draft) {
     int dr1 = *dr1p, dr2 = *dr2p, dr3 = *dr3p, dr4 = *dr4p;
     int va = *vap, vb = *vbp, vc = *vcp, vd = *vdp, ve = *vep;
-    bool a1 = va == dr1, a2 = a1 && vb == dr2, a3 = a2 && vc == dr3, a4 = a3 && vd == dr4;
+    // P12: max_draft gates depth to the verified columns (narrow-verify graph).
+    bool a1 = max_draft >= 1 && va == dr1;
+    bool a2 = max_draft >= 2 && a1 && vb == dr2;
+    bool a3 = max_draft >= 3 && a2 && vc == dr3;
+    bool a4 = max_draft >= 4 && a3 && vd == dr4;
     // P7: in-grammar rounds accept only the pending token; drafts are
     // unconstrained and must not commit past the constrained lane (slot 0)
     if (*cap) a1 = a2 = a3 = a4 = false;
@@ -567,10 +571,11 @@ void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft
                   const int* d_draft3, const int* d_draft4, const int* va, const int* vb,
                   const int* vc, const int* vd, const int* ve, const float* x1a,
                   const float* x1b, const float* x1c, const float* x1d, const float* x1e,
-                  float* h_next, int* outcome, int n_embd, const int* cap, cudaStream_t st) {
+                  float* h_next, int* outcome, int n_embd, const int* cap, int max_draft,
+                  cudaStream_t st) {
     k_finish_round<<<4, 256, 0, st>>>(d_P, d_token, d_draft, d_draft2, d_draft3, d_draft4, va,
                                       vb, vc, vd, ve, x1a, x1b, x1c, x1d, x1e, h_next, outcome,
-                                      n_embd, cap);
+                                      n_embd, cap, max_draft);
     CUDA_CHECK(cudaGetLastError());
 }
 

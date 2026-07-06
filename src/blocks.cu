@@ -308,6 +308,37 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cu
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Top1-top2 logit margin: the drafter's own confidence, the p_min-gated-depth
+// signal (P12). Single block, grid-stride local top-2 -> shared-mem pairwise
+// merge -> *out = m1 - m2. Runs on the SAME logits the drafter argmaxed; a
+// SEPARATE pass that never touches k_argmax, so the canonical greedy gate is
+// unaffected. Graph-capture safe (fixed launch, device out).
+__global__ void k_margin(const float* __restrict__ x, int n, float* __restrict__ out) {
+    float v1 = -FLT_MAX, v2 = -FLT_MAX;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float xi = x[i];
+        if (xi > v1) { v2 = v1; v1 = xi; }
+        else if (xi > v2) { v2 = xi; }
+    }
+    __shared__ float s1[256], s2[256];
+    s1[threadIdx.x] = v1; s2[threadIdx.x] = v2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) {
+            float a1 = s1[threadIdx.x], a2 = s2[threadIdx.x];
+            float b1 = s1[threadIdx.x + s], b2 = s2[threadIdx.x + s];
+            s1[threadIdx.x] = fmaxf(a1, b1);
+            s2[threadIdx.x] = (a1 >= b1) ? fmaxf(a2, b1) : fmaxf(b2, a1);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = s1[0] - s2[0];
+}
+void margin(const float* x, int n, float* d_out, cudaStream_t st) {
+    k_margin<<<1, 256, 0, st>>>(x, n, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // P7: argmax over grammar-legal tokens only. mask_ids[slot] indexes a
 // device-resident bitmask pool (-1 = unconstrained); the ids buffer is
 // rewritten by the host between CUDA-graph launches while the pool pointer

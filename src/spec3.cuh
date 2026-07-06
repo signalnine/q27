@@ -74,11 +74,15 @@ void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cud
 void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
                 int* pos_d, int* pos_e, int* pos_m, int* pos_m2, int* pos_m3, int* pos_m4,
                 int* outcome, cudaStream_t st = 0);
+// max_draft (P12 gated depth): the widest verify column this graph computed
+// (W-1 for a width-W verify). Drafts beyond it are forced rejected so a
+// narrow-verify graph never commits an uncomputed lane. max_draft=4 = the full
+// depth-4 round (bit-identical to the pre-P12 path).
 void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
                   const int* d_draft3, const int* d_draft4, const int* va, const int* vb,
                   const int* vc, const int* vd, const int* ve, const float* x1a,
                   const float* x1b, const float* x1c, const float* x1d, const float* x1e,
                   float* h_next, int* outcome, int n_embd, const int* cap,
-                  cudaStream_t st = 0);
+                  int max_draft = 4, cudaStream_t st = 0);
 
 } // namespace q27k

@@ -87,6 +87,10 @@ void argmax_masked(const float* x, int n, const unsigned* pool, int words, const
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
             cudaStream_t st = 0);
 
+// Top1-top2 logit margin (drafter confidence for P12 p_min-gated depth). Writes
+// one float (m1 - m2) to d_out. Separate pass; does not affect argmax/canonical.
+void margin(const float* x, int n, float* d_out, cudaStream_t st = 0);
+
 // Sampling (roadmap #2, docs/sampling-design.md Phase 1). temp>0 ONLY: greedy
 // stays on argmax/argmax_masked (bitwise, canonical-gated) via a host branch.
 // Param block: read on-device so one captured graph serves every request --

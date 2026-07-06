@@ -555,6 +555,33 @@ static void test_gemv10_scaling(q27::DeviceModel& dm, const q27::Model& m) {
 // P7: masked argmax -- argmax restricted to grammar-legal tokens via a
 // resident bitmask pool + per-slot mask ids. mask id -1 (or null pool) must
 // match plain argmax BITWISE (canonical gate depends on it).
+static void test_margin() {
+    // k_margin must equal the CPU top1-top2 gap exactly (same fp adds: none --
+    // it's pure max/compare, so bitwise-exact is achievable).
+    const int N = 248320;
+    float* d_x; float* d_out;
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)N * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, 4));
+    double worst = 0;
+    for (int seed : {5, 71, 999}) {
+        std::vector<float> logits = rand_vec(N, seed);
+        float m1 = -1e30f, m2 = -1e30f;
+        for (int i = 0; i < N; i++) {
+            float v = logits[i];
+            if (v > m1) { m2 = m1; m1 = v; }
+            else if (v > m2) m2 = v;
+        }
+        CUDA_CHECK(cudaMemcpy(d_x, logits.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+        q27k::margin(d_x, N, d_out, 0);
+        float got;
+        CUDA_CHECK(cudaMemcpy(&got, d_out, 4, cudaMemcpyDeviceToHost));
+        worst = std::max(worst, (double)std::fabs(got - (m1 - m2)));
+    }
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_out));
+    check("margin top1-top2 vs CPU", worst, 1e-6);
+}
+
 static void test_masked_argmax() {
     const int N = 248320, WORDS = (N + 31) / 32;
     std::vector<float> logits = rand_vec(N, 71);
@@ -1473,6 +1500,7 @@ int main(int argc, char** argv) {
     test_delta_wy();
     test_wy_stream_isolation();
     test_masked_argmax();
+    test_margin();
     test_sample();
     test_spec_sample();
     test_gemv10_scaling(dm, m);

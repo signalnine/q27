@@ -21,6 +21,14 @@ int main(int argc, char** argv) {
                 while (*p && *p != ',') p++;
                 if (*p == ',') p++;
             }
+        } else if (!strcmp(argv[i], "--tokens-file") && i + 1 < argc) {
+            // long prompts exceed the 128KB single-arg limit; read ids (comma /
+            // space / newline separated) from a file instead.
+            FILE* tf = fopen(argv[++i], "r");
+            if (!tf) { fprintf(stderr, "cannot open tokens-file %s\n", argv[i]); return 1; }
+            int v; char sep;
+            while (fscanf(tf, "%d", &v) == 1) { toks.push_back(v); (void)fscanf(tf, "%c", &sep); }
+            fclose(tf);
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
