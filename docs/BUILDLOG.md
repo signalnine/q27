@@ -1591,3 +1591,56 @@ ALL PASS; canonical **4c4120c72056aba2bc2d2561471eafce** EXACT. Branch left UNPU
 UNMERGED for Gabe (public repo; merge is his call).
 
 Files: README.md, src/engine.cuh (comment-only graph-zoo block), docs/BUILDLOG.md.
+
+## 2026-07-07 (P14 Task 6) -- NEGATIVE: fd2 lane-pair fusion (k_attn_fd3) killed on the perf gate
+
+**What:** implemented the deferred Task-6 lane-pair fusion (Gabe's explicit go on the Task-5
+marginal result): `k_attn_fd3` pairs verify lanes per block -- grid
+`dim3(ceil(ntok/2), FD2_NS, n_kv_heads)` (Task-5 lane-innermost order kept, pair index
+fastest), per-lane online-softmax state in per-lane register slices (`m[2][6], l[2][6],
+acc[2][6][8]`, all compile-time-indexed per the quantize3 landmine rule), ONE KV row read
+serving both lanes when the split bases align (always for consecutive verify positions except
+~1/128 chunk-boundary straddles), odd-ntok last block single-lane via a `has1` guard, scratch
+layout + combine untouched, `Q27_FD=fd2` fallback to the unpaired kernel (v1 fallback
+unchanged). Design + full post-mortem: **docs/attn-fd3-design.md** (kept per the kill
+protocol; kernel reverted).
+
+**Every correctness gate passed; the BENCH killed it.** Stage-B occupancy skeleton
+(`-Xptxas -v`, CUDA 13.2, both archs): exactly **168 regs, 0 spills, 18,816B smem/block ->
+3 blocks / 12 warps per SM** on sm_86 AND sm_120 (gate floor: <=168 regs, >=3 blocks -- PASS
+at the boundary; fd2 reference: 119/122 regs -> 4 blocks / 16 warps). test_kernels **384
+checks ALL PASS, 0 FAIL**: all 132 fd2 gates unchanged; 160 new fd3 gates (fd3-vs-fd2
+BITWISE, run-to-run determinism, default-dispatch==fd3, Q27_FD=fd2 fallback; seq
+{1,47,1024,16384,61440} x ntok {1,2,3,4,5} x {fp8,fp16}) ALL **err 0.000e+00** -- the
+bitwise-vs-fd2 contract held exactly. Canonical **4c4120c72056aba2bc2d2561471eafce** EXACT
+on the fd3 binary.
+
+**Bench (kill):** server rig, docs prompts, greedy, 1 warmup + n=3 medians (spread <0.1%),
+same-binary same-session A/B via `Q27_FD=fd2` (which reproduced the recorded Task-5 POST
+baselines within 0.3% in every cell -- no session drift; tok/round + rounds IDENTICAL
+fd2-vs-fd3 in every cell, live bitwise confirmation):
+61K ungated **118.9 -> 114.2 t/s (-4.0%)** (28.58 -> 29.75 ms/round, 113 rounds);
+61K gated0.5+dexit **124.3 -> 118.1 (-5.0%)**; 2K ungated 115.4 -> 115.1 (-0.3%); 2K
+gated0.5 129.5 -> 129.4 (-0.1%). Kill criterion: 61K ungated gain < +5% -> REVERT.
+
+**Why it lost (nsys per-instance, fd3 binary @61K vs Task-5 fd2 rows):** draft (grid x=1,
+single lane -- fd2's exact work, only the resource shape differs) **128.2 -> 218.9 us
+(+71%)**; verify (x=3) 487.3 -> 548.2 us (+13%) despite ~halved pair KV traffic. Predicted
+round delta +1.34 ms/round vs measured +1.17 -- consistent. **The kernel is
+latency-hiding-bound before it is DRAM-BW-bound: dropping 16 -> 12 warps/SM costs more than
+halving KV bytes saves.** The honest per-lane register state (120 floats) pins regs >= ~168
+-> 3 blocks/SM; breaking even needs fd2's 16 warps (~128 regs), unreachable without changing
+per-lane fp order (= tolerance-gate + canonical-re-derive class, NOT this task's contract).
+The >=12-warp Stage-B floor was too permissive -- for future occupancy gates on this kernel
+family, the bar is "no worse than the incumbent's warps/SM", not an absolute 12.
+
+**Follow-on options recorded in the design doc:** (a) accept fp-order change and batch a
+narrower-state pair kernel into a tolerance-gate + canonical-re-derive cycle (orchestrator's
+call, attn-fd2-design.md:42-56 policy); (b) smem-tile KV sharing / __ldcs -- measure first.
+The R~4.25 headroom stands unclaimed; Task 5's +2.7% remains the shipped fd2 state.
+
+**Revert hygiene:** src/spec3.cu, src/spec3.cuh, src/test_kernels.cu restored to the Task-8
+tip (7c2ff95) BEFORE this commit; full `make` rebuilt; test_kernels ALL PASS and canonical
+EXACT re-verified on the reverted tree. This commit lands docs only.
+
+Files: docs/attn-fd3-design.md (new, design + post-mortem), docs/BUILDLOG.md.
