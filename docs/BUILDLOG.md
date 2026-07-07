@@ -1695,3 +1695,33 @@ promotes, +2.9%; live T8 ~73% d4-sat -> promotes, ~breakeven).
 
 Files: docs/maxd6-decision.md (verdict appended), src/engine.cuh + src/server.cu (42ccf6d).
 Next per queue: prefill-attn O(N^2) (54% of prefill @128K).
+
+## 2026-07-07 (prefill-attn Phase 0) -- ncu attribution: latency/occupancy-starved, NOT bandwidth/tensor bound
+
+Queue-top item started (branch prefill-attn; plan docs/plans/2026-07-07-prefill-attn.md).
+Phase 0 = ncu on `k_attn_prefill_mma` at 128K to decide the lever ranking before any rewrite.
+
+Rig: existing HEAD binary (canonical 4c4120c7 verified, no rebuild), 5090 free, fixture
+scratchpad/synthtoks.bin (140k random int32 < VOCAB; prefill timing value-independent).
+Baseline no-profiler 128K prefill 75.45s / 1737 t/s (P14 band). ncu 2026.1 sudo -n,
+`-k k_attn_prefill_mma --launch-skip 1900 --launch-count 3` -> 3 launches at chunk ~118,
+base ~121K (PF_T=1024 -> 16 attn x 128 chunks = 2048 total launches; first attempt's
+--launch-skip 6000 overshot and profiled nothing). Report scratchpad/pf_attn_128k.ncu-rep.
+
+Deepest launch (44.8ms, grid (4,64,8)=2048 blocks, nsplit=8): **DRAM 1.98%** (35 GB/s of
+1790), **L2 hit 95.6%** (KV L2-resident at depth, NOT re-streamed -- P4 split already killed
+the DRAM problem), **tensor 33%** ("should not be a bottleneck"), **IPC 0.42**, issue slots
+9.9% busy, 14.2 stall-cyc/inst. **Achieved occupancy 12.5%** (6 warps/SM, 1 CTA). Occupancy
+DUAL-limited: **Block Limit Registers = 1 (248 regs/thread) AND Block Limit Shared Mem = 1
+(84.48 KB)**. Stalls spread: long_scoreboard 30% / math_pipe_throttle 28% / barrier 15% /
+wait 14% = occupancy-starvation signature (6 warps hide nothing).
+
+VERDICT: PROCEED. Two corrections to the plan: (1) FLOP-derived ~39% tensor is really ~33%;
+(2) shrinking smem ALONE won't raise occupancy -- registers co-bind (the o[32][4] O
+accumulator is 128 regs/thread), so any 2-CTA play needs a register cut too. Phase 1
+(cp.async) confirmed as the first move: attacks the largest stall (long_scoreboard 30%) by
+prefetching the next tile's K/V, raising IPC within the existing 6 warps, no occupancy
+needed, bitwise-safe. Full data: docs/perf-attribution-prefill-attn.md.
+
+Files: docs/plans/2026-07-07-prefill-attn.md (plan + Task-1 verdict + register-cut notes),
+docs/perf-attribution-prefill-attn.md (new). Docs only; no code changed.
