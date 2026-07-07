@@ -1754,3 +1754,55 @@ Tolerance-gated (breaks greedy bitwise). Gabe approved proceeding 2026-07-07.
 
 Files: src/prefill.cu (cp.async helpers + prefetch pipeline + launch),
 docs/perf-attribution-prefill-attn.md (Phase 1 result appended), docs/plans/2026-07-07-prefill-attn.md (Task 2 verdict).
+
+## 2026-07-07 (prefill-attn Phase 1 CORRECTION) -- cp.async is +5.4%, NOT neutral -- prior test used fp16 KV where cp.async is dead code
+
+**The Phase-1 "neutral" verdict above is WRONG -- methodology error.** `kv_fp8` defaults to
+false (fp16 KV); fp8 is opt-in via `Q27_KV=fp8` (engine.cuh:284/306). cp.async lives only on
+the fp8 path (`CPA = sizeof(CT)==1`). Every Phase-0/1 run used fp16 KV -- and `--kvstats`
+even *forbids* fp8 (engine.cu:458) -- so `CPASYNC=1` and `=0` both ran the identical fp16
+blocking path. "Bitwise + same speed" meant cp.async never executed, not that it's neutral.
+
+**Redone on the real fp8 path** (`Q27_KV=fp8`, `--pf 131072 --ctx 133120`, `Q27_PF_NOSERIAL=1`
+-- the kvstats fp8-ban forced this harness):
+| config | 128K prefill wall |
+|---|---|
+| CPASYNC=0 (blocking, f16 mma) | **72.10 s** (1818 t/s) |
+| CPASYNC=1 (cp.async, f16 mma) | **68.20 s** (1922 t/s) |
+| CPASYNC=1 + FP8MMA=1 (fp8 QK^T) | 68.16 s (1923 t/s) |
+
+**cp.async = 72.10 -> 68.20 s = +5.4% on the fp8 prefill wall (~+10% on the attention
+kernel).** The +5.4% is common-mode-clean (the d_gen OOB below was identical across configs).
+So cp.async is a REAL WIN on the production path -- Phase 1 is a keep, not a wash. (The fp16
+path stays on blocking staging, no smem room; production is fp8 so that's fine.)
+
+fp8 QK^T (Phase 2 2a) = 68.20 -> 68.16 = neutral SO FAR, as predicted: 2a still runs the now-
+redundant K convert that offsets the fewer-MMA saving. Removing that convert when fp8q (2b) is
+where the fp8 throughput shows up. Greedy output identical f16-vs-fp8 QK^T (fp8 perturbation
+below the argmax-flip threshold on this prompt); logit-level tolerance check pending.
+
+Lesson: ALWAYS set `Q27_KV=fp8` when benching the prefill-attn path; `--kvstats` is fp16-only
+so use `--pf N --ctx >N Q27_PF_NOSERIAL=1` for fp8 prefill timing.
+
+Files: docs (correction). Numbers on the pre-d_gen-fix binary; delta is common-mode so valid.
+
+## 2026-07-07 (fix) -- d_gen long-context OOB write (CUDA-review #1 / the top single-user bug)
+
+`d_gen` was a fixed 65,536-int buffer (`MAX_GEN_TRACK`); batched prefill's final
+`step_with(prompt[NP-1])` runs `k_advance` writing `d_gen[NP-1]` (blocks.cu:102) with no
+capacity check. Any prompt > 65,536 tokens at `--ctx > 65,536` therefore wrote OOB -- and the
+prefill-attn benchmarking (131072-token prefills) was triggering it on every deep run. The
+write is post-forward (advance sits at the end of the step_with graph, after logits), so it's
+a small scattered scribble that left the timing/logit measurements valid, but it is genuine
+UB and the #1 documented correctness bug.
+
+Fix: allocate `d_gen` from `max_ctx` instead of the fixed 65,536 (engine.cuh:336). NP is
+already bounded `<= max_ctx` by the generate() guard, so `d_gen[NP-1]` is now always in
+bounds -- exact, no per-write branch. Cost: negligible (d_gen goes 256 KB -> max_ctx*4).
+
+GATES: full make clean. Canonical 4c4120c7 EXACT (d_gen is a tracking buffer, not in the
+decode compute path -- output unchanged). compute-sanitizer memcheck on a 66,000-token
+prefill (>65,536): **ERROR SUMMARY: 0 errors** (was an OOB global write pre-fix).
+
+Files: src/engine.cuh (d_gen alloc). Addresses docs/cuda-review-2026-07-07.md #1,
+docs/SECURITY-MODEL.md carve-out #4.

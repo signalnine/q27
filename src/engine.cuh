@@ -333,7 +333,11 @@ struct Engine {
         A((void**)&ffn_g, N_FFN * 4); A((void**)&ffn_u, N_FFN * 4);
         A((void**)&logits, VOCAB * 4);
         A((void**)&d_pos, 4); A((void**)&d_token, 4); A((void**)&d_step, 4);
-        A((void**)&d_gen, MAX_GEN_TRACK * 4);
+        // sized to max_ctx (was fixed MAX_GEN_TRACK=65536): batched prefill's
+        // final step_with writes d_gen[NP-1], and NP can reach max_ctx, so any
+        // prompt > 65536 with --ctx > 65536 wrote OOB (CUDA-review #1). NP is
+        // already bounded <= max_ctx by the generate() guard, so this is exact.
+        A((void**)&d_gen, (size_t)max_ctx * 4);
         A((void**)&d_amax, 8);
         A((void**)&d_samp, sizeof(q27k::SampleParams));
         // d_nuc: 5 lanes x {thresh,M,logZ,mass}. Plain path uses lane 0; the
