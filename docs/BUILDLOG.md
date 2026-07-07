@@ -1837,3 +1837,37 @@ Sampled-path fixes (Philox, top-p) verified by canonical-no-regression only; a d
 sampled A/B would firm the top-p diffuse-case behavior. ChatML strip is a targeted
 mitigation; the fuller fix (token-wise encode with specials off for content) is deferred as
 it touches the prefix-cache path.
+
+## 2026-07-07 (4th session) -- depth-match multi-prompt confirm: the -31% did NOT generalize
+
+The owed multi-prompt confirmation of the 2026-07-06 n=1 depth-match (q27 145.6 vs tuned
+llama 190.3, "~31% faster at depth"). Same methodology, 4 payload flavors at ~75.4K matched
+tokens (q27 count_tokens vs llama /tokenize within ~15 tok), single-stream greedy, decode
+256, raw completion endpoints (q27 /v1/completions "prompt" = raw encode, no template;
+llama /completion), fresh server per leg, 1 cold prefill + 3 identical replays (replay
+spread <=0.3%). q27 legs = HEAD fa028d2 production serving config (fp8 KV, --fast-head),
+gated Q27_PMIN=0.5 (Q27_DEXIT default-on) and ungated; llama = Q5_K_M, draft-mtp
+n_max=10 p_min=0.5, q8_0 KV. Logs thunderdome/results/{q27-depthmatch-*,llama-depthmatch-tuned}.log.
+
+    ~75.4K ctx, decode 256      q27 ungated  q27 gated(0.5)  llama tuned   winner
+    P1 transcript (CC A/B log)     118.2        123.3 (3.56)   111.4 (69%)  q27 +10.7%
+    P2 repro (docs + self-copy)    141.7        153.0 (4.41)   154.4 (87%)  tie  -0.9%
+    P3 code (CUDA src concat)       83.8         93.1 (2.37)    99.5 (76%)  llama +6.9%
+    P4 echo (3KB block repeated)      --        158.0 (4.92)  229.9 (100%)  llama +45%
+    (parens: q27 tok/round | llama draft-acceptance)  P1-P3 geomean: 120.6 vs 119.6
+
+**Verdict: the 07-06 -31% was prompt-specific AND pre-P12.** On the current build the
+mixed-flavor picture is PARITY (geomean +0.9% q27); q27 wins transcript, ties repro, loses
+code ~7%. llama's remaining edge is structural and lives in the near-verbatim tail: at
+P4's 100% acceptance its depth-10 drafts (11-tok rounds) beat q27's depth-4 ceiling
+(4.92 tok/round = saturated) by +45% -- exactly the >90%-fired regime the maxd6 NO-GO
+measurement identified, and raising the ceiling is already priced (needs an
+acceptance-predicting gate, not theta). Secondary results: (a) first multi-prompt
+depth confirmation of the P12 gate: +4.3%/+8.0%/+11.1% on P1/P2/P3 -- biggest where
+acceptance is LOWEST; (b) acceptance is strongly flavor-dependent at depth (2.37-4.92
+tok/round across payloads), so any single-prompt depth number is a draw, same lesson as
+score basins; (c) the 07-06 prompt behaved like repro-flavor (its 4.57 tok/round sits at
+P2's 4.41) where llama is at its best. Methodology gotcha: greedy raw-completion of
+plain markdown docs EOSes immediately (dec=0) at 75K depth -- prose payloads need an
+open continuation (mid-echo cut or list form); two payload shapes were discarded for
+instant-EOS before P2 landed as docs+self-copy.

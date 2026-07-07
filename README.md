@@ -74,15 +74,16 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab q27 230s
   vs llama 120s -- q27 **1.92x slower** at equal score (0.847 vs 0.843);
   analytics q27 180s vs llama 190s, but the llama leg sat in its low-score
-  takes it). Decode RATE at depth -- DEPTH-MATCHED cross-engine run 2026-07-06
-  (~75.5K ctx, single-stream greedy, SAME prompt both engines): q27 145.6 t/s
-  (fp8, lossless head) BEATS untuned llama (139.5, draft6/pmin0) but the TUNED
-  opponent (llama draft10/pmin0.5) hits **190.3 t/s -- ~31% FASTER than q27 at
-  depth**. So the old "beats llama at depth" held only vs the UNTUNED opponent;
-  against the strongest llama, q27 LOSES decode rate at depth. p_min is worth
-  +36% for llama here (vs +15% at 2K) -- skipping the expensive deep-KV verify
-  on low-confidence positions -- which makes confidence-gated depth (roadmap)
-  q27's clear next decode win. q27 fast-head adds only ~7% (~156), still short.
+  takes it). Decode RATE at depth -- DEPTH-MATCHED cross-engine, multi-prompt
+  confirm 2026-07-07 (4 flavors @~75.4K matched tokens, single-stream greedy,
+  post-P12/P14 q27 gated Q27_PMIN=0.5 vs tuned llama draft10/pmin0.5): **PARITY
+  on mixed traffic** (P1-P3 geomean q27 120.6 vs llama 119.6) -- q27 wins
+  transcript +10.7% (123.3 vs 111.4), ties repro (153.0 vs 154.4), loses code
+  ~7% (93.1 vs 99.5). llama's edge is the NEAR-VERBATIM tail: pure-echo payload
+  229.9 vs 158.0 (+45%) -- its depth-10 drafts beat q27's depth-4/5 ceiling
+  when acceptance saturates (the maxd6 NO-GO regime; ceiling raise needs an
+  acceptance-predicting gate). The 07-06 n=1 "-31%" (q27 145.6 ungated vs
+  190.3) was prompt-specific (repro-flavored slice) AND pre-P12 -- retired.
   The collab wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
   llama's ~11K) -- a prompt/sampling lever, not an engine one. The llama
   leg was NOT handicapped: mainline b9857 with hybrid context checkpoints
@@ -448,14 +449,16 @@ the output-volume wall gap.
   ~0-1). So our cross-engine A/B UNDER-STATED llama by ~15%; the honest
   strongest-llama decode baseline is **~117 t/s @2K** (q27 @2K 169-209 still
   wins clearly at short ctx).
-- **Depth-matched cross-engine DONE (~75.5K ctx, single-stream greedy, SAME
-  prompt): q27 145.6 t/s (fp8, lossless head) vs llama tuned (draft10/pmin0.5)
-  190.3 -- the TUNED opponent is ~31% FASTER than q27 at depth**; q27 only beats
-  UNTUNED llama (139.5, draft6/pmin0). So the prior "beats llama at depth" was
-  vs the untuned opponent. p_min is worth +36% for llama at depth (vs +15% @2K)
-  -- skipping the expensive deep-KV verify on low-confidence positions. This is
-  the headline honest correction and it makes confidence-gated depth (below)
-  q27's clear next decode win.
+- **Depth-matched cross-engine, multi-prompt confirm DONE 2026-07-07 (4 flavors
+  @~75.4K matched tokens, greedy, 3 replays each, spread <=0.3%): post-P12/P14
+  q27 (gated 0.5) is at PARITY with tuned llama (draft10/pmin0.5) on mixed
+  flavors** -- transcript 123.3 vs 111.4 (q27 +10.7%), repro 153.0 vs 154.4
+  (tie), code 93.1 vs 99.5 (llama +6.9%), geomean 120.6 vs 119.6. llama keeps
+  a structural +45% on PURE-ECHO traffic (229.9 vs 158.0, 100% draft
+  acceptance): depth-10 drafts vs q27's 4/5 ceiling, the regime the maxd6
+  NO-GO already priced. The 07-06 n=1 result (ungated q27 145.6 vs 190.3,
+  "~31% faster") was repro-flavored and pre-P12 -- superseded. P12 gate
+  confirmed multi-prompt at depth: +4.3/+8.0/+11.1% (biggest at LOW acceptance).
 - 128K prefill re-measured (`--kvstats 131072`, synthetic tokens -- prefill
   time is value-independent): **fp8 g64-default 71.5s, fp16 g64 76.5s, fp8
   exact(`Q27_PF_XG=32`) 75.5s, fp16 exact 80.4s** -- ~1700-1830 t/s. KV format
