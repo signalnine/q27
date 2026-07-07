@@ -116,6 +116,8 @@ sudo -n ncu --set full --launch-count 3 --launch-skip 200 -k k_attn_prefill_mma 
 **Files:** `src/prefill.cu` (`k_attn_prefill_mma`)
 **Dependencies:** Task 1 confirms occupancy/barrier stall
 
+> **MEASURED 2026-07-07 -- NEUTRAL (~0%), IMPLEMENTED + kept as Phase-2 scaffolding.** cp.async prefetch (fp8 path, `Q27_PF_CPASYNC` default on) is bitwise-identical (canonical 4c4120c7; A/B 36b83fd8) but 128K prefill wall ON 76.30s vs OFF 76.40s = +0.2% on the isolated attention kernel. Root cause: loads are 95.6% L2-hit (not DRAM), the fp8 convert pass eats the saving, and 6-warp occupancy leaves nothing to overlap behind. Retired as a standalone lever; the raw-fp8 prefetch scaffolding is kept because Phase 2 (fp8-MMA, Task 3) reuses it. See docs/perf-attribution-prefill-attn.md.
+
 **What:** the inner loop today is `__syncthreads -> stage K/V (global->smem, elementwise convert) -> __syncthreads -> QK^T MMA -> softmax -> PV MMA`, fully serializing the next tile's loads behind the current tile's compute with only 6 warps to hide either. Convert to a software pipeline: prefetch tile `p+1`'s K/V with `cp.async` (`cp.async.cg.shared.global`) into a second smem buffer while tile `p`'s MMAs run, `cp.async.wait_group` + `__syncthreads` at the boundary, ping-pong the two buffers. This is a **memory-scheduling change only** -- the MMA inputs, accumulation order, softmax, and outputs are bit-for-bit unchanged, so the fp16 path stays bitwise-identical.
 
 **Subtlety (the one real correctness trap):** `cp.async` copies raw bytes; the current staging does a per-element *convert* (fp8/fp16 -> half in `kv2h`) during the copy. cp.async cannot convert. Two options -- pick per Phase-0 data:

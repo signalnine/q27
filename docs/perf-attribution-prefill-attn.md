@@ -105,3 +105,16 @@ more directly and is where the plan should spend first.
   the stall mix at the crossover if Phase 1 tuning needs it.
 - Report kept at `scratchpad/pf_attn_128k.ncu-rep` (root-owned). Regenerate with the Task-1
   command in the plan if fixtures are re-cleaned.
+
+## Phase 1 result (cp.async K/V prefetch) -- NEUTRAL
+
+Implemented cp.async double-buffered prefetch of the next PP-tile's raw fp8 K/V (fp8 path;
+`Q27_PF_CPASYNC`, default on), convert-on-consume. Bitwise-identical (canonical 4c4120c7;
+prefill A/B 36b83fd8 on==off). 128K prefill wall, flag-only same-binary A/B (delta =
+isolated attention kernel): **ON 76.30s vs OFF 76.40s = +0.2%. NEUTRAL.** cp.async engaged
+(27 cp.async in PTX). Root cause: (1) loads are 95.6% L2-hit at depth (cp.async hides DRAM
+latency, not L2); (2) fp8 needs a separate smem->smem convert pass that eats the saving;
+(3) 6-warp occupancy leaves no independent work to overlap the async load. cp.async is
+occupancy-independent; this kernel is occupancy-bound. **Lever retired as a standalone;
+scaffolding kept for Phase 2 fp8-MMA** (removes the convert, halves smem, doubles QK^T
+throughput -> attacks math_pipe_throttle 28% and is a step toward 2 CTAs/SM).

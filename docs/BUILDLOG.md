@@ -1725,3 +1725,32 @@ needed, bitwise-safe. Full data: docs/perf-attribution-prefill-attn.md.
 
 Files: docs/plans/2026-07-07-prefill-attn.md (plan + Task-1 verdict + register-cut notes),
 docs/perf-attribution-prefill-attn.md (new). Docs only; no code changed.
+
+## 2026-07-07 (prefill-attn Phase 1) -- cp.async K/V prefetch: MEASURED NEUTRAL (~0%), kept as Phase-2 scaffolding
+
+Implemented cp.async double-buffered prefetch in k_attn_prefill_mma (fp8 path only;
+`Q27_PF_CPASYNC`, default on). Raw fp8 K/V of the next PP-tile is cp.async-prefetched into a
++16 KB smem buffer (total 100,864 B <= the 101,376 B sm_120 optin cap) while the current
+tile's MMAs run; convert-on-consume feeds kv2h the identical bytes -> bitwise-identical.
+fp16 path lacks smem room, keeps the blocking staging. New PTX helpers cpasync16/commit/
+wait_all; 27 cp.async in the generated PTX (confirmed engaged -- cuobjdump/ncu were just
+missing from PATH, hence earlier empty greps).
+
+GATES: full make clean (sm_86+sm_120). Canonical 4c4120c7 EXACT. Prefill bitwise A/B
+(greedy -n 8, 8K prompt, nsplit=2): CPASYNC=1 == CPASYNC=0 == 36b83fd8 -- BITWISE PASS.
+
+PERF: 128K prefill wall, same binary, flag-only A/B (so the delta is the isolated attention
+kernel): CPASYNC=1 76.30s vs CPASYNC=0 76.40s = **+0.2% on attention. NEUTRAL.** Root cause
+(consistent with Phase 0): (1) at depth the K/V loads are already 95.6% L2-hit (~200cyc), not
+the DRAM cost cp.async shines against; (2) fp8 forces a separate smem->smem convert pass
+(fp8->half for the fp16 MMA) that eats the saving; (3) the kernel is occupancy-starved (6
+warps) so there's little independent work to overlap the async load behind. cp.async is an
+occupancy-INDEPENDENT lever; this kernel's bottleneck is occupancy.
+
+DECISION: keep the scaffolding (raw-fp8 prefetch pipeline is exactly what fp8-MMA reuses) and
+proceed to Phase 2 (fp8-MMA) -- consume raw fp8 directly in the MMA: removes the convert,
+halves K/V smem, doubles QK^T throughput (attacks the measured 28% math_pipe_throttle).
+Tolerance-gated (breaks greedy bitwise). Gabe approved proceeding 2026-07-07.
+
+Files: src/prefill.cu (cp.async helpers + prefetch pipeline + launch),
+docs/perf-attribution-prefill-attn.md (Phase 1 result appended), docs/plans/2026-07-07-prefill-attn.md (Task 2 verdict).

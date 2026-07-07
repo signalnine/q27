@@ -828,6 +828,23 @@ static __device__ __forceinline__ uint32_t h2u(__half2 h) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// cp.async 16-byte global->shared copy (sm_80+; compiles on sm_86 and sm_120).
+// Bytes beyond src_bytes are zero-filled -- used to zero tail positions past
+// p_hi without a branch. Phase 1: hides the K/V load latency (long_scoreboard,
+// 30% of the deep-context stall per the 2026-07-07 ncu attribution) by
+// prefetching the next PP-tile's raw fp8 while the current tile's MMAs run.
+static __device__ __forceinline__ void cpasync16(void* smem, const void* gmem, int src_bytes) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
+                 "r"(src_bytes));
+}
+static __device__ __forceinline__ void cpasync_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+static __device__ __forceinline__ void cpasync_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+
 // transposed 8x8 b16 fragment loads for the PV phase: one x2 per (n, h)
 // replaces 4 scalar smem loads + 2 packs, same bits into the mma.
 static __device__ __forceinline__ void ldm_x2_trans(uint32_t& r0, uint32_t& r1, const void* p) {
@@ -852,7 +869,7 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
                    const CT* __restrict__ kc, const CT* __restrict__ vc,
                    float* __restrict__ outT, int out_row, float* __restrict__ part,
                    int base_pos, int tile_t0, int T, int n_kv_heads, int head_dim,
-                   float scale) {
+                   float scale, int cp_async) {
     constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8; // padded smem rows (halfs)
     const int kvh = blockIdx.x;
     const int t0 = tile_t0 + blockIdx.y * TT;
@@ -885,6 +902,13 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
     __half* s_q = s_h;                    // [6][TT][LDH]
     __half* s_k = s_q + 6 * TT * LDH;     // [PP][LDH]
     __half* s_v = s_k + PP * LDH;         // [PP][LDH]
+    // cp.async raw prefetch buffers: one PP-tile of K and V, contiguous (no LDH
+    // pad, 16B-aligned). fp8 only -- the fp16 path lacks smem room under the
+    // 99 KB sm_120 cap, so it stays on the blocking staging (CPA=false).
+    constexpr bool CPA = (sizeof(CT) == 1);
+    CT* s_kraw = (CT*)(s_v + PP * LDH);   // [PP*HD] (valid only when CPA)
+    CT* s_vraw = s_kraw + PP * HD;        // [PP*HD]
+    const bool cpa = CPA && cp_async;
 
     // stage Q (fp32 -> fp16) once: warp w stages its own head's 16 tokens
     {
@@ -905,35 +929,81 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
         for (int e = 0; e < 4; e++) o[i][e] = 0.f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
 
+    // cp.async prologue: issue the first tile's raw K/V prefetch. src_bytes=0
+    // zero-fills tail positions past p_hi (fp8 0x00 -> kv2h -> 0.0, matching the
+    // blocking path's explicit zero).
+    if (cpa) {
+        for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
+            int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+            int gpos = p_lo + pp;
+            size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * HD + d16, &kc[off], gpos < p_hi ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+        }
+        cpasync_commit();
+    }
+
     for (int p0 = p_lo; p0 < p_hi; p0 += PP) {
         const int np = min(PP, p_hi - p0);
-        __syncthreads();
-        // vectorized staging: 8 KV elements per load (uint2 for fp8, uint4
-        // for fp16), same converted bits as the old elementwise path
-        for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
-            int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
-            bool ok = pp < np;
-            size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
-            CT kraw[8], vraw[8];
-            __half2* kd = (__half2*)(s_k + pp * LDH + d8);
-            __half2* vd = (__half2*)(s_v + pp * LDH + d8);
-            if (ok) {
-                #pragma unroll
-                for (int j = 0; j < 8; j++) { kraw[j] = kc[off + j]; vraw[j] = vc[off + j]; }
+        if (cpa) {
+            cpasync_wait_all();  // this tile's raw K/V is resident
+            __syncthreads();
+            // convert raw fp8 -> half in s_k/s_v: identical bytes through kv2h
+            // as the blocking path, so the MMA inputs are bit-for-bit unchanged
+            for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
+                int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+                __half2* kd = (__half2*)(s_k + pp * LDH + d8);
+                __half2* vd = (__half2*)(s_v + pp * LDH + d8);
+                const CT* kr = s_kraw + pp * HD + d8;
+                const CT* vr = s_vraw + pp * HD + d8;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    kd[j] = __halves2half2(kv2h(kraw[2 * j]), kv2h(kraw[2 * j + 1]));
-                    vd[j] = __halves2half2(kv2h(vraw[2 * j]), kv2h(vraw[2 * j + 1]));
-                }
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    kd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
-                    vd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                    kd[j] = __halves2half2(kv2h(kr[2 * j]), kv2h(kr[2 * j + 1]));
+                    vd[j] = __halves2half2(kv2h(vr[2 * j]), kv2h(vr[2 * j + 1]));
                 }
             }
+            __syncthreads();  // half ready; raw buffer free to overwrite
+            // prefetch the NEXT tile -- overlaps the QK^T/PV MMAs below (hides
+            // the K/V load latency that dominates the deep-context stall)
+            if (p0 + PP < p_hi) {
+                for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
+                    int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+                    int gpos = p0 + PP + pp;
+                    size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(s_kraw + pp * HD + d16, &kc[off], gpos < p_hi ? 16 : 0);
+                    cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+                }
+                cpasync_commit();
+            }
+        } else {
+            __syncthreads();
+            // vectorized staging: 8 KV elements per load (uint2 for fp8, uint4
+            // for fp16), same converted bits as the old elementwise path
+            for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
+                int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+                bool ok = pp < np;
+                size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+                CT kraw[8], vraw[8];
+                __half2* kd = (__half2*)(s_k + pp * LDH + d8);
+                __half2* vd = (__half2*)(s_v + pp * LDH + d8);
+                if (ok) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) { kraw[j] = kc[off + j]; vraw[j] = vc[off + j]; }
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        kd[j] = __halves2half2(kv2h(kraw[2 * j]), kv2h(kraw[2 * j + 1]));
+                        vd[j] = __halves2half2(kv2h(vraw[2 * j]), kv2h(vraw[2 * j + 1]));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        kd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                        vd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                    }
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         // S = Q K^T for this warp's 16 tokens x 32 positions (4 n8 subtiles)
         float s[4][4];
@@ -1197,7 +1267,15 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         !(e && !strcmp(e, "lite")) && head_dim == 256 && n_q_heads == 6 * n_kv_heads;
     if (use_mma) {
         constexpr int TT = 16, PP = 32, LDH = 256 + 8;
-        const size_t SM = (size_t)(6 * TT + 2 * PP) * LDH * sizeof(__half);
+        // fp8 adds one PP-tile of raw K+V (16 KB) for the cp.async prefetch;
+        // fp16 has no room under the 99 KB cap and keeps the blocking path.
+        const size_t SM = (size_t)(6 * TT + 2 * PP) * LDH * sizeof(__half) +
+                          (sizeof(CT) == 1 ? (size_t)2 * PP * 256 * sizeof(CT) : 0);
+        static int cpa_env = -1;
+        if (cpa_env < 0) {
+            const char* ce = getenv("Q27_PF_CPASYNC");
+            cpa_env = ce ? atoi(ce) : 1;  // default ON for the fp8 path
+        }
         static bool attr2 = false;
         if (!attr2) {
             CUDA_CHECK(cudaFuncSetAttribute(k_attn_prefill_mma<CT>,
@@ -1218,7 +1296,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         k_attn_prefill_mma<CT><<<grid, 192, SM, st>>>(qT, q_stride, q_row, (const CT*)kc,
                                                       (const CT*)vc, outT, out_row, part,
                                                       base_pos, t0, t0 + SB, n_kv_heads,
-                                                      head_dim, scale);
+                                                      head_dim, scale, cpa_env);
         CUDA_CHECK(cudaGetLastError());
         if (nsplit > 1) {
             dim3 g2(SB, n_q_heads);
