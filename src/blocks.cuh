@@ -131,12 +131,14 @@ void sample_g(const float* logits, int n, const SampleParams* d_sp, float* d_nuc
 // d_nuc + lane*4). Identical kernel to sample_g's -> spec/plain share the target.
 void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
              cudaStream_t st = 0);
-// Rejection-sampling accept walk over the 4 greedy drafts vs the 5-lane logits2.
+// Rejection-sampling accept walk over up to max_draft greedy drafts vs logits2.
 // d_nuc5 = [5][4], d_P = committed position (Philox key), cap forces n=1.
+// max_draft = accept-walk depth (P14 confidence gate: width-W verify walks W-1
+// drafts; stop_lane inits to max_draft so all-accept commits the bonus lane).
 // Writes d_spec[3] = {n, stop_lane, exclude_token}.
 void spec_accept(const float* logits2, const float* d_nuc5, const int* dr1, const int* dr2,
                  const int* dr3, const int* dr4, const SampleParams* d_sp, const int* d_P,
-                 const int* cap, int vocab, int* d_spec, cudaStream_t st = 0);
+                 const int* cap, int max_draft, int vocab, int* d_spec, cudaStream_t st = 0);
 // Resample the new pending token from the stop lane's nucleus (exclude the
 // rejected draft) via device-indirected Gumbel-max; writes it into d_out.
 void sample_stop(const float* logits2, const float* d_nuc5, const int* d_spec,

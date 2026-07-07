@@ -1470,10 +1470,12 @@ static void test_spec_sample() {
     printf("    [lane0 thr=%.3f mass_gpu=%.4f mass_cpu=%.4f]\n", thr0, mass0, cpu_mass);
     check("spec nucleus mass vs CPU", std::fabs(mass0 - cpu_mass), 2e-3);
 
-    auto round = [&](int P, int& n_out, int& nt_out) {
+    // P14: round() takes max_draft (the accept-walk cap). max_draft==4 reproduces
+    // the pre-P14 width-5 behavior (stop_lane init 4, loop k<4).
+    auto round = [&](int P, int md, int& n_out, int& nt_out) {
         CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
         q27k::spec_accept(d_logits2, d_nuc5, d_drafts, d_drafts + 1, d_drafts + 2, d_drafts + 3,
-                          d_sp, d_P, d_cap, V, d_spec, 0);
+                          d_sp, d_P, d_cap, md, V, d_spec, 0);
         q27k::sample_stop(d_logits2, d_nuc5, d_spec, d_sp, d_P, V, d_out, d_scr, 0);
         int spec[3], nt;
         CUDA_CHECK(cudaMemcpy(spec, d_spec, 3 * 4, cudaMemcpyDeviceToHost));
@@ -1484,7 +1486,7 @@ static void test_spec_sample() {
     // (b) seeded identity: same (seed, P) -> identical n and nt.
     {
         int n1, nt1, n2, nt2;
-        round(555, n1, nt1); round(555, n2, nt2);
+        round(555, 4, n1, nt1); round(555, 4, n2, nt2);
         check("spec seeded identity", (double)((n1 != n2) || (nt1 != nt2)), 0.5);
     }
 
@@ -1493,7 +1495,7 @@ static void test_spec_sample() {
     std::vector<int> obs(V, 0);
     int accepts = 0, excl_viol = 0, oob = 0;
     for (int t = 0; t < N; t++) {
-        int n, nt; round(t, n, nt);
+        int n, nt; round(t, 4, n, nt);
         if (n >= 2) accepts++;                       // lane 0 accepted dr1
         int commit = (n == 1) ? nt : drafts[0];      // token committed at lane 0's position
         if (n == 1 && nt == drafts[0]) excl_viol++;  // rejected draft must not reappear
@@ -1515,6 +1517,74 @@ static void test_spec_sample() {
     double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
     printf("    [spec chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
     check("spec rejection-sampling vs served target", chi2 < bound ? 0.0 : 1.0, 0.5);
+
+    // ---- P14 max_draft (accept-walk cap) tests ----
+    // Per-lane served prob p_served(dr_k)=softmax_full_k(dr_k)/mass_k (0 if the
+    // draft fell outside its nucleus) for the cap tests below.
+    double ps_lane[4];
+    for (int k = 0; k < 4; k++) {
+        double Mx = L[k][0]; for (int i = 1; i < V; i++) Mx = std::max(Mx, (double)L[k][i]);
+        double Z = 0; for (int i = 0; i < V; i++) Z += std::exp((double)invT * (L[k][i] - Mx));
+        double thr = nuc[k * 4 + 0], mass = nuc[k * 4 + 3];
+        double sf = std::exp((double)invT * (L[k][drafts[k]] - Mx)) / Z;
+        ps_lane[k] = (L[k][drafts[k]] >= thr) ? sf / mass : 0.0;
+    }
+
+    // (f) cap honored: n never exceeds max_draft+1. (c) lane-0 accept prob is
+    // unchanged by the cap (the walk always evaluates lane 0 first when md>=1).
+    for (int md = 1; md <= 4; md++) {
+        int maxn = 0, acc0 = 0; const int M2 = 8192;
+        for (int t = 0; t < M2; t++) {
+            int n, nt; round(1000000 + md * 100000 + t, md, n, nt);
+            if (n > maxn) maxn = n;
+            if (n >= 2) acc0++;                      // lane 0 accepted (reached lane 1)
+        }
+        printf("    [cap md=%d maxn=%d(<=%d) acc0=%.4f p_served=%.4f]\n",
+               md, maxn, md + 1, (double)acc0 / M2, ps_lane[0]);
+        check("spec cap honors max_draft", (double)(maxn > md + 1), 0.5);
+        check("spec lane0 accept == p_served under cap",
+              std::fabs((double)acc0 / M2 - ps_lane[0]), 0.03);
+    }
+
+    // (c') per-lane conditional accept rate == p_served(dr_k) at full depth
+    // (max_draft=4): the Phase-2 property survives the walk under the cap param.
+    {
+        const int M3 = 16384; int reached[4] = {0}, acc[4] = {0};
+        for (int t = 0; t < M3; t++) {
+            int n, nt; round(3000000 + t, 4, n, nt);
+            int s = n - 1;                            // stop_lane: lanes 0..s-1 accepted
+            for (int k = 0; k < 4; k++) {
+                if (s >= k) reached[k]++;             // reached lane k
+                if (s > k) acc[k]++;                  // lane k accepted
+            }
+        }
+        for (int k = 0; k < 4; k++) {
+            double rate = reached[k] ? (double)acc[k] / reached[k] : 0.0;
+            printf("    [lane%d cond-accept=%.4f p_served=%.4f reached=%d]\n",
+                   k, rate, ps_lane[k], reached[k]);
+            if (reached[k] < 500) continue;           // too few to judge
+            check("spec per-lane accept == p_served", std::fabs(rate - ps_lane[k]), 0.05);
+        }
+    }
+
+    // (g) all-accept -> stop_lane==max_draft (bonus lane). Dominant drafts
+    // (p_served==1) force every lane to accept under any seed, for md 1..4.
+    {
+        std::vector<float> dom(5 * V, 0.f);
+        for (int k = 0; k < 4; k++) dom[k * V + drafts[k]] = 50.f; // drafts[k] dominates lane k
+        CUDA_CHECK(cudaMemcpy(d_logits2, dom.data(), 5 * V * 4, cudaMemcpyHostToDevice));
+        for (int k = 0; k < 5; k++)
+            q27k::nucleus(d_logits2 + k * V, V, d_sp, d_nuc5 + k * 4, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int viol = 0;
+        for (int md = 1; md <= 4; md++)
+            for (int t = 0; t < 256; t++) {
+                int n, nt; round(4000000 + md * 100000 + t, md, n, nt);
+                if (n != md + 1) viol++;              // all-accept => stop_lane==md
+            }
+        printf("    [all-accept viol=%d (want 0)]\n", viol);
+        check("spec all-accept stop_lane==max_draft", (double)viol, 0.5);
+    }
 
     CUDA_CHECK(cudaFree(d_logits2)); CUDA_CHECK(cudaFree(d_nuc5)); CUDA_CHECK(cudaFree(d_spec));
     CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_P)); CUDA_CHECK(cudaFree(d_drafts));

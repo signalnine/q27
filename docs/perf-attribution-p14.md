@@ -219,3 +219,67 @@ weights and GDN are already length-flat per token.
 - **Blackwell ncu metric drift**: `dram__bytes_read.sum` silently no-collects (use
   `dram__bytes_op_read.sum`); and server prefill MTP-warm fd2 pollutes launch-skip. Direct
   DRAM-byte R is recorded UNMEASURED-DIRECT; the nsys time-proxy stands in and is decisive.
+
+---
+
+## Task 3 -- P12 gate ported to the sampled spec path (measured)
+
+Same 61K docs prompt + a 2K docs prompt, server (bench template), `/v1/completions`,
+`max_tokens=384`, 1 warmup + n=3 (spread <0.2%). Sampled = `temperature=0.7, top_p=0.95,
+seed=42`. Each `Q27_PMIN` = one server restart (read once at `build_spec_graphs`). t/s /
+ms/round / tok/round from the `[req]` log (`tps`, `dec_ms`, `dec/rounds`). Binary = branch
+tip with Task 3 (per-width sampled verify graphs + capped accept walk). Baseline re-measured
+on this binary (Task 2 shifted timing; the doc's Step-3 80.0 t/s / 2.415 tok/round predates
+Task 2 and its tok/round came from `[sample-stats]`, a different counter than `dec/rounds`).
+
+### Sampled (T=0.7), the target metric
+
+| ctx | metric      | ungated | Q27_PMIN=0.5 | Q27_PMIN=1.0 |
+|----:|-------------|--------:|-------------:|-------------:|
+| 2K  | t/s         | 135.7   | 146.6 (+8.0%)| 120.3 (-11.3%)|
+| 2K  | ms/round    | 21.94   | 20.31        | 18.56        |
+| 2K  | tok/round   | 2.977   | 2.977        | 2.233        |
+| 61K | t/s         | 95.1    | 95.1 (+0.0%) | 91.0 (-4.3%) |
+| 61K | ms/round    | 30.38   | 25.73        | 23.98        |
+| 61K | tok/round   | 2.887   | 2.446        | 2.182        |
+
+**Perf-gate verdict: NOT MET at 61K.** The gate criterion (best theta >= +2% at 61K-class
+ctx, no 2K regression > 1.5%) fails: best sampled theta @61K is 0.5 at **+0.0%**. At 2K,
+theta=0.5 is a clean **+8.0%** (tok/round IDENTICAL 2.977 -> the narrowing only skipped
+would-be-rejected lanes, pure per-round savings) and does not regress. theta=1.0 over-narrows
+and regresses at both ctx.
+
+Mechanism: the gate narrows verify width from the DRAFTER's top1-top2 margin. For greedy
+verify, a low-margin draft is usually argmax-rejected anyway, so narrowing loses nothing.
+For SAMPLED (rejection) verify, a low-margin draft still has a real chance of being accepted,
+so at 61K the narrowing cuts accept-able lanes -> tok/round drops 2.887 -> 2.446, the extra
+rounds (133 -> 157) exactly offset the cheaper round (30.38 -> 25.73 ms), netting +0.0%. At
+2K the acceptance profile happens to align (stream unchanged), so it is pure win. The gate is
+acceptance-(prompt-)dependent -- consistent with the Step-2 greedy finding.
+
+### Greedy cross-check @61K (same binary) -- machinery is healthy
+
+| 61K greedy | ungated | Q27_PMIN=0.5 | Q27_PMIN=1.0 |
+|------------|--------:|-------------:|-------------:|
+| t/s        | 116.1   | 119.5 (+2.9%)| 123.8 (+6.6%)|
+| ms/round   | 29.28   | 26.55        | 24.42        |
+| tok/round  | 3.398   | 3.174        | 3.024        |
+
+The greedy gate still delivers its win (+6.6% at theta=1.0) on this binary, proving the
+shared gate machinery (draft graph + margin readback + cap loop + per-width verify) is NOT
+regressed by Task 3. The sampled +0.0% is therefore a genuine rejection-acceptance effect,
+not an implementation bug. (Note the greedy vs sampled theta ordering INVERTS: greedy prefers
+theta=1.0 at 61K, sampled prefers 0.5 -- the aggressive gate that helps greedy hurts sampled.)
+
+Deep-ctx aside: `prompt16k.txt` actually tokenizes to ~94K tokens (mislabeled by Task 1);
+sampled gated theta=1.0 there collapses to 1.272 tok/round / 53.1 t/s -- theta=1.0 degrades
+monotonically with ctx on sampled decode.
+
+### Takeaway for Task 4
+
+Task 3's verify-side gate is neutral for sampled 61K docs traffic. The remaining sampled
+lever is the DRAFT side: Task 4 (per-step draft early-exit) stops DRAFTING at the first
+sub-theta margin, saving ~1.5 ms/draft-pass regardless of whether the verify would have
+accepted -- a cost the verify-only gate cannot touch. Task 3 is the necessary substrate
+(per-width sampled verify graphs + capped accept walk) for that. Default remains ungated
+(`Q27_PMIN` unset), so this change is zero-risk to production sampled traffic.

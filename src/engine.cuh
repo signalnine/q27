@@ -5,6 +5,7 @@
 #include <memory>
 #include <chrono>
 #include <functional>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -190,6 +191,10 @@ struct Engine {
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
+    // P14: per-width sampled verify graphs (sampled analog of verify_graph_w).
+    // [W=2..5][perm=0..5]; the sampled+gated round drafts depth-4, reads the 4
+    // draft margins, caps the accept walk at W-1, and launches this at width W.
+    cudaGraphExec_t verify_sample_graph_w[6][6] = {}; // [W][perm]
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 6;
@@ -832,10 +837,15 @@ struct Engine {
     // Draws key Philox on *d_P; greedy graphs stay bitwise (separate graph set).
     void spec_verify_launches_sampled() {
         spec_verify_forward();
-        for (int k = 0; k < 5; k++)
+        // P14: width-vw sampled verify -- nucleus stats + accept walk over the
+        // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
+        // accept walk caps at vw-1 drafts so finish never commits an uncomputed
+        // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
+        // unchanged: it keys on n<=vw and its src select covers n in 1..5.
+        for (int k = 0; k < vw; k++)
             q27k::nucleus(logits2 + (size_t)k * VOCAB, VOCAB, d_samp, d_nuc + k * 4, stm);
         q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
-                          d_accept_cap, VOCAB, d_spec, stm);
+                          d_accept_cap, vw - 1, VOCAB, d_spec, stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, stm);
         q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
                              x1_b, x1_c, x1_d, x1_e, h_next, d_outcome, N_EMBD, stm);
@@ -938,7 +948,12 @@ struct Engine {
             // P13 adaptive maxd: also capture the depth-4 draft (draft_graph_lo)
             // so spec_round can pick draft depth per round. gate_maxd is forced to
             // 5 under auto, so draft_graph[p] above is the depth-5 (hi) graph.
-            if (maxd_auto) {
+            // P14: capture it whenever gate_maxd==5 (auto OR fixed Q27_MAXD=5), not
+            // just auto -- the sampled+gated path is always a depth-4 draft and
+            // needs the depth-4 graph even under fixed depth-5. One extra graph per
+            // perm, no new buffers; greedy still selects draft_graph_lo only under
+            // maxd_auto (spec_round unchanged), so its behavior is untouched.
+            if (gate_maxd == 5) {
                 dmax = 4;
                 cudaGraph_t gdl;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -987,6 +1002,21 @@ struct Engine {
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
             CUDA_CHECK(cudaGraphInstantiate(&spec_sample_graph[p], gr, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gr));
+            // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
+            // verify_graph_w loop. The sampled tail is always depth-4, so the
+            // widest sampled verify is width-5 (W<=5) regardless of gate_maxd.
+            // Same buffers as the monolithic sampled verify; only vw shrinks.
+            for (int W = 2; W <= 5; W++) {
+                vw = W;
+                cudaGraph_t gw;
+                CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+                spec_verify_launches_sampled();
+                CUDA_CHECK(cudaStreamEndCapture(stm, &gw));
+                CUDA_CHECK(
+                    cudaGraphInstantiate(&verify_sample_graph_w[W][p], gw, nullptr, nullptr, 0));
+                CUDA_CHECK(cudaGraphDestroy(gw));
+            }
+            vw = 5;
         }
         perm = 0;
         // P12: confidence-gated depth. Q27_PMIN=theta engages the gate (drafter
@@ -996,7 +1026,7 @@ struct Engine {
         if (pm) pmin_theta = (float)atof(pm);
         fprintf(stderr,
                 "spec graphs captured (6 perms, depth-4; +split D/V; +P12b per-width verify "
-                "2..%d%s); Q27_PMIN=%.3f (%s), gate_maxd=%d%s\n",
+                "2..%d%s; +P14 sampled per-width verify 2..5); Q27_PMIN=%.3f (%s), gate_maxd=%d%s\n",
                 gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", pmin_theta,
                 pmin_theta > 0 ? "gated" : "off", gate_maxd,
                 maxd_auto ? " (auto: floats 4..5)" : "");
@@ -1106,11 +1136,36 @@ struct Engine {
     // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
     // h_next is the prefill hidden. Tools are off under sampling, so no split path.
     int spec_sample_round(int* emit) {
+        // First token from the retained prefill logits (kind 0, no forward) --
+        // BEFORE any spec round, on both the gated and ungated branches, so the
+        // gated/ungated first token is identical at a given seed.
         if (samp_first) {
             samp_first = false;
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
         }
-        CUDA_CHECK(cudaGraphLaunch(spec_sample_graph[perm], stm));
+        if (pmin_theta > 0.f) {
+            // P14 confidence-gated sampled round -- mirror spec_round's gated
+            // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
+            // depth-4: draft_graph[perm] is depth-4 when gate_maxd==4; under
+            // gate_maxd==5 (auto or fixed) draft_graph_lo[perm] is the depth-4
+            // draft (captured whenever gate_maxd==5). Cap the accept walk at 4.
+            // Tools are off under sampling, so no split path.
+            const int md_used = 4; // sampled ceiling is 4; cap <= 4 by construction
+            cudaGraphExec_t dg = (gate_maxd == 5) ? draft_graph_lo[perm] : draft_graph[perm];
+            CUDA_CHECK(cudaGraphLaunch(dg, stm));
+            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
+                                       cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            int cap = 0;
+            while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
+            assert(cap <= 4);
+            int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
+            CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W][perm], stm));
+            // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
+            // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(spec_sample_graph[perm], stm));
+        }
         int oc[7];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));

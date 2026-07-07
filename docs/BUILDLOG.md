@@ -1374,3 +1374,59 @@ the removed k_margin cost), 116.1 t/s (was 109.9); 2K 21.25 -> 20.93 ms/round (-
 as predicted.
 
 Files: blocks.cu, blocks.cuh, engine.cuh, test_kernels.cu.
+
+## 2026-07-06 (P14 Task 3) -- P12 confidence gate on the sampled spec path
+
+**What.** Ported the P12/P12b confidence gate + gated-round plumbing to the production
+sampled spec path (`spec_sample_round`, engine.cuh). Default sampled traffic (T<=0.7) can now
+narrow the sampled verify per-round like greedy does. CANONICAL-EXACT (greedy untouched):
+canonical md5 **4c4120c72056aba2bc2d2561471eafce** EXACT.
+
+**Kernel (`blocks.cu`).** `k_spec_accept` + wrapper gain `int max_draft`: `stop_lane` inits to
+`max_draft` (was 4), the accept walk loops `k < max_draft` (was `< 4`). A width-W sampled
+verify walks `max_draft = W-1` drafts; all-accept commits `max_draft` drafts + the bonus lane
+(n=max_draft+1). max_draft=4 reproduces the pre-P14 width-5 behavior bit-for-bit.
+
+**Engine (`engine.cuh`).** `spec_verify_launches_sampled` is now per-width: nucleus loop `k <
+vw` (was `<5`), `spec_accept(..., vw-1, ...)`. **`k_finish_sampled` needs NO change** -- it
+keys on `n = spec[0]` and its `src` select (`n==5?x1e:...:x1a`) covers n in 1..5; with
+max_draft=vw-1 and vw<=5, n<=5 always. `build_spec_graphs` captures a new
+`verify_sample_graph_w[6][6]` for W=2..5 (mirrors the greedy per-width loop; sampled tail is
+always depth-4 so W<=5 regardless of gate_maxd). Draft-graph selection is FIXED: the
+sampled+gated path ALWAYS drafts depth-4, so `draft_graph_lo` is now captured whenever
+`gate_maxd==5` (widened from maxd_auto-only -- so a fixed `Q27_MAXD=5` also has a depth-4
+draft); one extra graph/perm, no new buffers, greedy selection unchanged. `spec_sample_round`
+gains the gated branch mirroring `spec_round`: launch depth-4 draft, D2H the 4 margins,
+`cap = leading run >= theta` (assert cap<=4), launch `verify_sample_graph_w[max(cap+1,2)]`.
+The `samp_first` bootstrap stays ABOVE the gate/ungated branch, so token 0 (retained prefill
+logits, `sample_g` kind 0) is identical on both paths.
+
+**LIMITATION (P13 EMA).** sat/yield EMAs are NOT updated from sampled rounds this phase (the
+sampled ceiling is fixed at 4); Q27_MAXD=auto adaptive-maxd applies to greedy only.
+
+**Correctness gates -- ALL PASS.** `test_kernels --sampling-only` incl. new max_draft cases:
+cap honored (n<=md+1 for md 1..4), lane-0 accept==p_served under each cap, per-lane conditional
+accept==p_served at md=4 (lanes 0..3), all-accept stop_lane==max_draft (viol=0). Full
+`test_kernels` ALL PASS. `tools/sampling_gate.sh` ALL PASS (greedy canonical, seeded identity,
+seed-varies, sampled!=greedy, accept-vs-temp). NEW live gates: sampled+gated seeded
+reproducibility (seed 42 byte-identical x2, seed 43 differs); first-token identity
+gated(Q27_PMIN=1.0) vs ungated same seed 42 (both first tok=11751); gated T=0.7 = 3.00
+tok/round (no acceptance collapse). Build sm_86+sm_120 warning-clean.
+
+**PERF -- gate NOT met at 61K (honest, calibration finding, not a bug).** Sampled T=0.7 docs
+prompt, server n=3 medians (`[req]` dec/rounds): 61K best theta = 0.5 at **+0.0%** (95.1 ->
+95.1 t/s), theta=1.0 **-4.3%**; 2K theta=0.5 **+8.0%** (146.6 vs 135.7, tok/round IDENTICAL --
+pure per-round savings), theta=1.0 -11.3%. The +2% @61K target (calibration-updated from the
+greedy analog) is missed. Mechanism: the drafter-margin gate narrows verify; greedy would
+argmax-reject a low-margin draft anyway (narrowing free), but sampled rejection can still
+accept it, so at 61K the narrowing cuts accept-able lanes (tok/round 2.887->2.446) and the
+extra rounds offset the cheaper round -> net 0. GREEDY cross-check on THIS binary confirms the
+shared machinery is healthy: 61K greedy +6.6% (theta 1.0) / +2.9% (theta 0.5). So the sampled
+result is a genuine rejection-acceptance effect. Full tables in docs/perf-attribution-p14.md
+(Task 3 section). Gate stays OFF by default (Q27_PMIN unset) -> zero risk to production
+sampled traffic. The sampled win, if any, is on the DRAFT side (Task 4 early-exit); Task 3 is
+its substrate. `verify_sample_graph_w` IS exercised now (the gated sampled branch drives it
+whenever Q27_PMIN>0 under sampling) and is proven correct by the reproducibility/first-token
+gates; it just does not yet pay for itself at 61K on docs traffic.
+
+Files: blocks.cu, blocks.cuh, engine.cuh, test_kernels.cu, docs/perf-attribution-p14.md.

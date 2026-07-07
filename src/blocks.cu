@@ -639,16 +639,18 @@ __global__ void k_spec_accept(const float* __restrict__ logits2,
                               const int* __restrict__ dr2p, const int* __restrict__ dr3p,
                               const int* __restrict__ dr4p, const SampleParams* __restrict__ sp,
                               const int* __restrict__ dP, const int* __restrict__ cap,
-                              int vocab, int* __restrict__ out) {
+                              int max_draft, int vocab, int* __restrict__ out) {
     const float inv_temp = sp->inv_temp;
     const unsigned long long seed = sp->seed;
     const unsigned pos = (unsigned)*dP;
     const int dr[4] = {*dr1p, *dr2p, *dr3p, *dr4p};
-    int stop_lane = 4, exclude = -1;
+    // P14 gate: width-W verify walks max_draft = W-1 drafts. stop_lane inits to
+    // max_draft so all-accept commits max_draft drafts + the bonus lane (n=max_draft+1).
+    int stop_lane = max_draft, exclude = -1;
     if (*cap) {
         stop_lane = 0; // n=1: commit only the pending, resample lane 0 fresh
     } else {
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < max_draft; k++) {
             const float* nl = nuc5 + (size_t)k * 4;
             const float thr = nl[0], M = nl[1], logZ = nl[2], mass = nl[3];
             const int d = dr[k];
@@ -666,9 +668,9 @@ __global__ void k_spec_accept(const float* __restrict__ logits2,
 }
 void spec_accept(const float* logits2, const float* nuc5, const int* dr1, const int* dr2,
                  const int* dr3, const int* dr4, const SampleParams* d_sp, const int* d_P,
-                 const int* cap, int vocab, int* d_spec, cudaStream_t st) {
-    k_spec_accept<<<1, 1, 0, st>>>(logits2, nuc5, dr1, dr2, dr3, dr4, d_sp, d_P, cap, vocab,
-                                   d_spec);
+                 const int* cap, int max_draft, int vocab, int* d_spec, cudaStream_t st) {
+    k_spec_accept<<<1, 1, 0, st>>>(logits2, nuc5, dr1, dr2, dr3, dr4, d_sp, d_P, cap, max_draft,
+                                   vocab, d_spec);
     CUDA_CHECK(cudaGetLastError());
 }
 
