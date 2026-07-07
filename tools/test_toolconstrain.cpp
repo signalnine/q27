@@ -217,6 +217,35 @@ static void test_c7_split_brain_rebind() {
     CHECK(!r.eng.constraint_log.empty() && r.eng.constraint_log.back() == 0);
 }
 
+// m3 (review): pool_dead set mid-scan must stop the scan -- a second marker in
+// the SAME round must not re-engage (a cached mask id could otherwise bypass
+// the pool and later disengage nondeterministically mid-call)
+static void test_m3_pool_dead_stops_scan() {
+    Rig r;
+    r.eng.pool_cap = 0;
+    int em[4] = {T_MARK, T_HELLO, T_MARK, T_GET};
+    int m = r.tc.scan_round(em, 4);
+    CHECK(m == -1);
+    CHECK(r.tc.pool_dead);
+    CHECK(r.tc.engaged == 1);    // first marker only; second never attempted
+    CHECK(r.tc.pool_drops == 1);
+    CHECK(!r.tc.active);
+}
+
+// m4 (review): a call that COMPLETES inside the entry token's remainder bytes
+// (marker+body+closer in one piece) must not stage a mask for a closed state
+static void test_m4_closed_within_entry_token() {
+    Rig r;
+    r.tok.vocab.push_back("<tool_call>{\"name\": \"run_tests\", \"arguments\": {}}</tool_call>");
+    int one_shot = (int)r.tok.vocab.size() - 1;
+    int em[2] = {one_shot, T_HELLO};
+    int m = r.tc.scan_round(em, 2);
+    CHECK(m == -1);              // nothing to truncate; call already complete
+    CHECK(!r.tc.active);         // closed, not left engaged
+    // no constraint may be left staged for the closed state
+    CHECK(r.eng.constraint_log.empty() || r.eng.constraint_log.back() == -1);
+}
+
 // C13 (host half): a full call closes; closer disengages; constraint cleared
 static void test_closer_disengages() {
     Rig r;
@@ -239,6 +268,8 @@ int main() {
     test_c5_marker_at_last_token();
     test_c6_pool_full_sticky();
     test_c7_split_brain_rebind();
+    test_m3_pool_dead_stops_scan();
+    test_m4_closed_within_entry_token();
     test_closer_disengages();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);

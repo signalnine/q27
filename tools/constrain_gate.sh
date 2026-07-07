@@ -48,6 +48,9 @@ m = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", stats)}
 if m.get("engaged", 0) < 1: print("[gate] FAIL: never engaged"); fails += 1
 if m.get("disengaged", 0) != 0: print(f"[gate] FAIL: {m['disengaged']} disengages"); fails += 1
 if m.get("refinish", 0) < 1: print("[gate] FAIL: refinish never fired"); fails += 1
+# the core perm-rewind path (m<n) must actually be exercised, not just the
+# m==n pending-only degenerate (review m5)
+if m.get("trunc", 0) < 1: print("[gate] FAIL: truncation (perm rewind) never fired"); fails += 1
 text = open(f"{out}/base.txt").read()
 calls = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.S)
 if not calls:

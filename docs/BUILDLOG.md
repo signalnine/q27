@@ -1936,3 +1936,19 @@ serving; the flag is now SAFE (no score-0 basins) and buys structural validity w
 robustness matters -- the strict-parser A/B can run with it on. The known speed fix
 remains the P11 split path (proven token-identical, 4.2x in-call) blocked on its
 orchestration race.
+
+**P15 adversarial review pass (same session).** Independent reviewer confirmed the
+refinish/rewind math correct on every reachable path (gated widths, maxd auto depth-5,
+DEXIT, EOS-in-kept/discarded, R1b boundary, CLI-canonical unreachability) and the
+invariant as structural, not just empirical. Findings fixed: **M1** dangling tc-hook
+lambdas surviving a non-CUDA throw out of generate() (httplib catches at routing, next
+request on a hook-less path would call a destroyed stack frame) -- HookGuard RAII nulls
+on_pending/on_drafts/on_round on any exit, constructed after slot_guard so hooks clear
+before the slot frees; **m3** pool_dead set mid-scan now stops the scan (a second
+same-round marker with a cached entry mask could bypass the pool and disengage
+nondeterministically mid-call later); **m4** a call completing inside the entry token's
+remainder no longer stages a closed-state mask (defensive; not producible with the real
+BPE vocab); **m5** the gate now asserts trunc>=1 so the perm-rewind path (not just the
+m==n degenerate) stays exercised. **m2** documented as a comment: the split-brain check
+is range-only -- safe while the pool is append-only; pool reset/eviction would need
+whole-map epoch invalidation. m3/m4 landed RED->GREEN in test_toolconstrain (11 tests).

@@ -54,7 +54,11 @@ struct BasicToolConstrainer {
         // split-brain gate: the per-slot map may only point INSIDE the
         // engine's live pool; anything else is a stale mapping (pool reset
         // behind the map's back) -- re-upload rather than decode under a
-        // wrong mask.
+        // wrong mask. LIMITATION (review m2): this is a RANGE check, not an
+        // identity check -- it cannot catch an id that is stale but still
+        // in-range. Safe today because the pool is append-only for an
+        // engine's lifetime; if pool reset/eviction is ever added, the whole
+        // host2dev map must be invalidated (epoch stamp), not spot-checked.
         if (slot >= 0 && slot >= eng->mask_pool_used) {
             fprintf(stderr, "[toolgram] stale mask id %d >= pool %d -- re-uploading\n", slot,
                     eng->mask_pool_used);
@@ -156,8 +160,23 @@ struct BasicToolConstrainer {
                     break;
                 }
             if (!rem_ok) continue; // keep scanning; a later marker may engage
+            if (tg.closed()) {
+                // the whole call completed inside this token's remainder --
+                // nothing left to constrain (and a closed-state mask must
+                // never be staged). Post-call text continues unconstrained.
+                active = false;
+                fprintf(stderr, "[toolgram] call closed within entry token\n");
+                continue;
+            }
             apply(tg);
-            if (!active) continue; // pool-full drop inside apply
+            if (!active) {
+                // pool-full drop inside apply: stickiness must hold from this
+                // token on -- a later marker whose entry mask happens to be
+                // cached would otherwise engage and then disengage
+                // nondeterministically mid-call at the first uncached state.
+                if (pool_dead) return -1;
+                continue;
+            }
             skip_feed = j + 1;     // kept tokens must not re-feed the grammar
             return j + 1;
         }

@@ -82,6 +82,22 @@ static q27k::SampleParams parse_sample(const json& body) {
 // truncate+refinish), on_pending (next-round slot-0 mask), on_id (in-call feed).
 using ToolConstrainer = q27::BasicToolConstrainer<Engine, q27::Tokenizer>;
 
+// P15 review M1: the tc hooks capture the handler's stack-local constrainer by
+// reference. A non-CUDA throw out of generate() (bad_alloc, json ops in the
+// on_token callback) unwinds past the manual `eng.on_X = nullptr` lines --
+// httplib catches at routing, the process survives, and the NEXT request on a
+// hook-less path (OpenAI/Responses) would invoke dangling lambdas. This guard
+// nulls them on any exit. Construct AFTER slot_guard so hooks clear BEFORE the
+// slot is freed for reuse (reverse destruction order).
+struct HookGuard {
+    Engine& e;
+    ~HookGuard() {
+        e.on_pending = nullptr;
+        e.on_drafts = nullptr;
+        e.on_round = nullptr;
+    }
+};
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C] "
@@ -623,6 +639,7 @@ int main(int argc, char** argv) {
             Slot& sl = claim_slot(prompt);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
+            HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
             eng.samp = parse_sample(body);
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
@@ -717,6 +734,7 @@ int main(int argc, char** argv) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
+                HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
                 eng.samp = samp;
                 q27::GpuGate::Lease lk(gpu_gate);
                 double qw = ms_since(rt.t0);
