@@ -582,6 +582,68 @@ static void test_margin() {
     check("margin top1-top2 vs CPU", worst, 1e-6);
 }
 
+// P14: fused draft argmax+margin. The single pass must reproduce, EXACTLY:
+//  - argmax()'s token (same tie semantics, since the grid partition matches), and
+//  - margin()'s value == CPU top1-top2 (pure selection, no fp reassociation).
+// Cases: random logits, all-equal (ties everywhere), max@0, max@last, and a
+// duplicated max value at two indices (pins margin==0 and the higher-index win).
+static void test_argmax_top2() {
+    const int N = 248320;
+    float *d_x, *d_margin, *d_margin2, *d_blk2;
+    int *d_tok, *d_tok2;
+    unsigned long long *d_blk1, *d_scr;
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)N * 4));
+    CUDA_CHECK(cudaMalloc(&d_margin, 4));
+    CUDA_CHECK(cudaMalloc(&d_margin2, 4));
+    CUDA_CHECK(cudaMalloc(&d_tok, 4));
+    CUDA_CHECK(cudaMalloc(&d_tok2, 4));
+    CUDA_CHECK(cudaMalloc(&d_blk1, 128 * 8));
+    CUDA_CHECK(cudaMalloc(&d_blk2, 128 * 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, 8));
+    double worst_tok = 0, worst_cpu = 0, worst_kern = 0;
+    auto run_case = [&](std::vector<float>& logits) {
+        float m1 = -1e30f, m2 = -1e30f;
+        for (int i = 0; i < N; i++) {
+            float v = logits[i];
+            if (v > m1) { m2 = m1; m1 = v; }
+            else if (v > m2) m2 = v;
+        }
+        float cpu_margin = m1 - m2;
+        CUDA_CHECK(cudaMemcpy(d_x, logits.data(), (size_t)N * 4, cudaMemcpyHostToDevice));
+        q27k::argmax_margin(d_x, N, d_tok, d_margin, d_blk1, d_blk2, 0);
+        int ftok; float fmargin;
+        CUDA_CHECK(cudaMemcpy(&ftok, d_tok, 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&fmargin, d_margin, 4, cudaMemcpyDeviceToHost));
+        q27k::argmax(d_x, N, d_tok2, d_scr, 0);
+        int atok;
+        CUDA_CHECK(cudaMemcpy(&atok, d_tok2, 4, cudaMemcpyDeviceToHost));
+        q27k::margin(d_x, N, d_margin2, 0);
+        float kmargin;
+        CUDA_CHECK(cudaMemcpy(&kmargin, d_margin2, 4, cudaMemcpyDeviceToHost));
+        worst_tok = std::max(worst_tok, (double)std::abs(ftok - atok));
+        // exact float equality: any nonzero diff is a bug (both are pure selection)
+        worst_cpu = std::max(worst_cpu, fmargin == cpu_margin ? 0.0 : 1.0);
+        worst_kern = std::max(worst_kern, fmargin == kmargin ? 0.0 : 1.0);
+    };
+    for (int seed : {5, 71, 999}) { std::vector<float> l = rand_vec(N, seed); run_case(l); }
+    { std::vector<float> l(N, 1.5f); run_case(l); }                 // all-equal ties
+    { std::vector<float> l = rand_vec(N, 13); l[0] = 1e4f; run_case(l); }        // max@0
+    { std::vector<float> l = rand_vec(N, 17); l[N - 1] = 1e4f; run_case(l); }    // max@last
+    { std::vector<float> l = rand_vec(N, 23); l[100] = 5e3f; l[200000] = 5e3f;   // dup max
+      run_case(l); }
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_margin));
+    CUDA_CHECK(cudaFree(d_margin2));
+    CUDA_CHECK(cudaFree(d_tok));
+    CUDA_CHECK(cudaFree(d_tok2));
+    CUDA_CHECK(cudaFree(d_blk1));
+    CUDA_CHECK(cudaFree(d_blk2));
+    CUDA_CHECK(cudaFree(d_scr));
+    check("argmax_top2 token == argmax()", worst_tok, 0.5);
+    check("argmax_top2 margin == CPU top1-top2", worst_cpu, 0.5);
+    check("argmax_top2 margin == margin() kernel", worst_kern, 0.5);
+}
+
 static void test_masked_argmax() {
     const int N = 248320, WORDS = (N + 31) / 32;
     std::vector<float> logits = rand_vec(N, 71);
@@ -1501,6 +1563,7 @@ int main(int argc, char** argv) {
     test_wy_stream_isolation();
     test_masked_argmax();
     test_margin();
+    test_argmax_top2();
     test_sample();
     test_spec_sample();
     test_gemv10_scaling(dm, m);

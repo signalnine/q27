@@ -1336,3 +1336,41 @@ landmine.**
 
 Commits (branch): e80cd59 P12 gate; 339e9df structs->6 + gemv width-6; f5b4dac mod-6 perm + 6th
 GDN buffer; bea6833 6th-lane wiring + quantize3 fix; edc3250 default depth-4 / Q27_MAXD=5 opt-in.
+
+## 2026-07-06 (P14 Task 2) -- fuse draft argmax+margin into one full-vocab pass (k_argmax_top2)
+
+The Task-1 attribution (docs/perf-attribution-p14.md) pinned `k_margin` at **0.545 ms/round @61K
+ungated** -- a DEAD scan: the ungated default never reads a margin, but P12 captured a separate
+248320-wide single-block `k_margin` per draft into the monolithic `spec_graph`, so every ungated
+round paid for 4 top-2 scans nobody reads. This task fuses each draft's argmax and its margin into
+ONE full-vocab pass. CANONICAL-EXACT.
+
+**Kernels (`blocks.cu`).** `k_argmax_top2<<<128,256>>>` does k_argmax's per-thread strict-`>`
+top-1 (packed via `am_pack`) AND k_margin's top-2 in the same grid-stride loop, then a shared-mem
+pairwise merge; `k_top2_finalize<<<1,128>>>` combines the 128 block partials and writes tok +
+(top1-top2). Two invariants make it bit-identical: (1) the grid + packed-u64 max lattice are the
+SAME as k_argmax, so the token and all tie-breaks match exactly (per-thread lowest index, highest
+index across threads); (2) `am_unpack_val` is the exact inverse of am_pack's monotonic map, and the
+margin is pure selection (no fp reassociation, only the final subtract), so it equals k_margin's
+value order-independently. `k_argmax` and `k_margin` both stay in-tree (verify path / tests).
+
+**Wiring (`engine.cuh`).** `mtp_forward` gains an optional `margin_dst` -- non-null (draft path
+only) swaps its trailing `q27k::argmax` for the fused `argmax_margin`, null keeps the plain argmax
+for every other caller (deviation from the plan sketch, which put the call in `spec_draft_launches`:
+the argmax was already INSIDE mtp_forward at :595, so folding the fused call there avoids a redundant
+second argmax and keeps one code path). `spec_draft_launches` drops the 4-5 separate `margin()`
+calls and passes `d_draft_margin + k` -- slot mapping (0..4 for drafts 1..5) unchanged. Scratch
+`d_am_blk1` (128 u64) + `d_am_blk2` (128 float) alloc'd beside `d_draft_margin`.
+
+**Gates.** test_kernels ALL PASS incl. 3 new fused assertions (token==argmax(), margin==CPU
+top1-top2, margin==margin(), all err 0.0e+00 across random n=248320 + all-equal + max@0 + max@last +
+duplicated-max). Canonical md5 **4c4120c72056aba2bc2d2561471eafce** EXACT. 16K gated identity
+(`Q27_PMIN=0.5`, before/after binaries): emitted text **byte-identical**, **46 rounds** both,
+2.80 tok/round both. Build sm_86+sm_120 warning-clean.
+
+**Bench (server, docs prompts, ungated, n=3 median):** 61K **29.87 -> 29.28 ms/round (-0.59**, =
+the removed k_margin cost), 116.1 t/s (was 109.9); 2K 21.25 -> 20.93 ms/round (-0.32), 114.7 t/s
+(was 112.9). Round counts deterministic across runs (no stale-binary tell). Small, non-negative,
+as predicted.
+
+Files: blocks.cu, blocks.cuh, engine.cuh, test_kernels.cu.

@@ -91,6 +91,13 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
 // one float (m1 - m2) to d_out. Separate pass; does not affect argmax/canonical.
 void margin(const float* x, int n, float* d_out, cudaStream_t st = 0);
 
+// P14: fused argmax + top1-top2 margin in ONE full-vocab pass (draft path only).
+// d_tok gets the same token as argmax() (bit-identical tie semantics); d_margin
+// gets the same value as margin(). d_blk1 (128 u64) + d_blk2 (128 float) are
+// caller-allocated block-partial scratch (no allocation during graph capture).
+void argmax_margin(const float* x, int n, int* d_tok, float* d_margin,
+                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st = 0);
+
 // Sampling (roadmap #2, docs/sampling-design.md Phase 1). temp>0 ONLY: greedy
 // stays on argmax/argmax_masked (bitwise, canonical-gated) via a host branch.
 // Param block: read on-device so one captured graph serves every request --

@@ -159,6 +159,10 @@ struct Engine {
     cudaGraphExec_t verify_graph_w[7][6] = {}; // [W=1..6][perm=0..5]
     float* d_draft_margin = nullptr; // [5] drafter top1-top2 margins (device)
     float h_draft_margin[5] = {};
+    // P14: block-partial scratch for the fused draft argmax+margin (k_argmax_top2
+    // -> k_top2_finalize). 128 blocks each emit one (packed top1, top2) pair.
+    unsigned long long* d_am_blk1 = nullptr; // [128] packed (top1,idx) per block
+    float* d_am_blk2 = nullptr;              // [128] top2 per block
     float pmin_theta = 0.f; // Q27_PMIN; <=0 => gating off (always full width 5)
     // gate_maxd = deepest draft the gate may reach (Q27_MAXD, 4 or 5). Default 4:
     // the robust win on all traffic (depth-4 gate = +10.8% @60K). maxd=5 draws 5
@@ -273,6 +277,8 @@ struct Engine {
         A((void**)&d_nuc, 5 * 4 * 4);
         A((void**)&d_spec, 3 * 4);
         A((void**)&d_draft_margin, 5 * 4); // P12/P12b: up to 5 draft margins
+        A((void**)&d_am_blk1, 128 * 8);    // P14: fused draft argmax+margin scratch
+        A((void**)&d_am_blk2, 128 * 4);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
         A(&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
@@ -559,8 +565,13 @@ struct Engine {
 
     // MTP draft head (blk.64, SPEC.md): draft the token AFTER d_token, given
     // h_next = post-output_norm hidden of the current position (*d_pos_m).
+    // margin_dst != null (draft path only): fuse the trailing argmax with the P12
+    // top1-top2 margin into ONE full-vocab pass -- draft_dst gets the SAME token as
+    // the plain argmax (bit-identical tie semantics), margin_dst gets margin()'s
+    // value. margin_dst == null keeps the plain argmax for every other caller.
     void mtp_forward(const float* h_src = nullptr, const int* tok_src = nullptr,
-                     int* draft_dst = nullptr, const int* pos_src = nullptr) {
+                     int* draft_dst = nullptr, const int* pos_src = nullptr,
+                     float* margin_dst = nullptr) {
         if (!h_src) h_src = h_next;
         if (!tok_src) tok_src = d_token;
         if (!draft_dst) draft_dst = d_draft;
@@ -592,7 +603,10 @@ struct Engine {
                                     ? &dm.get("output_q4.weight")
                                     : &dm.get("output.weight");
         mm(*head, x1, mtp_logits);
-        q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
+        if (margin_dst)
+            q27k::argmax_margin(mtp_logits, VOCAB, draft_dst, margin_dst, d_am_blk1, d_am_blk2, stm);
+        else
+            q27k::argmax(mtp_logits, VOCAB, draft_dst, d_amax, stm);
     }
 
     // vw = verify batch width (# lanes: pending + drafts), read at GRAPH-CAPTURE
@@ -729,25 +743,22 @@ struct Engine {
         // hidden (x1) chains into draft 2 at pos_m2 -> d_draft2, draft 3 at
         // pos_m3 -> d_draft3, and draft 4 at pos_m4 -> d_draft4 (each pass
         // also fills its MTP KV row)
-        // P12: after each draft's argmax, snapshot its top1-top2 margin (the
-        // drafter's confidence) into d_draft_margin[k]. Write-only scratch read
-        // only by the gated spec_round; does not affect tokens/h_next, so every
-        // existing graph stays token-identical. ~4 tiny kernels/round.
-        mtp_forward(h_next, d_token, d_draft, d_pos_m);
-        q27k::margin(mtp_logits, VOCAB, d_draft_margin + 0, stm);
+        // P12: each draft's top1-top2 margin (the drafter's confidence) lands in
+        // d_draft_margin[k]. P14: FUSED into the draft's argmax -- one full-vocab
+        // pass per draft (was argmax + a separate k_margin scan). Value-identical
+        // to the old pair (same token, same margin), so every existing graph stays
+        // token-identical and the margin slot mapping (0..4 for drafts 1..5) is
+        // unchanged. Margins are write-only scratch, read only by the gated round.
+        mtp_forward(h_next, d_token, d_draft, d_pos_m, d_draft_margin + 0);
         CUDA_CHECK(cudaMemcpyAsync(h_next2, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2);
-        q27k::margin(mtp_logits, VOCAB, d_draft_margin + 1, stm);
+        mtp_forward(h_next2, d_draft, d_draft2, d_pos_m2, d_draft_margin + 1);
         CUDA_CHECK(cudaMemcpyAsync(h_next3, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next3, d_draft2, d_draft3, d_pos_m3);
-        q27k::margin(mtp_logits, VOCAB, d_draft_margin + 2, stm);
+        mtp_forward(h_next3, d_draft2, d_draft3, d_pos_m3, d_draft_margin + 2);
         CUDA_CHECK(cudaMemcpyAsync(h_next4, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(h_next4, d_draft3, d_draft4, d_pos_m4);
-        q27k::margin(mtp_logits, VOCAB, d_draft_margin + 3, stm);
+        mtp_forward(h_next4, d_draft3, d_draft4, d_pos_m4, d_draft_margin + 3);
         if (dmax > 4) { // P12b: 5th draft + margin for gated depth-5
             CUDA_CHECK(cudaMemcpyAsync(h_next5, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-            mtp_forward(h_next5, d_draft4, d_draft5, d_pos_m5);
-            q27k::margin(mtp_logits, VOCAB, d_draft_margin + 4, stm);
+            mtp_forward(h_next5, d_draft4, d_draft5, d_pos_m5, d_draft_margin + 4);
         }
     }
 

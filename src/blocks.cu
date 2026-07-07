@@ -278,6 +278,15 @@ __device__ __forceinline__ unsigned long long am_pack(float v, int idx) {
     return ((unsigned long long)u << 32) | (unsigned)idx;
 }
 
+// Exact inverse of am_pack's monotonic map (recovers the packed float value).
+// P14: the fused draft top-2 kernel unpacks the top1 pack to feed k_margin's
+// pairwise top-2 merge on the same values -- so the fused margin is bit-identical
+// to k_margin's.
+__device__ __forceinline__ float am_unpack_val(unsigned long long p) {
+    unsigned u = (unsigned)(p >> 32);
+    return __uint_as_float((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u);
+}
+
 __global__ void k_argmax_reset(unsigned long long* best) { *best = 0; }
 
 __global__ void k_argmax(const float* __restrict__ x, int n,
@@ -305,6 +314,80 @@ void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch, cu
     k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
     k_argmax<<<128, 256, 0, st>>>(x, n, d_scratch);
     k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// P14: fused top-2 for the draft path -- one full-vocab pass produces the argmax
+// token (bit-identical tie semantics to k_argmax: per-thread strict >, packed-u64
+// max across threads/blocks) AND the top1-top2 margin (P12 gate signal). Replaces
+// k_argmax + k_margin on the draft path; both stay in-tree (verify path / tests).
+// Launch grid matches k_argmax (<<<128,256>>>) so the per-thread index partition --
+// hence every tie-break -- is identical. Margin is pure selection (no fp arithmetic
+// besides the final subtract) so it equals k_margin's value order-independently.
+__global__ void k_argmax_top2(const float* __restrict__ x, int n,
+                              unsigned long long* __restrict__ blk1,
+                              float* __restrict__ blk2) {
+    float v1 = -FLT_MAX, v2 = -FLT_MAX;
+    int i1 = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float xi = x[i];
+        if (xi > v1) { v2 = v1; v1 = xi; i1 = i; }
+        else if (xi > v2) { v2 = xi; }
+    }
+    __shared__ unsigned long long s1[256];
+    __shared__ float s2[256];
+    s1[threadIdx.x] = am_pack(v1, i1);
+    s2[threadIdx.x] = v2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) {
+            unsigned long long a1 = s1[threadIdx.x], b1 = s1[threadIdx.x + s];
+            float a2 = s2[threadIdx.x], b2 = s2[threadIdx.x + s];
+            // top1: packed max, identical lattice to k_argmax's reduction.
+            // top2: k_margin's pairwise merge (below) on the unpacked top1 values.
+            float a1v = am_unpack_val(a1), b1v = am_unpack_val(b1);
+            s1[threadIdx.x] = max(a1, b1);
+            s2[threadIdx.x] = (a1v >= b1v) ? fmaxf(a2, b1v) : fmaxf(b2, a1v);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { blk1[blockIdx.x] = s1[0]; blk2[blockIdx.x] = s2[0]; }
+}
+
+// Single block (<=256 threads): the same pairwise (top1,top2) merge over the nblk
+// per-block partials; writes tok = low 32 bits of the global max pack and
+// margin = top1 - top2. Mirrors k_top2's cross-block combine as a tree (not an
+// atomic) since we also need the paired top2, but the top1 winner is identical to
+// k_argmax's atomicMax result (both are order-independent packed max).
+__global__ void k_top2_finalize(const unsigned long long* __restrict__ blk1,
+                                const float* __restrict__ blk2, int nblk,
+                                int* __restrict__ tok, float* __restrict__ margin_out) {
+    __shared__ unsigned long long s1[256];
+    __shared__ float s2[256];
+    int t = threadIdx.x;
+    if (t < nblk) { s1[t] = blk1[t]; s2[t] = blk2[t]; }
+    else { s1[t] = am_pack(-FLT_MAX, 0); s2[t] = -FLT_MAX; }
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            unsigned long long a1 = s1[t], b1 = s1[t + s];
+            float a2 = s2[t], b2 = s2[t + s];
+            float a1v = am_unpack_val(a1), b1v = am_unpack_val(b1);
+            s1[t] = max(a1, b1);
+            s2[t] = (a1v >= b1v) ? fmaxf(a2, b1v) : fmaxf(b2, a1v);
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        tok[0] = (int)(unsigned)(s1[0] & 0xffffffffull);
+        margin_out[0] = am_unpack_val(s1[0]) - s2[0];
+    }
+}
+
+void argmax_margin(const float* x, int n, int* d_tok, float* d_margin,
+                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st) {
+    k_argmax_top2<<<128, 256, 0, st>>>(x, n, d_blk1, d_blk2);
+    k_top2_finalize<<<1, 128, 0, st>>>(d_blk1, d_blk2, 128, d_tok, d_margin);
     CUDA_CHECK(cudaGetLastError());
 }
 
