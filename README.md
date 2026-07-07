@@ -93,15 +93,18 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 - Serving: multi-slot (`--slots N`) with R1b round-granularity GPU
   time-slicing (FIFO gate + engine yield hooks; queue-wait class dead,
   outputs byte-identical solo vs interleaved); server defaults fp8 KV
-  (opt out `--kv-fp16`). `--constrain-tools` exists but is OFF in eval
-  serving: the capped grammar has a measured engage-lag hole (first
-  post-engage token samples unmasked, so a hallucinated tool name
-  greedy-loops to score 0 -- build log 2026-07-04) and in-grammar
-  acceptance is capped 1/round (~22 t/s inside tool-call bodies). The
-  0.786 tie was earned by the tolerant PARSER chain (17 recoveries in the
-  final rerun), not the grammar; a strict-parser rerun with the grammar on
-  (zero rescues, both legs) is an open gate, blocked on the engage-lag fix.
-  Constraint is wired on the Anthropic `/v1/messages` path only
+  (opt out `--kv-fp16`). `--constrain-tools`: the engage-lag hole is FIXED
+  (P15, 2026-07-07): the round is truncated at the `<tool_call>` marker and
+  re-finished from resident per-lane state, so every in-grammar byte
+  (including the whole tool name) is decided under the mask -- verified by
+  round-phase invariance, zero disengages, sanitizer-clean, canonical
+  bitwise (tools/constrain_gate.sh). Serving-state gates shipped with it:
+  clear-at-claim, sticky pool-full disengage, split-brain id rebind, `tg=`
+  telemetry. Still not DEFAULT-on: in-grammar acceptance is capped 1/round
+  (~22 t/s inside call bodies; cost soak pending) and the strict-parser
+  rerun (zero rescues both legs -- the engine-true tie proof) is now
+  UNBLOCKED but not yet run. Constraint is wired on the Anthropic
+  `/v1/messages` path only
 - Claude Code as harness (same-day A/B 2026-07-05, native Anthropic BOTH
   engines, no proxy either leg -- build log): T8 q27 **167s @ 0.82** vs
   llama 222s @ 0.50, the day's only matched-basin pair; first real-client
@@ -514,20 +517,19 @@ docs/perf-attribution-p14.md.
   It is the expensive kernel rewrite (fd3 design doc + occupancy gate), so it is
   DEFERRED pending explicit approval on the marginal Task 5 result.
 
-**Open quality gates (red-team pass 2026-07-05):**
+**Open quality gates (red-team pass 2026-07-05; P15 status 2026-07-07):**
 - strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,
   zero rescues required -- the proof that the 0.786 tie is engine-true
-  rather than harness-carried. Blocked on the engage-lag fix
+  rather than harness-carried. UNBLOCKED by the P15 engage-lag fix; needs
+  a strict-parser knob (rescues are currently unconditional) + a
+  thunderdome campaign
 - constraint-cost soak: one agentic soak with `--constrain-tools` on vs
   off (in-grammar acceptance cap 1/round is ~22 t/s inside call bodies;
   measure what that does to depth-heavy wall time before it defaults on)
-- constrain-tools x serving-state gate before the flag ever defaults on
-  under `--slots`: assert the global-mask-cache / per-slot host2dev /
-  per-engine pool mapping stays coherent (the R1-deferred split-brain);
-  define pool-full behavior (a full 512-mask pool today silently
-  disengages constraint on that slot only); clear the device constraint
-  at request claim (a non-CUDA throw before `tc.end()` leaks a stale
-  lane-0 mask + accept-cap-1 into the next request on that slot); keep
+- constrain-tools x serving-state gates: SHIPPED with P15 -- split-brain
+  ids are validated + rebound (rebinds counter), pool-full sticky-
+  disengages per request (visible in `tg=`), and the device constraint is
+  cleared at request claim (leak test in tools/constrain_gate.sh). Keep
   `Q27_TOOL_SPLIT` off under `--slots` (P11 race). Checkpoint-restore x
   grammar needs NO gate: audited 2026-07-05, restore touches only GDN
   state/conv rings/positions and grammar is per-request, engaging only on

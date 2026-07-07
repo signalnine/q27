@@ -1871,3 +1871,55 @@ P2's 4.41) where llama is at its best. Methodology gotcha: greedy raw-completion
 plain markdown docs EOSes immediately (dec=0) at 75K depth -- prose payloads need an
 open continuation (mid-echo cut or list form); two payload shapes were discarded for
 instant-EOS before P2 landed as docs+self-copy.
+
+## 2026-07-07 (4th session, later) -- P15: constrain-tools engage-lag FIXED + serving-state gates
+
+The 07-04 hole that kept `--constrain-tools` off in serving is closed. Root cause
+recap: the grammar engaged on decoded text, but a spec round decides the round tail +
+the new pending token in one launch -- everything decided in the marker's round sampled
+UNMASKED, so a hallucinated name prefix could be chosen free and the mask then spliced
+a trie-legal char into it mid-name ("getg_project" -> disengage -> tool-not-found
+greedy loop -> score 0).
+
+**Fix: round truncation + re-finish (no snapshots).** The round's per-lane GDN states
+survive in the six rotating role buffers (the round commits by advancing `perm`, never
+by copying), lane hiddens sit in x1..x1_f and lane logits in logits2, and KV/MTP rows
+past the kept position are overwrite-safe. So when the marker completes at em[m-1],
+`Engine::refinish_round(m, n)` rewinds: perm -= (n-m), d_P = P+m, h_next <- x1[m-1],
+and the new pending is a masked re-argmax of lane m-1's resident logits -- the mask is
+live from the FIRST post-marker decision, hence over every tool-name byte (the llama
+grammar property). generate() gained an `on_round(em, n) -> m` hook (server-only,
+greedy-only; CLI/canonical path never sets it); the constrainer moved to
+src/toolconstrain.h (`BasicToolConstrainer<EngineT, TokT>`, unit-testable CPU-side)
+with trigger detection in scan_round() -- the round batch is scanned PRE-emission, so
+discarded tail tokens are never emitted, fed, or parsed.
+
+**Serving-state gates (07-05 audit a/b/c) shipped with it:**
+- clear-at-claim: generate() entry clears any leftover device constraint (stale lane-0
+  mask + accept-cap-1 leak from a non-CUDA throw); guarded on host mirrors so the
+  canonical path issues zero new device work.
+- pool-full parity: mask-pool exhaustion now sticky-disengages for the REST of the
+  request (one log + counter) instead of silently dropping per-mask; a cached failed
+  add (-1 in host2dev) retries instead of caching the failure forever.
+- split-brain: a per-slot pool id outside the engine's live pool is detected,
+  logged, re-uploaded (rebinds counter).
+- `[req]` gained `tg=engaged,disengaged,pool_drops,rebinds` after end= (parser-safe).
+
+**Verification (tools/constrain_gate.sh + tools/test_toolconstrain.cpp):** 9 CPU unit
+tests (engage/truncate/span/rem/skip-feed/sticky-pool/rebind/closer) ALL PASS; E2E
+(tools/constrain_e2e.cu, production chatml_prompt preamble, tools named getg_project/
+run_tests to force the hallucination case): emitted call has a REGISTERED name, JSON
+parses, zero disengages, and refinish+truncation actually fired (trunc=1 -- the marker
+completed mid-round); output bytes IDENTICAL across Q27_PMIN unset/0.5/1.0 (round-
+phase invariance); clear-at-claim leak test RED->GREEN verified (guard disabled =
+forced-token corruption, guard on = byte-identical legs); canonical 4c4120c7 EXACT;
+test_kernels ALL PASS; compute-sanitizer memcheck 0 errors on the constrained E2E
+(dual-arch build; sm_120-only builds throw fatbin-probe noise under the sanitizer).
+Server smoke: non-stream + stream Anthropic paths both return registered-name
+tool_use blocks with tg= telemetry.
+
+Still open before default-on: constraint-cost soak (in-call cap is 1/round) and the
+strict-parser A/B (zero rescues both legs) -- the latter needs a strict-parser knob
+(tolerant rescues are currently unconditional). Q27_TOOL_SPLIT stays forbidden under
+--slots (P11 race, unchanged). Constrained+sampled remains Phase 3 (tc.enabled gates
+on greedy).

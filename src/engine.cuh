@@ -1332,6 +1332,13 @@ struct Engine {
     // host grammar can stage next round's slot-0 mask (state must include
     // the pending token -- masks lag one token otherwise).
     std::function<void(int)> on_pending;
+    // P15: called after each greedy spec round with the round's emitted
+    // tokens BEFORE anything is emitted or committed host-side. Returns -1
+    // for no action, or m in [1..n] when the <tool_call> marker completed at
+    // em[m-1]: generate() truncates the round to m tokens and refinishes so
+    // the first post-marker decision onward is grammar-masked (the engage-lag
+    // fix). Server-only, greedy-only; CLI never sets it.
+    std::function<int(const int*, int)> on_round;
     // R1b: optional preemption hook, called between decode rounds and
     // between prefill chunks -- the two boundaries where this engine's
     // device state is coherent. Returns true if the GPU was actually
@@ -1383,6 +1390,40 @@ struct Engine {
         h_cap0 = 0;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, 5 * 4, cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+    }
+    // Full constraint reset: every lane mask id back to -1 + cap 0 (covers
+    // stale split-path lanes that set_tool_constraint(-1) alone would miss).
+    void clear_tool_constraint() {
+        h_mask_id0 = -1;
+        h_cap0 = 0;
+        tool_split_active = false;
+        for (int i = 0; i < 8; i++) h_mask_ids5[i] = -1;
+        CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, 8 * 4, cudaMemcpyHostToDevice, stm));
+        CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
+    }
+    // P15 engage-lag fix: rewind the JUST-FINISHED greedy spec round from n
+    // accepted tokens to m (1 <= m <= n) and re-decide the pending token under
+    // the freshly staged slot-0 mask. Everything needed is still resident:
+    // per-lane GDN states / conv rings sit in the rotating role buffers (the
+    // round "commits" by advancing perm, never by copying -- state-after-lane-
+    // (m-1) is old role m-1), lane hiddens in x1..x1_f, lane logits in
+    // logits2. KV/MTP rows past the kept position are rewritten by the next
+    // round. Must be called BETWEEN rounds (server on_round hook), with the
+    // engage mask already staged on this stream so the re-argmax orders after
+    // it. Returns the new pending token. The CLI/canonical path never sets
+    // on_round, so this code is unreachable there.
+    int refinish_round(int m, int n, int P_target) {
+        perm = (perm + (m - n) + 6) % 6;
+        CUDA_CHECK(cudaMemcpyAsync(d_P, &P_target, 4, cudaMemcpyHostToDevice, stm));
+        const float* lanes[6] = {x1, x1_b, x1_c, x1_d, x1_e, x1_f};
+        CUDA_CHECK(cudaMemcpyAsync(h_next, lanes[m - 1], (size_t)N_EMBD * 4,
+                                   cudaMemcpyDeviceToDevice, stm));
+        q27k::argmax_masked(logits2 + (size_t)(m - 1) * VOCAB, VOCAB, d_mask_pool, mask_words,
+                            d_mask_ids, 0, d_token, d_amax, stm);
+        int new_pending = -1;
+        CUDA_CHECK(cudaMemcpyAsync(&new_pending, d_token, 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        return new_pending;
     }
 
     // ---- batched prefill (M6): T-token chunk versions of the blocks ----
@@ -1710,6 +1751,20 @@ struct Engine {
             gs.end = "refused";
             return 0;
         }
+        // 07-05 audit (c), clear-at-claim: a non-CUDA throw between a prior
+        // generate() and its tc.end() can leave a stale lane-0 mask +
+        // accept-cap-1 (or stale split-path lane masks) on this engine, which
+        // would silently constrain THIS request. Guarded on the host mirrors,
+        // so paths that never constrained (CLI, canonical gates) issue no new
+        // device work and stay bitwise.
+        {
+            bool stale = h_mask_id0 >= 0 || h_cap0 != 0;
+            for (int i = 0; i < 5 && !stale; i++) stale = h_mask_ids5[i] >= 0;
+            if (stale) {
+                fprintf(stderr, "[toolgram] stale device constraint cleared at claim\n");
+                clear_tool_constraint();
+            }
+        }
         // R1b preemption point (no-op when the hook is unset or nobody waits)
         auto round_gap = [&] {
             if (!on_round_gap) return;
@@ -1890,6 +1945,16 @@ struct Engine {
             int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
                              : spec_round(em);
             rounds++;
+            // P15 engage-lag fix: let the host grammar scan the whole round
+            // pre-emission; on a mid-round <tool_call> completion, truncate to
+            // the marker token and re-decide the pending under the staged mask.
+            if (!sampling && on_round) {
+                int m = on_round(em, n);
+                if (m >= 1 && m <= n) {
+                    last_pending = refinish_round(m, n, Ph + m);
+                    n = m;
+                }
+            }
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {
                 if (em[k] == eos) { done("eos"); return emitted; }

@@ -25,6 +25,7 @@
 #include "tokenizer.h"
 #include "api_common.h"
 #include "toolgram.h"
+#include "toolconstrain.h"
 #include "../third_party/httplib.h"
 #include "../third_party/json.hpp"
 
@@ -75,139 +76,11 @@ static q27k::SampleParams parse_sample(const json& body) {
     return s;
 }
 
-// P7: per-request constrained tool decoding. Watches emitted token ids;
-// on <tool_call> it activates the grammar and drives Engine slot-0 masks
-// per accepted token. The token already pending when <tool_call> appears was
-// decided unconstrained (spec-decode lag) -- if it or any entry-race token is
-// grammar-illegal, the constrainer DISENGAGES for that call and the parser
-// fallback recovers downstream (logged either way).
-struct ToolConstrainer {
-    Engine* eng = nullptr;
-    const q27::Tokenizer* tok = nullptr;
-    q27::ToolMaskCache* cache = nullptr;
-    std::vector<int>* host2dev = nullptr;
-    bool enabled = false, active = false;
-    q27::ToolGrammar tg;
-    q27::ToolGrammar staged_state; // grammar state whose mask is in verify slot 0
-    std::vector<std::string> names;
-    std::string tail; // rolling decoded-text window for the opener trigger
-    long engaged = 0, disengaged = 0;
-
-    void begin(std::vector<std::string> n) {
-        active = false;
-        tail.clear();
-        names = std::move(n);
-    }
-    // pool id for grammar state g's legal-token mask (-1 if pool full)
-    int mask_id(const q27::ToolGrammar& g) {
-        int ci = cache->get(g);
-        if ((int)host2dev->size() <= ci) host2dev->resize(ci + 1, -2);
-        int& slot = (*host2dev)[ci];
-        if (slot == -2) slot = eng->mask_pool_add(cache->mask(ci).data());
-        return slot;
-    }
-    void apply(const q27::ToolGrammar& g) {
-        int slot = mask_id(g);
-        if (slot < 0) { drop("mask pool full"); return; }
-        staged_state = g; // P11: on_drafts advances from here for lanes 1-4
-        eng->set_tool_constraint(slot);
-    }
-    // P11: mid-round, given the 4 draft tokens, stage per-lane masks. Lane 0 =
-    // staged_state (the pending position, legal set already correct); lane k =
-    // that state advanced over drafts d1..dk. If a draft is grammar-illegal,
-    // remaining lanes reuse the last legal mask -- moot, since acceptance
-    // breaks at that lane anyway (its verify argmax is legal != the draft).
-    void on_drafts(const int* dr) {
-        int ids[5];
-        q27::ToolGrammar c = staged_state;
-        ids[0] = mask_id(c);
-        bool alive = true;
-        for (int k = 1; k <= 4; k++) {
-            if (alive)
-                for (char ch : tok->decode_one(dr[k - 1]))
-                    if (!c.advance(ch)) { alive = false; break; }
-            ids[k] = alive ? mask_id(c) : ids[k - 1];
-            if (ids[k] < 0) ids[k] = ids[k - 1] < 0 ? ids[0] : ids[k - 1];
-        }
-        if (ids[0] < 0) return; // pool exhausted; verify keeps prior masks
-        eng->set_tool_masks5(ids);
-    }
-    // Stage next round's slot-0 mask: the constrained lane decides the token
-    // AFTER the pending one, so simulate the pending token on a copy first.
-    void on_pending(int id) {
-        if (!enabled || !active || id < 0) return;
-        q27::ToolGrammar peek = tg;
-        for (char c : tok->decode_one(id))
-            if (!peek.advance(c)) return; // entry-race pending; on_id will drop
-        if (peek.closed()) { eng->set_tool_constraint(-1); return; }
-        apply(peek);
-    }
-    void drop(const char* why) {
-        if (active) {
-            eng->set_tool_constraint(-1);
-            active = false;
-            disengaged++;
-            fprintf(stderr, "[toolgram] disengaged: %s\n", why);
-        }
-    }
-    // The model emits the <tool_call>/<\/tool_call> markers as plain BPE
-    // pieces (never the added token), so both trigger and closer are matched
-    // on decoded TEXT; the closer lives inside the grammar (CLOSER_ states).
-    void on_id(int id) {
-        if (!enabled || names.empty()) return;
-        std::string bytes = tok->decode_one(id);
-        if (!active) {
-            tail += bytes;
-            if (tail.size() > 64) tail.erase(0, tail.size() - 64);
-            size_t pos = tail.rfind("<tool_call>");
-            // engage only when the marker COMPLETES within this token; any
-            // remainder bytes after it already belong to the call body
-            if (pos != std::string::npos && pos + 11 > tail.size() - bytes.size()) {
-                std::string rem = tail.substr(pos + 11);
-                tg.reset(names);
-                active = true;
-                engaged++;
-                fprintf(stderr, "[toolgram] engaged (rem=%zu)\n", rem.size());
-                if (getenv("Q27_TG_TRACE")) {
-                    std::string t2 = tail;
-                    for (auto& ch : t2) if (ch == '\n') ch = '~';
-                    fprintf(stderr, "[tg-trace] tail at engage: %s\n", t2.c_str());
-                }
-                for (char c : rem)
-                    if (!tg.advance(c)) {
-                        char why[64];
-                        snprintf(why, sizeof why, "entry byte 0x%02x rejected", (unsigned char)c);
-                        drop(why);
-                        return;
-                    }
-                apply(tg);
-            }
-            return;
-        }
-        if (getenv("Q27_TG_TRACE")) {
-            std::string t2 = bytes;
-            for (auto& ch : t2) if (ch == '\n') ch = '~';
-            fprintf(stderr, "[tg-trace] feed: %s\n", t2.c_str());
-        }
-        for (char c : bytes)
-            if (!tg.advance(c)) {
-                char why[64];
-                snprintf(why, sizeof why, "byte 0x%02x rejected", (unsigned char)c);
-                drop(why);
-                return;
-            }
-        if (tg.closed()) {
-            eng->set_tool_constraint(-1);
-            active = false;
-            tail.clear();
-            fprintf(stderr, "[toolgram] call closed\n");
-            return;
-        }
-    }
-    void end() {
-        if (active) drop("generation ended in-grammar");
-    }
-};
+// P7/P15: per-request constrained tool decoding -- logic lives in
+// toolconstrain.h (unit-tested CPU-side; see tools/test_toolconstrain.cpp).
+// The engage-lag fix wires three hooks per generation: on_round (scan_round ->
+// truncate+refinish), on_pending (next-round slot-0 mask), on_id (in-call feed).
+using ToolConstrainer = q27::BasicToolConstrainer<Engine, q27::Tokenizer>;
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -392,14 +265,24 @@ int main(int argc, char** argv) {
     // GPU-busy accounting is (pf_ms + dec_ms - gw); tps likewise understates
     // raw decode rate under contention. New fields sit after end= -- the
     // reqlog_gate parse regex stops there.
-    auto req_log = [&](const ReqTrace& rt, double qw_ms, const Engine& e, int slot_id) {
+    // P15 constrain-tools telemetry: per-request grammar counters, appended
+    // after end= like the P13/gate fields so reqlog_gate's parse is unaffected.
+    auto tg_stats = [](const ToolConstrainer& tc) -> std::string {
+        if (!tc.enabled) return "";
+        char b[96];
+        snprintf(b, sizeof b, " tg=%ld,%ld,%ld,%ld", tc.engaged, tc.disengaged, tc.pool_drops,
+                 tc.rebinds);
+        return std::string(b);
+    };
+    auto req_log = [&](const ReqTrace& rt, double qw_ms, const Engine& e, int slot_id,
+                       const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
         char p13buf[64], gatebuf[192];
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
@@ -420,7 +303,8 @@ int main(int argc, char** argv) {
                                 e.gate_n_hist[1], e.gate_n_hist[2], e.gate_n_hist[3],
                                 e.gate_n_hist[4], e.gate_n_hist[5], e.gate_n_hist[6]),
                        gatebuf)
-                    : "");
+                    : "",
+                extra.c_str());
     };
     // R1b routing: claim a FREE engine (Slot::busy=false) that can take the
     // prompt, or block until one frees. Tiers among free engines unchanged
@@ -763,6 +647,8 @@ int main(int argc, char** argv) {
             tc.begin(tool_names_v);
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+            if (tc.enabled)
+                eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
                 tc.on_id(id);
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) route(ch, t);
@@ -771,8 +657,9 @@ int main(int argc, char** argv) {
             tc.end();
             eng.on_pending = nullptr;
             eng.on_drafts = nullptr;
+            eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
-            req_log(rt, qw, eng, sl.id);
+            req_log(rt, qw, eng, sl.id, tg_stats(tc));
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!tool_buf.empty())
@@ -922,6 +809,8 @@ int main(int argc, char** argv) {
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
+                if (tc.enabled)
+                    eng.on_round = [&](const int* em, int nr) { return tc.scan_round(em, nr); };
                 int produced = eng.generate(prompt, nm, EOS, [&](int id) {
                     tc.on_id(id);
                     for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) emit_seg(ch, t);
@@ -930,8 +819,9 @@ int main(int argc, char** argv) {
                 tc.end();
                 eng.on_pending = nullptr;
                 eng.on_drafts = nullptr;
+                eng.on_round = nullptr;
                 eng.on_round_gap = nullptr;
-                req_log(rt, qw, eng, sl.id);
+                req_log(rt, qw, eng, sl.id, tg_stats(tc));
                 for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) emit_tool();
