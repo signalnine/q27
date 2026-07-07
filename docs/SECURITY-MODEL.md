@@ -107,6 +107,12 @@ already opt-in, already documented OFF under `--slots`. Not a new finding.
 
 ## Carve-out: findings that bite EVEN a single user
 
+> **STATUS 2026-07-07: all carve-out bugs below are FIXED** -- d_gen OOB (#4, prefill-attn
+> branch), null-content abort (#1), empty-prompt stale-state (#2), ChatML injection (#7),
+> and the correctness bugs (L2-eps, Model move-assign UB, DeviceModel double-free, --ctx
+> floor) in commits fd0f504 and 4fa9d24. Canonical 4c4120c7 unchanged. The multi-tenant /
+> untrusted-artifact findings above remain dispositioned out by design (not "unfixed vulns").
+
 The "ignore multi-tenant" instruction must not bury these. None of them need an attacker.
 A benign malformed request, an oversized-but-honest prompt, or untrusted *content* (not
 an untrusted client) from the operator's own workflow trips them. These are the ones

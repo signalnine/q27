@@ -1806,3 +1806,34 @@ prefill (>65,536): **ERROR SUMMARY: 0 errors** (was an OOB global write pre-fix)
 
 Files: src/engine.cuh (d_gen alloc). Addresses docs/cuda-review-2026-07-07.md #1,
 docs/SECURITY-MODEL.md carve-out #4.
+
+## 2026-07-07 (review bug-fix pass) -- all remaining confirmed review bugs fixed
+
+Cleared the confirmed bugs from both review docs before resuming perf work (d_gen was
+already done). Two commits, each full-make + canonical 4c4120c7 (all changes are
+near-zero-head / sampled / discarded-value / never-triggered / prompt-content paths, so
+greedy is untouched):
+
+fd0f504 (batch): CUDA #6 L2-eps (prefill batched path max(sum,eps)->eps^2, ggml semantics);
+CUDA #2 Philox u==1 clamp (top ~128 x0 rounded to 2^32 -> infinite Gumbel; sampled only);
+CUDA #4 split-prefill only when t0==0 (absolute-vs-relative row corruption, latent); CUDA #5
+dp4a staging tt<nt guard (OOB read past T, discarded values, latent); Security #1 null-content
+guard (const operator[] SIGABRT on content-less message, OpenAI endpoints); Security #2 refuse
+NP<1 (empty prompt decoded from stale recurrent state); Model move-assign UB (munmap instead
+of ~Model()+reuse); DeviceModel copy deleted (raw-CUDA-ptr double-free); --ctx floor 32.
+
+4fa9d24: CUDA #3 top-p (k_nucleus_d bisects the logit threshold over a 40-logit window, 16
+steps, vs the old prob-cutoff [0,1] 12-step that degenerated to full-vocab on diffuse
+distributions; sampled only); Security #7 ChatML injection (strip <|im_start|>/<|im_end|>
+from untrusted content+roles in chatml_prompt; no-op for marker-free content so the prefix
+cache is unchanged).
+
+Out of scope (per SECURITY-MODEL, single-operator engine on own artifacts): the
+multi-tenant network findings and the untrusted-tokenizer bugs (#9-11: zero-length special
+loop, unchecked fread, embedding OOB). Left as documented, not fixed. Ledgers
+(docs/cuda-review-2026-07-07.md, docs/SECURITY-MODEL.md) updated to FIXED status.
+
+Sampled-path fixes (Philox, top-p) verified by canonical-no-regression only; a dedicated
+sampled A/B would firm the top-p diffuse-case behavior. ChatML strip is a targeted
+mitigation; the fuller fix (token-wise encode with specials off for content) is deferred as
+it touches the prefix-cache path.

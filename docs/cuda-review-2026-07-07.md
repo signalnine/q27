@@ -3,7 +3,12 @@
 **Provenance:** external CUDA-focused security/correctness review. Each finding
 independently verified against source at HEAD `623cdb1`; line numbers below are the
 *corrected* ones (the review's were mostly a few lines stale). This is the tracking
-ledger -- no code changed by writing it.
+ledger.
+
+> **STATUS 2026-07-07: all six findings (#1-#6) and the additional correctness risks
+> (L2-eps, move-assign UB, DeviceModel copy, --ctx floor) are FIXED** -- d_gen in the
+> prefill-attn branch, the rest in commits fd0f504 (batch) and 4fa9d24 (top-p). Canonical
+> 4c4120c7 unchanged throughout. The Q27_TOOL_SPLIT note stays opt-in / off by default.
 
 **Disposition in one line:** all six are real code observations, but only **#1 fires on
 the greedy production path**, and only at `--ctx > 65536`. #2/#3 are sampled-path only
