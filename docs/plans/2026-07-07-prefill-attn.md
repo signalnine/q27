@@ -144,6 +144,32 @@ Default to (a): cp.async the fp16 path, leave fp8 staging as-is, let Phase 2 own
 **Dependencies:** Task 2 (pipeline in place; fp8 becomes the fast staging path)
 **Requires Gabe's explicit go** -- this is the expensive numeric-path kernel rewrite, the Phase-2 analog of the P14 "expensive rewrite needs explicit approval" rule.
 
+> **2026-07-07 ATTEMPT (2a: fp8 QK^T only) -- REVERTED. Found a hard design conflict + two
+> gotchas; captured here for a proper pass.** Implemented `mma.sync.m16n8k32.e4m3.e4m3.f32`
+> for QK^T (K straight from `s_kraw`, Q cast half->e4m3; fragment k-layout: a/b regs hold
+> `k=tg*4+{0..3}` and `+16`, accumulator layout identical to the f16 path so softmax/PV are
+> untouched). It compiles on both arches (fp8 mma is sm_89+, guarded; sm_86 gets a no-op),
+> and `fp8q` engages via the `--pf`/generate path (`[pfattn] szCT=1 use_mma=1 cpa=1 fp8=1`).
+> **Blockers:**
+> 1. **smem conflict (fundamental).** cp.async prefetches tile p+1 into `s_kraw` BEFORE the
+>    MMA, but the fp8 QK^T reads `s_kraw` DURING the MMA -- so it reads the wrong tile (p+1).
+>    The f16 path is immune (it reads the converted `s_k`). Double-buffering `s_kraw` to fix
+>    it needs +16 KB -> 117 KB, over the 99 KB sm_120 cap. **cp.async-prefetch and
+>    fp8-direct-read cannot coexist in smem as currently laid out.** The way out is to shrink
+>    smem FIRST -- stage Q as fp8 (`s_q` 50.7 KB -> 25.3 KB), which frees room for a
+>    double-buffered `s_kraw` AND is the step toward 2 CTAs/SM. So fp8-MMA must start from the
+>    Q-fp8 + smem-relayout, not bolt onto the Phase-1 cp.async buffer.
+> 2. **Test the prefill kernel via `--pf N --ctx >N`, NOT `-n`.** The normal `-n` generation
+>    path prefills through a route that never calls `attn_prefill_launch` (diagnostic never
+>    fired); only `generate()` (used by `--pf`) does. All greedy/logit A/Bs via `-n` are
+>    meaningless for this kernel. For fp8-MMA correctness, use `--pf` without
+>    `Q27_PF_NOSERIAL` (serial-vs-batched continuation gate) or add a logit dump to the `--pf`
+>    path.
+> 3. In 2a the K convert is still run (redundant when fp8q) -- neutral timing until removed.
+>
+> Revert hygiene: `src/prefill.cu` restored to HEAD (clean cp.async, +5.4%); canonical 4c4120c7
+> re-verified. fp8-MMA is a from-the-smem-layout rewrite, gated on Gabe's go.
+
 **What (the elegant part):** under `Q27_KV=fp8` the K and V caches are *already* E4M3 bytes. Today the kernel up-converts them to fp16 in smem and runs `mma.sync.m16n8k16.f16`. Blackwell (sm_120) supports fp8 MMA (`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`): consume the cached fp8 bytes directly in QK^T. This (a) doubles MMA throughput on the QK^T phase, (b) halves K staging smem and traffic (no half up-convert, and cp.async moves half the bytes), (c) with the freed smem, makes longer tiles feasible (see Task 4). Only Q (qk-normed, bounded -- the P2 kvstats probe measured K amax <=21.8, well inside E4M3 range) needs casting to fp8, and the P (softmax probs in [0,1]) x V phase can stay fp16-accumulate or also go fp8 depending on the tolerance result.
 
 **Occupancy reality (Phase 0):** point (c) is necessary but NOT sufficient. Phase 0 measured **Block Limit Registers = 1** (248 regs/thread) alongside Block Limit Shared Mem = 1 -- so freeing smem does NOT reach 2 CTAs/SM until registers also drop to <=170 (2 blocks x 192 threads x 170 = 65280 <= 65536). The `o[32][4]` output accumulator is 128 regs/thread by itself; a 2-CTA occupancy win requires restructuring it (smem-spill O, or a narrower per-warp tile) TOGETHER with the smem shrink. Do not expect longer tiles / higher occupancy from fp8 smem savings alone. The fp8 MMA still pays for itself via (a) doubled QK^T throughput (attacks the measured 28% math_pipe_throttle stall) even at unchanged 12.5% occupancy -- treat that as the primary Phase 2 payoff, with 2-CTA occupancy a separate, register-gated sub-goal.
