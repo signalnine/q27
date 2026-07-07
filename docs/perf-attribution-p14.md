@@ -198,7 +198,7 @@ weights and GDN are already length-flat per token.
 |---|---|---|---|
 | **Task 5** fd2 lane-innermost grid | R >= 2 GO; R < 1.3 SKIP | **R ~= 4.25** (verify/draft time, BW-bound; linear-in-width) | **GO** |
 | **Task 5b** FD2_NS retune (draft) | draft-attn >= 1.5 ms/round @61K | **0.51 ms/round** | **SKIP** |
-| **Task 6** fd2 lane-pair fusion | R >= 2 AND Task 5 shipped AND attn still >= ~2x BW floor AND Gabe approval | R>=2 met; rest pending Task 5 | **DEFER** -- re-decide on Task 5 results (Task 5 may capture most of the R~4.25 headroom for free) |
+| **Task 6** fd2 lane-pair fusion | R >= 2 AND Task 5 shipped AND attn still >= ~2x BW floor AND Gabe approval | R>=2 met; **Task 5 shipped +2.7% (marginal) -- captured only ~10% of the verify per-instance time, so most of the R~4.25 headroom REMAINS** | **DEFER (Gabe's call)** -- Task 5 did NOT capture most of the headroom; the lane-pair fusion still has a real target, but it is the expensive kernel rewrite and needs explicit go |
 | **Task 7** gate_maxd 6-8 brief | uses measured draft/verify economics | draft step ~0.13 ms attn + GEMV; per-lane verify ~+100 us + ~127 us/verify-attn-instance; P12b depth-5 already loses on low-acceptance docs (BUILDLOG) | **PROCEED (write brief)**; preliminary: GO only for high-acceptance agentic traffic. Needs post-Task-4 (early-exit) draft cost to finalize |
 | **nucleus-rewrite follow-on** | sampled-path tax >= 3% | **+1.07% ms/round @61K** | **NO-GO** |
 
@@ -376,3 +376,97 @@ compare only within a table row.
 Commands: `scratchpad/task4_matrix.sh` (identity + perf matrix), `task4_extra.sh` (overhead
 probe + auto smoke), `task4_ungated.sh` (ungated reference), all driving
 `srv4.sh`/`measure4.py`; per-run texts + rounds in `scratchpad/id_*` for the identity diffs.
+
+---
+
+## Task 5 -- fd2 lane-innermost grid scheduling (bitwise L2 fix)
+
+**GO condition (Task 1 Step 5): R ~= 4.25 >= 2.** The verify fd2 grid was
+`dim3(n_kv_heads, FD2_NS, ntok)` -- the token lane (`blockIdx.z`) is the SLOWEST-varying
+axis, so all of lane 0's blocks schedule before lane 1's and each verify lane re-streams the
+full KV slice from DRAM (zero cross-lane L2 reuse by construction). The KV read address
+depends on `(pos, kv_head)` only, NOT on the token lane, so the `vw` same-`(head,split)`
+blocks read byte-identical KV.
+
+### The change (spec3.cu, `k_attn_fd2` + `attn_decode3_fd2`)
+
+Pure index remap -- lane becomes the FASTEST-varying axis so the same-`(head,split)` blocks
+of all verify lanes co-schedule onto the same ~1MB KV chunk:
+
+```
+- launch:  dim3 g1(n_kv_heads, FD2_NS, ntok);
++ launch:  dim3 g1(ntok, FD2_NS, n_kv_heads);
+- kernel:  const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
++ kernel:  const int t = blockIdx.x, sp = blockIdx.y, kvh = blockIdx.z;
+```
+
+Per-block work, per-lane fp accumulation order, the scratch-cell addressing per
+`(head, split, lane)` triple (`part + (pair*FD2_NS + sp)*FD_ST`, `pair = t*(NKV*GQA) +
+kvh*GQA + j`), and the combine kernel are byte-for-byte unaffected -- only the block
+enumeration ORDER differs. The v1 fallback (`k_attn_fd`, `Q27_FD=v1`) is untouched. The
+ntok=1 draft launches share the wrapper (grid `dim3(1, FD2_NS, NKV)`) -- harmless (x=t=0).
+
+### Gates -- ALL PASS
+
+1. **Build.** Full `make`, sm_86 + sm_120: no warnings from spec3.cu (only the pre-existing
+   engine.cu/server.cu/tokenizer.cpp warnings).
+2. **test_kernels ALL PASS** (0 FAIL): the fd2 gates (fd2-vs-v1 tolerance, run-to-run
+   bitwise determinism, default-dispatch bitwise) pass unchanged over the full
+   seq {1,47,1024,16384,61440} x ntok {1,5} x {fp8,fp16} matrix.
+   **Bitwise-vs-pre-change PROVEN on the FULL matrix** (stronger than the plan's substitute):
+   a temporary FNV-1a fingerprint over every fd2 output byte of every matrix cell (both
+   dtypes, all ntok lanes) is IDENTICAL pre vs post = `5f0e1d98593d2283` (pre binary built by
+   stashing only the spec3 remap, keeping the fingerprint helper; helper reverted before the
+   commit so the landed diff is spec3.cu-only). PLUS the plan's named substitute: 61K greedy
+   `generated:` text byte-IDENTICAL pre vs post (1308 bytes, 3/3 runs). tok/round and
+   round-counts are also identical pre vs post in every bench cell.
+3. **Canonical EXACT `4c4120c72056aba2bc2d2561471eafce`** on the pre binary, the post binary,
+   and the final committed binary.
+
+### Bench (server, docs prompts, greedy, n=3 medians, spread <0.1%)
+
+Pre baseline re-measured on the saved pre-change server binary
+(`scratchpad/pre/q27-server`); post on the committed binary. Same server template
+(`Q27_PF_XG=32 --ctx 131072 --no-think --fast-head`), `/v1/completions`, `max_tokens=384`,
+1 warmup + n=3, fields from the `[req]` log. tok/round and rounds are IDENTICAL pre vs post
+in every cell (bitwise fd2), so the entire delta is per-round attention cost.
+
+| config | ctx | PRE t/s | POST t/s | delta | PRE ms/round | POST ms/round | tok/round | rounds |
+|--------|----:|--------:|---------:|------:|-------------:|--------------:|----------:|-------:|
+| ungated            | 61K | 116.1 | **119.3** | **+2.7%** | 29.27 | 28.50 | 3.398 | 113 |
+| gated theta=0.5+dexit | 61K | 121.8 | **124.2** | +2.0% | 26.06 | 25.55 | 3.174 | 121 |
+| ungated            | 2K  | 115.5 | 115.5 | +0.0% | 20.78 | 20.77 | 2.400 | 160 |
+| gated theta=0.5+dexit | 2K  | 129.6 | 129.5 | -0.1% | 17.75 | 17.76 | 2.299 | 167 |
+
+**Decision (plan rule on 61K ungated t/s): +2.7% is in the [+1.5%, +3%) band -> KEEP, flagged
+MARGINAL.** Not >= +3% (would be an unqualified keep) but well above the +1.5% revert floor.
+2K does NOT regress (ungated +0.0%, gated -0.1%, both << the 1.5% floor) -- the empty-split
+early-return scheduling is unaffected by the axis order.
+
+### Mechanism confirmation (nsys, direct)
+
+Step-4-style capture on the POST binary (`Q27_PROF_DECODE=1`,
+`nsys --trace=cuda --cuda-graph-trace=node --capture-range=cudaProfilerApi
+--capture-range-end=stop`, one 61K request, `cuda_gpu_kern_sum`), compared against the Task-1
+pre-change fd2 row (same node-traced methodology, so pre/post are apples-to-apples):
+
+| fd2 per-instance (ns) | PRE (Task 1) | POST | delta |
+|---|---:|---:|---:|
+| Med (verify z=5 dominant) | 542,076 | **487,325** | **-10.1%** |
+| Min (draft z=1)           | 125,151 | 128,191 | ~flat (single-lane draft: no cross-lane question) |
+| Max (verify z=5)          | 549,788 | 506,109 | -8.0% |
+
+The verify per-instance time drops ~10% toward the draft z=1 floor while the draft z=1 time
+is unchanged -- the exact signature of cross-lane KV L2 reuse (co-scheduled verify lanes now
+hit L2 for a portion of the KV slice instead of each re-streaming it from DRAM). 16 verify
+fd2/round x -54.8 us = **-0.88 ms/round** predicted from the per-instance drop, consistent
+with the observed **-0.77 ms/round** ungated round reduction. The reuse is PARTIAL (verify
+did not collapse to the draft floor): the 5090's L2 absorbs a minority of the ~63 MB/layer
+fp8 KV slice per co-scheduled wave, not all of it -- which is why the win is real but
+marginal (+2.7%), not the full R~4.25 headroom. That residual headroom is the Task 6
+(lane-pair fusion) target, still DEFERRED pending Gabe's call on this marginal result.
+
+Commands: pre binary from `git stash push -- src/spec3.cu` + `make` (fingerprint helper
+retained), saved to `scratchpad/pre/`; server A/B via `scratchpad/srv5.sh BIN PMIN DEXIT` +
+`measure4.py`; nsys capture in `scratchpad/nsys_post61k.{nsys-rep,sqlite}`; pre fd2 row in
+`scratchpad/kern_ung.csv` (Task 1).

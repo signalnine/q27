@@ -318,7 +318,14 @@ template <typename CT, int NW>
 __global__ void k_attn_fd2(CP3 qp, int q_stride, const CT* __restrict__ kc,
                            const CT* __restrict__ vc, float* __restrict__ part, IP3 pos,
                            int n_kv_heads, int gqa, int head_dim, float scale) {
-    const int kvh = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    // P14: lane (token) is the FASTEST-varying grid axis so the vw same-split
+    // blocks for a given (head, split) co-schedule and share the ~1MB KV chunk
+    // in L2 instead of each lane re-streaming it from DRAM (Task 1 R~=4.25).
+    // PURE INDEX REMAP: per-block work, per-lane fp accumulation order, and the
+    // scratch-cell addressing per (head, split, lane) are byte-for-byte
+    // unchanged; only the block enumeration order differs. Launch grid is
+    // dim3(ntok, FD2_NS, n_kv_heads) to match (see attn_decode3_fd2).
+    const int t = blockIdx.x, sp = blockIdx.y, kvh = blockIdx.z;
     const int seq = *pos.p[t] + 1;
     // empty split: no partial is written; the combine kernel derives the
     // used-split count from pos and never reads these slots. Keeps high
@@ -441,7 +448,7 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
     // smem 12.3KB, under the 48KB default: no cudaFuncSetAttribute needed.
     constexpr int NW2 = 4;
     size_t sm = (size_t)(2 * 6) * 256 * sizeof(float);
-    dim3 g1(n_kv_heads, FD2_NS, ntok);
+    dim3 g1(ntok, FD2_NS, n_kv_heads);  // P14: lane (x) fastest -> cross-lane KV L2 reuse
     if (fp8)
         k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
             q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,

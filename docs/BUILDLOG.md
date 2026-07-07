@@ -1491,3 +1491,57 @@ ungated at 61K); Q27_DEXIT default-ON (positive or neutral in every measured cel
 Files: engine.cuh (spec_draft_step_launches + capture + both gated branches),
 docs/plans/2026-07-06-p14-perf-levers.md (corrected Step-1 proof + Step-4 loop),
 docs/perf-attribution-p14.md.
+
+## 2026-07-07 (P14 Task 5) -- fd2 lane-innermost grid order: cross-lane KV L2 reuse (+2.7%, MARGINAL, KEPT)
+
+**What.** Task-1 measured R~=4.25 (verify fd2 per-instance time linear in verify width on a
+BW-bound kernel => each verify lane re-streams the full KV slice from DRAM, zero cross-lane
+L2 reuse). Cause: the verify grid `dim3(n_kv_heads, FD2_NS, ntok)` puts the token lane on
+`blockIdx.z`, the SLOWEST-varying axis, so all of lane 0's blocks schedule before lane 1's.
+But the KV read address depends on `(pos, kv_head)` only -- NOT the lane -- so the `vw`
+same-`(head,split)` blocks read byte-identical KV. **Fix: make the lane the FASTEST axis** so
+those blocks co-schedule and share the ~1MB KV chunk in L2. PURE INDEX REMAP, two lines in
+spec3.cu:
+
+```
+- dim3 g1(n_kv_heads, FD2_NS, ntok);   const int kvh=blockIdx.x, sp=blockIdx.y, t=blockIdx.z;
++ dim3 g1(ntok, FD2_NS, n_kv_heads);   const int t=blockIdx.x, sp=blockIdx.y, kvh=blockIdx.z;
+```
+
+Per-block work, per-lane fp accumulation order, scratch-cell addressing per
+`(head,split,lane)`, and the combine kernel are byte-for-byte unaffected -- only the block
+enumeration ORDER differs. v1 fallback (`k_attn_fd`, `Q27_FD=v1`) untouched. Task 5b SKIP
+(draft-attn 0.51 ms/round < 1.5 floor, Task 1 Step 6). CANONICAL-EXACT.
+
+**Gates -- ALL PASS.** (1) Full make sm_86+sm_120: no spec3.cu warnings. (2) test_kernels ALL
+PASS (0 FAIL): fd2-vs-v1 tolerance, run-to-run bitwise, default-dispatch bitwise all
+unchanged over seq {1,47,1024,16384,61440} x ntok {1,5} x {fp8,fp16}. **Bitwise-vs-pre-change
+proven on the FULL matrix**: a temporary FNV-1a fingerprint over every fd2 output byte of
+every matrix cell is IDENTICAL pre vs post (`5f0e1d98593d2283`; pre binary built by stashing
+ONLY the spec3 remap and keeping the fingerprint helper; helper reverted before commit so the
+landed diff is spec3.cu-only). Plus the named substitute: 61K greedy `generated:` text
+byte-identical pre vs post (1308 B, 3/3). (3) Canonical **4c4120c72056aba2bc2d2561471eafce**
+EXACT on pre, post, and final binary.
+
+**Bench (server, docs prompts, greedy, n=3 medians, spread <0.1%; pre re-measured on the
+saved pre-change binary).** tok/round and round-counts IDENTICAL pre vs post in every cell
+(bitwise fd2), so the whole delta is per-round attention cost. **61K ungated 116.1 -> 119.3
+t/s = +2.7%** (29.27 -> 28.50 ms/round). 61K gated theta=0.5+dexit 121.8 -> 124.2 = +2.0%.
+2K ungated +0.0% (115.5=115.5), 2K gated -0.1% -- no short-ctx regression (empty-split
+early-return unaffected by axis order). **Decision (plan rule on 61K ungated): +2.7% is in
+the [+1.5%, +3%) band -> KEEP, flagged MARGINAL** (above the +1.5% revert floor, below the
++3% unqualified-keep bar).
+
+**Mechanism (nsys, direct).** Step-4-style POST capture vs the Task-1 pre-change fd2 row
+(same node-traced methodology): verify fd2 per-instance Med **542.1 -> 487.3 us (-10.1%)**,
+Max 549.8 -> 506.1 (-8.0%), while the draft z=1 Min is flat (125.2 -> 128.2 us; single-lane
+draft has no cross-lane question). Verify time drops ~10% toward the draft floor = the exact
+L2-reuse signature. 16 verify/round x -54.8 us = -0.88 ms/round predicted, matches the
+observed -0.77 ms/round. **Reuse is PARTIAL** -- the 5090 L2 absorbs a minority of the
+~63 MB/layer fp8 KV per co-scheduled wave, not all of it -- which is why the win is real but
+marginal, NOT the full R~4.25 headroom. The residual headroom is the Task 6 (lane-pair
+fusion) target, which therefore is NOT made redundant by Task 5; still DEFERRED pending
+Gabe's explicit go (expensive kernel rewrite).
+
+Files: src/spec3.cu (2-line index remap), docs/perf-attribution-p14.md (Task 5 section +
+go/no-go Task 6 row updated).
