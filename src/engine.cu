@@ -826,6 +826,25 @@ int main(int argc, char** argv) {
                 if (first) {
                     ttft = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                                .count();
+                    // --dump-logits on the BATCHED leg captures the post-prefill
+                    // logits at position pf_n (still resident in e.logits before
+                    // the first decode overwrites them) -- i.e. the batched
+                    // prefill kernel's own output. This is the only route that
+                    // exercises k_attn_prefill_mma[_fp8q]; --nll prefills per-token
+                    // via step_with and never hits it. Enables an fp8q-vs-default
+                    // logit A/B (cosine/maxdiff/KL) to quantify the fp8 QK^T delta
+                    // at depth -- the default-on gate the greedy checks don't give.
+                    if (batched && !dump.empty()) {
+                        std::vector<float> lg(VOCAB);
+                        CUDA_CHECK(cudaMemcpy(lg.data(), e.logits, (size_t)VOCAB * 4,
+                                              cudaMemcpyDeviceToHost));
+                        FILE* df = fopen(dump.c_str(), "wb");
+                        if (df) {
+                            fwrite(lg.data(), 4, VOCAB, df);
+                            fclose(df);
+                            fprintf(stderr, "pf logits[pos %d] -> %s\n", pf_n, dump.c_str());
+                        }
+                    }
                     first = false;
                 }
                 out.push_back(id);

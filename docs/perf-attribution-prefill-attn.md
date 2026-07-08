@@ -164,6 +164,26 @@ routes:
 - `--pfcache` warm-vs-cold **IDENTICAL**, and mid-divergence checkpoint-restore **IDENTICAL**,
   under fp8q
 
-**Opt-in KEEP.** Follow-up before any default-on: a batched-prefill NLL/needle path
-(`--nll` is per-token today) to quantify the PPL / long-context-retrieval delta at depth --
-the greedy gates bound token-flip but not sub-argmax drift on a 361K needle.
+**Deep logit A/B (default-on quality gate) -- PASS.** Wired `--dump-logits` into the `--pf`
+batched leg (dumps the post-prefill position-N logits, the only route that hits this kernel;
+`--nll` is per-token). fp8q vs default-fp8 (f16-MMA) at **position 131072** over a 131072-token
+varied prompt (101,863 distinct ids from synthtoks):
+
+| metric | fp8q vs default @128K | P2 fp8-KV reference |
+|---|---|---|
+| cosine | **0.9999827** | 0.9995 |
+| max\|dlogit\| | 0.100 | -- |
+| KL(def\|\|fp8q) | 1.9e-4 | 3.4e-5 |
+| argmax | **MATCH** (95726) | -- |
+| top-5 | **5/5** | -- |
+
+Tighter cosine than the shipped fp8 KV cache; identical greedy top-1 and top-5 at max depth.
+The fp8 QK^T adds essentially no quality delta even at 128K -- the "silent quality loss on
+deep prompts" risk is measured and absent. Repro: `Q27_KV=fp8 [Q27_PF_FP8MMA=1]
+Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file scratchpad/pf_toks.txt --pf 131072
+--ctx 133120 --dump-logits <out>`, then scratchpad/cmp_logits.py.
+
+**Opt-in KEEP; quality-gated for default-on.** The one gate not yet run is a needle-retrieval
+sweep (retrieval is more sensitive than a single next-token logit) -- the logit A/B bounds
+per-position drift, a needle would confirm depth-placed recall. Cheap now that the dump path
+exists.

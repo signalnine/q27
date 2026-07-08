@@ -1998,3 +1998,14 @@ Skipped w/ reason: #5 one-time cudaFuncSetAttribute (matches existing code, sing
 SECURITY-MODEL); #6 grid-remap divergence (Task 1.5 was never adopted -- L2 already 95.6%,
 no default-path remap to diverge from). Re-verified after fixes: canonical 4c4120c7,
 serial-vs-batched IDENTICAL @ pf=512, --pfcache IDENTICAL, fp8q 128K unchanged.
+
+**Deep logit A/B wired + PASSED (default-on quality gate).** `--dump-logits` now fires on the
+`--pf` batched leg, dumping the post-prefill position-N logits -- the only route through
+k_attn_prefill_mma[_fp8q] (`--nll` prefills per-token via step_with, never hits it; this was
+the plan's stated gate gap). fp8q vs default-fp8 at **position 131072** (131072-token varied
+prompt, 101,863 distinct ids): **cosine 0.9999827** (tighter than the P2 fp8-KV 0.9995),
+max|dlogit| 0.100, KL 1.9e-4, **argmax MATCH (95726), top-5 5/5**. So the fp8 QK^T adds
+essentially zero quality delta at max depth -- the "silent deep-prompt quality loss" risk is
+measured and absent. Perf reconfirmed same runs: default 68.00s / fp8q 60.19s = +11.5%.
+Only remaining default-on gate: a needle-retrieval sweep (retrieval > single-logit
+sensitivity), cheap now the dump path exists. Repro in the attribution doc.
