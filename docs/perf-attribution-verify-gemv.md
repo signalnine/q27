@@ -72,6 +72,32 @@ only if Task 2 stalls out well short of the roofline.
 ~1.24x decode if fully captured. Task 2 keep-bar: >=2% end-to-end decode t/s (full engine,
 n=3, canonical bitwise).
 
+## Task 2 result (Phase 1, bitwise-safe) -- +5.9% decode @61K, KEEP
+
+Two applications of one change: activation reads 4x uint2 -> 2x uint4 (same bytes, same
+component order into the same dp4a sequence; integer-exact, fp acc order untouched ->
+greedy bitwise BY CONSTRUCTION, canonical held exactly both times). No smem, no geometry
+change, registers flat -- deliberately inside the -4%-smem-lesson constraints.
+
+| step | 61K gated decode (n=3 median) | delta |
+|---|---|---|
+| baseline (Task 0) | 163.2 t/s (dec_ms 4901) | -- |
+| `k_gemv_q4_n` (batched verify) | **172.2 t/s** (4645) | **+5.5%** |
+| + `k_gemv_q4` (single/draft) | **172.9 t/s** (4627) | +0.4% (noise-level; bounded +0.7% by the 1.6 ms/round share; kept for pattern consistency) |
+
+Same 173 rounds every config (engine-level bitwise confirmation). Captures ~1.6 ms/round
+of the ~5.7 ms/round roofline gap (~28%). `k_gemv_q8_n` untouched (already uint4 loads).
+
+## Plan verdict after Task 2
+
+**Task 3 (tensor-core verify, canonical-breaking): NOT JUSTIFIED.** Phase 0 showed dp4a
+issue was never the limiter (issue 11-13%); Phase 1 captured the cheap latency win. The
+residual ~4 ms/round gap is L1TEX-latency structure (per-column re-reads at 63-89%
+occupancy), and the remaining bitwise-safe levers (prefetch depth, register-pressure
+tuning) are in the marginal band with occupancy risk -- the fd2/smem precedents say stop
+here. Re-open only with a new fact (e.g. a future activation layout that batches columns
+contiguously, making the x-reads one coalesced stream).
+
 ## Commands
 
 Every number above: the Method commands + `ncu --import scratchpad/vg_gemv.ncu-rep --page

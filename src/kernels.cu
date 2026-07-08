@@ -167,15 +167,20 @@ __global__ void k_gemv_q4(const uint8_t* __restrict__ W, const __half* __restric
     for (int ch = lane; ch < n_chunks; ch += 32) {
         uint4 w = __ldg(wr + ch);
         float s = __half2float(__ldg(sr + (ch >> 1))) * __ldg(xs + ch);
-        const uint2* xp = xeo + (size_t)ch * 4;
+        // Task 2 (verify-gemv): 2x uint4 activation reads, same bytes/order as
+        // the old 4x uint2 (bitwise; see k_gemv_q4_n for the Phase-0 rationale).
+        const uint4* xp = (const uint4*)(xeo + (size_t)ch * 4);
+        const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
         const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
         int di = 0;
-#pragma unroll
-        for (int u = 0; u < 4; u++) {
-            uint2 xv = __ldg(xp + u);
-            di = __dp4a((int)(ws[u] & 0x0F0F0F0Fu), (int)xv.x, di);
-            di = __dp4a((int)((ws[u] >> 4) & 0x0F0F0F0Fu), (int)xv.y, di);
-        }
+        di = __dp4a((int)(ws[0] & 0x0F0F0F0Fu), (int)xv0.x, di);
+        di = __dp4a((int)((ws[0] >> 4) & 0x0F0F0F0Fu), (int)xv0.y, di);
+        di = __dp4a((int)(ws[1] & 0x0F0F0F0Fu), (int)xv0.z, di);
+        di = __dp4a((int)((ws[1] >> 4) & 0x0F0F0F0Fu), (int)xv0.w, di);
+        di = __dp4a((int)(ws[2] & 0x0F0F0F0Fu), (int)xv1.x, di);
+        di = __dp4a((int)((ws[2] >> 4) & 0x0F0F0F0Fu), (int)xv1.y, di);
+        di = __dp4a((int)(ws[3] & 0x0F0F0F0Fu), (int)xv1.z, di);
+        di = __dp4a((int)((ws[3] >> 4) & 0x0F0F0F0Fu), (int)xv1.w, di);
         acc += s * (float)(di - 8 * __ldg(xisum + ch));
     }
     acc = warp_reduce(acc);

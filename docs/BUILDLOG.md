@@ -2084,3 +2084,14 @@ decode **163.2 -> 172.2 t/s median n=3 (+5.5%, spread 0.1%)**, dec_ms 4901 -> 46
 ms/round roofline gap (~26%). NOT applied to k_gemv_q8_n (its activation loads are already
 uint4) or the single-column kernels (draft path, 3.1 ms/round, same pattern applies --
 candidate follow-up).
+
+**verify-gemv Task 2 close-out: single-column k_gemv_q4 + plan verdict.** Same 2x-uint4
+change on the draft-path k_gemv_q4: 172.2 -> 172.9 t/s median n=3 (+0.4%, noise-level,
+bounded at +0.7% by the 1.6 ms/round share; KEPT for strictly-positive median + load-shape
+consistency across the q4 kernels). Canonical EXACT both commits, test_kernels ALL PASS,
+same 173 rounds throughout. **Task 2 total: 163.2 -> 172.9 t/s (+5.9%) @61K gated, greedy
+bitwise, ~28% of the roofline gap captured.** **Task 3 (tensor-core verify, breaks
+canonical): NOT JUSTIFIED -- killed.** Phase 0 showed dp4a issue was never the limiter;
+the residual gap is L1TEX-latency structure and the remaining safe levers are
+marginal-band with occupancy risk (fd2/smem precedents). verify-gemv plan COMPLETE:
+attribution + verdicts in docs/perf-attribution-verify-gemv.md.
