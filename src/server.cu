@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[64], gatebuf[192];
+        char p13buf[64], gatebuf[384];
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
@@ -311,13 +311,21 @@ int main(int argc, char** argv) {
                             : "",
                 // maxd6 GO-IF: cumulative gated-round histograms on this engine --
                 // margin-run depth (gch, cap 0..5) and accepted length (gnh, n 1..6).
+                // accept-gate Phase 0: per-lane fired/accepted (glf/gla, lanes 1..5)
+                // -- the conditional yields the marginals cannot reconstruct.
                 e.pmin_theta > 0.f
                     ? (snprintf(gatebuf, sizeof gatebuf,
-                                " gch=%ld,%ld,%ld,%ld,%ld,%ld gnh=%ld,%ld,%ld,%ld,%ld,%ld",
+                                " gch=%ld,%ld,%ld,%ld,%ld,%ld gnh=%ld,%ld,%ld,%ld,%ld,%ld"
+                                " glf=%ld,%ld,%ld,%ld,%ld gla=%ld,%ld,%ld,%ld,%ld",
                                 e.gate_cap_hist[0], e.gate_cap_hist[1], e.gate_cap_hist[2],
                                 e.gate_cap_hist[3], e.gate_cap_hist[4], e.gate_cap_hist[5],
                                 e.gate_n_hist[1], e.gate_n_hist[2], e.gate_n_hist[3],
-                                e.gate_n_hist[4], e.gate_n_hist[5], e.gate_n_hist[6]),
+                                e.gate_n_hist[4], e.gate_n_hist[5], e.gate_n_hist[6],
+                                e.gate_lane_fired[1], e.gate_lane_fired[2],
+                                e.gate_lane_fired[3], e.gate_lane_fired[4],
+                                e.gate_lane_fired[5], e.gate_lane_acc[1],
+                                e.gate_lane_acc[2], e.gate_lane_acc[3],
+                                e.gate_lane_acc[4], e.gate_lane_acc[5]),
                        gatebuf)
                     : "",
                 extra.c_str());

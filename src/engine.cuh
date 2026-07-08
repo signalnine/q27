@@ -240,6 +240,11 @@ struct Engine {
     // n_hist[6]/sum(n_hist), p(5th lane accepted | fired) = n_hist[6]/cap_hist[5].
     long gate_cap_hist[6] = {}; // [cap]
     long gate_n_hist[7] = {};   // [n]; index 0 unused
+    // acceptance-gate Phase 0: per-draft-lane conditional acceptance on gated
+    // rounds. Lane j (1..gate_maxd) FIRED iff cap >= j; ACCEPTED iff n >= j+1.
+    // Gives the live yields p(acc_j | fired_j) that the two marginals above
+    // cannot reconstruct (docs/acceptance-gate-design.md).
+    long gate_lane_fired[6] = {}, gate_lane_acc[6] = {}; // [j]; index 0 unused
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
@@ -1200,7 +1205,13 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 32, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
-        if (gate_cap >= 0) { gate_cap_hist[gate_cap]++; gate_n_hist[n]++; }
+        if (gate_cap >= 0) {
+            gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
+            for (int j = 1; j <= gate_cap; j++) {
+                gate_lane_fired[j]++;
+                if (n >= j + 1) gate_lane_acc[j]++;
+            }
+        }
         // P13 adaptive maxd: fold this round's realized accept into the ceiling.
         // At depth-4, promote when the ceiling saturates (n==maxd+1) often enough;
         // at depth-5, demote when the 5th lane stops paying (n<6). On a switch,
