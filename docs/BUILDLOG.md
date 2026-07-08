@@ -1952,3 +1952,21 @@ BPE vocab); **m5** the gate now asserts trunc>=1 so the perm-rewind path (not ju
 m==n degenerate) stays exercised. **m2** documented as a comment: the split-brain check
 is range-only -- safe while the pool is append-only; pool reset/eviction would need
 whole-map epoch invalidation. m3/m4 landed RED->GREEN in test_toolconstrain (11 tests).
+
+**prefill-attn Phase 2 (fp8 QK^T MMA) -- START + design (2026-07-07, branch
+`prefill-attn-fp8mma` off master 535093f).** Baseline re-confirmed on this box: fp8 128K
+prefill **67.80s / 1933 t/s** (`Q27_KV=fp8 --pf 131072 --ctx 133120 Q27_PF_NOSERIAL=1`),
+within 0.6% of the Phase-1 68.20s -- cp.async is the current before-number. Canonical
+4c4120c7 holds. **Design (resolves the ec1a54c revert's smem conflict):** the revert kept
+s_q fp16 (50.7KB) + s_k + a double-buffered s_kraw = 117KB > 99KB cap. Fix: stage Q as
+e4m3 (s_q 50.7->25.3KB) and DROP s_k (K read straight from fp8), freeing room for a
+double-buffered s_kraw (2x8KB). New fp8-QK^T layout: s_q fp8 25.3 + s_v half 16.9 +
+s_kraw fp8 x2 16 + s_vraw fp8 8 = ~66KB, comfortably under cap. QK^T becomes
+`mma.sync.m16n8k32.e4m3.e4m3.f32` (8 k32 steps vs 16 k16); a-regs = uint32 of 4
+consecutive e4m3 at k=tg*4+{0..3} and +16 (rows gid/gid+8), b-regs = same for K[n=gid];
+accumulator layout identical to the f16 path so softmax/PV/output are byte-untouched. PV
+stays fp16 (V still converted to s_v). Gated behind a 2nd template instantiation
+(FP8MMA=true, CT=fp8 only) selected by `Q27_PF_FP8MMA` -- default path is a separate
+compiled kernel, bit-identical. Tolerance-gated (fp16 path stays bitwise). Next:
+implement + unit A/B <=5e-4 + prefix-cache identity + canonical + the P2 deep battery
+(PPL/nll-long/needle 6/6).
