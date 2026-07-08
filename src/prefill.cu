@@ -827,6 +827,26 @@ static __device__ __forceinline__ void mma_f16(float& d0, float& d1, float& d2, 
           "f"(c3));
 }
 
+// fp8 e4m3 QK^T: mma.sync.m16n8k32 (4 fp8/reg, f32 accumulate). sm_89+ only
+// (Blackwell sm_120 has it); sm_86 gets an accumulate-identity no-op so the
+// build links -- the fp8-MMA prefill path never engages on the 3090 (no fp8 HW,
+// and attn_prefill_launch only routes here under Q27_PF_FP8MMA + fp8 KV).
+static __device__ __forceinline__ void mma_e4m3(float& d0, float& d1, float& d2, float& d3,
+                                                uint32_t a0, uint32_t a1, uint32_t a2,
+                                                uint32_t a3, uint32_t b0, uint32_t b1, float c0,
+                                                float c1, float c2, float c3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2),
+          "f"(c3));
+#else
+    d0 = c0; d1 = c1; d2 = c2; d3 = c3;
+#endif
+}
+
 static __device__ __forceinline__ uint32_t h2u(__half2 h) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
@@ -1150,6 +1170,274 @@ k_attn_prefill_mma(const float* __restrict__ qT, int q_stride, int q_row,
     }
 }
 
+// fp8 QK^T variant of k_attn_prefill_mma (Phase 2, Q27_PF_FP8MMA). Q staged as
+// e4m3 (s_q 25.3KB vs 50.7), K read straight from the fp8 cache in the MMA
+// (mma.sync.m16n8k32.e4m3) so s_k is dropped and s_kraw is double-buffered for
+// cp.async -- the smem relayout the ec1a54c revert prescribed. PV stays fp16 (V
+// still converted to s_v). Softmax/PV/output are byte-identical to the f16
+// kernel (m16n8 f32 accumulator layout is K-independent); only QK^T numerics
+// change (Q-cast + fp8 accumulate), tolerance-gated. fp8 KV only. ~66KB smem.
+__global__ void __launch_bounds__(192, 1)
+k_attn_prefill_mma_fp8q(const float* __restrict__ qT, int q_stride, int q_row,
+                        const __nv_fp8_e4m3* __restrict__ kc,
+                        const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ outT,
+                        int out_row, float* __restrict__ part, int base_pos, int tile_t0, int T,
+                        int n_kv_heads, int head_dim, float scale, int cp_async) {
+    // LDQ/LDK pad s_q/s_kraw so the fp8 QK^T uint32 reads don't 8-way bank-conflict
+    // (word stride coprime-ish to 32; the f16 path gets this free via LDH).
+    constexpr int TT = 16, PP = 32, HD = 256, LDH = HD + 8, LDQ = HD + 4, LDK = HD + 16;
+    const int kvh = blockIdx.x;
+    const int t0 = tile_t0 + blockIdx.y * TT;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+    const int nsp = gridDim.z, sp = blockIdx.z;
+    const int trows = gridDim.y * TT;
+    const int qh = kvh * 6 + warp;
+
+    const int tile_last = min(t0 + TT, T) - 1;
+    const int tile_max = base_pos + tile_last + 1;
+    if (tile_last < t0) return;
+
+    const int chunk = nsp > 1 ? ((tile_max + nsp - 1) / nsp + PP - 1) / PP * PP : tile_max;
+    const int p_lo = sp * chunk, p_hi = min(tile_max, p_lo + chunk);
+    if (nsp > 1 && p_lo >= tile_max) {
+        if (tg == 0) {
+            size_t b0 = ((size_t)(qh * trows + t0 + gid) * nsp + sp) * PF_PART_STRIDE;
+            size_t b1 = ((size_t)(qh * trows + t0 + gid + 8) * nsp + sp) * PF_PART_STRIDE;
+            part[b0] = -FLT_MAX; part[b0 + 1] = 0.f;
+            part[b1] = -FLT_MAX; part[b1 + 1] = 0.f;
+        }
+        return;
+    }
+
+    // smem: s_q fp8 [6*TT*LDQ] | s_v half [PP*LDH] | s_kraw fp8 x2 [2*PP*LDK] |
+    // s_vraw fp8 [PP*HD] ~= 65.9KB. No s_k (K consumed as fp8 in the MMA).
+    extern __shared__ unsigned char smem_raw8[];
+    __nv_fp8_e4m3* s_q = (__nv_fp8_e4m3*)smem_raw8;           // [6][TT][LDQ]
+    __half* s_v = (__half*)(s_q + 6 * TT * LDQ);              // [PP][LDH]
+    __nv_fp8_e4m3* s_kraw = (__nv_fp8_e4m3*)(s_v + PP * LDH); // [2][PP*LDK] ping-pong
+    __nv_fp8_e4m3* s_vraw = s_kraw + 2 * PP * LDK;            // [PP*HD] (V converted, no pad)
+    const bool cpa = cp_async != 0;
+
+    // stage Q (fp32 -> e4m3) once: warp w stages its own head's 16 tokens
+    for (int idx = lane; idx < TT * HD; idx += 32) {
+        int tt = idx / HD, d = idx % HD;
+        int t = t0 + tt;
+        float v = t < T ? qT[(size_t)t * q_row + (size_t)qh * q_stride + d] : 0.f;
+        s_q[(warp * TT + tt) * LDQ + d] = __nv_fp8_e4m3(v);
+    }
+
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; i++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[i][e] = 0.f;
+    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
+
+    int cur = 0;
+    if (cpa) {
+        // prologue: prefetch tile p_lo K into s_kraw[0], V into s_vraw
+        for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
+            int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+            int gpos = p_lo + pp;
+            size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+            cpasync16(s_kraw + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
+            cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+        }
+        cpasync_commit();
+    }
+
+    for (int p0 = p_lo; p0 < p_hi; p0 += PP) {
+        const int np = min(PP, p_hi - p0);
+        __nv_fp8_e4m3* kbuf = s_kraw + (cpa ? cur : 0) * PP * LDK;
+        if (cpa) {
+            cpasync_wait_all();  // this tile's raw K in kbuf, V in s_vraw
+            __syncthreads();
+            // convert only V (raw fp8 -> half in s_v); K stays raw in kbuf for
+            // the fp8 MMA. Same kv2h bytes as the blocking path.
+            for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
+                int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+                __half2* vd = (__half2*)(s_v + pp * LDH + d8);
+                const __nv_fp8_e4m3* vr = s_vraw + pp * HD + d8;
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    vd[j] = __halves2half2(kv2h(vr[2 * j]), kv2h(vr[2 * j + 1]));
+            }
+            __syncthreads();  // s_v ready; s_vraw free; kbuf still holds this tile
+            // prefetch NEXT tile K into the OTHER buffer + V into s_vraw --
+            // overlaps the QK^T/PV MMAs; kbuf (s_kraw[cur]) is untouched
+            if (p0 + PP < p_hi) {
+                __nv_fp8_e4m3* knext = s_kraw + (1 - cur) * PP * LDK;
+                for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += blockDim.x) {
+                    int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+                    int gpos = p0 + PP + pp;
+                    size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(knext + pp * LDK + d16, &kc[off], gpos < p_hi ? 16 : 0);
+                    cpasync16(s_vraw + pp * HD + d16, &vc[off], gpos < p_hi ? 16 : 0);
+                }
+                cpasync_commit();
+            }
+        } else {
+            __syncthreads();
+            // blocking: load K raw into kbuf (=s_kraw[0]); convert V -> s_v
+            for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += blockDim.x) {
+                int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+                bool ok = pp < np;
+                size_t off = ((size_t)(p0 + pp) * n_kv_heads + kvh) * head_dim + d8;
+                __half2* vd = (__half2*)(s_v + pp * LDH + d8);
+                __nv_fp8_e4m3* kd = kbuf + pp * LDK + d8;
+                if (ok) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) kd[j] = kc[off + j];
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        vd[j] = __halves2half2(kv2h(vc[off + 2 * j]), kv2h(vc[off + 2 * j + 1]));
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) kd[j] = __nv_fp8_e4m3(0.f);
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        vd[j] = __halves2half2(__float2half_rn(0.f), __float2half_rn(0.f));
+                }
+            }
+            __syncthreads();
+        }
+
+        // S = Q K^T, fp8 m16n8k32 (8 k32 steps). a/b regs = uint32 of 4
+        // consecutive e4m3 at k = tg*4 + {0..3} (low) and +16 (high); rows
+        // gid / gid+8. Accumulator s[n][0..3] identical layout to the f16 path.
+        float s[4][4];
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[n][e] = 0.f;
+        const __nv_fp8_e4m3* qb = s_q + warp * TT * LDQ;
+#pragma unroll
+        for (int kk = 0; kk < HD / 32; kk++) {
+            const int kb = kk * 32;
+            uint32_t a0 = *(const uint32_t*)(qb + gid * LDQ + kb + tg * 4);
+            uint32_t a1 = *(const uint32_t*)(qb + (gid + 8) * LDQ + kb + tg * 4);
+            uint32_t a2 = *(const uint32_t*)(qb + gid * LDQ + kb + tg * 4 + 16);
+            uint32_t a3 = *(const uint32_t*)(qb + (gid + 8) * LDQ + kb + tg * 4 + 16);
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                uint32_t b0 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4);
+                uint32_t b1 = *(const uint32_t*)(kbuf + (n * 8 + gid) * LDK + kb + tg * 4 + 16);
+                mma_e4m3(s[n][0], s[n][1], s[n][2], s[n][3], a0, a1, a2, a3, b0, b1, s[n][0],
+                         s[n][1], s[n][2], s[n][3]);
+            }
+        }
+
+        // mask + online softmax (verbatim from k_attn_prefill_mma)
+        const int r0g = t0 + gid, r1g = t0 + gid + 8;
+        const int b0r = base_pos + r0g + 1 - p0;
+        const int b1r = base_pos + r1g + 1 - p0;
+        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int c0 = n * 8 + tg * 2, c1 = c0 + 1;
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[n][e] *= scale;
+            if (c0 >= b0r || c0 >= np) s[n][0] = -FLT_MAX;
+            if (c1 >= b0r || c1 >= np) s[n][1] = -FLT_MAX;
+            if (c0 >= b1r || c0 >= np) s[n][2] = -FLT_MAX;
+            if (c1 >= b1r || c1 >= np) s[n][3] = -FLT_MAX;
+            rmax0 = fmaxf(rmax0, fmaxf(s[n][0], s[n][1]));
+            rmax1 = fmaxf(rmax1, fmaxf(s[n][2], s[n][3]));
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, off));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, off));
+        }
+        const float mn0 = fmaxf(m0, rmax0), mn1 = fmaxf(m1, rmax1);
+        const float sc0 = expf(m0 - mn0), sc1 = expf(m1 - mn1);
+        float rl0 = 0.f, rl1 = 0.f;
+#pragma unroll
+        for (int n = 0; n < 4; n++) {
+            s[n][0] = s[n][0] == -FLT_MAX ? 0.f : expf(s[n][0] - mn0);
+            s[n][1] = s[n][1] == -FLT_MAX ? 0.f : expf(s[n][1] - mn0);
+            s[n][2] = s[n][2] == -FLT_MAX ? 0.f : expf(s[n][2] - mn1);
+            s[n][3] = s[n][3] == -FLT_MAX ? 0.f : expf(s[n][3] - mn1);
+            rl0 += s[n][0] + s[n][1];
+            rl1 += s[n][2] + s[n][3];
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            rl0 += __shfl_xor_sync(0xffffffff, rl0, off);
+            rl1 += __shfl_xor_sync(0xffffffff, rl1, off);
+        }
+        l0 = l0 * sc0 + rl0;
+        l1 = l1 * sc1 + rl1;
+        m0 = mn0;
+        m1 = mn1;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            o[i][0] *= sc0;
+            o[i][1] *= sc0;
+            o[i][2] *= sc1;
+            o[i][3] *= sc1;
+        }
+
+        // P x V -> O (fp16, verbatim from k_attn_prefill_mma)
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            pa[h][0] = h2u(__floats2half2_rn(s[2 * h][0], s[2 * h][1]));
+            pa[h][1] = h2u(__floats2half2_rn(s[2 * h][2], s[2 * h][3]));
+            pa[h][2] = h2u(__floats2half2_rn(s[2 * h + 1][0], s[2 * h + 1][1]));
+            pa[h][3] = h2u(__floats2half2_rn(s[2 * h + 1][2], s[2 * h + 1][3]));
+        }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int d0 = n * 8;
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int kp0 = h * 16;
+                uint32_t b0, b1;
+                ldm_x2_trans(b0, b1, s_v + (kp0 + (lane & 15)) * LDH + d0);
+                mma_f16(o[n][0], o[n][1], o[n][2], o[n][3], pa[h][0], pa[h][1], pa[h][2],
+                        pa[h][3], b0, b1, o[n][0], o[n][1], o[n][2], o[n][3]);
+            }
+        }
+
+        if (cpa) cur = 1 - cur;
+    }
+
+    // normalize + write (verbatim from k_attn_prefill_mma)
+    const int tr0 = t0 + gid, tr1 = t0 + gid + 8;
+    if (nsp > 1) {
+        size_t b0 = ((size_t)(qh * trows + tr0) * nsp + sp) * PF_PART_STRIDE;
+        size_t b1 = ((size_t)(qh * trows + tr1) * nsp + sp) * PF_PART_STRIDE;
+        if (tg == 0) {
+            part[b0] = m0; part[b0 + 1] = l0;
+            part[b1] = m1; part[b1 + 1] = l1;
+        }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int d0 = n * 8 + tg * 2;
+            part[b0 + 2 + d0] = o[n][0];
+            part[b0 + 2 + d0 + 1] = o[n][1];
+            part[b1 + 2 + d0] = o[n][2];
+            part[b1 + 2 + d0 + 1] = o[n][3];
+        }
+        return;
+    }
+    const float inv0 = l0 > 0.f ? 1.0f / l0 : 0.f, inv1 = l1 > 0.f ? 1.0f / l1 : 0.f;
+#pragma unroll
+    for (int n = 0; n < 32; n++) {
+        const int d0 = n * 8 + tg * 2;
+        if (tr0 < T) {
+            outT[(size_t)tr0 * out_row + (size_t)qh * head_dim + d0] = o[n][0] * inv0;
+            outT[(size_t)tr0 * out_row + (size_t)qh * head_dim + d0 + 1] = o[n][1] * inv0;
+        }
+        if (tr1 < T) {
+            outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0] = o[n][2] * inv1;
+            outT[(size_t)tr1 * out_row + (size_t)qh * head_dim + d0 + 1] = o[n][3] * inv1;
+        }
+    }
+}
+
 // merge S split partials for one (token, q-head): m* = max m_s,
 // O = sum O_s * exp(m_s - m*), out = O / (sum l_s * exp(m_s - m*))
 __global__ void k_attn_pf_combine(const float* __restrict__ part, float* __restrict__ outT,
@@ -1278,6 +1566,48 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         if (cpa_env < 0) {
             const char* ce = getenv("Q27_PF_CPASYNC");
             cpa_env = ce ? atoi(ce) : 1;  // default ON for the fp8 path
+        }
+        // Phase 2: fp8 QK^T MMA (Q27_PF_FP8MMA, fp8 KV only). Own smem relayout
+        // (s_q e4m3 + double-buffered s_kraw, no s_k) -- separate kernel, the
+        // default fp16/fp8 path below is untouched.
+        static int fp8mma_env = -1;
+        if (fp8mma_env < 0) {
+            const char* fe = getenv("Q27_PF_FP8MMA");
+            fp8mma_env = fe ? atoi(fe) : 0;
+        }
+        if constexpr (sizeof(CT) == 1) {
+            if (fp8mma_env) {
+                constexpr int LDQ = 260, LDK = 272;  // match k_attn_prefill_mma_fp8q pads
+                const size_t SM8 = (size_t)6 * TT * LDQ * sizeof(__nv_fp8_e4m3) +
+                                   (size_t)PP * LDH * sizeof(__half) +
+                                   (size_t)(2 * PP * LDK + PP * 256) * sizeof(__nv_fp8_e4m3);
+                static bool attr8 = false;
+                if (!attr8) {
+                    CUDA_CHECK(cudaFuncSetAttribute(
+                        k_attn_prefill_mma_fp8q,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, SM8));
+                    attr8 = true;
+                }
+                int nsplit = 1;
+                if (part && t0 == 0) {
+                    const char* se = getenv("Q27_PF_SPLIT");
+                    nsplit = se ? atoi(se) : (base_pos + t0 + SB) / 4096;
+                    nsplit = nsplit < 1 ? 1 : nsplit > PF_SPLIT_MAX ? PF_SPLIT_MAX : nsplit;
+                }
+                const int tiles = (SB + TT - 1) / TT;
+                dim3 grid(n_kv_heads, tiles, nsplit);
+                k_attn_prefill_mma_fp8q<<<grid, 192, SM8, st>>>(
+                    qT, q_stride, q_row, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, outT,
+                    out_row, part, base_pos, t0, t0 + SB, n_kv_heads, head_dim, scale, cpa_env);
+                CUDA_CHECK(cudaGetLastError());
+                if (nsplit > 1) {
+                    dim3 g2(SB, n_q_heads);
+                    k_attn_pf_combine<<<g2, 256, 0, st>>>(part, outT, out_row, head_dim,
+                                                          tiles * TT, nsplit);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                return;
+            }
         }
         static bool attr2 = false;
         if (!attr2) {

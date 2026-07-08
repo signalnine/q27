@@ -130,3 +130,40 @@ Phase 1 is a KEEP. The 95.6%-L2-hit occupancy analysis still holds -- cp.async h
 it overlaps the L2 *load* latency (long_scoreboard 30%) with the MMAs even at 6 warps; the
 earlier "L2 not DRAM so cp.async won't help" reasoning was too pessimistic. Bench lesson:
 always `Q27_KV=fp8` for this path; `--kvstats` is fp16-only.
+
+## Phase 2 result (fp8 QK^T MMA, `Q27_PF_FP8MMA`) -- +11.8% @128K
+
+fp8 e4m3 QK^T (`mma.sync.m16n8k32.e4m3.e4m3.f32`) consuming the fp8 KV cache directly,
+via the smem relayout the ec1a54c revert prescribed: Q staged as e4m3 (s_q 50.7->25.3KB),
+s_k dropped (K read raw from a **double-buffered** s_kraw so cp.async prefetch and
+fp8-direct-read coexist), PV stays fp16 (V still converted to s_v). New separate kernel
+`k_attn_prefill_mma_fp8q`, opt-in; the default fp16/fp8 kernels are untouched (canonical
+4c4120c7 holds -- it is a distinct compiled kernel).
+
+**Bank-conflict padding was load-bearing.** The fp8 QK^T packs 4 consecutive e4m3 into a
+uint32; from contiguous s_q/s_kraw the gid dimension gives an 8-way smem bank conflict (the
+f16 path dodges it via padded LDH=264). Padding s_q to LDQ=260 and s_kraw to LDK=272
+(+~1.4KB smem; total ~66KB, under the 99KB cap) lifted the win from +4.9% to +11.8%.
+
+| 128K prefill (`Q27_KV=fp8 --pf 131072 --ctx 133120 NOSERIAL`) | wall | t/s |
+|---|---|---|
+| default fp8 (f16-MMA) | 68.27s | 1920 |
+| fp8q unpadded | 64.57s | 2030 (+4.9%) |
+| **fp8q padded** | **60.20s** | **2177 (+11.8%)** |
+
++11.8% end-to-end 128K ~= **+22% on the attention kernel** (~54% of prefill) -- clears the
+plan's >=10% attn keep-bar. The fp8 MMA attacks the measured 28% `math_pipe_throttle`
+stall at the unchanged 12.5% occupancy, exactly the Phase-0 prediction.
+
+**Correctness (greedy/identity gates).** `--nll` prefills per-token via `step_with` (decode
+attention), NOT the batched prefill kernel, so fp8q is validated through the batched-prefill
+routes:
+- canonical 4c4120c7 unchanged (decode + default prefill paths bit-identical)
+- serial-vs-batched continuation **IDENTICAL @ pf=512 and pf=4096** (fp8q batched prefill vs
+  the serial per-token reference -- the fp8 QK^T never flips the greedy argmax at depth)
+- `--pfcache` warm-vs-cold **IDENTICAL**, and mid-divergence checkpoint-restore **IDENTICAL**,
+  under fp8q
+
+**Opt-in KEEP.** Follow-up before any default-on: a batched-prefill NLL/needle path
+(`--nll` is per-token today) to quantify the PPL / long-context-retrieval delta at depth --
+the greedy gates bound token-flip but not sub-argmax drift on a 361K needle.

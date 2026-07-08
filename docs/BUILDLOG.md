@@ -1970,3 +1970,18 @@ stays fp16 (V still converted to s_v). Gated behind a 2nd template instantiation
 compiled kernel, bit-identical. Tolerance-gated (fp16 path stays bitwise). Next:
 implement + unit A/B <=5e-4 + prefix-cache identity + canonical + the P2 deep battery
 (PPL/nll-long/needle 6/6).
+
+**prefill-attn Phase 2 (fp8 QK^T MMA) -- SHIPPED (opt-in), +11.8% @128K.** New kernel
+`k_attn_prefill_mma_fp8q` (mma.sync.m16n8k32.e4m3), engaged by `Q27_PF_FP8MMA=1` on the
+fp8 path; the default fp16/fp8 kernels are untouched (separate compiled kernel, canonical
+4c4120c7 unchanged). The revert's smem conflict is resolved by staging Q as e4m3 (s_q
+50.7->25.3KB) and dropping s_k so s_kraw can double-buffer. **Bank-conflict padding was
+load-bearing**: the fp8 QK^T packs 4 e4m3/uint32 and hits an 8-way conflict from contiguous
+s_q/s_kraw; padding LDQ=260 / LDK=272 (+~1.4KB, total ~66KB) took it from +4.9% -> +11.8%.
+128K wall (fp8, NOSERIAL): default f16-MMA 68.27s / fp8q 60.20s (2177 t/s) = **+11.8%
+end-to-end ~= +22% on the attn kernel** (attacks the Phase-0 28% math_pipe_throttle at
+12.5% occ). Correctness (greedy/identity -- `--nll` is per-token so it does NOT hit this
+kernel; validated via batched-prefill routes): canonical unchanged, serial-vs-batched
+continuation IDENTICAL @ pf=512 AND pf=4096, `--pfcache` warm/cold + mid-divergence
+checkpoint-restore IDENTICAL, all under fp8q. Opt-in KEEP; default-on gated on a
+batched-prefill PPL/needle path (filed). attribution: docs/perf-attribution-prefill-attn.md.
