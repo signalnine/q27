@@ -191,20 +191,27 @@ int main(int argc, char** argv) {
         // E6 gate: depth-3 chain, binned by PASS-2 margin (the runtime gate
         // signal). d3 only matters when the d1,d2 prefix is accepted, so track
         // p(prefix ok | bin) and p(d3 ok | prefix ok, bin) separately.
-        struct Pend3 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1; };
+        struct Pend3 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1; float margin3 = 0; };
         std::vector<Pend3> pend3(N + 8);
         long c3n[5] = {0}, c3pre[5] = {0}, c3ok[5] = {0};
+        // accept-gate Phase 0b: acceptance binned by each pass's OWN margin
+        // (the signal the live per-step gate actually thresholds), conditioned
+        // on the prefix being accepted -- oKok/oKn = p(dK | prefix ok, mK bin).
+        // The cK* bins above key on the pass-2 margin only.
+        long o3n[5] = {0}, o3ok[5] = {0};
         // P3 gate: depth-4 chain -- p(pass-4 draft | d1,d2,d3 all accepted).
         // Build depth-4 only if p(d4|prefix-3) holds ~>=60%.
-        struct Pend4 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1, d3 = -1; };
+        struct Pend4 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1, d3 = -1; float margin4 = 0; };
         std::vector<Pend4> pend4(N + 8);
         long c4n[5] = {0}, c4pre[5] = {0}, c4ok[5] = {0};
+        long o4n[5] = {0}, o4ok[5] = {0};
         // Depth-5 gate (roadmap #4, 2026-07-03): p(pass-5 draft | d1..d4 all
         // accepted). Chain barely decays through d4 (97.4%), so measure d5
         // before dismissing it -- projected +5-6%% net if the pattern holds.
-        struct Pend5 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1, d3 = -1, d4 = -1; };
+        struct Pend5 { int pred = -1; float margin2 = 0; int d1 = -1, d2 = -1, d3 = -1, d4 = -1; float margin5 = 0; };
         std::vector<Pend5> pend5(N + 8);
         long c5n[5] = {0}, c5pre[5] = {0}, c5ok[5] = {0};
+        long o5n[5] = {0}, o5ok[5] = {0};
         for (int step = 0; step < N + (int)toks.size() - 1; step++) {
             bool prompt_phase = step < (int)toks.size();
             int tok = prompt_phase ? toks[step] : -1;
@@ -215,10 +222,13 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(&next_tok, e.d_token, 4, cudaMemcpyDeviceToHost));
             if (!prompt_phase) seq.push_back(next_tok);
             int pos = step; // hidden h(pos) just computed; next token = next_tok
-            // score pending predictions targeting this newly known token
+            // score pending predictions targeting this newly known token.
+            // Guard: pends are only STORED for indices < N+8 (write sites are
+            // range-checked); a prompt longer than N used to read past the
+            // vectors here (heap garbage swamped every counter to 0).
             int known_idx = (int)seq.size() - 1;
-            for (auto* pd : {&pend1[0], &pend2[0]}) (void)pd;
-            if (pend1[known_idx].pred >= 0) {
+            bool in_pend = known_idx < (int)pend1.size(); // all five are N+8
+            if (in_pend && pend1[known_idx].pred >= 0) {
                 n1++;
                 bool ok = pend1[known_idx].pred == seq[known_idx];
                 if (ok) n1ok++;
@@ -227,40 +237,46 @@ int main(int argc, char** argv) {
                     if (pend1[known_idx].rank2 == seq[known_idx]) r2cap++;
                 }
             }
-            if (pend2[known_idx].pred >= 0) {
+            if (in_pend && pend2[known_idx].pred >= 0) {
                 n2++;
                 bool ok = pend2[known_idx].pred == seq[known_idx];
                 int b = bin(pend2[known_idx].margin);
                 bn[b]++;
                 if (ok) { n2ok++; bok[b]++; }
             }
-            if (pend3[known_idx].pred >= 0 && known_idx >= 2) {
+            if (in_pend && known_idx >= 2 && pend3[known_idx].pred >= 0) {
                 const Pend3& p3 = pend3[known_idx];
                 int b = bin(p3.margin2);
                 c3n[b]++;
                 if (p3.d1 == seq[known_idx - 2] && p3.d2 == seq[known_idx - 1]) {
                     c3pre[b]++;
-                    if (p3.pred == seq[known_idx]) c3ok[b]++;
+                    int ob = bin(p3.margin3);
+                    o3n[ob]++;
+                    if (p3.pred == seq[known_idx]) { c3ok[b]++; o3ok[ob]++; }
                 }
             }
-            if (pend4[known_idx].pred >= 0 && known_idx >= 3) {
+            if (in_pend && known_idx >= 3 && pend4[known_idx].pred >= 0) {
                 const Pend4& p4 = pend4[known_idx];
                 int b = bin(p4.margin2);
                 c4n[b]++;
                 if (p4.d1 == seq[known_idx - 3] && p4.d2 == seq[known_idx - 2] &&
                     p4.d3 == seq[known_idx - 1]) {
                     c4pre[b]++;
-                    if (p4.pred == seq[known_idx]) c4ok[b]++;
+                    int ob = bin(p4.margin4);
+                    o4n[ob]++;
+                    if (p4.pred == seq[known_idx]) { c4ok[b]++; o4ok[ob]++; }
                 }
             }
-            if (pend5[known_idx].pred >= 0 && known_idx >= 4) {
+            if (in_pend && known_idx >= 4 && pend5[known_idx].pred >= 0) {
                 const Pend5& p5 = pend5[known_idx];
                 int b = bin(p5.margin2);
                 c5n[b]++;
                 if (p5.d1 == seq[known_idx - 4] && p5.d2 == seq[known_idx - 3] &&
                     p5.d3 == seq[known_idx - 2] && p5.d4 == seq[known_idx - 1]) {
                     c5pre[b]++;
-                    if (p5.pred == seq[known_idx]) c5ok[b]++;
+                    int ob = bin(p5.margin5);
+                    o5n[ob]++;
+                    if (p5.pred == seq[known_idx]) { c5ok[b]++; o5ok[ob]++; }
                 }
             }
             if (step >= N + (int)toks.size() - 2) break;
@@ -314,8 +330,8 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
                                   cudaMemcpyDeviceToHost));
             auto [d3, d3b, m3] = top2(l1);
-            (void)d3b; (void)m3;
-            if (known_idx + 3 < (int)pend3.size()) pend3[known_idx + 3] = {d3, m2, d1, d2};
+            (void)d3b;
+            if (known_idx + 3 < (int)pend3.size()) pend3[known_idx + 3] = {d3, m2, d1, d2, m3};
             // MTP pass 4: chain from pass-3 hidden, draft seq[known_idx+4]
             // (P3 depth-4 gate measurement; binned by pass-2 margin like E6)
             int mp4 = pos + 4;
@@ -326,8 +342,8 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
                                   cudaMemcpyDeviceToHost));
             auto [d4, d4b, m4] = top2(l1);
-            (void)d4b; (void)m4;
-            if (known_idx + 4 < (int)pend4.size()) pend4[known_idx + 4] = {d4, m2, d1, d2, d3};
+            (void)d4b;
+            if (known_idx + 4 < (int)pend4.size()) pend4[known_idx + 4] = {d4, m2, d1, d2, d3, m4};
             // MTP pass 5: chain from pass-4 hidden, draft seq[known_idx+5]
             int mp5 = pos + 5;
             CUDA_CHECK(cudaMemcpyAsync(e.d_token, &d4, 4, cudaMemcpyHostToDevice, e.stm));
@@ -337,8 +353,8 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(l1.data(), e.mtp_logits, (size_t)VOCAB * 4,
                                   cudaMemcpyDeviceToHost));
             auto [d5, d5b, m5] = top2(l1);
-            (void)d5b; (void)m5;
-            if (known_idx + 5 < (int)pend5.size()) pend5[known_idx + 5] = {d5, m2, d1, d2, d3, d4};
+            (void)d5b;
+            if (known_idx + 5 < (int)pend5.size()) pend5[known_idx + 5] = {d5, m2, d1, d2, d3, d4, m5};
             // restore d_token for the next step_free
             CUDA_CHECK(cudaMemcpy(e.d_token, &next_tok, 4, cudaMemcpyHostToDevice));
         }
@@ -384,6 +400,21 @@ int main(int argc, char** argv) {
                "extra t/round ~= +%.3f (ungated; net = this minus ~7%%/depth round tax)\n",
                100.0 * t5pre / (t5n ? t5n : 1), 100.0 * t5ok / (t5pre ? t5pre : 1),
                (double)t5ok / (t5n ? t5n : 1));
+        // accept-gate Phase 0b: same acceptance, binned by each pass's OWN
+        // margin (the live gate's actual per-step signal), prefix-conditioned.
+        // Flat rows across bins = margin does not predict acceptance at that
+        // depth -> theta-schedule complement is dead, yield feedback is the
+        // whole game (docs/acceptance-gate-design.md).
+        printf("  acceptance by OWN-pass margin, prefix ok (accept-gate Phase 0b):\n");
+        struct { const char* name; long *on, *ook; } own[3] = {
+            {"d3", o3n, o3ok}, {"d4", o4n, o4ok}, {"d5", o5n, o5ok}};
+        for (auto& d : own) {
+            printf("    %s:", d.name);
+            for (int b = 0; b < 5; b++)
+                printf("  %s=%5.1f%%(n=%ld)", bl[b],
+                       100.0 * d.ook[b] / (d.on[b] ? d.on[b] : 1), d.on[b]);
+            printf("\n");
+        }
         // cumulative gate margin>=theta; extra tokens/round ~= f * p(prefix|gate)
         // * p(d3|prefix,gate). Caveat: per-POSITION sampling; live rounds sample
         // accepted spans, so f here slightly understates the gated fraction.
