@@ -2107,3 +2107,21 @@ test_tokenizer PASS both modes, E2E smoke = byte-identical well-formed tool_use 
 modes on a clean call (no rescue fired, strict did not over-suppress). Default behavior
 byte-unchanged (knob off = old code path).
 
+**Strict-parser A/B campaign (same session) -- VERDICT: NOT engine-true; mode-1 rescue is
+load-bearing.** CC greedy, T2+T8, canonical server config (PMIN=0.5, slots 2), three legs:
+tolerant T8 **0.837**/150s with **12 rescued calls** (mode-1 dropped-wrapper, 2 fallback
+events, one on the OPENING turn); strict T8 **0.000**/4s -- the first assistant turn emits
+its tool calls wrapper-less, strict suppresses, CC sees text-only and one-shot-quits;
+strict + --constrain-tools T8 **0.549**/491s -- the grammar carries every wrapped call
+(session survives, 2.17M tokens) but ONE mid-session wrapper-less turn still bypasses it
+(the constrainer engages at <tool_call>; bare-JSON turns are invisible to it) and the lost
+calls degrade hidden_tests 0.94 -> 0.22. T2 was uninformative (one-shot-quit basin fired on
+BOTH legs -- tolerant's opener was un-rescuable even by the full chain, [drift] UN-RESCUED).
+Fairness: llama-server's chat parser has the same tolerance class (its own wrapper-less
+recovery), so cross-engine A/Bs remain apples-to-apples as SYSTEM comparisons; the refuted
+claim is only that q27's scores survive with rescues off. FOLLOW-UP LEVER (not built):
+engage the constrain grammar on a bare {"name" opener too -- closes the wrapper-less bypass
+and would make strict+constrain the true zero-rescue configuration. Logs:
+parser-{tolerant,strict,strictc}-server.log (session scratchpad). README quality-gates
+updated; this closes the last open red-team gate.
+

@@ -518,11 +518,20 @@ docs/perf-attribution-p14.md.
   DEFERRED pending explicit approval on the marginal Task 5 result.
 
 **Open quality gates (red-team pass 2026-07-05; P15 status 2026-07-07):**
-- strict-parser A/B rerun, both legs, tolerant-parser fallbacks disabled,
-  zero rescues required -- the proof that the 0.786 tie is engine-true
-  rather than harness-carried. UNBLOCKED by the P15 engage-lag fix; needs
-  a strict-parser knob (rescues are currently unconditional) + a
-  thunderdome campaign
+- strict-parser A/B -- **DONE 2026-07-08, verdict: NOT engine-true; the mode-1
+  (dropped-wrapper) rescue is load-bearing.** `Q27_TOOL_STRICT=1` severs every
+  rescue (plain-JSON wrapped calls only, bare-scan off, [q27-strict] logs count
+  suppressions). T8 CC greedy: tolerant **0.837** (12 mode-1 rescues incl. the
+  OPENING turn) / strict **0.000** (first-turn wrapper-less call suppressed ->
+  CC one-shot-quits) / strict + `--constrain-tools` **0.549** (grammar carries
+  wrapped calls, session survives 491s, but one mid-session wrapper-less turn
+  still bypasses the grammar -- the constrainer only engages at `<tool_call>`,
+  so a bare-JSON turn is invisible to it). Honest framing: q27+CC scores
+  measure engine+tolerant-parser as a SYSTEM; llama-server's chat parser has
+  the same tolerance class, so cross-engine A/Bs stay apples-to-apples.
+  Follow-up lever (not built): engage the constrain grammar on a bare
+  `{"name"` opener too, closing the wrapper-less bypass -- that would make
+  strict+constrain the zero-rescue configuration.
 - constraint-cost soak: one agentic soak with `--constrain-tools` on vs
   off (in-grammar acceptance cap 1/round is ~22 t/s inside call bodies;
   measure what that does to depth-heavy wall time before it defaults on)
