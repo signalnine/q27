@@ -2042,3 +2042,17 @@ prefill vs fp16(deq) (tol)` at bound 1e-1 (observed 4.265e-2; a fragment-layout 
 O(1)+ garbage). The same-err match between the old FAIL and the new tolerance PASS proves
 fp8q engages under =1 and disengages under =0 in one process. test_kernels ALL PASS (225),
 canonical 4c4120c7 holds.
+
+**verify-gemv Task 0 -- branch + fixtures + baseline (2026-07-08, branch `verify-gemv` off
+master 1709b93).** Fixtures regenerated (they were cleaned again): `scratchpad/prep_tokens.py`
+rewritten per docs/perf-attribution-p14.md lines 20-27 -- corpus `sorted(docs/*.md)+README.md`
+HF-tokenized with `hf-bf16/tokenizer.json`, tiled to 124,506 ids (max 248,068, matches the P14
+recipe exactly); emits prompt2k/16k/61k.txt + toks60k/75k.txt. Regen: `python3
+scratchpad/prep_tokens.py` from the repo root. NOTE the docs corpus GREW since P14 (18 files
+now), so text != P14's -- acceptance is content-dependent and much higher on the new corpus
+(templated BUILDLOG text): gated 61K decode is 163.2 t/s median n=3 (173 rounds/800 tok, 4.62
+tok/rnd) vs P14-era 124-125 -- NOT comparable, do not read as a speedup. The content-independent
+anchor reproduces: ungated nsys (node-trace, Q27_PROF_DECODE rig, 170 rounds) kernel-sums/round
+= batched verify GEMV **12.38 ms/rnd** (P14 12.24, +1.2%), single/draft **3.11** (exact),
+weight-stream total **15.49 vs 15.4 (+0.6%)** -- Task 0's 5% sanity gate PASS, harness valid.
+test_kernels ALL PASS, canonical 4c4120c7 exact.
