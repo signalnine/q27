@@ -38,7 +38,7 @@ declare -a PROMPTS=(
 )
 
 run_one() { # $1=ids -> prints "tps t_per_round" on stdout, full output to $2
-  CUDA_VISIBLE_DEVICES=0 "$BIN" "$MODEL" --tokens "$1" -n 128 --ctx 2048 --spec >"$2" 2>&1
+  CUDA_VISIBLE_DEVICES=${BENCH_GPU:-0} "$BIN" "$MODEL" --tokens "$1" -n 128 --ctx 2048 --spec >"$2" 2>&1
   sed -n 's/^spec decode:.*= \([0-9.]*\) t\/s (\([0-9.]*\) tokens\/round.*/\1 \2/p' "$2"
 }
 

@@ -2887,3 +2887,39 @@ no-think/greedy defaults; vLLM nightly's --default-chat-template-kwargs +
 --override-generation-config close the parity gap server-side. New
 thunderdome adapter claude-code-vllm-haight (approved) mirrors the other
 legs byte-for-byte.
+
+## 2026-07-09 (q27 on the RTX 3090, sm_86) -- same scores, 7-12x wall; 32K is the practical ctx ceiling; arch-probe fix validated on real Ada-less silicon
+
+Base model, production config, GPU 1 (vox transcribers unloaded for the run).
+
+**Canonical forks ACROSS ARCHITECTURES (fp16 KV): 3090 = 6894254e...** vs
+5090 a2982c51 -- internally width-invariant (ungated == gated == auto), so
+the bitwise contract holds PER-ARCH; sm_86 codegen/ULP differences fork the
+tie-heavy trajectory exactly like cross-build lotteries. (The fp8-KV leg
+happens to land on the 5090 md5 -- coincidence of this trajectory, not a
+guarantee.) shortbench_suite gained BENCH_GPU= and the 3090 gates on its
+own canonical.
+
+**Throughput:** shortbench suite 87.9 t/s (55% of the 5090's 161.1, on 52%
+of the bandwidth; per-prompt tok/round identical -- pure hardware scaling).
+cctx replay d5 58.2 / auto 59.7 (36% of 5090; trajectory basin-forked, own
+numbers). Canonical-fixture decode 84.5 vs 131.5.
+
+**Serving envelope:** --ctx 65536 OOMs at CUDA-graph instantiation (model
+17.7GB + graph set + 2.2GB KV > 24GB); --ctx 32768 serves at 23.1GB.
+[pfattn] logged "loaded image sm_86 < sm_89: fp8-MMA prefill unavailable"
+-- the review follow-up #4 arch-probe gate doing its job on real hardware.
+
+**Trials (claude-code-q27-haight -> :8081 on GPU 1):**
+    T4 phantom-invoice  0.83 @164s   (5090: 0.833 @23s)
+    T6 monorepo         0.85 @496s   (5090: 0.850 @42s)
+    T2 collab-server    NOT VIABLE at 32K: conversation outgrows ctx; the
+    server 400s correctly (5x ctx-limit) but CC does NOT compact against a
+    32K window (its compaction assumptions target Anthropic-sized windows,
+    the 07-05 ops-note risk realized) -- terminal "Prompt is too long".
+
+Read: scores are IDENTICAL to the 5090 -- quality is the model + parser,
+fully preserved on sm_86; wall is 7-12x (bandwidth + no fp8-MMA prefill +
+f16 fallbacks). The 3090 is a functional overflow/test device for small-ctx
+agentic work, not a serving peer. CC-vs-small-window compaction is the real
+limiter for bigger tasks, not the engine.
