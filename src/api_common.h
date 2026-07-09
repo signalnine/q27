@@ -466,9 +466,58 @@ inline std::string infer_tool_name(const json& tools, const json& args) {
 // the raw object first (never disturbs a working mode-6 rescue); only when that
 // fails, peel single-key object shells (bounded) and retry. On success the
 // caller gets the INNER args -- the shell must not reach the tool.
+// Drift mode 8 (2026-07-09, base Qwen3.6-27B-MTP, T10 ecommerce first turn,
+// stable at greedy): the call object is well-formed but names the tool under
+// a string-valued ALIAS key -- {"function": "Read", "arguments": {...}} --
+// typically batched, behind a dangling {"name": prefix line, with a stray
+// </tool_call> closer. Resolve the alias against the REGISTERED tool names
+// only (a prose JSON example with an unregistered value must not become a
+// call); args = the sibling arguments/parameters/input object, else the
+// remainder minus the alias key.
+inline bool resolve_aliased_call(const json& tools, const json& obj, std::string& name,
+                                 json& args) {
+    if (!tools.is_array() || !obj.is_object()) return false;
+    static const char* aliases[] = {"function", "tool", "tool_name"};
+    const char* akey = nullptr;
+    std::string cand;
+    for (const char* a : aliases)
+        if (obj.contains(a) && obj[a].is_string()) { cand = obj[a]; akey = a; break; }
+    if (!akey || cand.empty()) return false;
+    bool registered = false;
+    for (const auto& t : tools) {
+        std::string nm;
+        if (t.is_object() && t.contains("function") && t["function"].is_object())
+            nm = t["function"].value("name", std::string());
+        if (nm.empty() && t.is_object()) nm = t.value("name", std::string());
+        if (nm == cand) { registered = true; break; }
+    }
+    if (!registered) return false;
+    static const char* argkeys[] = {"arguments", "parameters", "input"};
+    for (const char* k : argkeys)
+        if (obj.contains(k) && obj[k].is_object()) {
+            name = cand;
+            args = obj[k];
+            return true;
+        }
+    json rest = obj;
+    rest.erase(akey);
+    if (!rest.is_object()) return false;
+    name = cand;
+    args = std::move(rest);
+    return true;
+}
+
 inline std::string infer_tool_name_unwrapped(const json& tools, json& args) {
     std::string nm = infer_tool_name(tools, args);
     if (!nm.empty()) return nm;
+    { // mode 8: the extracted object itself is an alias-named call
+        std::string an;
+        json aa;
+        if (resolve_aliased_call(tools, args, an, aa)) {
+            args = std::move(aa);
+            return an;
+        }
+    }
     static const char* shells[] = {"function", "arguments", "parameters", "input", "tool_call"};
     json u = args;
     for (int hop = 0; hop < 3 && u.is_object() && u.size() == 1; hop++) {
@@ -556,7 +605,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     text_in.c_str());
         return out;
     }
-    bool m2 = false, m5 = false, m6 = false;        // drift-mode flags (exit-gate catalog)
+    bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
     const std::string text = escape_content_tags(text_in);
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
     const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
@@ -638,14 +687,16 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             continue;
         }
         const std::string& seg = san;
-        bool shaped = false, m6cand = false;
-        json j6;
+        bool shaped = false, m6cand = false, m8cand = false;
+        json j6, j8;
         try {
             json j = json::parse(seg);
             shaped = j.is_object() && j.contains("name") && j.contains("arguments");
             if (!shaped && j.is_object() && j.contains("name") &&
                 j["name"].is_object() && !j.contains("arguments")) {
                 m6cand = true; j6 = std::move(j);
+            } else if (!shaped && j.is_object()) {
+                m8cand = true; j8 = std::move(j);
             }
         } catch (...) {}
         if (shaped) {
@@ -670,6 +721,19 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 i = text.find('{', end + 1);
                 continue;
             }
+        } else if (m8cand && tools) {
+            // mode 8: alias-named call object ({"function": "Read", ...});
+            // registered-name validation inside keeps prose JSON out
+            std::string an;
+            json aa;
+            if (resolve_aliased_call(*tools, j8, an, aa)) {
+                ToolCall tc; tc.ok = true; tc.name = std::move(an); tc.arguments = std::move(aa);
+                if (first == std::string::npos) first = i;
+                out.push_back(std::move(tc));
+                m8 = true;
+                i = text.find('{', end + 1);
+                continue;
+            }
         }
         i = text.find('{', i + 1);
     }
@@ -684,6 +748,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // drop a dangling {"tool_call": opener fragment (mode-4 wrapper junk)
         if (p.size() >= 13 && p.compare(p.size() - 13, 13, "{\"tool_call\":") == 0)
             p = strip_ws2(p.substr(0, p.size() - 13));
+        // drop a dangling {"name": opener fragment (mode-6/8 hybrid prefix line)
+        if (p.size() >= 8 && p.compare(p.size() - 8, 8, "{\"name\":") == 0)
+            p = strip_ws2(p.substr(0, p.size() - 8));
         *prefix = p;
     }
     // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
@@ -697,6 +764,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         if (m4) modes[mi++] = '4';
         if (m5) modes[mi++] = '5';
         if (m6) modes[mi++] = '6';
+        if (m8) modes[mi++] = '8';
         modes[mi] = 0;
         fprintf(stderr, "[drift] recovered=%zu modes=%s\n", out.size(), modes);
     } else if (text_in.find("{\"name\"") != std::string::npos ||

@@ -363,7 +363,30 @@ int main(int argc, char** argv) {
         auto v9 = q27::parse_bare_tool_calls(
             "{\"name\":\n{\"file_path\": \"/w/a.md\"}}", &pre, &tools8);
         bool ok9 = v9.size() == 1 && v9[0].name == "Read";
-        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9;
+        // eighth observed mode (2026-07-09, base Qwen3.6-27B-MTP, T10
+        // ecommerce first turn, stable at greedy -- one-shot-quit root
+        // cause): well-formed call objects naming the tool under a
+        // string-valued "function" alias, batched, behind a dangling
+        // {"name": prefix line, with a stray </tool_call> closer. All
+        // calls must recover and the dangling opener must not leak into
+        // the text prefix.
+        auto v10 = q27::parse_bare_tool_calls(
+            "I'll examine the structure.\n\n{\"name\":\n"
+            "{\"function\": \"Read\", \"arguments\": {\"file_path\": \"/w/src/types.ts\"}}\n"
+            "{\"function\": \"Read\", \"arguments\": {\"file_path\": \"/w/src/bus.ts\"}}\n"
+            "{\"function\": \"Read\", \"arguments\": {\"file_path\": \"/w/package.json\"}}\n"
+            "</tool_call>", &pre, &tools8);
+        bool ok10 = v10.size() == 3 && v10[0].name == "Read" && v10[2].name == "Read" &&
+                    v10[0].arguments.value("file_path", "") == "/w/src/types.ts" &&
+                    v10[2].arguments.value("file_path", "") == "/w/package.json" &&
+                    pre == "I'll examine the structure.";
+        // an alias value NOT in the registry must never become a call
+        // (prose JSON examples stay prose)
+        auto v11 = q27::parse_bare_tool_calls(
+            "{\"function\": \"rm_rf\", \"arguments\": {\"path\": \"/\"}}", &pre, &tools8);
+        bool ok11 = v11.empty();
+        bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
+                  ok10 && ok11;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }
