@@ -2923,3 +2923,31 @@ fully preserved on sm_86; wall is 7-12x (bandwidth + no fp8-MMA prefill +
 f16 fallbacks). The 3090 is a functional overflow/test device for small-ctx
 agentic work, not a serving peer. CC-vs-small-window compaction is the real
 limiter for bigger tasks, not the engine.
+
+## 2026-07-09 (llama.cpp on the 3090) -- decode TIES q27 on sm_86; both engines cap at 32K; CC-vs-32K fragility is engine-independent
+
+Mirror of the q27-3090 leg: mainline 1491, base Q4_K_M, draft-mtp 10/0.5,
+q8 KV, GPU 1. -c 131072 and 65536 both fail context creation on 24GB (then
+segv on llama's own error path); -c 32768 serves at 23.85GB -- MORE than
+q27's 23.1GB at the same ctx (fp8 KV + graphs beats q8 KV on footprint).
+
+**cctx replay @25.8K, warm medians: llama 60.4 t/s vs q27 58.2 (d5) /
+59.7 (auto) -- a TIE.** The 5090's 1.65x q27 lead on this payload
+evaporates on sm_86: no fp8-MMA, f16 fallbacks, and wider verify rounds
+cost more per ms, so both engines sit on the same bandwidth wall
+(basin-forked trajectories; +/-5% is noise here).
+
+**Trials at the 32K ceiling:** llama T4 crashed @37s (0.65 partial, CC
+exit after 17 turns at ~30.6K in) and T6 crashed @40s (0.81 partial, 36
+turns, ~30.4K) -- both died at conversation ~= ctx - margin, where llama's
+context error is a shape CC treats as terminal. q27 completed T4 0.83 /
+T6 0.85 at the same window because its trajectories stayed under 32K --
+its T2 died identically when the conversation outgrew the window. Verdict:
+at 32K windows CC agentic work is trajectory-lottery-gated on EVERY
+engine; the 3090 is a small-task/overflow device, and CC's
+compaction-vs-small-window mismatch (07-05 ops note) is the binding
+constraint, not either engine.
+
+3090 box score (base model, same day): decode ~58-60 t/s both engines;
+q27 completes 2/3 trials at identical-to-5090 scores; llama 0/2 at this
+window. vox transcribers were stopped for the runs.
