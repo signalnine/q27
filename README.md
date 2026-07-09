@@ -1,6 +1,14 @@
 # q27
 
-A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + trained-in MTP heads) on a single RTX 5090. One model, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
+A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090. One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4).
+
+**Baseline model (2026-07-09): vanilla Qwen3.6-27B-MTP** (`qwen36-27b-mtp`,
+canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate
+scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
+`CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
+Historical numbers in this README were measured on Qwopus unless noted --
+the base model runs ~8% slower at equal settings (pure spec-acceptance gap,
+same weights-shape: shortbench 166.1 vs 179.7).
 
 ## State of the engine (2026-07-08)
 

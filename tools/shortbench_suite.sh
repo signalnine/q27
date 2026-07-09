@@ -20,12 +20,12 @@
 #
 # Usage: tools/shortbench_suite.sh [model.q27]
 set -u
-MODEL="${1:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}"
+MODEL="${1:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}"
 BIN="$(dirname "$0")/../build/q27"
-# Qwopus canonical (fd2-era; Q27_FD=v1 -> 58b6ae85...). Other models carry
-# their own baseline: CANON_MD5=<md5> env overrides (qwen36-27b-mtp base:
-# a2982c5197c627551b27d76a0a94b220, established 2026-07-08).
-CANON_MD5="${CANON_MD5:-4c4120c72056aba2bc2d2561471eafce}"
+# Baseline canonical: vanilla qwen36-27b-mtp (the benchmark standard,
+# 2026-07-09). Fine-tunes carry their own: CANON_MD5=<md5> env overrides
+# (Qwopus fd2-era: 4c4120c72056aba2bc2d2561471eafce; Q27_FD=v1 -> 58b6ae85...).
+CANON_MD5="${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}"
 
 CANON_IDS="760,6511,314,9338,369"
 declare -a NAMES=(hash-table merge-sorted planets translate-fr tcp-vs-udp)
