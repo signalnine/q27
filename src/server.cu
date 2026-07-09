@@ -166,14 +166,18 @@ int main(int argc, char** argv) {
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
         if (si > 0) {
-            // coarse per-slot floor: 5 GDN buffer sets (~3 GB) + KV + MTP KV
-            // + slack; skip extra slots rather than abort on cudaMalloc
+            // coarse per-slot floor: GDN recurrent state (exact bytes from
+            // slot 0's own allocation -- review 2026-07-09: the old "5 sets
+            // ~3GB" constant predated the maxd6/7 widenings) + prefill/attn
+            // scratch (~700 MB) + KV + MTP KV + slack; skip extra slots
+            // rather than abort on cudaMalloc
             size_t freeb = 0, totalb = 0;
             cudaMemGetInfo(&freeb, &totalb);
             // KV bytes/token from the engine's own sizing (34 KB at 1-byte
             // elements, 68 KB fp16) -- slots[0] is always constructed first
             size_t kvb = (size_t)sctx * 34 * 1024 * slots[0].eng->kv_esz();
-            size_t need = (3500ull << 20) + kvb + (kvb >> 3) + (512ull << 20);
+            size_t need = slots[0].eng->gdn_state_bytes + (700ull << 20) + kvb + (kvb >> 3) +
+                          (512ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);
@@ -303,7 +307,8 @@ int main(int argc, char** argv) {
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
                 ms_since(srv_t0),
-                // P13: cumulative adaptive-maxd activity on this engine (auto only)
+                // P13: adaptive-maxd activity, per request (dctl resets at
+                // generate() entry -- review 2026-07-09 isolation fix)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
                                         " md4=%ld md5=%ld md6=%ld md7=%ld mprom=%ld"
                                         " mdem=%ld",

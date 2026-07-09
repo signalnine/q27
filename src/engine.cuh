@@ -233,6 +233,9 @@ struct Engine {
     // MTP passes/round and only pays off on high-acceptance (agentic) traffic
     // (+2.6% agentic, -8% docs), so it is opt-in.
     int gate_maxd = 4;
+    // exact bytes of resident GDN recurrent state (all S buffers + conv
+    // rings, every set); accumulated at alloc, read by server slot admission
+    size_t gdn_state_bytes = 0;
     // Single source for every context guard/clamp (generate() loop, CLI spec
     // loop, server n_max clamps). A full-width verify round launched at P
     // writes attention-KV rows P+1..P+gate_maxd+1 and MTP-KV rows
@@ -252,7 +255,10 @@ struct Engine {
     bool maxd_auto = false;
     cudaGraphExec_t draft_graph_lo[8] = {}; // depth-4 draft (auto mode only)
     DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
-                   // CPU tests (tools/test_depthctl.cpp); semantics unchanged
+                   // CPU tests (tools/test_depthctl.cpp). Engine-lifetime
+                   // object, request-lifetime STATE: generate() calls
+                   // dctl.reset() at entry (review 2026-07-09), so each
+                   // request starts at k_min and earns its own depth.
     // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
     // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
     // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
@@ -547,10 +553,21 @@ struct Engine {
                 A((void**)&ring_spare4[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare5[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // P12b
                 A((void**)&ring_spare5[il], 3 * GDN_CH * 4);
+                // spare sets 6/7 are allocated at EVERY gate_maxd (review
+                // 2026-07-09, accepted tradeoff ~157MB each): the perm
+                // rotation is uniformly mod-8 ((role+perm)%8), so all 8 sets
+                // enter rotation even at shallow ceilings. A width-dependent
+                // modulus would save the VRAM but complicate the
+                // refinish_round rewind (the P15-hardened state machinery).
                 A((void**)&S_spare6[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd6
                 A((void**)&ring_spare6[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare7[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd7
                 A((void**)&ring_spare7[il], 3 * GDN_CH * 4);
+                // 9 S-buffers (main + 7 spares + snap) + 9 rings per GDN layer
+                // -- keep in sync when adding sets; server slot admission
+                // sizes its floor from this (review 2026-07-09: the old
+                // hardcoded "5 sets ~3GB" predated maxd6/7)
+                gdn_state_bytes += 9ull * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -1839,6 +1856,9 @@ struct Engine {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
+        // per-request depth-controller isolation (review 2026-07-09): without
+        // this, unrelated requests inherit the previous tenant's ceiling/EMAs
+        if (maxd_auto) dctl.reset();
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly

@@ -2327,8 +2327,13 @@ All env-tunable: Q27_MAXD_HI/HI6/FLO6/LO/EMA.
 **Measured (CLI legs + server replay A/B, fp8 KV + fast-head, greedy theta 0.5):**
 
     cctx (real-CC flavor)   d4 202.6 | d5 216.1 | d6 222.0 (+2.7% vs d5, 7-tok
-    rounds on 64%) | auto(server, warm) 222.6 = +4.7% vs d5 -- auto BEATS fixed-6
-    by demoting through weak stretches. Emitted text BYTE-IDENTICAL d4/5/6/auto.
+    rounds on 64%) | auto(server, warm) 222.6 -- auto matches-or-beats fixed-6
+    by demoting through weak stretches. [CORRECTED 2026-07-09, review: this
+    line originally claimed +4.7% vs d5, but 222.6 is a warm-SERVER number and
+    the d5 216.1 here is a CLI leg -- cross-harness, so the +4.7% is not a
+    valid delta; vs the CLI d5 it is +3.0%. Same-harness rerun on the
+    post-review binary: see the 2026-07-09 review-fixes entry.]
+    Emitted text BYTE-IDENTICAL d4/5/6/auto.
     Ladder live: 2 promotes 0 demotes, final ceiling 6.
     Envelope auto vs Phase-1 auto: echo/codegen/testgen/docs61k never promote to 6
     (sat5 .12-.30 vs hi6) -> within noise (+0.6..-1.2%); docs (the bursty boundary
