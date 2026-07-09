@@ -2453,3 +2453,31 @@ Scores: q27 above llama on both tasks at n=1; treat as basin samples. Both
 engines' first-turn behavior on the base model depends on their tolerant
 parsers (q27 needed the mode-7 rescue; llama's own wrapper-less recovery
 carried its legs -- same tolerance class, system-fair).
+
+## 2026-07-09 (three-stack cctx shootout) -- q27 222.6 vs vLLM-NVFP4+MTP 155.5 vs llama 98.4 t/s
+
+Third leg of the cross-engine comparison: PrismaSCOUT NVFP4 (rdtand mixed
+NVFP4+BF16 export of BASE Qwen3.6-27B, 5.31 bpp, compressed-tensors) on vLLM
+nightly v0.23.1rc1.dev748, 5090-pinned, kv fp8, 32K len (vllm-serve keys
+prismascout-27b[-mtp] added in the 5090-local-llm repo). Same cctx payload
+(25.8K CC transcript), decode isolated as wall(256) - wall(1) since vLLM
+AUTO-DISABLES prefix caching on hybrid-GDN models (enable_prefix_caching=False
+in the engine config; hit rate 0%) -- every request re-prefills.
+
+    decode @ cctx 25.8K       t/s     bpw    notes
+    q27 auto ladder          222.6    5.25   96.7% prefix-cache in live serving
+    vLLM PrismaSCOUT MTP k=3 155.5    5.31   MTP +112% on this stack/payload
+    llama Q4_K_M tuned        98.4    4.98   draft-mtp 10/0.5, accept 66%
+    vLLM PrismaSCOUT no-MTP   73.5    5.31
+
+Two findings that update priors: (1) the July "vLLM MTP net-negative on 5090"
+does NOT generalize -- that was modelopt+marlin at short ctx; on
+compressed-tensors + current nightly + echo-heavy 26K traffic MTP k=3 is
++112%. Both results stand in their contexts; the finding is
+backend/payload-conditional. (2) The bigger structural gap for AGENTIC serving
+is prefix caching: the hybrid-GDN recurrent state makes APC all-or-nothing,
+vLLM punts (0% reuse -> every CC turn re-prefills the whole conversation,
+2.5-2.7s at 26K and growing with depth), llama checkpoint-searches, and q27's
+P8/P9 snapshot+checkpoint machinery ran 96.7% reuse over the live trials.
+Batch-1 decode at matched depth: q27 +43% over vLLM's best leg despite NVFP4
+tensor-core dequant -- bandwidth-bound decode doesn't care about MMA peak.
