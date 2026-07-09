@@ -2327,8 +2327,13 @@ All env-tunable: Q27_MAXD_HI/HI6/FLO6/LO/EMA.
 **Measured (CLI legs + server replay A/B, fp8 KV + fast-head, greedy theta 0.5):**
 
     cctx (real-CC flavor)   d4 202.6 | d5 216.1 | d6 222.0 (+2.7% vs d5, 7-tok
-    rounds on 64%) | auto(server, warm) 222.6 = +4.7% vs d5 -- auto BEATS fixed-6
-    by demoting through weak stretches. Emitted text BYTE-IDENTICAL d4/5/6/auto.
+    rounds on 64%) | auto(server, warm) 222.6 -- auto matches-or-beats fixed-6
+    by demoting through weak stretches. [CORRECTED 2026-07-09, review: this
+    line originally claimed +4.7% vs d5, but 222.6 is a warm-SERVER number and
+    the d5 216.1 here is a CLI leg -- cross-harness, so the +4.7% is not a
+    valid delta; vs the CLI d5 it is +3.0%. Same-harness rerun on the
+    post-review binary: see the 2026-07-09 review-fixes entry.]
+    Emitted text BYTE-IDENTICAL d4/5/6/auto.
     Ladder live: 2 promotes 0 demotes, final ceiling 6.
     Envelope auto vs Phase-1 auto: echo/codegen/testgen/docs61k never promote to 6
     (sat5 .12-.30 vs hi6) -> within noise (+0.6..-1.2%); docs (the bursty boundary
@@ -2595,3 +2600,83 @@ bytes) across the pair: chunk-split breaks the fp summation tree (bitwise
 Task 2 era). The surviving width-8 economics: +2.33 ms/round marginal
 (post launch-bounds), structural in equal parts GEMV lane-loop and fd2
 per-lane KV. Depth-7 stays opt-in; the ladder 4..6 remains the optimum.
+
+## 2026-07-09 (external review 623cdb1..f2dddbc) -- 2 P0 + 4 P1 all verified and fixed; DepthCtl lifetime made a deliberate, measured choice
+
+External review of the maxd6/maxd7/accept-gate range landed 6 findings (2 P0,
+4 P1) + notables. Every finding verified against the code before fixing; all
+confirmed (one sub-claim relocated: string-value \uXXXX was already strict --
+the incomplete-escape hole was the KEY-string escape path).
+
+**P0 #1 -- ctx admission was depth-5-era at every guard.** The maxd6/7
+widenings never re-audited the context guards: generate()'s loop stopped at
+`P+7 > max_ctx`, the CLI spec loop likewise, and all six server n_max clamps
+reserved `-6` -- but a full-width round at gate_maxd 6/7 writes attention-KV
+rows through P+8 (MTP rows through P+7), overrunning the caches by up to 2
+rows near the ceiling (silent corruption the prefix cache could then reuse).
+All seven sites now derive from one accessor, `Engine::ctx_round_reserve()
+= gate_maxd + 2`. Boundary-tested at --ctx 32 / Q27_MAXD=7 under
+compute-sanitizer (fp16 + fp8 KV): guard stops at P=24 (24+9>32), 0 errors.
+
+**P0 #2 -- direct CLI had no prompt/generation bounds.** Ingestion stepped
+an arbitrary tokens-file into caches sized --ctx (the "8K tokens-file dies
+at default ctx" gotcha was this bug wearing a stats costume), and the final
+d_gen copy read `prompt+n_gen` ints from a max_ctx-sized buffer. Now: refuse
+prompt > ctx, clamp n_gen, refuse --nll-chunk > ctx (nll-long already
+clamped).
+
+**P1 #3 -- mask cache could cross tool allowlists.** ToolGrammar::signature()
+(the server-global mask-cache key) omitted names_, so requests with different
+tool sets collided at equal grammar states -- B could be steered into A's
+tools. Signature now appends a sorted allowlist key. Regression R1.
+
+**P1 #4 -- top-p broke at high temperature.** The cutoff bisection searched
+raw logits [M-40, M] while mass is inv_temp-scaled: at T=10 the window spans
+4 scaled nats and the threshold pinned at M-40 (a two-tier test distribution
+kept 44% for top_p=0.95). Window is now 40*max(1,T) raw = >=40 scaled nats;
+T<=1 bitwise-unchanged. GPU test 3b: thresh -61.3, mass 0.9502.
+
+**P1 #5 -- ChatML stripping missed the OpenAI path + tools.** apply_chat_template
+concatenated raw roles/content (server OpenAI chat bypassed api_common's
+strip_ctrl entirely); tools_preamble dumped declarations verbatim. Both
+boundaries now strip <|im_start|>/<|im_end|>; forged messages tokenize
+identically to their pre-stripped equivalents (test).
+
+**P1 #6 -- ToolGrammar accepted JSON that json::parse rejects.** Single J_NUM
+state took 1..2e+-3 / 01 / 1e5e5; ',' before '}' / ']' fell into the
+empty-object/array cases (trailing commas); J_KEYESC took '\u' in one hop
+(\uZZ in keys). Full JSON number FSM (8 states, leading-zero rule), _REQ
+states after commas, 4-hex key-escape states. Regression R2 (25 cases).
+
+**Notables:**
+- **DepthCtl lifetime**: reviewer flagged docs-vs-behavior mismatch
+  (engine-lifetime state described as per-stream). Built reset() + hooked it
+  per-request, then MEASURED it: cctx auto 207.9 vs d5 211.3 (-1.6%) -- a
+  50-round request spends its life re-earning depth; docs61k neutral.
+  Decision: carry stays the DEFAULT (single-user rig, multi-tenant out of
+  scope per SECURITY-MODEL.md, consecutive requests are turns of one
+  conversation); Q27_MAXD_RESET=1 opts into per-request isolation.
+  reset() + 6 CPU checks stay.
+- **Slot admission floor** derived from a depth-5-era "5 GDN sets ~3GB"
+  constant -> engines report exact gdn_state_bytes, admission uses it.
+- **S_spare6/7 always allocated** (~157MB each at any gate_maxd): accepted
+  and documented -- perm rotation is uniformly mod-8, so all 8 sets enter
+  rotation even at shallow ceilings; a width-dependent modulus would
+  complicate the P15-hardened refinish machinery for pure VRAM savings.
+- **BUILDLOG 2026-07-08 "+4.7%" corrected**: 222.6 was warm-server vs a CLI
+  d5 leg (cross-harness). Same-harness rerun on the post-review binary
+  (server replay, fresh server per leg, 1 cold + 3 warm medians, Q27_KV=fp8
+  Q27_PMIN=0.5 Q27_DEXIT=1): cctx @25.8K d5 211.9 vs auto 220.7 = **+4.2%**;
+  docs61k @61K d5 111.5 vs auto 109.9 (-1.4%, known bursty-flavor noise;
+  round-grouping flickers across replays under carry -- emitted tokens
+  identical). No 100K payload exists; rerun scope is 26K + 61K.
+  README's three +4.7% sites corrected to the same-harness numbers.
+
+**Gates:** canonical 4c4120c7 EXACT at MAXD 4/5/6/7/auto/auto7 (+ auto/auto7
+with Q27_MAXD_RESET=1); base-model canonical a2982c51 EXACT; test_kernels
+ALL PASS (incl. new high-T nucleus); test_depthctl 46 PASS; test_toolconstrain
+ALL PASS (incl. R1/R2); test_tokenizer suite PASS (incl. both-boundary
+sanitize); compute-sanitizer clean on the ctx-boundary rig (fp16 + fp8 KV).
+
+Out of this pass: Makefile wiring for test_toolconstrain (pending approval --
+build/run documented in the test header meanwhile).

@@ -259,6 +259,75 @@ static void test_closer_disengages() {
     CHECK(r.tc.disengaged == 0); // clean close is not a disengage
 }
 
+// R1 (review 2026-07-09 P1 #3): masks are keyed by the tool-name allowlist.
+// The cache is server-global and shared across requests; before the fix, two
+// grammars at the same state with DIFFERENT allowlists collided on one cache
+// entry, so request B could be steered into request A's tool names.
+static void test_r1_allowlist_in_cache_key() {
+    FakeTok tok = mk_tok();
+    q27::ToolMaskCache cache;
+    cache.init(&tok.vocab, T_CLOSER);
+    q27::ToolGrammar ga, gb;
+    ga.reset({"get_project"});
+    gb.reset({"run_tests"});
+    CHECK(ga.signature() != gb.signature());
+    const char* pre = "{\"name\": \"";
+    CHECK(ga.advance_str(pre));
+    CHECK(gb.advance_str(pre));
+    int ia = cache.get(ga), ib = cache.get(gb);
+    CHECK(ia != ib);
+    const auto& ma = cache.mask(ia);
+    const auto& mb = cache.mask(ib);
+    CHECK(ma[T_GET >> 5] & (1u << (T_GET & 31)));    // "get" legal under A
+    CHECK(!(mb[T_GET >> 5] & (1u << (T_GET & 31)))); // ...and illegal under B
+    // registration order must not fragment the cache (canonicalized key)
+    q27::ToolGrammar gc, gd;
+    gc.reset({"aa", "bb"});
+    gd.reset({"bb", "aa"});
+    CHECK(gc.signature() == gd.signature());
+}
+
+// R2 (review 2026-07-09 P1 #6): the grammar must reject malformed JSON that
+// json::parse downstream would reject -- otherwise constrained decode can
+// still produce an unparseable tool call.
+static bool accepts_args(const std::string& args_json) {
+    q27::ToolGrammar g;
+    g.reset({"t"});
+    if (!g.advance_str("{\"name\": \"t\", \"arguments\": " + args_json + "}")) return false;
+    return g.done();
+}
+static void test_r2_strict_json() {
+    // valid JSON stays sampleable
+    CHECK(accepts_args("{\"x\": 1}"));
+    CHECK(accepts_args("{\"x\": -0.5}"));
+    CHECK(accepts_args("{\"x\": 0}"));
+    CHECK(accepts_args("{\"x\": -0}"));
+    CHECK(accepts_args("{\"x\": 1e5}"));
+    CHECK(accepts_args("{\"x\": 1E+5}"));
+    CHECK(accepts_args("{\"x\": 0.25e-3}"));
+    CHECK(accepts_args("{\"x\": [1, 2.5, -3e2]}"));
+    CHECK(accepts_args("{\"x\": []}"));
+    CHECK(accepts_args("{\"x\": {}}"));
+    CHECK(accepts_args("{\"x\": \"\\u0041\"}"));
+    CHECK(accepts_args("{\"\\u0041\": 1}"));
+    // malformed numbers (old single J_NUM state accepted all of these)
+    CHECK(!accepts_args("{\"x\": 1..2}"));
+    CHECK(!accepts_args("{\"x\": 1e+-3}"));
+    CHECK(!accepts_args("{\"x\": --1}"));
+    CHECK(!accepts_args("{\"x\": +1}"));
+    CHECK(!accepts_args("{\"x\": 1e}"));
+    CHECK(!accepts_args("{\"x\": 1e5e5}"));
+    CHECK(!accepts_args("{\"x\": 01}"));
+    CHECK(!accepts_args("{\"x\": 1.}"));
+    CHECK(!accepts_args("{\"x\": .5}"));
+    CHECK(!accepts_args("{\"x\": -}"));
+    // trailing commas
+    CHECK(!accepts_args("{\"x\": 1,}"));
+    CHECK(!accepts_args("{\"x\": [1,]}"));
+    // incomplete \u escape in an object key (old J_KEYESC took 'u' in one hop)
+    CHECK(!accepts_args("{\"\\uZZ00\": 1}"));
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -271,6 +340,8 @@ int main() {
     test_m3_pool_dead_stops_scan();
     test_m4_closed_within_entry_token();
     test_closer_disengages();
+    test_r1_allowlist_in_cache_key();
+    test_r2_strict_json();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

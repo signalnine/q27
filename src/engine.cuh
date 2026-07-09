@@ -233,6 +233,17 @@ struct Engine {
     // MTP passes/round and only pays off on high-acceptance (agentic) traffic
     // (+2.6% agentic, -8% docs), so it is opt-in.
     int gate_maxd = 4;
+    // exact bytes of resident GDN recurrent state (all S buffers + conv
+    // rings, every set); accumulated at alloc, read by server slot admission
+    size_t gdn_state_bytes = 0;
+    // Single source for every context guard/clamp (generate() loop, CLI spec
+    // loop, server n_max clamps). A full-width verify round launched at P
+    // writes attention-KV rows P+1..P+gate_maxd+1 and MTP-KV rows
+    // P+1..P+gate_maxd, so a round may only launch while
+    // P + ctx_round_reserve() <= max_ctx. Review 2026-07-09 P0 #1: the
+    // depth-5-era hardcoded 7 (and the servers' -6) overran the caches by up
+    // to 2 rows when gate_maxd reached 6/7.
+    int ctx_round_reserve() const { return gate_maxd + 2; }
     // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
     // between 4 and 5 from realized acceptance, so agentic streaks get depth-5
     // (+2.6%) while prose stays depth-4 (no -8% draft tax) -- automatically, per
@@ -244,7 +255,14 @@ struct Engine {
     bool maxd_auto = false;
     cudaGraphExec_t draft_graph_lo[8] = {}; // depth-4 draft (auto mode only)
     DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
-                   // CPU tests (tools/test_depthctl.cpp); semantics unchanged
+                   // CPU tests (tools/test_depthctl.cpp). ENGINE-lifetime
+                   // state, deliberately (review 2026-07-09): warm start
+                   // across same-conversation turns beats per-request
+                   // re-earning by a measured 1.6% on short requests, and
+                   // multi-tenant isolation is out of scope
+                   // (SECURITY-MODEL.md). Q27_MAXD_RESET=1 flips to
+                   // per-request reset at generate() entry.
+    bool maxd_reset = false; // Q27_MAXD_RESET=1: reset dctl per request
     // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
     // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
     // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
@@ -539,10 +557,21 @@ struct Engine {
                 A((void**)&ring_spare4[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare5[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // P12b
                 A((void**)&ring_spare5[il], 3 * GDN_CH * 4);
+                // spare sets 6/7 are allocated at EVERY gate_maxd (review
+                // 2026-07-09, accepted tradeoff ~157MB each): the perm
+                // rotation is uniformly mod-8 ((role+perm)%8), so all 8 sets
+                // enter rotation even at shallow ceilings. A width-dependent
+                // modulus would save the VRAM but complicate the
+                // refinish_round rewind (the P15-hardened state machinery).
                 A((void**)&S_spare6[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd6
                 A((void**)&ring_spare6[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare7[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd7
                 A((void**)&ring_spare7[il], 3 * GDN_CH * 4);
+                // 9 S-buffers (main + 7 spares + snap) + 9 rings per GDN layer
+                // -- keep in sync when adding sets; server slot admission
+                // sizes its floor from this (review 2026-07-09: the old
+                // hardcoded "5 sets ~3GB" predated maxd6/7)
+                gdn_state_bytes += 9ull * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -1036,6 +1065,7 @@ struct Engine {
         if (gate_maxd > 7) gate_maxd = 7;
         if (maxd_auto) dctl.k_max = gate_maxd;
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
+        if (const char* e = getenv("Q27_MAXD_RESET")) maxd_reset = atoi(e) != 0;
         if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI6")) dctl.hi6 = (float)atof(e);
@@ -1831,6 +1861,14 @@ struct Engine {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
+        // Depth-controller lifetime (review 2026-07-09): by default the
+        // ladder CARRIES across requests -- this is a single-user rig
+        // (multi-tenant is out of scope per SECURITY-MODEL.md) and
+        // consecutive requests are usually turns of the same conversation,
+        // where re-earning depth from k_min costs a measured -1.6% on
+        // 256-token requests (BUILDLOG 2026-07-09). Q27_MAXD_RESET=1 opts
+        // into per-request isolation (each request starts at k_min).
+        if (maxd_auto && maxd_reset) dctl.reset();
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -2024,14 +2062,14 @@ struct Engine {
                         samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
                         rounds > 0 ? (double)emitted / rounds : 0.0, emitted, rounds);
         };
-        // ctx guard: a round writes attention-KV rows P+1..P+6 (and MTP rows
-        // P+1..P+5, P12b depth-5); launching with P > max_ctx-7 would write past
-        // the caches and corrupt adjacent allocations (which the prefix cache
-        // would then reuse). Stop instead -- a max-length response ends a few
-        // tokens short of the absolute ceiling rather than corrupting state.
+        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
+        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
+        // beyond the caches and corrupt adjacent allocations (which the prefix
+        // cache would then reuse). Stop instead -- a max-length response ends a
+        // few tokens short of the absolute ceiling rather than corrupting state.
         int Ph = P;
         while (emitted < n_max) {
-            if (Ph + 7 > max_ctx) { done("ctx-guard"); return emitted; }
+            if (Ph + ctx_round_reserve() > max_ctx) { done("ctx-guard"); return emitted; }
             int em[8]; // maxd7: spec_round can emit up to 8 tokens (depth-7)
             int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
                              : spec_round(em);

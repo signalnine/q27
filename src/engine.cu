@@ -68,6 +68,20 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
+    // Review 2026-07-09 P0 #2: the direct CLI path fed prompt ingestion and
+    // generation straight into the KV caches and d_gen (all sized --ctx) with
+    // no bound -- an oversized tokens-file corrupted the caches, and the final
+    // d_gen copy read past the allocation. Refuse/clamp up front instead.
+    if ((int)toks.size() > ctx) {
+        fprintf(stderr, "prompt %zu tokens > --ctx %d -- refusing (raise --ctx)\n", toks.size(),
+                ctx);
+        return 1;
+    }
+    if (!toks.empty() && (int)toks.size() + n_gen > ctx) {
+        n_gen = ctx - (int)toks.size();
+        fprintf(stderr, "-n clamped to %d (prompt %zu + n must fit --ctx %d)\n", n_gen,
+                toks.size(), ctx);
+    }
 
     Engine e(path, ctx);
     e.fast_head = fast;
@@ -571,6 +585,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (nll_chunk > ctx) {
+            // each chunk steps positions 0..C-1 into caches sized --ctx
+            fprintf(stderr, "--nll-chunk %d > --ctx %d -- refusing (raise --ctx)\n", nll_chunk,
+                    ctx);
+            return 1;
+        }
         const int C = nll_chunk, first = C / 2;
         int nchunks = (int)tk.size() / C;
         if (nll_max > 0) nchunks = std::min(nchunks, nll_max);
@@ -977,7 +997,7 @@ int main(int argc, char** argv) {
         }
         int total_emitted = 0, rounds = 0, hist[8] = {0}; // maxd7: up to 8-tok rounds
         while ((int)out.size() < n_gen) {
-            if (P + 7 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
+            if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
             int em[8]; // maxd7: depth-7 emits up to 8 tokens
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);

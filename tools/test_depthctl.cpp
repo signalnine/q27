@@ -245,6 +245,23 @@ int main() {
         }
         CHECK(demoted_at > 0 && demoted_at <= 40, "low-fired level-7 stream demotes via flo7");
     }
+    { // reset(): per-request isolation (review 2026-07-09) -- learned state
+      // cleared, tunables survive, next request re-earns depth from k_min
+        DepthCtl c;
+        c.k_max = 7;
+        c.hi = 0.42f; // tunable must survive reset
+        for (int i = 0; i < 41; i++) c.update(c.cur, c.cur, c.cur + 1); // deep + warm
+        CHECK(c.cur > c.k_min && c.promotes > 0, "(pre) warmed to a deep ceiling");
+        c.reset();
+        CHECK(c.cur == c.k_min, "reset returns to k_min");
+        CHECK(c.promotes == 0 && c.demotes == 0, "reset clears counters");
+        bool rz = true;
+        for (int i = 0; i < 8; i++) rz = rz && c.rounds[i] == 0 && c.sat[i] == 0.f;
+        CHECK(rz, "reset clears per-level rounds and sat");
+        CHECK(c.hi == 0.42f && c.k_max == 7, "tunables survive reset");
+        for (int i = 0; i < 41; i++) c.update(c.cur, c.cur, c.cur + 1);
+        CHECK(c.cur == 7, "post-reset request re-earns depth normally");
+    }
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }

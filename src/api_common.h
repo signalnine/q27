@@ -152,9 +152,23 @@ inline void normalize_cc_billing_header(std::string& sys) {
     for (size_t i = v; i < end; ++i) sys[i] = 'f';
 }
 
+// Strip ChatML role delimiters from untrusted content/roles so they can't forge
+// prompt structure (Security #7): the tokenizer matches <|im_start|>/<|im_end|>
+// as control tokens anywhere, so a document or tool result containing them would
+// otherwise become real role boundaries. Operator content that legitimately
+// includes the literal markers loses them -- the safe tradeoff vs injection.
+inline std::string strip_ctrl(std::string s) {
+    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
+        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+    return s;
+}
+
 inline std::string tools_preamble(const json& tools) {
     std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
-    for (auto& t : tools) s += "\n" + t.dump();
+    // tool declarations carry caller-controlled (and often third-party-
+    // authored) description strings -- same forgery surface as message
+    // content (review 2026-07-09 P1 #5)
+    for (auto& t : tools) s += "\n" + strip_ctrl(t.dump());
     s += "\n</tools>\n\nFor each function call, return a JSON object with the function name "
          "and arguments inside <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": "
          "<function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<IMPORTANT>\n"
@@ -171,17 +185,6 @@ inline std::string tools_preamble(const json& tools) {
 // stable_off (P8): char offset where the trailing assistant-open begins.
 // Everything before it re-renders identically next turn (snapshot-safe);
 // everything after (assistant open + think prefill) is per-turn volatile.
-// Strip ChatML role delimiters from untrusted content/roles so they can't forge
-// prompt structure (Security #7): the tokenizer matches <|im_start|>/<|im_end|>
-// as control tokens anywhere, so a document or tool result containing them would
-// otherwise become real role boundaries. Operator content that legitimately
-// includes the literal markers loses them -- the safe tradeoff vs injection.
-inline std::string strip_ctrl(std::string s) {
-    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
-    return s;
-}
-
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
                                  bool think = true, size_t* stable_off = nullptr) {
     std::string p;

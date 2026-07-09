@@ -58,6 +58,21 @@ struct DepthCtl {
         }
     }
 
+    // Per-request isolation (review 2026-07-09): the controller lives on the
+    // engine, which serves unrelated requests back-to-back -- without a reset
+    // each request inherits the previous tenant's ceiling and EMAs (depth
+    // trajectory becomes traffic-history-dependent, and a saturating tenant
+    // hands the next one a deep ceiling it hasn't earned). Called at
+    // generate() entry; tunables (bars, ema_a, k_max) survive, learned state
+    // does not. Cost: each request re-earns depth over ~2/ema_a rounds.
+    void reset() {
+        cur = k_min;
+        for (int i = 0; i < 8; i++) { sat[i] = 0.f; yld[i] = 1.f; rounds[i] = 0; }
+        fired_ema = 0.f;
+        promotes = demotes = 0;
+        enter(cur);
+    }
+
     // Fold one gated greedy round into the ceiling. md = ceiling the round
     // drafted under (<0 = not a gated round: no-op), cap = this round's
     // margin-run depth, n = tokens committed (1..md+1).

@@ -166,14 +166,18 @@ int main(int argc, char** argv) {
     for (int si = 0; si < n_slots; si++) {
         int sctx = si == 0 ? ctx : slot1_ctx;
         if (si > 0) {
-            // coarse per-slot floor: 5 GDN buffer sets (~3 GB) + KV + MTP KV
-            // + slack; skip extra slots rather than abort on cudaMalloc
+            // coarse per-slot floor: GDN recurrent state (exact bytes from
+            // slot 0's own allocation -- review 2026-07-09: the old "5 sets
+            // ~3GB" constant predated the maxd6/7 widenings) + prefill/attn
+            // scratch (~700 MB) + KV + MTP KV + slack; skip extra slots
+            // rather than abort on cudaMalloc
             size_t freeb = 0, totalb = 0;
             cudaMemGetInfo(&freeb, &totalb);
             // KV bytes/token from the engine's own sizing (34 KB at 1-byte
             // elements, 68 KB fp16) -- slots[0] is always constructed first
             size_t kvb = (size_t)sctx * 34 * 1024 * slots[0].eng->kv_esz();
-            size_t need = (3500ull << 20) + kvb + (kvb >> 3) + (512ull << 20);
+            size_t need = slots[0].eng->gdn_state_bytes + (700ull << 20) + kvb + (kvb >> 3) +
+                          (512ull << 20);
             if (freeb < need) {
                 fprintf(stderr, "slot %d SKIPPED: %.1f GB free < %.1f GB needed\n", si,
                         freeb / 1e9, need / 1e9);
@@ -303,7 +307,8 @@ int main(int argc, char** argv) {
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
                 ms_since(srv_t0),
-                // P13: cumulative adaptive-maxd activity on this engine (auto only)
+                // P13: adaptive-maxd activity, cumulative on this engine
+                // (per-request when Q27_MAXD_RESET=1 -- review 2026-07-09)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
                                         " md4=%ld md5=%ld md6=%ld md7=%ld mprom=%ld"
                                         " mdem=%ld",
@@ -497,8 +502,9 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            // re-clamp to the routed slot (rows P+1..P+6 must stay in ctx)
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            // re-clamp to the routed slot (rows P+1..P+gate_maxd+1 must stay
+            // in ctx; reserve derived from the engine's active max depth)
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             std::string text;
             q27::Utf8Gate ugate;
             int n = eng.generate(prompt, n_max, EOS, [&](int id) {
@@ -537,7 +543,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 auto send = [&](const json& j) {
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
@@ -658,7 +664,7 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             StreamSplitter sp;
             q27::Utf8Gate ugate;
             std::string think, text, tool_buf;
@@ -754,7 +760,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 ToolConstrainer tc;
                 tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
                 tc.host2dev = &sl.tool_mask_host2dev;
@@ -1080,7 +1086,7 @@ int main(int argc, char** argv) {
             q27::GpuGate::Lease lk(gpu_gate);
             double qw = ms_since(rt.t0);
             eng.on_round_gap = make_yield(eng);
-            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+            n_max = std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
             json items = json::array();
             int tool_counter = 0;
             auto [ctx, flush_think, flush_text, flush_tool] =
@@ -1134,7 +1140,7 @@ int main(int argc, char** argv) {
                 double qw = ms_since(rt.t0);
                 eng.on_round_gap = make_yield(eng);
                 const int nm =
-                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - 6));
+                    std::max(0, std::min(n_max, eng.max_ctx - (int)prompt.size() - (eng.ctx_round_reserve() - 1)));
                 auto ev = [&](const json& j) {
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +

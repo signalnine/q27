@@ -1389,6 +1389,42 @@ static void test_sample() {
         check("sample nucleus enough+minimal", (enough && minimal) ? 0.0 : 1.0, 0.5);
     }
 
+    // 3b. high-temperature nucleus: the threshold search window must scale
+    //     with T (review 2026-07-09 P1 #4). Two-tier logits: 8 head tokens
+    //     near 0, 4088 bulk near -60. At T=10 the bulk holds ~56% of the
+    //     scaled mass, all deeper than the old fixed 40-raw-logit window, so
+    //     the old kernel pinned the threshold at M-40 and kept ~44% for
+    //     top_p=0.95.
+    {
+        const int n2 = 4096;
+        std::vector<float> x2 = rand_vec(n2, 777);
+        for (int i = 0; i < n2; i++) x2[i] += (i < 8 ? 0.f : -60.f);
+        float* d_x2;
+        CUDA_CHECK(cudaMalloc(&d_x2, n2 * 4));
+        CUDA_CHECK(cudaMemcpy(d_x2, x2.data(), n2 * 4, cudaMemcpyHostToDevice));
+        const float invT = 0.1f, topp = 0.95f;
+        q27k::SampleParams sp{invT, topp, 1};
+        CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
+        int z = 0;
+        CUDA_CHECK(cudaMemcpy(d_pos, &z, 4, cudaMemcpyHostToDevice));
+        q27k::sample_g(d_x2, n2, d_sp, d_nuc, d_pos, 1, d_out, d_scr, 0);
+        float nuc[3];
+        CUDA_CHECK(cudaMemcpy(nuc, d_nuc, 12, cudaMemcpyDeviceToHost));
+        double M2 = x2[0];
+        for (int i = 1; i < n2; i++) M2 = std::max(M2, (double)x2[i]);
+        double Z2 = 0;
+        std::vector<double> p2(n2);
+        for (int i = 0; i < n2; i++) { p2[i] = std::exp(invT * (x2[i] - M2)); Z2 += p2[i]; }
+        double mass = 0, mmin = 1e9;
+        for (int i = 0; i < n2; i++)
+            if (x2[i] >= nuc[0]) { mass += p2[i] / Z2; mmin = std::min(mmin, p2[i] / Z2); }
+        bool enough = mass >= topp - 0.03;
+        bool minimal = (mass - mmin) <= topp + 0.03;
+        printf("    [high-T nucleus mass=%.4f thresh=%.2f]\n", mass, nuc[0]);
+        check("sample nucleus high-T enough+minimal", (enough && minimal) ? 0.0 : 1.0, 0.5);
+        CUDA_CHECK(cudaFree(d_x2));
+    }
+
     // 4. chi-square vs analytic renormalized truncated softmax over the SAME
     //    GPU nucleus. Deterministic (fixed seed, pos=0..N-1).
     {

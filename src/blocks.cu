@@ -525,8 +525,17 @@ __global__ void k_nucleus_d(const float* __restrict__ x, int n, const SamplePara
     // Bisect on the LOGIT threshold directly (unbounded below), not a prob cutoff
     // in [0,1]: the old 12-step tau bisection could not resolve cutoffs < 2^-12, so
     // a diffuse distribution fell through to thresh=-FLT_MAX = full vocab (CUDA
-    // review #3). A 40-logit window below M covers all non-negligible mass.
-    if (t == 0) { s_logZ = logf(sh[0]); s_lo = M - 40.0f; s_hi = M; }
+    // review #3). The window below M must cover all non-negligible SCALED mass:
+    // weights go as exp(inv_temp * (x - M)), so 40 raw logits only span 40*T_inv
+    // scaled nats -- at T=10 a fixed 40-raw window kept ~8% of the nucleus (review
+    // 2026-07-09 P1 #4). Scale the window to 40 scaled nats (relative weight
+    // e^-40 ~ 4e-18: negligible at any vocab size); T <= 1 keeps the original 40
+    // exactly, so low-temp behavior is bitwise-unchanged. Bisection resolution in
+    // scaled space stays constant: 40 / 2^16 nats.
+    if (t == 0) {
+        const float win = 40.0f * fmaxf(1.0f, 1.0f / inv_temp);
+        s_logZ = logf(sh[0]); s_lo = M - win; s_hi = M;
+    }
     __syncthreads();
     const float logZ = s_logZ;
     if (top_p < 1.0f) {
