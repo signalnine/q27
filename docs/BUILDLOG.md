@@ -2543,3 +2543,35 @@ uncapped; caught by y7 appearing in its telemetry.
 
 Do-not-retry without new facts: ladder-7 by default (this A/B), d8 (strictly
 worse cost curve until width-8 is attributed).
+
+## 2026-07-09 (width-8 attribution) -- SOLVED: one real cliff fixed (+2.3% on d7), the rest is structural lane-amortization exhaustion
+
+The maxd7 follow-on. Micro rig tools/width_bench.cu (gemv q4/q8 at nb=5..8 on
+real shapes, L2-rotated; fd2 fp8 at ntok=5..8, verify-shaped positions,
+28.7K + 61K). The +3.0 ms width-8 marginal decomposed exactly:
+
+1. **q8_n register cliff at nb=8 -- REAL, FIXED.** 94 regs -> 2 CTAs/SM (vs 3
+   at nb<=7); the v1.4 Q8 residual writers are mid-size and latency-sensitive
+   (the giant head masked it in micros). `__launch_bounds__(256, N<=5?4:3)`
+   pins 3 CTAs through nb=8 (80 regs + 40B stack spill). q4_n got the same
+   treatment (68->64 regs, 4 CTAs at nb=8) -- neutral there, kept for headroom.
+   Register allocation only; canonical 4c4120c7 EXACT (ungated/d7/auto),
+   test_kernels ALL PASS. Same-build cctx2: **fixed-d7 196.3 -> 200.9 t/s
+   (+2.3%), width-8 marginal 3.02 -> 2.33 ms**; d6 209.7 / auto 209.9 neutral.
+2. **q4_n at nb=8: NOT occupancy.** ncu (Gabe-run, sudo): L1 hit 95.7/95.6,
+   occupancy 62/61%, no-eligible 75% BOTH widths -- but DRAM demand DROPS
+   998 -> 754 GB/s at nb=8. The kernel is latency-bound with the weight
+   stream no longer binding: each warp's serial per-lane work (+14% at 8/7)
+   converts ~1:1 into runtime (+17%/call = ~1.5 ms/round over ~400 calls).
+   **The batched-GEMV lane-amortization curve is EXHAUSTED past ~7 lanes** --
+   the marginal lane costs a full lane of latency, not a shared-stream ride.
+3. **fd2 +15-17%/lane at 7->8 = +0.8 ms/round** (per-lane KV re-read;
+   the old decaying-increment extrapolation was a width<=5 artifact).
+
+Verdict unchanged: d7 stays OPT-IN (auto7), auto stays 4..6 (-4.2% for fixed
+d7 vs d6 on cctx2 even after the fix). **The named lever for d7+ (and for
+every gated width): lane-split GEMV** -- 2 warps/row x N/2 lanes halves the
+per-warp latency chain at the cost of L2-absorbed double weight reads (DRAM
+headroom exists: 43-57%). Medium kernel rework; pairs with the deferred fd3
+lane-pair fusion as the "deep-width machinery" pair. Re-run the d7 A/B when
+either lands. Rig committed: tools/width_bench.cu (+ Makefile target).

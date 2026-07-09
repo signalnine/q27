@@ -24,6 +24,9 @@ build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h s
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
 
+build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
+	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
+
 build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp \
                     src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/device_model.h src/loader.h src/cuda_common.h | build
 	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp -o $@

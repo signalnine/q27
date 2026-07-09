@@ -237,9 +237,16 @@ struct Q8Lanes {
     float* y[10];
 };
 
+// maxd7 width-8 attribution (BUILDLOG 2026-07-09): N=8 naturally compiles to
+// 68 regs -> 3 CTAs/SM (vs 64 regs / 4 CTAs at N<=7), and this latency-bound
+// kernel (long_scoreboard-dominated, verify-gemv Phase 0) loses 25% of its
+// latency-hiding warps: +16.5%/call. Pin 4 CTAs/SM through N=8 (ptxas fits
+// 64 regs); N=10 keeps its natural 3. Register allocation only -- values are
+// bit-identical (canonical-gated).
 template <int N>
-__global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
-                            const Q4Lanes L, int64_t rows, int64_t cols) {
+__global__ void __launch_bounds__(256, N <= 8 ? 4 : 3)
+    k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
+                const Q4Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -288,9 +295,14 @@ __global__ void k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restr
     }
 }
 
+// Same treatment: q8_n at N=8 needs 94 regs -> 2 CTAs/SM (N=6/7: 80 -> 3;
+// N<=5: 64 -> 4). The v1.4 Q8 residual writers (ssm_out/attn_output) are
+// mid-size and latency-sensitive like the Q4 mats. Pin 3 CTAs through N=8
+// (85-reg budget, small spill beats the 2-CTA cliff); N<=5 keeps 4.
 template <int N>
-__global__ void k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
-                            const Q8Lanes L, int64_t rows, int64_t cols) {
+__global__ void __launch_bounds__(256, N <= 5 ? 4 : 3)
+    k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
+                const Q8Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
     const int lane = threadIdx.x & 31;
