@@ -6,15 +6,17 @@ A narrow inference engine for **Qwopus3.6-27B-v2-MTP** (Qwen3.6-27B hybrid + tra
 
 - **Adaptive draft-depth ladder 4..6 SHIPPED (2026-07-08, maxd6):** the spec
   round can now draft/verify to depth 6 (7-lane verify, perm mod-7, +157 MB GDN
-  state), controlled per stream by a 3-bar controller (`src/depthctl.h`, 30 CPU
-  tests): promote 4->5 at sustained ceiling-saturation >= 0.50, promote 5->6 at
+  state), controlled by a 3-bar controller (`src/depthctl.h`, CPU-tested;
+  engine-lifetime carry by default, `Q27_MAXD_RESET=1` for per-request
+  isolation): promote 4->5 at sustained ceiling-saturation >= 0.50, promote 5->6 at
   >= 0.60, demote on conditional top-lane yield < 0.35 (the measured win/loss
   crossover) or on level-6 margin-run firing < 0.45. Ships ONLY as
   `Q27_MAXD=auto` (fixed `Q27_MAXD=6` exists for testing); binary defaults
   untouched. Measured on a real-CC-transcript replay @25.8K (the traffic that
   fires deep): d4 202.6 / d5 216.1 / d6 222.0 t/s, 7-token rounds on 64% of
-  rounds, **auto 222.6 = +4.7% over d5 -- auto beats even fixed-6** by demoting
-  through weak stretches. Emitted text byte-identical at every ceiling
+  rounds, **auto 220.7 vs d5 211.9 = +4.2% same-harness** (server replay,
+  2026-07-09 review rerun; the original +4.7% mixed a warm-server auto number
+  with a CLI d5 leg). Emitted text byte-identical at every ceiling
   (canonical 4c4120c7 EXACT at d4/5/6/auto). Envelope payloads that don't
   saturate never promote past 5 (within noise of the 4..5 ladder). This
   reverses the 07-07 maxd6 NO-GO on refreshed economics -- docs/maxd6-decision.md
@@ -376,8 +378,9 @@ verify-only gate lacked. **Recommended production config (2026-07-08):
 4->5, >= 0.60 for 5->6), demote when the top lane's CONDITIONAL yield drops
 below the measured breakeven (0.35) or, at level 6, when margin runs reach
 6-deep too rarely to amortize the 6th draft step (fired < 0.45). Measured:
-+2.7% geomean over d4-gated across the payload envelope; +4.7% over fixed-d5
-on real-CC-transcript traffic (222.6 t/s @25.8K); envelope flavors that don't
++2.7% geomean over d4-gated across the payload envelope; +4.2% over fixed-d5
+on real-CC-transcript traffic (220.7 vs 211.9 t/s @25.8K, same-harness server
+replay 2026-07-09); envelope flavors that don't
 saturate never promote and stay within noise of the 4..5 ladder. Knobs:
 `Q27_MAXD_HI/HI6/LO/FLO6/EMA`; greedy also tolerates theta=1.0 for +4.9%, but
 sampled theta=1.0 nets -2.1%, so 0.5 is the cross-path default. The sampled
@@ -435,7 +438,7 @@ live in "Decode methodology" above.
 | prefill-attn Phase 2: fp8 QK^T MMA (`mma.sync.e4m3`, Q staged fp8, bank-conflict padding) -- DEFAULT-ON on fp8 KV | 128K prefill **68.3 -> 59.6s (+11.8%**, ~2200 t/s); logit cosine 0.9999827 + argmax MATCH @131K; needle **6/6 to ~301K**; fp16 path + canonical untouched; `Q27_PF_FP8MMA=0` opts out |
 | verify-gemv: activation reads 4x uint2 -> 2x uint4 in `k_gemv_q4_n` (+ single-col) | decode @61K **163.2 -> 172.9 t/s (+5.9%)** on 2026-07-08 fixtures; GEMV was LATENCY-bound (long_scoreboard 90%, 39-47% DRAM peak) -- weights were fine, the per-column activation loads hammered L1TEX; bitwise BY CONSTRUCTION (same bytes, same dp4a order); tensor-core verify NOT justified |
 | accept-gate Phase 1: conditional lane-5 yield + `maxd_lo` 0.10 -> 0.35 (the measured d5 crossover) | `Q27_MAXD=auto` becomes the production rec: **+2.7% geomean over d4-gated** across the 5-payload envelope, beats BOTH fixed ceilings; the old unconditional yield EMA sat above the demote bar on traffic where fixed-d5 measured -1.7% |
-| maxd6: adaptive ladder 4..6 (7-lane verify, perm mod-7, +157 MB; 3-bar depthctl hi/hi6/flo6) | real-CC-transcript @25.8K: d4 202.6 / d5 216.1 / d6 222.0 (7-tok rounds on 64%); **auto 222.6 = +4.7% vs d5**, beats fixed-6; text byte-identical at every ceiling; canonical 4c4120c7 EXACT; non-saturating flavors never promote past 5 |
+| maxd6: adaptive ladder 4..6 (7-lane verify, perm mod-7, +157 MB; 3-bar depthctl hi/hi6/flo6) | real-CC-transcript @25.8K: d4 202.6 / d5 216.1 / d6 222.0 (7-tok rounds on 64%); **auto 220.7 vs d5 211.9 = +4.2% same-harness** (2026-07-09 review rerun; original +4.7% claim mixed harnesses); text byte-identical at every ceiling; canonical 4c4120c7 EXACT; non-saturating flavors never promote past 5 |
 
 Headline numbers from E2 onward include the +4000 GDDR7 offset (~+4%; stock
 depth-3 ~181 est. from the E2 ratio). Caveat: consumer GDDR7 has no ECC, and
