@@ -2421,3 +2421,35 @@ d7 headroom signal is now confirmed on real serving traffic.
 Ops: ~/thunderdome (NOT /mnt/ai/projects/thunderdome) is the live rig with
 the *-haight adapters; `./thunderdome run --orchestrator claude-code-q27-haight
 --task T8 --trials 1`; adapter expects the engine on host port 8081.
+
+## 2026-07-08 (cross-engine, base qwen36) -- q27 2.26x llama decode at matched depth; trials q27 0.842/0.851 vs llama 0.818/0.841
+
+Same BASE model (Qwen3.6-27B-MTP) both engines, quant bracket around q27 v1.4's
+5.25 bpw: llama Q4_K_M 16.8 GB (4.98) and Q5_K_M 19.5 GB (5.79), quantized
+locally from the merged BF16 (llama-quantize needed a rebuild -- stale-lib
+symbol error). llama = mainline build 1491, tuned config (--spec-type draft-mtp
+--spec-draft-n-max 10 --spec-draft-p-min 0.5, q8_0 KV, temp 0,
+enable_thinking:false), CUDA_VISIBLE_DEVICES=0 (auto-split OOMs onto the busy
+3090 at 131K ctx).
+
+**Rate at matched depth (cctx replay, 25.8K tok, n=256, warm medians):**
+llama Q4_K_M **98.4 t/s** (draft accept 179/271 = 66% at n_max 10) vs q27 d4
+202.6 / d5 216.1 / d6 222.0 / **auto 222.6 -- 2.26x**. llama Q5_K_M leg
+CRASHED serving the first request (segv in update_slots, llama-side,
+unreported). July context: tuned llama measured 111-190 t/s on Qwopus flavors
+at 75K; on THIS transcript-flavor payload the gap is structural -- q27's
+ladder runs 5.3-5.9 tok/round where llama's chain nets ~3.3.
+
+**CC trials (claude-code-*-haight, n=1 greedy, same harness/tool block):**
+T8 q27 **0.842 @ 312s** vs llama **0.818 @ 178s**; T2 q27 **0.851 @ 136s** vs
+llama **0.841 @ 165s**. Wall is trajectory-confounded as always (q27's T8 run
+did ~1.7x the prompt volume: 5.4M vs 3.2M tokens served); trial-weighted
+decode rates (q27 177 t/s @ up-to-109K vs llama 185 t/s on its shallower mix)
+are NOT comparable across different trajectories -- the replay number above is
+the controlled comparison. Prefill effective: q27 2309-2569 t/s (96.7% prefix
+cache) vs llama 1720 t/s (its own cache also ~97% effective).
+
+Scores: q27 above llama on both tasks at n=1; treat as basin samples. Both
+engines' first-turn behavior on the base model depends on their tolerant
+parsers (q27 needed the mode-7 rescue; llama's own wrapper-less recovery
+carried its legs -- same tolerance class, system-fair).
