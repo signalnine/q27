@@ -17,6 +17,7 @@
 #include "spec3.cuh"
 #include "prefill.cuh"
 #include "cuda_common.h"
+#include "depthctl.h"
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
@@ -224,15 +225,9 @@ struct Engine {
     // The ceiling changes round grouping / draft depth / verify width only -- never
     // the emitted sequence (greedy is width-invariant), so decode stays bitwise.
     bool maxd_auto = false;
-    int cur_maxd = 4;                       // live ceiling (starts shallow)
     cudaGraphExec_t draft_graph_lo[6] = {}; // depth-4 draft (auto mode only)
-    float sat_ema = 0.f;                    // depth-4: EMA of (n reached ceiling)
-    float yield_ema = 1.f;                  // depth-5: EMA of (5th lane accepted)
-    float maxd_ema_a = 1.f / 16.f;          // EMA weight (~11-round half-life)
-    float maxd_hi = 0.50f;                  // promote 4->5 when sat_ema >= hi
-    float maxd_lo = 0.10f;                  // demote 5->4 when yield_ema < lo
-    long maxd_rounds4 = 0, maxd_rounds5 = 0; // gated rounds run at each ceiling
-    long maxd_promotes = 0, maxd_demotes = 0; // 4->5 / 5->4 transitions
+    DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
+                   // CPU tests (tools/test_depthctl.cpp); semantics unchanged
     // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
     // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
     // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
@@ -240,6 +235,11 @@ struct Engine {
     // n_hist[6]/sum(n_hist), p(5th lane accepted | fired) = n_hist[6]/cap_hist[5].
     long gate_cap_hist[6] = {}; // [cap]
     long gate_n_hist[7] = {};   // [n]; index 0 unused
+    // acceptance-gate Phase 0: per-draft-lane conditional acceptance on gated
+    // rounds. Lane j (1..gate_maxd) FIRED iff cap >= j; ACCEPTED iff n >= j+1.
+    // Gives the live yields p(acc_j | fired_j) that the two marginals above
+    // cannot reconstruct (docs/acceptance-gate-design.md).
+    long gate_lane_fired[6] = {}, gate_lane_acc[6] = {}; // [j]; index 0 unused
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[6] = {};
@@ -947,9 +947,9 @@ struct Engine {
         if (gate_maxd < 4) gate_maxd = 4;
         if (gate_maxd > 5) gate_maxd = 5;
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
-        if (const char* e = getenv("Q27_MAXD_EMA")) maxd_ema_a = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_HI")) maxd_hi = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_LO")) maxd_lo = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5;
         auto seed_positions = [&]() {
             CUDA_CHECK(cudaMemcpyAsync(d_pos_a, &z0, 4, cudaMemcpyHostToDevice, stm));
@@ -1150,7 +1150,7 @@ struct Engine {
             // P13 adaptive maxd: the ceiling floats between 4 and 5 per stream
             // (cur_maxd); pick the matching draft graph. draft_graph[perm] is
             // depth-5 under auto (gate_maxd forced 5), draft_graph_lo is depth-4.
-            md_used = maxd_auto ? cur_maxd : gate_maxd;
+            md_used = maxd_auto ? dctl.cur : gate_maxd;
             if (dexit_on) {
                 // P14 draft early-exit: launch draft steps one at a time and
                 // stop at the first sub-theta margin (that step still ran --
@@ -1200,28 +1200,16 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 32, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
-        if (gate_cap >= 0) { gate_cap_hist[gate_cap]++; gate_n_hist[n]++; }
-        // P13 adaptive maxd: fold this round's realized accept into the ceiling.
-        // At depth-4, promote when the ceiling saturates (n==maxd+1) often enough;
-        // at depth-5, demote when the 5th lane stops paying (n<6). On a switch,
-        // seed the opposite EMA to open an observation window (hysteresis). The
-        // ceiling changes only round grouping -- the token sequence is invariant.
-        if (maxd_auto && md_used >= 0) {
-            if (md_used < 5) {
-                maxd_rounds4++;
-                float hit = (n >= md_used + 1) ? 1.f : 0.f;
-                sat_ema += maxd_ema_a * (hit - sat_ema);
-                // promote: seed yield_ema just above the demote line so depth-5
-                // gets a bounded grace window (~1/alpha rounds) to prove itself
-                // before it can be demoted, rather than an all-1.0 sticky window.
-                if (sat_ema >= maxd_hi) { cur_maxd = 5; yield_ema = 2.f * maxd_lo; maxd_promotes++; }
-            } else {
-                maxd_rounds5++;
-                float hit = (n >= 6) ? 1.f : 0.f;
-                yield_ema += maxd_ema_a * (hit - yield_ema);
-                if (yield_ema < maxd_lo) { cur_maxd = 4; sat_ema = 0.f; maxd_demotes++; }
+        if (gate_cap >= 0) {
+            gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
+            for (int j = 1; j <= gate_cap; j++) {
+                gate_lane_fired[j]++;
+                if (n >= j + 1) gate_lane_acc[j]++;
             }
         }
+        // P13 adaptive maxd: fold this round's realized accept into the ceiling
+        // (extracted to depthctl.h; semantics + comments live there).
+        if (maxd_auto) dctl.update(md_used, gate_cap, n);
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[7];
         perm = (perm + (n - 1)) % 6;

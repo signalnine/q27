@@ -46,7 +46,7 @@ echo "[gate] phase 1 (single slot): log $LOG1"
 start_server "$LOG1" || exit 1
 
 PORT=$PORT LOG=$LOG1 python3 - <<'PYEOF'
-import json, os, re, sys, urllib.request
+import json, os, re, sys, urllib.error, urllib.request
 
 port, log = os.environ["PORT"], os.environ["LOG"]
 base = f"http://127.0.0.1:{port}"
@@ -85,8 +85,14 @@ post("/v1/chat/completions", {"model": "q27", "max_tokens": 8,
                  {"role": "user", "content": "Say OK."}]})
 post("/v1/messages", {"model": "q27", "max_tokens": 24, "stream": True,
     "system": SYS_A, "messages": [{"role": "user", "content": U1}]})
-post("/v1/messages", {"model": "q27", "max_tokens": 16,
-    "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+# T6 oversize prompt: since 2f47508 the server returns an anthropic-shaped
+# HTTP 400 (ctx-limit) instead of a 200 -- expect it, then require health.
+try:
+    post("/v1/messages", {"model": "q27", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+    sys.exit("T6: oversize prompt unexpectedly succeeded (want HTTP 400)")
+except urllib.error.HTTPError as e:
+    assert e.code == 400, f"T6: expected 400, got {e.code}"
 with urllib.request.urlopen(base + "/health", timeout=10) as r:
     assert json.loads(r.read())["status"] == "ok", "server unhealthy after T6"
 
@@ -112,10 +118,12 @@ def chk(cond, name):
     return cond
 
 ok = True
-ok &= chk(len(recs) == 6, f"C1 six [req] lines (got {len(recs)})")
-if len(recs) == 6:
-    t1, t2, t3, t4, t5, t6 = recs
-    ok &= chk(all(recs[i]["rid"] < recs[i+1]["rid"] for i in range(5)),
+# 5, not 6: since 2f47508 the T6 oversize prompt 400s at validation (asserted
+# above) and never reaches generation, so it emits no [req] line.
+ok &= chk(len(recs) == 5, f"C1 five [req] lines (got {len(recs)})")
+if len(recs) == 5:
+    t1, t2, t3, t4, t5 = recs
+    ok &= chk(all(recs[i]["rid"] < recs[i+1]["rid"] for i in range(4)),
               "C3 rid increasing")
     ok &= chk(t1["conv"] == t2["conv"], "C4a same conversation -> same conv")
     ok &= chk(t1["conv"] != t3["conv"], "C4b different system -> different conv")
@@ -127,7 +135,8 @@ if len(recs) == 6:
     ok &= chk(t1["qw"] >= 0 and t1["tok"] >= 0 and t1["cb"] >= 0, "C7b nonneg")
     ok &= chk(t4["api"] == "oai" and t1["api"] == "anth" and t5["api"] == "anth",
               "C8 api tags")
-    ok &= chk(t6["end"] == "refused", f"C9 oversize end=refused (got {t6['end']})")
+    # C9 (oversize refused cleanly) is the T6 400-assert + post-T6 health probe
+    # in the request section above; no [req] line to check anymore.
 sys.exit(0 if ok else 1)
 PYEOF
 RC1=$?
@@ -142,7 +151,7 @@ echo "[gate] phase 2 (--slots 2): log $LOG2"
 start_server "$LOG2" --slots 2 --slot1-ctx 4096 || exit 1
 
 PORT=$PORT LOG=$LOG2 python3 - <<'PYEOF'
-import json, os, re, sys, urllib.request
+import json, os, re, sys, urllib.error, urllib.request
 
 port, log = os.environ["PORT"], os.environ["LOG"]
 base = f"http://127.0.0.1:{port}"
@@ -181,8 +190,14 @@ post("/v1/messages", {"model": "q27", "max_tokens": 48, "system": SYS_B,
     "messages": [{"role": "user", "content": UB},
                  {"role": "assistant", "content": reply_b or "A fine anapest."},
                  {"role": "user", "content": "Name the poet you quoted."}]})
-post("/v1/messages", {"model": "q27", "max_tokens": 16,
-    "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+# C15 oversize prompt: anthropic-shaped 400 since 2f47508 (no [req] line),
+# then the server must stay healthy.
+try:
+    post("/v1/messages", {"model": "q27", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "alpha bravo charlie delta " * 4000}]})
+    sys.exit("C15: oversize prompt unexpectedly succeeded (want HTTP 400)")
+except urllib.error.HTTPError as e:
+    assert e.code == 400, f"C15: expected 400, got {e.code}"
 with urllib.request.urlopen(base + "/health", timeout=10) as r:
     assert json.loads(r.read())["status"] == "ok", "server unhealthy after oversize"
 
@@ -203,9 +218,9 @@ def chk(cond, name):
     return cond
 
 ok = True
-ok &= chk(len(recs) == 5, f"C1' five [req] lines (got {len(recs)})")
-if len(recs) == 5:
-    a1, b1, a2, b2, ov = recs
+ok &= chk(len(recs) == 4, f"C1' four [req] lines (got {len(recs)})")
+if len(recs) == 4:
+    a1, b1, a2, b2 = recs
     ok &= chk(a2["hit"] > 0, f"C12a interleaved A2 warm (hit={a2['hit']})")
     ok &= chk(b2["hit"] > 0, f"C12b interleaved B2 warm (hit={b2['hit']})")
     ok &= chk(all(r["slot"] is not None for r in recs), "C13a slot= present")
@@ -213,7 +228,7 @@ if len(recs) == 5:
         ok &= chk(a1["slot"] == a2["slot"], "C13b A sticky slot")
         ok &= chk(b1["slot"] == b2["slot"], "C13c B sticky slot")
         ok &= chk(a1["slot"] != b1["slot"], "C13d A,B on different slots")
-    ok &= chk(ov["end"] == "refused", f"C15 oversize refused (got {ov['end']})")
+    # C15 (oversize refused, healthy) is the 400-assert + health probe above.
 sys.exit(0 if ok else 1)
 PYEOF
 RC2=$?

@@ -157,3 +157,21 @@ level exclusivity) with no GPU dependency.
 - Post-verify-gemv c_j and d4/d5 deltas (all current numbers pre-date +5.5%).
 - Whether any lane below 5 ever sits sub-bar on real traffic (sets Phase 2
   scope).
+
+## 2026-07-08 RESOLVED -- Phases 0-1 SHIPPED, Phase 2 dead, verdict
+
+Phase 0 (BUILDLOG "accept-gate Phase 0") refreshed everything: the d5 crossover
+is **y5 ~ 0.35 conditional** (-1.7% at .282 @61K, +0.2% at .355, +2.7% at .45+
+@26K) -- half the maxd6-era estimate; verify-gemv moved it. y2..y4 sit at
+.42-.95 everywhere -> **no lane below 5 approaches the bar; the per-lane ladder
+(Phase 2 / plan Task 7) is dead by measurement**, exactly the gate the plan set.
+Margin bins: instrumented (--stats own-pass bins) but not needed -- yield
+feedback alone carried the result; theta stays scalar.
+
+Phase 1 shipped the acceptance gate at depth-5 scale (conditional yield + seed
+clamp + lo=0.35): auto beats BOTH fixed legs overall (+2.7% geomean vs the
+d4-gated production rec, +0.6% vs fixed-5) and self-protects on the one losing
+flavor. Production rec: `Q27_PMIN=0.5 Q27_MAXD=auto`. Residual: -1.1%
+promote-churn on 61K docs (pre-existing; escalating promote-hysteresis is the
+known shave, unbuilt). The strategic follow-on this unlocks: re-run the maxd6
+ceiling-6 GO-IF on these economics.

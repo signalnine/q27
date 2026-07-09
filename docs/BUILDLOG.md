@@ -2125,3 +2125,129 @@ and would make strict+constrain the true zero-rescue configuration. Logs:
 parser-{tolerant,strict,strictc}-server.log (session scratchpad). README quality-gates
 updated; this closes the last open red-team gate.
 
+
+## 2026-07-08 (accept-gate Phase 0) -- depth economics REFRESHED post-verify-gemv: d5 crossover yield is ~0.35, not ~0.7
+
+Phase 0 of docs/acceptance-gate-design.md (plan docs/plans/2026-07-08-acceptance-gate.md),
+branch acceptance-gate. Telemetry first, then the maxd6 A/B re-run on current HEAD -- the
+maxd6 economics predate verify-gemv's +5.5% decode and are stale in the
+pessimistic-for-depth direction.
+
+**Telemetry (shipped).** (a) Per-lane fired/accepted counters `glf/gla` in `[req]`
+(9113e8e): lane j fired iff cap>=j, accepted iff n>=j+1 -- the conditional yields
+p(acc_j|fired_j) that the gch/gnh marginals cannot reconstruct. (b) `--stats` own-pass
+margin bins (fe37595): p(acc_k | m_k bin, prefix ok) for k=3..5; m3/m4/m5 were computed
+and voided since E3. Also fixed there: the stats pend arrays are sized N+8 but scoring
+indexed them by known_idx across the WHOLE prompt -- any prompt longer than --stats N
+read heap garbage and zeroed every counter (bug present since E3; --stats needs
+prompt << N usage or this fix). Rig fix en route: reqlog_gate.sh predated the 2f47508
+anthropic-shaped ctx-limit 400 and crashed on it uncaught (bf782c7); C1/C9/C15 updated
+(no [req] line for validation-rejected requests -- /v1/completions silently returns
+0 tokens for prompt>ctx instead of a 400, noted, not fixed here).
+
+**A/B rig (5db7b23).** tools/make_payloads.py + tools/accept_ab.sh: frozen ~26K
+raw-completion payloads spanning the saturation axis + a 61K docs leg; fresh server
+per leg, fp8 KV + --fast-head, greedy, 1 cold prefill + 3 identical replays (medians,
+det asserted). Payload lessons paid for: plain mid-function cuts EOS in ~8 tokens at
+26K depth (twice); an explicit open stub forces sustained generation; self-copy at 13K
+token echo distance does NOT saturate acceptance (y5 0.53) -- the >0.9 regime needs
+short-range repetition, and even a 2.5KB block repeated (depth-match P4 flavor) only
+reached y5 0.51 here.
+
+**Measured (scratchpad/accept_ab_run3.log, accept_ab_61k.log), Q27_PMIN=0.5 dexit1:**
+
+    payload      ctx   d4 t/s   d5 t/s  d5 net   auto    y5(d5)  fired5
+    echo         28K   151.6    155.7   +2.7%    155.7   0.514   0.507
+    docs         25K   168.1    177.5   +5.6%    175.2   0.769   0.600
+    codegen      26K   163.9    164.2   +0.2%    169.5   0.355   0.443
+    testgen      27K   162.0    168.3   +3.9%    166.1   0.447   0.576
+    docs61k      61K   114.4    112.5   -1.7%    113.0   0.282   0.433
+
+**Findings, decision-grade:**
+1. **The maxd6-era loss regime has mostly inverted at 26K.** Fixed-d5 is >= d4 on every
+   26K flavor (geomean +3.1%); the maxd6 measurement had -5.4% codegen at y5 0.56 --
+   post-verify-gemv, +0.2% at y5 0.355. The crossover yield is **~0.35** (bracketed:
+   -1.7% at 0.282, +0.2% at 0.355, +2.7% at 0.45+), half the maxd6-derived ~0.7.
+2. **maxd_lo=0.10 is 3.5x below the crossover AND in the wrong units.** yield_ema today
+   is p(n=6) over ALL depth-5 rounds (~y5 x fired); at docs61k steady state that is
+   ~0.12 > 0.10 -> auto would sit at depth-5 losing -1.7% indefinitely. The
+   acceptance-gate premise stands, at depth-5 scale: demote on CONDITIONAL yield
+   (p(acc5|fired), the glf/gla quantity) against a bar at the measured crossover.
+3. **Promote/grace churn is a real live cost.** auto on docs61k: fired5 0.032 with
+   y5 0.000 -- promote, burn an 11-round grace window with zero deep accepts, demote,
+   repeat = **-1.2% vs plain d4**. Conditional yield + bar 0.35 demotes on the same
+   evidence in the same window; HI=0.5 stays (correctly excludes docs61k sat~0.42,
+   admits every 26K winner -- second revalidation of P13's bar).
+4. **auto is the right default shape.** It beat fixed-d5 on codegen (+3.4% vs d4 by
+   demoting through low-yield stretches) and tracked within ~1.5% of the best fixed
+   leg elsewhere; with the Phase-1 bars it should dominate both fixed legs everywhere.
+5. **Per-lane ladder below 5 is DEAD (plan Task 7 gate).** y2..y4 sit at 0.42-0.95
+   across all flavors -- no measured lane below 5 approaches the ~0.35 bar. Phase 2
+   collapses into Phase 1 as the plan anticipated.
+6. **maxd6/ceiling-6 reopens LATER, with these numbers.** With d5 breakeven-to-winning
+   across the 26K envelope and a working acceptance bar, the d6 GO-IF calculus
+   (maxd6-decision.md) deserves a re-run -- but only after Phase 1 ships and only as
+   the separately-priced P12b-class build. Not this branch.
+
+Own-pass margin bins (--stats, Task 2): populated and sane on synthetic prompts, but
+the frozen-payload bins are the useful calibration -- deferred to a follow-on --stats
+pass on the payload set if the theta-schedule question ever becomes live; the yield
+feedback path does not need it (design doc "supporting role").
+
+## 2026-07-08 (accept-gate Phase 1) -- SHIPPED: conditional yield + retuned bars; auto is now the recommended gated config (+2.7% geomean vs d4-gated)
+
+The Phase-0 measurement made Phase 1 knob-shaped and killed Phase 2 (per-lane ladder:
+no lane below 5 approaches the bar; plan Task 7 gate). Changes, all in the extracted
+controller (src/depthctl.h, ecf7a31 refactor -- canonical-exact, round-identical):
+
+1. **Conditional yield.** yield_ema updates only on rounds where the 5th lane FIRED
+   (gate_cap >= md_used); unfired rounds carry no evidence and, under early-exit,
+   barely pay. The old unconditional EMA (~y5 x fired) sat above lo=0.10 on traffic
+   where fixed-d5 measured -1.7% -- a sticky-loss regime the controller could never
+   leave. Now the EMA measures y5 in the same units as the bar.
+2. **Promote-seed clamp** min(1, 2*lo) -- 2*lo past 1.0 would stretch the demote grace
+   window arbitrarily.
+3. **maxd_lo 0.10 -> 0.35** = the measured crossover (Phase 0: -1.7% at y5 .282,
+   +0.2% at .355, +2.7% at .45+). maxd_hi stays 0.50 (third revalidation: excludes
+   docs61k sat~0.42, admits every 26K winner). Both still env-overridable.
+
+17 CPU tests (tools/test_depthctl.cpp, `make` target build/test_depthctl) pin the old
+semantics + the three changes (unfired-no-evidence, seed clamp, 33%-yield demotes /
+50%-yield holds at the production bar).
+
+**A/B (frozen Phase-0 payloads, scratchpad/accept_ab_phase1.log):**
+
+    payload      d4      d5      auto(old)  auto(NEW)  new vs best fixed
+    echo         151.6   155.7   155.7      156.4      +0.4% (beats both)
+    docs         168.1   177.5   175.2      176.2      -0.7% of d5
+    codegen      163.9   164.2   169.5      170.0      +3.5% (beats both)
+    testgen      162.0   168.3   166.1      166.6      -1.0% of d5
+    docs61k      114.4   112.5   113.0      113.1      -1.1% of d4
+
+auto(new) geomean vs the current production rec (d4-gated): **+2.7%**; vs fixed-5:
++0.6% -- auto dominates both fixed legs overall. **Production rec becomes
+`Q27_PMIN=0.5 Q27_MAXD=auto`** (binary defaults unchanged: auto remains opt-in, so
+nothing moves for existing configs; lo=0.35 applies only under auto).
+
+**Honest residuals.** (a) docs61k auto pays -1.1% vs plain d4 -- promote/grace churn
+(sat bursts past 0.5, zero-yield window, demote, repeat; fired5 .032, y5 .000).
+Identical in the old controller; a demote-count promote-escalator could shave it,
+not built (YAGNI at 1% worst-flavor). (b) The plan's T8-matched >= +1% criterion is
+satisfied by envelope interpolation only (live T8 ran fired .79 / y5 .82 -- past the
+docs point, where d5 = +5.6%); the maxd6 T8 payload artifacts are gone and were not
+reconstructed. (c) One plan criterion technically missed: "no payload below its d4
+baseline" -- docs61k at -1.1%, see (a); Q27_MAXD=4 remains available for pure
+long-ctx docs serving.
+
+Gates fresh at HEAD: test_kernels ALL PASS, test_depthctl 17/17, canonical 4c4120c7
+EXACT (ungated + gated-5 + auto), reqlog_gate both phases PASS, shortbench mean 179.8
+(baseline 179.7), replay determinism OK on all legs. Files: depthctl.h, engine.cuh,
+engine.cu, server.cu, Makefile, tools/{test_depthctl.cpp,accept_ab.sh,make_payloads.py,
+reqlog_gate.sh}, docs/{acceptance-gate-design.md,plans/2026-07-08-acceptance-gate.md}.
+
+**Follow-on unlocked (not this branch): reopen maxd6/ceiling-6.** With the crossover
+at ~0.35 and a bar that tracks it, the d6 GO-IF arithmetic deserves a re-run on the
+refreshed economics -- echo/docs flavors sit at y5 .5-.8 with headroom above the
+ceiling, and the depth-match P4 tail (llama +45% at 100% acceptance) is still on the
+table. Cost side unchanged: P12b-class 6->7 widening + quantize3-landmine audit +
+157 MB (maxd6-decision.md items 1-7).
