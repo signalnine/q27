@@ -346,6 +346,7 @@ void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float
         case 4: k_gemv_q4_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 5: k_gemv_q4_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 6: k_gemv_q4_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 7: k_gemv_q4_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd6 width-7
         case 10: k_gemv_q4_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
     }
@@ -367,6 +368,7 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float*
         case 4: k_gemv_q8_n<4><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 5: k_gemv_q8_n<5><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 6: k_gemv_q8_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 7: k_gemv_q8_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd6 width-7
         case 10: k_gemv_q8_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
     }
@@ -450,20 +452,25 @@ void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st, int ntok) {
 }
 
 __global__ void k_quantize_x3(CP3 xp, int8_t* n0, int8_t* n1, int8_t* n2, int8_t* n3, int8_t* n4,
-                              int8_t* n5, uint2* e0, uint2* e1, uint2* e2, uint2* e3, uint2* e4,
-                              uint2* e5, float* s0, float* s1, float* s2, float* s3, float* s4,
-                              float* s5, int* i0, int* i1, int* i2, int* i3, int* i4, int* i5,
-                              int nblocks) {
+                              int8_t* n5, int8_t* n6, uint2* e0, uint2* e1, uint2* e2, uint2* e3,
+                              uint2* e4, uint2* e5, uint2* e6, float* s0, float* s1, float* s2,
+                              float* s3, float* s4, float* s5, float* s6, int* i0, int* i1,
+                              int* i2, int* i3, int* i4, int* i5, int* i6, int nblocks) {
     int b = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (b >= nblocks) return;
     const int t = blockIdx.y;
     const float* x = xp.p[t];
-    // P12b: 6 lanes -- t==5 must select its OWN buffers, not fall through to n4
-    // (that overwrote lane 4's activation and corrupted the depth-5 verify).
-    int8_t* nat = t == 0 ? n0 : t == 1 ? n1 : t == 2 ? n2 : t == 3 ? n3 : t == 4 ? n4 : n5;
-    uint2* eo = t == 0 ? e0 : t == 1 ? e1 : t == 2 ? e2 : t == 3 ? e3 : t == 4 ? e4 : e5;
-    float* scale = t == 0 ? s0 : t == 1 ? s1 : t == 2 ? s2 : t == 3 ? s3 : t == 4 ? s4 : s5;
-    int* isum = t == 0 ? i0 : t == 1 ? i1 : t == 2 ? i2 : t == 3 ? i3 : t == 4 ? i4 : i5;
+    // P12b lesson (lane-count landmine): every lane must select its OWN
+    // buffers -- a fall-through overwrote lane 4's activation at ntok=6 and
+    // corrupted the depth-5 verify (memcheck-blind). maxd6: 7th lane (n6).
+    int8_t* nat = t == 0 ? n0 : t == 1 ? n1 : t == 2 ? n2 : t == 3 ? n3 : t == 4 ? n4
+                                                                    : t == 5 ? n5 : n6;
+    uint2* eo = t == 0 ? e0 : t == 1 ? e1 : t == 2 ? e2 : t == 3 ? e3 : t == 4 ? e4
+                                                                  : t == 5 ? e5 : e6;
+    float* scale = t == 0 ? s0 : t == 1 ? s1 : t == 2 ? s2 : t == 3 ? s3 : t == 4 ? s4
+                                                                     : t == 5 ? s5 : s6;
+    int* isum = t == 0 ? i0 : t == 1 ? i1 : t == 2 ? i2 : t == 3 ? i3 : t == 4 ? i4
+                                                                  : t == 5 ? i5 : i6;
     int lane = threadIdx.x & 31;
     float v = x[b * 32 + lane];
     float amax = fabsf(v);
@@ -493,9 +500,10 @@ void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st, int ntok) {
     dim3 g((nblocks + 7) / 8, ntok);
     k_quantize_x3<<<g, 256, 0, st>>>(
         x, xq.q[0].nat, xq.q[1].nat, xq.q[2].nat, xq.q[3].nat, xq.q[4].nat, xq.q[5].nat,
-        xq.q[0].eo, xq.q[1].eo, xq.q[2].eo, xq.q[3].eo, xq.q[4].eo, xq.q[5].eo, xq.q[0].scale,
-        xq.q[1].scale, xq.q[2].scale, xq.q[3].scale, xq.q[4].scale, xq.q[5].scale, xq.q[0].isum,
-        xq.q[1].isum, xq.q[2].isum, xq.q[3].isum, xq.q[4].isum, xq.q[5].isum, nblocks);
+        xq.q[6].nat, xq.q[0].eo, xq.q[1].eo, xq.q[2].eo, xq.q[3].eo, xq.q[4].eo, xq.q[5].eo,
+        xq.q[6].eo, xq.q[0].scale, xq.q[1].scale, xq.q[2].scale, xq.q[3].scale, xq.q[4].scale,
+        xq.q[5].scale, xq.q[6].scale, xq.q[0].isum, xq.q[1].isum, xq.q[2].isum, xq.q[3].isum,
+        xq.q[4].isum, xq.q[5].isum, xq.q[6].isum, nblocks);
     CUDA_CHECK(cudaGetLastError());
 }
 

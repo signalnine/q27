@@ -2290,3 +2290,68 @@ canonical + identity + determinism; cctx >= +3% replay A/B with no envelope payl
 below its d5 baseline; glf/gla extended to lane 6. d7/d8 explicitly deferred to
 live lane-6 telemetry. Files: tools/burst_sim.py (new), docs/maxd6-decision.md
 (verdict), scratchpad burst_*.csv + payloads (uncommitted).
+
+## 2026-07-08 (maxd6 build) -- SHIPPED: auto-ladder 4..6; cctx auto +4.7% vs d5, byte-identical, canonical EXACT
+
+The GO verdict built (branch maxd6-ladder; plan docs/plans/2026-07-08-maxd6-build.md).
+The P12b-class 6->7 widening plus a 3-bar depthctl ladder; ~5 hours measurement-to-merge,
+no lost sessions -- the quantize3-landmine audit was priced in and the lane fix landed
+with the widening, not after a divergence hunt.
+
+**Engine widening (b24864d).** perm mod-6 -> mod-7 + 7th GDN role (S_spare6/ring_spare6,
++157 MB); all graph arrays [6]->[7] (verify_graph_w -> [8][7], draft_step_graph ->
+[6][7]); 7th verify lane (_g) through qx5/mm5/gdn_pair/attn_pair/ffn_pair + the vw>6
+chains; gemv_q4_n/q8_n case 7; quantize3 7th explicit lane (THE P12b landmine class,
+fixed pre-emptively); logits2 7*VOCAB; fd scratch 7 lanes; outcome {n,t1,dr1..dr6,pending}
+(9 ints); prep/finish_round widened (a6 chain, n<=7); d_draft6/h_next6/d_pos_m6/d_pos_g;
+margins [6]; em[7] callers; glf/gla/gch/gnh lane-6/n-7 telemetry. Sampled path untouched
+(ceiling 4); constrained path unchanged (depth-4 draft via draft_graph_lo, now captured
+for gate_maxd>=5). Q27_MAXD=6 fixed accepted for testing; auto = the ladder; auto+DEXIT=0
+clamps to 4..5 (no depth-5 monolithic graph under a depth-6 ceiling; dexit is default-on).
+
+**depthctl ladder (135e4a0 + 6066ef7, 30 CPU tests).** Levels 4..6, per-level sat/yld
+EMAs, fresh-stint hysteresis on every level entry (enter(): sat=0, yld=min(1,2*lo) --
+prevents stale-EMA 6->5->4 cascades; behavior-identical at k_max=5). THREE bars, each
+measured onto a real failure mode:
+- hi=0.50 (4->5 promote, P13, revalidated again);
+- hi6=0.60 (5->6 promote): docs-flavor sat5 is BURSTY around .46-.5 and level-6 there
+  measured -1.9..-2.9%; cctx sustains .71. 0.60 alone did NOT stop docs (bursts cross it);
+- flo6=0.45 (level-6 fired-rate demote): the discriminator that finally separated docs
+  from cctx is NOT yield (both y6 ~.70 when fired) but HOW OFTEN margins run 6-deep
+  (docs ~.3 vs cctx .6+). The 6th draft step runs on every cap>=5 round; rare 6-deep
+  firing = pure tax the conditional-yield bar cannot see. Level-6 only: at level 5,
+  low-fired/high-yield flavors WIN (testgen fired .30, +3.9%) -- a fired bar there
+  would be wrong.
+All env-tunable: Q27_MAXD_HI/HI6/FLO6/LO/EMA.
+
+**Measured (CLI legs + server replay A/B, fp8 KV + fast-head, greedy theta 0.5):**
+
+    cctx (real-CC flavor)   d4 202.6 | d5 216.1 | d6 222.0 (+2.7% vs d5, 7-tok
+    rounds on 64%) | auto(server, warm) 222.6 = +4.7% vs d5 -- auto BEATS fixed-6
+    by demoting through weak stretches. Emitted text BYTE-IDENTICAL d4/5/6/auto.
+    Ladder live: 2 promotes 0 demotes, final ceiling 6.
+    Envelope auto vs Phase-1 auto: echo/codegen/testgen/docs61k never promote to 6
+    (sat5 .12-.30 vs hi6) -> within noise (+0.6..-1.2%); docs (the bursty boundary
+    flavor at sat5 ~.46-.49) was -2.9% pre-flo6, now 175.3 = noise vs Phase-1
+    (-0.5%), -1.2% vs fixed-d5 (the same auto-vs-fixed gap Phase 1 had).
+
+Width-7 lane cost MEASURED (closes the extrapolation): d5->d6 at fired6 .64 costs
++2.05 ms/round (24.48 -> 26.53 CLI) ~= 3.2 ms per fired-6 round all-in (6th draft +
+width-7 verify + re-segmentation) -- the maxd6-decision extrapolation said 1.6-1.9;
+benefit side was dead-on (tok/round 5.89 predicted 5.92).
+
+Gates fresh at HEAD: test_kernels ALL PASS, test_depthctl 30/30, canonical 4c4120c7
+EXACT (ungated + gated 4/5/6/auto), reqlog both phases, shortbench 177.6 (noise band),
+replay det=OK on converged legs (NONDET across replays on mid-convergence auto legs is
+the ladder's carried EMA state re-segmenting rounds -- tokens identical, documented).
+
+**Production rec unchanged in shape, better in depth: `Q27_PMIN=0.5 Q27_MAXD=auto`**
+(now the 4..6 ladder). Binary defaults untouched -- gate opt-in as always. NONDET
+round-segmentation across replays under auto is expected telemetry behavior.
+
+**Residuals / next.** (a) docs-class boundary traffic keeps a ~1% auto-vs-fixed gap
+(promote exploration; bounded by flo6). (b) d7/d8: cctx sat6 .64 STILL saturates --
+the ladder extends by the same recipe (S_spare7, [8]->[9] arrays, hi7/flo7) IF live
+lane-6 telemetry (glf/gla now report it) shows sustained sat6 >= .6 on real serving;
+the pointer-array lane refactor (maxd6-decision.md) becomes worth it at d7+. (c) The
+P4-echo tail (llama depth-10 +45%) remains open above d6.

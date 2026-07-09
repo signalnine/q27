@@ -305,8 +305,9 @@ int main(int argc, char** argv) {
                 ms_since(srv_t0),
                 // P13: cumulative adaptive-maxd activity on this engine (auto only)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
-                                        " md4=%ld md5=%ld mprom=%ld mdem=%ld", e.dctl.rounds4,
-                                        e.dctl.rounds5, e.dctl.promotes, e.dctl.demotes),
+                                        " md4=%ld md5=%ld md6=%ld mprom=%ld mdem=%ld",
+                                        e.dctl.rounds[4], e.dctl.rounds[5], e.dctl.rounds[6],
+                                        e.dctl.promotes, e.dctl.demotes),
                                p13buf)
                             : "",
                 // maxd6 GO-IF: cumulative gated-round histograms on this engine --
@@ -315,17 +316,19 @@ int main(int argc, char** argv) {
                 // -- the conditional yields the marginals cannot reconstruct.
                 e.pmin_theta > 0.f
                     ? (snprintf(gatebuf, sizeof gatebuf,
-                                " gch=%ld,%ld,%ld,%ld,%ld,%ld gnh=%ld,%ld,%ld,%ld,%ld,%ld"
-                                " glf=%ld,%ld,%ld,%ld,%ld gla=%ld,%ld,%ld,%ld,%ld",
+                                " gch=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                                " gnh=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                                " glf=%ld,%ld,%ld,%ld,%ld,%ld gla=%ld,%ld,%ld,%ld,%ld,%ld",
                                 e.gate_cap_hist[0], e.gate_cap_hist[1], e.gate_cap_hist[2],
                                 e.gate_cap_hist[3], e.gate_cap_hist[4], e.gate_cap_hist[5],
-                                e.gate_n_hist[1], e.gate_n_hist[2], e.gate_n_hist[3],
-                                e.gate_n_hist[4], e.gate_n_hist[5], e.gate_n_hist[6],
-                                e.gate_lane_fired[1], e.gate_lane_fired[2],
-                                e.gate_lane_fired[3], e.gate_lane_fired[4],
-                                e.gate_lane_fired[5], e.gate_lane_acc[1],
-                                e.gate_lane_acc[2], e.gate_lane_acc[3],
-                                e.gate_lane_acc[4], e.gate_lane_acc[5]),
+                                e.gate_cap_hist[6], e.gate_n_hist[1], e.gate_n_hist[2],
+                                e.gate_n_hist[3], e.gate_n_hist[4], e.gate_n_hist[5],
+                                e.gate_n_hist[6], e.gate_n_hist[7], e.gate_lane_fired[1],
+                                e.gate_lane_fired[2], e.gate_lane_fired[3],
+                                e.gate_lane_fired[4], e.gate_lane_fired[5],
+                                e.gate_lane_fired[6], e.gate_lane_acc[1], e.gate_lane_acc[2],
+                                e.gate_lane_acc[3], e.gate_lane_acc[4], e.gate_lane_acc[5],
+                                e.gate_lane_acc[6]),
                        gatebuf)
                     : "",
                 extra.c_str());
