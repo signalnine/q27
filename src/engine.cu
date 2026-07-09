@@ -42,6 +42,8 @@ int main(int argc, char** argv) {
     std::string nll_path;
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
+    std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
+    bool p0b = false;      // DFlash P0b S=16 verify-cost bench
     // Sampling (roadmap #2). temp>0 routes the --spec loop to the sampled spec
     // path (Phase 2); Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B.
     double temp = 0.0, top_p = 1.0;
@@ -66,6 +68,8 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
+        if (!strcmp(argv[i], "--dump-taps") && i + 1 < argc) taps_path = argv[++i];
+        if (!strcmp(argv[i], "--p0b")) p0b = true;
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
     // Review 2026-07-09 P0 #2: the direct CLI path fed prompt ingestion and
@@ -87,6 +91,113 @@ int main(int argc, char** argv) {
     e.fast_head = fast;
     e.build_graph();
     if (spec) e.build_spec_graphs();
+
+    if (!taps_path.empty()) {
+        // DFlash P0a tap capture (docs/dflash-block-verify-design.md):
+        // batched-prefill all but the last TAP_TAIL prompt tokens (the
+        // drafter's feature window only needs the recent committed tokens),
+        // then eager-forward the tail + generation dumping per-step taps.
+        // File format per step: int32 committed token, 5*N_EMBD fp32 taps.
+        const int TAP_TAIL = 160; // drafter window 128 + margin
+        if ((int)toks.size() + n_gen + 8 > ctx) {
+            fprintf(stderr, "--dump-taps: prompt %zu + n %d > --ctx %d -- refusing\n",
+                    toks.size(), n_gen, ctx);
+            return 1;
+        }
+        FILE* tf = fopen(taps_path.c_str(), "wb");
+        if (!tf) { fprintf(stderr, "cannot open %s\n", taps_path.c_str()); return 1; }
+        int NP = (int)toks.size();
+        int base = NP > TAP_TAIL ? NP - TAP_TAIL : 0;
+        if (base >= 32) {
+            int* d_toks;
+            CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)NP * 4));
+            CUDA_CHECK(cudaMemcpyAsync(d_toks, toks.data(), (size_t)NP * 4,
+                                       cudaMemcpyHostToDevice, e.stm));
+            const int PT = Engine::PF_T;
+            for (int c0 = 0; c0 < base; c0 += PT) {
+                int T = std::min(PT, base - c0);
+                e.prefill_chunk(d_toks + c0, c0, T);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaFree(d_toks));
+        } else {
+            base = 0;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(e.d_pos, &base, 4, cudaMemcpyHostToDevice, e.stm));
+        CUDA_CHECK(cudaMemcpyAsync(e.d_step, &base, 4, cudaMemcpyHostToDevice, e.stm));
+        std::vector<float> htaps(5 * (size_t)N_EMBD);
+        auto dump_step = [&](int committed) {
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            CUDA_CHECK(cudaMemcpy(htaps.data(), e.d_taps, htaps.size() * 4,
+                                  cudaMemcpyDeviceToHost));
+            fwrite(&committed, 4, 1, tf);
+            fwrite(htaps.data(), 4, htaps.size(), tf);
+        };
+        for (int i = base; i < NP; i++) { e.step_taps(toks[i]); dump_step(toks[i]); }
+        for (int g = 0; g < n_gen; g++) {
+            int tok_in;
+            CUDA_CHECK(cudaMemcpy(&tok_in, e.d_token, 4, cudaMemcpyDeviceToHost));
+            e.step_taps_free();
+            dump_step(tok_in);
+        }
+        fclose(tf);
+        fprintf(stderr, "taps: %d steps (%d prompt-tail + %d gen) -> %s\n",
+                NP - base + n_gen, NP - base, n_gen, taps_path.c_str());
+        return 0;
+    }
+
+    if (p0b) {
+        // DFlash P0b: batched-prefill the prompt to depth, then time the
+        // S=16 verify anatomy -- one T=16 prefill_chunk + the 16-row head
+        // (rmsnorm_T + qxT + mmT). Timing rig only: repeated chunks at the
+        // same positions corrupt GDN state by design; state is discarded.
+        int NP = (int)toks.size();
+        if (NP < 64 || NP + 16 > ctx) {
+            fprintf(stderr, "--p0b: need 64 <= prompt and prompt+16 <= ctx\n");
+            return 1;
+        }
+        int* d_toks;
+        float* d_lg;
+        CUDA_CHECK(cudaMalloc((void**)&d_toks, (size_t)NP * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d_lg, (size_t)16 * VOCAB * 4));
+        CUDA_CHECK(cudaMemcpyAsync(d_toks, toks.data(), (size_t)NP * 4, cudaMemcpyHostToDevice,
+                                   e.stm));
+        const int PT = Engine::PF_T;
+        const int depth = NP - 16;
+        for (int c0 = 0; c0 < depth; c0 += PT) {
+            int T = std::min(PT, depth - c0);
+            e.prefill_chunk(d_toks + c0, c0, T);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        const DevTensor& onw = e.dm.get("output_norm.weight");
+        const DevTensor& head = e.dm.get("output.weight");
+        auto cycle = [&](bool with_head) {
+            e.prefill_chunk(d_toks + depth, depth, 16);
+            if (with_head) {
+                q27k::rmsnorm_T(e.hT, (const float*)onw.data, e.x1T, N_EMBD, 16, EPS, e.stm);
+                e.qxT(e.x1T, N_EMBD, 16);
+                e.mmT(head, e.x1T, d_lg, 16);
+            }
+        };
+        cycle(true); // warm
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        cudaEvent_t v0, v1;
+        CUDA_CHECK(cudaEventCreate(&v0));
+        CUDA_CHECK(cudaEventCreate(&v1));
+        const int REPS = 50;
+        for (int pass = 0; pass < 2; pass++) {
+            bool with_head = pass == 1;
+            CUDA_CHECK(cudaEventRecord(v0, e.stm));
+            for (int r = 0; r < REPS; r++) cycle(with_head);
+            CUDA_CHECK(cudaEventRecord(v1, e.stm));
+            CUDA_CHECK(cudaEventSynchronize(v1));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, v0, v1));
+            printf("p0b depth=%d T=16 %s: %.3f ms/cycle\n", depth,
+                   with_head ? "chunk+head" : "chunk-only", ms / REPS);
+        }
+        return 0;
+    }
 
     if (burst_n > 0) {
         // ctx budget (review follow-up 2026-07-09 #1): the rig steps

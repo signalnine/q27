@@ -670,10 +670,16 @@ struct Engine {
     }
 
     // enqueue one full token onto stm (no syncs, no allocations: graph-safe)
-    void token_launches() {
+    // taps: DFlash Phase-0 rig plumbing (docs/dflash-block-verify-design.md
+    // P0a) -- when non-null, the residual stream h is copied after each
+    // DFLASH_TAP layer. Host-side branch only: build_graph captures with
+    // taps == nullptr, so the graphed paths are byte-identical.
+    static constexpr int DFLASH_TAPS[5] = {1, 16, 31, 46, 61}; // z-lab target_layer_ids; P0a measured the +-1 convention equal (AL 2.10 vs 2.18)
+    void token_launches(float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
                            stm);
+        int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm(h, (const float*)T(il, "attn_norm.weight").data, x1, N_EMBD, EPS, stm);
             if (attn_layer[il]) attn_block(il, x1, y);
@@ -683,6 +689,11 @@ struct Engine {
                           EPS, stm);
             ffn(il, x1, y);
             q27k::add_inplace(h, y, N_EMBD, stm);
+            if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
+                CUDA_CHECK(cudaMemcpyAsync(taps + (size_t)tap_k * N_EMBD, h, N_EMBD * 4,
+                                           cudaMemcpyDeviceToDevice, stm));
+                tap_k++;
+            }
         }
         q27k::rmsnorm(h, (const float*)dm.get("output_norm.weight").data, x1, N_EMBD, EPS, stm);
         qx(x1, N_EMBD);
@@ -2159,4 +2170,17 @@ struct Engine {
     }
     // generation step: d_token already holds the model's own prediction
     void step_free() { CUDA_CHECK(cudaGraphLaunch(graph_exec, stm)); }
+
+    // DFlash Phase-0 tap capture: EAGER forward (no graph) writing the
+    // residual stream after DFLASH_TAPS layers into d_taps. Debug rig only.
+    float* d_taps = nullptr; // [5][N_EMBD]
+    void step_taps(int token) {
+        if (!d_taps) CUDA_CHECK(cudaMalloc((void**)&d_taps, 5 * N_EMBD * 4));
+        CUDA_CHECK(cudaMemcpyAsync(d_token, &token, 4, cudaMemcpyHostToDevice, stm));
+        token_launches(d_taps);
+    }
+    void step_taps_free() {
+        if (!d_taps) CUDA_CHECK(cudaMalloc((void**)&d_taps, 5 * N_EMBD * 4));
+        token_launches(d_taps);
+    }
 };

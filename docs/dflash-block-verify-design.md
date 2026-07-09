@@ -166,3 +166,57 @@ tight but viable for Phase-1 bring-up at reduced ctx.
 FlashRT (flashrt-project/FlashRT, Apache-2.0) -- integration reference;
 z-lab/Qwen3.6-27B-DFlash (MIT) -- drafter checkpoint;
 lucebox-hub/dflash -- original block-diffusion drafter recipe.
+
+---
+
+## Phase-0 VERDICT (2026-07-09): NO-GO for the primary target
+
+Measured same-day on the design's own gates (rig: `--dump-taps` +
+`--p0b` in engine.cu, torch harness scratchpad/dflash_p0a.py):
+
+**P0a -- drafter AL on q27-captured hiddens (base model, 5.25 bpw):**
+
+    cctx (agent transcript, the serving flavor)  AL 2.10  (67% -> 46%
+        cycles accept nothing; ctx-rows-raw fix took 1.41 -> 2.10)
+    cctx, taps shifted one layer (+-1 convention) AL 2.18 -- a wash
+    cctx, window 1 (per-cycle mode)               AL 1.70 -- ring works
+    prose @8K                                     AL 2.65
+
+Prose 2.65 vs FlashRT's published prose 3.0 (Thor, their impl)
+validates the harness to first order. KILL BAR was AL < 5.5: measured
+2.1-2.2 on the traffic that matters. The ladder's trained-in MTP nets
+5.29 tok/round on the SAME traffic -- the 5-layer block drafter is not
+close, independent of verify cost.
+
+**P0b -- S=16 verify cost on the existing prefill path:**
+
+    depth 1.7K: 41.3 ms | depth 26K: 47.2 ms | depth 61K: 53.2 ms
+    (chunk+head; +1.1 ms for the 16-row head)
+
+~Flat in depth => kernel-shape cost (T=1024-tuned prefill kernels at
+T=16), not attention. Weight-read floor is ~10 ms; a DEDICATED small-T
+GEMM verify could plausibly reach 13-18 ms -- but even a
+floor-touching 12 ms cycle needs AL > 2.7 to match the ladder, and
+needs AL ~5.5+ to justify the build. Not there.
+
+**Why FlashRT's +30-60% didn't transfer:** their gains are measured
+against a WEAK MTP baseline (fixed K=6, AL 2.4-2.9). Our
+margin-gated adaptive ladder already extracts 5.3 tok/round from the
+same trained-in MTP heads on agentic traffic; their best DFlash flavor
+(4.57) never reaches our live baseline.
+
+**Honest nuance:** on LOW-acceptance flavors (docs61k-class, ladder
+~3 tok/round at ~26 ms = 0.12 tok/ms), drafter AL ~2.65 at a
+hypothetical 13 ms dedicated cycle = 0.20 tok/ms -- DFlash could win
++60-70% THERE. But that requires the dedicated small-T verify (the
+expensive Phase-1/2 build, P15-class GDN state machinery) and pays
+only on the flavors our serving profile cares least about. Not
+commissioned.
+
+**DO-NOT-RETRY unless:** (a) a drafter retrained on q27-quant hiddens
+exists, or (b) any block drafter shows AL >= 6 on agent-transcript
+traffic, or (c) the serving profile shifts to low-acceptance flavors
+AND the small-T verify gets built for another reason. The rig stays:
+`--dump-taps <file>` (eager tap capture, graphs untouched, canonical
+EXACT) and `--p0b` (S=16 cycle timing) in engine.cu;
+scratchpad/dflash_p0a.py.
