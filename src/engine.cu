@@ -975,10 +975,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "sampling: T=%.3f top_p=%.3f seed=%llu path=%s\n", temp, top_p, seed,
                     plain_sample ? "plain" : "spec");
         }
-        int total_emitted = 0, rounds = 0, hist[7] = {0}; // maxd6: up to 7-tok rounds
+        int total_emitted = 0, rounds = 0, hist[8] = {0}; // maxd7: up to 8-tok rounds
         while ((int)out.size() < n_gen) {
             if (P + 7 > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[7]; // maxd6: depth-6 emits up to 7 tokens
+            int em[8]; // maxd7: depth-7 emits up to 8 tokens
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
@@ -989,14 +989,14 @@ int main(int argc, char** argv) {
         }
         fprintf(stderr,
                 "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, 6-tok %d, "
-                "7-tok %d\n",
-                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6]);
+                "7-tok %d, 8-tok %d\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
         if (e.maxd_auto)
             fprintf(stderr,
-                    "adaptive maxd: %ld rounds @depth-4, %ld @depth-5, %ld @depth-6 "
-                    "(%ld promotes, %ld demotes); final ceiling=%d\n",
-                    e.dctl.rounds[4], e.dctl.rounds[5], e.dctl.rounds[6], e.dctl.promotes,
-                    e.dctl.demotes, e.dctl.cur);
+                    "adaptive maxd: %ld rounds @depth-4, %ld @depth-5, %ld @depth-6, "
+                    "%ld @depth-7 (%ld promotes, %ld demotes); final ceiling=%d\n",
+                    e.dctl.rounds[4], e.dctl.rounds[5], e.dctl.rounds[6], e.dctl.rounds[7],
+                    e.dctl.promotes, e.dctl.demotes, e.dctl.cur);
         drafted = rounds;
         accepted = total_emitted; // repurposed: tokens per round stats
         CUDA_CHECK(cudaEventRecord(t1, e.stm));

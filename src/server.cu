@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[64], gatebuf[384];
+        char p13buf[96], gatebuf[512];
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
@@ -305,9 +305,10 @@ int main(int argc, char** argv) {
                 ms_since(srv_t0),
                 // P13: cumulative adaptive-maxd activity on this engine (auto only)
                 e.maxd_auto ? (snprintf(p13buf, sizeof p13buf,
-                                        " md4=%ld md5=%ld md6=%ld mprom=%ld mdem=%ld",
+                                        " md4=%ld md5=%ld md6=%ld md7=%ld mprom=%ld"
+                                        " mdem=%ld",
                                         e.dctl.rounds[4], e.dctl.rounds[5], e.dctl.rounds[6],
-                                        e.dctl.promotes, e.dctl.demotes),
+                                        e.dctl.rounds[7], e.dctl.promotes, e.dctl.demotes),
                                p13buf)
                             : "",
                 // maxd6 GO-IF: cumulative gated-round histograms on this engine --
@@ -316,19 +317,21 @@ int main(int argc, char** argv) {
                 // -- the conditional yields the marginals cannot reconstruct.
                 e.pmin_theta > 0.f
                     ? (snprintf(gatebuf, sizeof gatebuf,
-                                " gch=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
-                                " gnh=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
-                                " glf=%ld,%ld,%ld,%ld,%ld,%ld gla=%ld,%ld,%ld,%ld,%ld,%ld",
+                                " gch=%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                                " gnh=%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                                " glf=%ld,%ld,%ld,%ld,%ld,%ld,%ld"
+                                " gla=%ld,%ld,%ld,%ld,%ld,%ld,%ld",
                                 e.gate_cap_hist[0], e.gate_cap_hist[1], e.gate_cap_hist[2],
                                 e.gate_cap_hist[3], e.gate_cap_hist[4], e.gate_cap_hist[5],
-                                e.gate_cap_hist[6], e.gate_n_hist[1], e.gate_n_hist[2],
-                                e.gate_n_hist[3], e.gate_n_hist[4], e.gate_n_hist[5],
-                                e.gate_n_hist[6], e.gate_n_hist[7], e.gate_lane_fired[1],
-                                e.gate_lane_fired[2], e.gate_lane_fired[3],
-                                e.gate_lane_fired[4], e.gate_lane_fired[5],
-                                e.gate_lane_fired[6], e.gate_lane_acc[1], e.gate_lane_acc[2],
+                                e.gate_cap_hist[6], e.gate_cap_hist[7], e.gate_n_hist[1],
+                                e.gate_n_hist[2], e.gate_n_hist[3], e.gate_n_hist[4],
+                                e.gate_n_hist[5], e.gate_n_hist[6], e.gate_n_hist[7],
+                                e.gate_n_hist[8], e.gate_lane_fired[1], e.gate_lane_fired[2],
+                                e.gate_lane_fired[3], e.gate_lane_fired[4],
+                                e.gate_lane_fired[5], e.gate_lane_fired[6],
+                                e.gate_lane_fired[7], e.gate_lane_acc[1], e.gate_lane_acc[2],
                                 e.gate_lane_acc[3], e.gate_lane_acc[4], e.gate_lane_acc[5],
-                                e.gate_lane_acc[6]),
+                                e.gate_lane_acc[6], e.gate_lane_acc[7]),
                        gatebuf)
                     : "",
                 extra.c_str());

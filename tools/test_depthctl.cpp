@@ -202,6 +202,49 @@ int main() {
         }
         CHECK(d.cur == 6 && d.demotes == 0, "cctx-like 0.67-fired level-6 stream holds");
     }
+    // ---- maxd7 ladder (2026-07-09): level 7 ----
+    { // k_max=6 regression: saturated stream tops out at 6 (no accidental 7)
+        DepthCtl c;
+        c.k_max = 6;
+        for (int i = 0; i < 64; i++) c.update(c.cur, c.cur, c.cur + 1);
+        CHECK(c.cur == 6, "k_max=6: saturated stream tops out at 6");
+    }
+    { // full promote path 4->5->6->7: 11 (hi .5) + 15 (hi6 .6) + 15 (hi7 .6)
+        DepthCtl c;
+        c.k_max = 7;
+        int at7 = -1, i = 0;
+        while (i++ < 96 && at7 < 0) {
+            c.update(c.cur, c.cur, c.cur + 1);
+            if (c.cur == 7 && at7 < 0) at7 = i;
+        }
+        CHECK(at7 == 41 && c.promotes == 3, "promote 4->5@11, 5->6@26, 6->7@41");
+    }
+    { // demote 7->6 on dead lane-7 yield; level-6 EMAs untouched by level-7 rounds
+        DepthCtl c;
+        c.k_max = 7;
+        for (int i = 0; i < 41; i++) c.update(c.cur, c.cur, c.cur + 1); // reach 7
+        CHECK(c.cur == 7, "(pre) at 7");
+        float y6 = c.yld[6];
+        int demoted_at = -1;
+        for (int i = 1; i <= 16 && demoted_at < 0; i++) {
+            c.update(7, 7, 7); // fired, 7th lane never accepted (n=7 < 8)
+            if (c.cur == 6) demoted_at = i;
+        }
+        CHECK(demoted_at == 11 && c.cur == 6, "demote 7->6 on miss round 11");
+        CHECK(c.yld[6] == y6 || c.yld[6] == 2.f * c.lo, "level-7 stint left level-6 yld to its fresh seed");
+    }
+    { // level-7 fired-rate bar (flo7): margins rarely running 7-deep demotes
+        DepthCtl c;
+        c.k_max = 7;
+        for (int i = 0; i < 41; i++) c.update(c.cur, c.cur, c.cur + 1);
+        int demoted_at = -1;
+        for (int i = 1; i <= 64 && demoted_at < 0; i++) {
+            bool fired = (i % 3 == 0); // fired 1-in-3, accepted whenever fired
+            c.update(7, fired ? 7 : 6, fired ? 8 : 7);
+            if (c.cur == 6) demoted_at = i;
+        }
+        CHECK(demoted_at > 0 && demoted_at <= 40, "low-fired level-7 stream demotes via flo7");
+    }
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -517,8 +517,8 @@ void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cud
 
 __global__ void k_prep_round(const int* __restrict__ dP, const int* __restrict__ dtok,
                              int* pa, int* pb, int* pc, int* pd, int* pe, int* pf, int* pg,
-                             int* pm, int* pm2, int* pm3, int* pm4, int* pm5, int* pm6,
-                             int* outcome) {
+                             int* ph, int* pm, int* pm2, int* pm3, int* pm4, int* pm5, int* pm6,
+                             int* pm7, int* outcome) {
     int P = *dP;
     *pa = P + 1;
     *pb = P + 2;
@@ -527,20 +527,23 @@ __global__ void k_prep_round(const int* __restrict__ dP, const int* __restrict__
     *pe = P + 5;
     *pf = P + 6; // P12b: 6th verify lane (depth-5)
     *pg = P + 7; // maxd6: 7th verify lane (depth-6)
+    *ph = P + 8; // maxd7: 8th verify lane (depth-7)
     *pm = P + 1;
     *pm2 = P + 2;
     *pm3 = P + 3;
     *pm4 = P + 4;
     *pm5 = P + 5; // P12b: 5th MTP draft position
     *pm6 = P + 6; // maxd6: 6th MTP draft position
+    *pm7 = P + 7; // maxd7: 7th MTP draft position
     outcome[1] = *dtok; // t1 snapshot (pre-round)
 }
 void prep_round(const int* d_P, const int* d_token, int* pos_a, int* pos_b, int* pos_c,
-                int* pos_d, int* pos_e, int* pos_f, int* pos_g, int* pos_m, int* pos_m2,
-                int* pos_m3, int* pos_m4, int* pos_m5, int* pos_m6, int* outcome,
-                cudaStream_t st) {
+                int* pos_d, int* pos_e, int* pos_f, int* pos_g, int* pos_h, int* pos_m,
+                int* pos_m2, int* pos_m3, int* pos_m4, int* pos_m5, int* pos_m6, int* pos_m7,
+                int* outcome, cudaStream_t st) {
     k_prep_round<<<1, 1, 0, st>>>(d_P, d_token, pos_a, pos_b, pos_c, pos_d, pos_e, pos_f, pos_g,
-                                  pos_m, pos_m2, pos_m3, pos_m4, pos_m5, pos_m6, outcome);
+                                  pos_h, pos_m, pos_m2, pos_m3, pos_m4, pos_m5, pos_m6, pos_m7,
+                                  outcome);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -548,17 +551,20 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
                                const int* __restrict__ dr1p, const int* __restrict__ dr2p,
                                const int* __restrict__ dr3p, const int* __restrict__ dr4p,
                                const int* __restrict__ dr5p, const int* __restrict__ dr6p,
-                               const int* __restrict__ vap, const int* __restrict__ vbp,
-                               const int* __restrict__ vcp, const int* __restrict__ vdp,
-                               const int* __restrict__ vep, const int* __restrict__ vfp,
-                               const int* __restrict__ vgp, const float* __restrict__ x1a,
+                               const int* __restrict__ dr7p, const int* __restrict__ vap,
+                               const int* __restrict__ vbp, const int* __restrict__ vcp,
+                               const int* __restrict__ vdp, const int* __restrict__ vep,
+                               const int* __restrict__ vfp, const int* __restrict__ vgp,
+                               const int* __restrict__ vhp, const float* __restrict__ x1a,
                                const float* __restrict__ x1b, const float* __restrict__ x1c,
                                const float* __restrict__ x1d, const float* __restrict__ x1e,
                                const float* __restrict__ x1f, const float* __restrict__ x1g,
-                               float* __restrict__ h_next, int* __restrict__ outcome, int n_embd,
+                               const float* __restrict__ x1h, float* __restrict__ h_next,
+                               int* __restrict__ outcome, int n_embd,
                                const int* __restrict__ cap, int max_draft) {
-    int dr1 = *dr1p, dr2 = *dr2p, dr3 = *dr3p, dr4 = *dr4p, dr5 = *dr5p, dr6 = *dr6p;
-    int va = *vap, vb = *vbp, vc = *vcp, vd = *vdp, ve = *vep, vf = *vfp, vg = *vgp;
+    int dr1 = *dr1p, dr2 = *dr2p, dr3 = *dr3p, dr4 = *dr4p, dr5 = *dr5p, dr6 = *dr6p,
+        dr7 = *dr7p;
+    int va = *vap, vb = *vbp, vc = *vcp, vd = *vdp, ve = *vep, vf = *vfp, vg = *vgp, vh = *vhp;
     // P12/P12b: max_draft gates depth to the verified columns (narrow-verify graph).
     bool a1 = max_draft >= 1 && va == dr1;
     bool a2 = max_draft >= 2 && a1 && vb == dr2;
@@ -566,43 +572,46 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
     bool a4 = max_draft >= 4 && a3 && vd == dr4;
     bool a5 = max_draft >= 5 && a4 && ve == dr5;
     bool a6 = max_draft >= 6 && a5 && vf == dr6; // maxd6: 6th draft vs lane-6 argmax
+    bool a7 = max_draft >= 7 && a6 && vg == dr7; // maxd7: 7th draft vs lane-7 argmax
     // P7: in-grammar rounds accept only the pending token; drafts are
     // unconstrained and must not commit past the constrained lane (slot 0)
-    if (*cap) a1 = a2 = a3 = a4 = a5 = a6 = false;
+    if (*cap) a1 = a2 = a3 = a4 = a5 = a6 = a7 = false;
     int n = 1 + (a1 ? 1 : 0) + (a2 ? 1 : 0) + (a3 ? 1 : 0) + (a4 ? 1 : 0) + (a5 ? 1 : 0) +
-            (a6 ? 1 : 0);
-    const float* src = n == 7 ? x1g : n == 6 ? x1f : n == 5 ? x1e : n == 4 ? x1d
-                       : n == 3 ? x1c : n == 2 ? x1b : x1a;
+            (a6 ? 1 : 0) + (a7 ? 1 : 0);
+    const float* src = n == 8 ? x1h : n == 7 ? x1g : n == 6 ? x1f : n == 5 ? x1e
+                       : n == 4 ? x1d : n == 3 ? x1c : n == 2 ? x1b : x1a;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         h_next[i] = src[i];
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        int nt = n == 7 ? vg : n == 6 ? vf : n == 5 ? ve : n == 4 ? vd
-                 : n == 3 ? vc : n == 2 ? vb : va;
+        int nt = n == 8 ? vh : n == 7 ? vg : n == 6 ? vf : n == 5 ? ve
+                 : n == 4 ? vd : n == 3 ? vc : n == 2 ? vb : va;
         *dtok = nt;
         *dP += n;
         outcome[0] = n;
-        // maxd6 outcome layout: [0]=n, [1]=t1(prep), [2..7]=dr1..dr6 (up to 7
-        // emitted tokens live in [1..n]), [8]=new pending.
+        // maxd7 outcome layout: [0]=n, [1]=t1(prep), [2..8]=dr1..dr7 (up to 8
+        // emitted tokens live in [1..n]), [9]=new pending.
         outcome[2] = dr1;
         outcome[3] = dr2;
         outcome[4] = dr3;
         outcome[5] = dr4;
         outcome[6] = dr5;
         outcome[7] = dr6;
-        outcome[8] = nt; // new pending token (P7: host grammar needs it pre-round)
+        outcome[8] = dr7;
+        outcome[9] = nt; // new pending token (P7: host grammar needs it pre-round)
     }
 }
 void finish_round(int* d_P, int* d_token, const int* d_draft, const int* d_draft2,
                   const int* d_draft3, const int* d_draft4, const int* d_draft5,
-                  const int* d_draft6, const int* va, const int* vb, const int* vc, const int* vd,
-                  const int* ve, const int* vf, const int* vg, const float* x1a, const float* x1b,
-                  const float* x1c, const float* x1d, const float* x1e, const float* x1f,
-                  const float* x1g, float* h_next, int* outcome, int n_embd, const int* cap,
+                  const int* d_draft6, const int* d_draft7, const int* va, const int* vb,
+                  const int* vc, const int* vd, const int* ve, const int* vf, const int* vg,
+                  const int* vh, const float* x1a, const float* x1b, const float* x1c,
+                  const float* x1d, const float* x1e, const float* x1f, const float* x1g,
+                  const float* x1h, float* h_next, int* outcome, int n_embd, const int* cap,
                   int max_draft, cudaStream_t st) {
     k_finish_round<<<4, 256, 0, st>>>(d_P, d_token, d_draft, d_draft2, d_draft3, d_draft4,
-                                      d_draft5, d_draft6, va, vb, vc, vd, ve, vf, vg, x1a, x1b,
-                                      x1c, x1d, x1e, x1f, x1g, h_next, outcome, n_embd, cap,
-                                      max_draft);
+                                      d_draft5, d_draft6, d_draft7, va, vb, vc, vd, ve, vf, vg,
+                                      vh, x1a, x1b, x1c, x1d, x1e, x1f, x1g, x1h, h_next,
+                                      outcome, n_embd, cap, max_draft);
     CUDA_CHECK(cudaGetLastError());
 }
 

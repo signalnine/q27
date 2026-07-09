@@ -2481,3 +2481,65 @@ vLLM punts (0% reuse -> every CC turn re-prefills the whole conversation,
 P8/P9 snapshot+checkpoint machinery ran 96.7% reuse over the live trials.
 Batch-1 decode at matched depth: q27 +43% over vLLM's best leg despite NVFP4
 tensor-core dequant -- bandwidth-bound decode doesn't care about MMA peak.
+
+## 2026-07-09 (maxd7) -- BUILT AND MEASURED: depth-7 machinery ships OPT-IN; auto stays 4..6 (width-8 round cost ~2x extrapolation)
+
+The d6 verdict's own gate (live sat6 >= ~.6; measured .64) authorized the build.
+Widening = the maxd6 recipe one lane deeper (branch maxd7-ladder, plan
+docs/plans/2026-07-09-maxd7.md): _h lane, perm mod-8, S_spare7 (+157 MB),
+width-8 verify, gemv case 8, quantize3 8th explicit lane, outcome
+{n,t1,dr1..dr7,pending}, hists to cap7/n8, glf/gla lane 7; depthctl level 7
+(hi7=.60, flo7=.45, 40 CPU tests). Gates: canonical 4c4120c7 EXACT at
+{ungated, 4,5,6,7,auto}; cctx emitted text BYTE-IDENTICAL across all six
+ceiling configs; test_kernels ALL PASS.
+
+**En-route incident, fully forensic'd (half the session): the cctx trajectory
+FLIPPED between 07-08 and 07-09 builds.** Yesterday's replay legs (b4a02285,
+4.56 tok/round, empty-think basin) vs today (a225f6a7, 3.21, thinking basin)
+-- divergence at TOKEN 3, a near-tie newline flip after <think>. Exonerated in
+order: the maxd7 widening (stash test), the hi6-era source (exact b24864d
+rebuild reproduces TODAY's text), rebuild determinism (two same-source builds
+byte-differ in ELF metadata only, behaviorally identical), the model file
+(byte-identical to a fresh deterministic re-repack from the intact BF16;
+an unexplained mtime bump at 21:22 was benign -- content verified). Verdict:
+**cross-BUILD near-tie re-rolls are a real, known class** (the canonical
+177.5->160.2 re-roll documented it); cross-build/cross-day emitted-TEXT
+comparisons on tie-heavy payloads are NOT a valid identity gate. Same-binary
+legs only -- which is what the A/B discipline always said. Hardening:
+/mnt/ai/models/qwen36-27b-mtp/CHECKSUMS.md5 now records the model file md5s.
+Corollary: 07-08's cctx numbers (222.6 etc.) and 07-09's are different BASINS
+of the same payload; each is internally valid, they are not comparable to
+each other. The three-stack shootout ordering is unaffected (each engine ran
+its own greedy basin; the structural findings -- APC-dead-on-hybrids, byte
+economics -- do not rest on basin luck).
+
+**Live T8 with the 4..7 ladder** (base qwen36, 30 reqs, ~1.95K gated rounds):
+level 7 SUSTAINED on merit where chosen -- md7 on 26% of rounds, lane-7 live
+fired .61 (bar .45) / yield .596 (bar .35), 15 promotes / 13 demotes, weighted
+decode 175.7 t/s (parity with the ladder-6 trial's 175.4 on a different
+basin). Trial score 0.262 = a 92s low basin (cross-build tie lottery again;
+scores are basin samples, telemetry is the signal).
+
+**The decisive same-build A/B (cctx2 = fresh transcript replay, HIGH-sat:
+y1..y7 = .98/.93/.89/.89/.88/.80/.81):**
+
+    auto 4..6   210.8 t/s  <- best (revalidated after the default revert)
+    fixed d6    209.8
+    auto 4..7   204.3      (-2.6% vs fixed-6)
+    fixed d7    196.3      (-6.4% vs fixed-6; tok/round +4.4% but ms/round
+                            25.96 -> 28.98 = +3.0 ms)
+
+**Depth-7 as built does NOT pay even in its best regime**: the width-8 round
+costs +3.0 ms over width-7 -- ~2x the decayed-increment extrapolation -- and
++0.24 tok/round cannot cover it. The fired/yield bars are blind to this
+failure mode (the lane is PRODUCTIVE; the machinery is what's expensive).
+DECISION: **auto default reverts to the 4..6 ladder** (validated above);
+`Q27_MAXD=auto7` opts into 4..7 and fixed `Q27_MAXD=7` stays, for the retune
+after the follow-on: **attribute the width-8 cost** (ncu on the 8-lane verify
+-- occupancy/L2/graph cliff?) -- if it shrinks to the extrapolated ~1.5 ms,
+depth-7 re-enters via the same A/B. Also fixed en route: hi7/flo7 env parses
+(Q27_MAXD_HI7/FLO7) were never wired -- the capped-auto A/B leg silently ran
+uncapped; caught by y7 appearing in its telemetry.
+
+Do-not-retry without new facts: ladder-7 by default (this A/B), d8 (strictly
+worse cost curve until width-8 is attributed).
