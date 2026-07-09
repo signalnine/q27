@@ -19,6 +19,17 @@ static __device__ __forceinline__ float warp_reduce_f(float v) {
 // dp4a'd against TB tokens' activations (weight DRAM traffic /TB; activation
 // tile stays L2-resident).
 
+// reports the __CUDA_ARCH__ of the image actually loaded on this device --
+// the honest capability signal for arch-conditional instruction paths (an
+// sm_89 device running the sm_86 image must NOT enable sm_89-only code)
+__global__ void k_arch_probe(int* out) {
+#if defined(__CUDA_ARCH__)
+    *out = __CUDA_ARCH__; // 860, 890, 1200, ...
+#else
+    *out = 0;
+#endif
+}
+
 template <int TB, int CS>
 __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                             const uint2* __restrict__ eo, const float* __restrict__ xs,
@@ -1586,23 +1597,32 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row, const 
         // fp16 canonical are untouched. Set Q27_PF_FP8MMA=0 to force the f16-MMA
         // fp8 path (bisection / <sm_89 auto-fallback via the guard below).
         // fp8 m16n8k32 MMA is sm_89+ (Blackwell sm_120 ok); the mma_e4m3
-        // stub NO-OPs on <sm_89 and would silently emit garbage. Cache the
-        // device-capability check (device doesn't change) but RE-READ the env
-        // per launch -- test_kernels exercises both the f16-staging bitwise
-        // path (=0) and the fp8q tolerance path (=1) in one process, and a
-        // getenv at launch frequency (once per chunk x layer) is noise.
+        // stub NO-OPs on <sm_89 and would silently emit garbage. Gate on the
+        // LOADED IMAGE, not the physical device (review follow-up 2026-07-09
+        // #4): the build carries sm_86 + sm_120 SASS only, so an sm_89 device
+        // (Ada) runs the sm_86 image -- where mma_e4m3 IS the no-op stub even
+        // though the device attribute says CC 8.9. k_arch_probe reports the
+        // __CUDA_ARCH__ the running image was compiled for. Cached (image
+        // doesn't change); the env is RE-READ per launch -- test_kernels
+        // exercises both the f16-staging bitwise path (=0) and the fp8q
+        // tolerance path (=1) in one process, and a getenv at launch
+        // frequency (once per chunk x layer) is noise.
         static int fp8mma_arch = -1;
         if (fp8mma_arch < 0) {
-            int dev = 0, mj = 0, mn = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
-            cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
-            fp8mma_arch = (mj * 10 + mn >= 89) ? 1 : 0;
+            int* d_arch = nullptr;
+            int h_arch = 0;
+            if (cudaMalloc(&d_arch, 4) == cudaSuccess) {
+                k_arch_probe<<<1, 1>>>(d_arch);
+                if (cudaMemcpy(&h_arch, d_arch, 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+                    h_arch = 0;
+                cudaFree(d_arch);
+            }
+            fp8mma_arch = h_arch >= 890 ? 1 : 0;
             if (!fp8mma_arch)
                 fprintf(stderr,
-                        "[pfattn] device sm_%d%d < sm_89: fp8-MMA prefill unavailable, "
+                        "[pfattn] loaded image sm_%d < sm_89: fp8-MMA prefill unavailable, "
                         "using f16-MMA\n",
-                        mj, mn);
+                        h_arch / 10);
         }
         const char* fe = getenv("Q27_PF_FP8MMA");
         const int fp8mma_env = (fe ? atoi(fe) : 1) && fp8mma_arch;  // default ON
