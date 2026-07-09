@@ -256,3 +256,63 @@ per-thread state duplication (e.g. __ldcs streaming hints, or a
 persistent-block KV tile walk that shares loads across lanes through
 smem instead of registers -- smem tiles do not double the register
 state but reintroduce the RMW-serialization fd2 removed; measure first).
+
+## fd3-v2 (2026-07-09): unit-per-warp, smem-tiled KV -- the tolerance-class retry
+
+The v1 post-mortem's unlock, taken deliberately: BREAK per-lane fp-order
+parity with fd2 (deterministic NEW order), confine the change to gated widths
+ntok>=6 (canonical + all width<=5 paths stay bitwise-EXACT on fd2), gate like
+fp8q (determinism, logit cosine/argmax at depth, needle) and ship OPT-IN
+(Q27_FD=fd3).
+
+Design:
+- Grid dim3(FD2_NS, n_kv_heads) -- NO lane axis. Block 256 thr = 8 warps.
+- Work units = (lane, head) pairs: ntok*6 <= 48 units, distributed
+  ceil(units/8) <= 6 per warp. Each warp owns its units WHOLLY: per-thread
+  state acc[6][8] + m[6] + l[6] + q[6][8] = fd2's register shape (~122 regs)
+  -> 2 CTAs x 8 warps = 16 warps/SM = fd2 occupancy parity. No cross-warp
+  merge epilogue (a unit's block partial IS its warp partial).
+- Position loop: smem tiles of T=48 rows, K+V staged cooperatively by all
+  256 threads (24 KB smem/block, under the 48KB default cap; 2 CTAs fit).
+  Every unit consumes the tile -> DRAM KV traffic / ntok (v1 halved it and
+  still lost warps; v2 divides by 6-8 at NO warp cost, and converts the
+  ~400-cycle DRAM stalls fd2 eats into ~30-cycle smem loads -- this attacks
+  the LATENCY-bound diagnosis, not just bytes).
+- Per-lane split geometry identical to fd2 (chunk/plo/phi from pos.p[t]);
+  per-unit predicates handle differing p_hi within the tile loop; a unit
+  visits its positions in ascending order (deterministic; different
+  grouping than fd2's 4-warp interleave -- THE tolerance delta).
+- Scratch partial layout and k_attn_fd_combine UNTOUCHED (per (t,kvh,j,sp)
+  cell, m/l/acc[256]); empty-split early-out per unit matches fd2.
+- Economics floor @61K w7: KV slice 31MB once = ~18us DRAM vs fd2's
+  ~0.68ms/instance; realistic target = 2-3x instance win at deep ctx.
+
+## fd3-v2/v3 OUTCOME (2026-07-09): KILLED -- the design space is now closed with data
+
+Three same-day variants, all correct, all lost (micro, fp8, verify-shaped
+positions, 28.7K + 61K, ntok 6..8; fd2 baseline 0.29-0.83 ms/instance):
+
+| variant | shape | regs/occupancy | result |
+|---|---|---|---|
+| v2a 256thr, 6 units/warp | smem tiles, sync stage | 128 + 288B STACK SPILL | +115..169% |
+| v2b + cp.async dbl-buffer | same | same | WORSE (+125..169%) -- staging was never the stall |
+| v2c 512thr, 3 units/warp | no spills (119 regs) | 16 warps/SM | +44..109% -- per-warp path 2x fd2 |
+| v3 pair-block + 4-phase split | fd2-parity path, halved traffic | 112-120 regs, 16 warps | **BITWISE vs fd2 (maxerr 0.0) and still +44..61%** |
+
+v3 is the decisive cell: identical per-unit math, identical critical path,
+identical occupancy, HALVED DRAM traffic -- and 1.5x slower. Mechanism: the
+smem tile round-trip (global -> cp.async -> smem -> LDS -> register) is a
+pure EXTRA hop over fd2's direct global->register loads, because Task-5's
+lane-innermost co-scheduling already shares the KV chunk through L2 across
+sibling lane-blocks. Every KV-sharing restructure in this family (v1
+register-pair -4%, v2 tile-share, v3 phase-split) re-buys bytes the L2 was
+already providing and pays issue/latency for the privilege.
+
+**fd2 + Task-5 ordering is a measured local optimum for this GPU's memory
+hierarchy.** Do-not-retry KV-sharing restructures. The residual
+verify-attention cost is addressable only by (a) fd3-mma: tensor-core
+flash-decode -- at ntok>=6 the (units x positions) score matrix is dense
+enough for m16n8k16 MMA, moving the math to IDLE tensor pipes instead of
+re-dividing the same ALU/issue budget (fp-order change, tolerance class,
+real headroom: the fp8q prefill precedent); or (b) fewer positions
+(KV pruning -- quality class). Both are separate projects.
