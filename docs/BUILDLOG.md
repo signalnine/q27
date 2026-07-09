@@ -2804,3 +2804,32 @@ saturates far above the cctx replay's fired5 ~.38, re-confirming that only
 real agent transcripts reach the deep regime. Serving-path changes under
 test: ChatML both-boundary strip, ctx preflights, lineage DepthCtl reset,
 strict tool grammar, mask-cache keying.
+
+## 2026-07-09 (thunderdome T1-T10) -- base model 0.834 mean over T1-T9; T10 surfaced drift mode 8 (fixed)
+
+Full T1-T10, claude-code-q27-haight, base qwen36, one trial each (T8/T10
+retrialed), post-review binary:
+
+    T1  time-tracker        0.841 @51s    hidden 1.000
+    T2  collab-server       0.851 @138s   hidden 1.000
+    T3  fts-search          0.760 @89s
+    T4  phantom-invoice     0.833 @23s
+    T5  task-queue marathon 0.789 @155s   hidden 0.930
+    T6  monorepo-disaster   0.850 @42s
+    T7  plugin-marketplace  0.890 @91s    hidden 1.000
+    T8  analytics-dashboard 0.846 @155s   (good basin; trial 1 bad auth-basin
+                                           0.564 @612s -- known artifact)
+    T9  ssg-toolkit         0.850 @97s
+    T10 ecommerce-backend   crash-class x2 (0.22 @2-4s) -> DRIFT MODE 8
+
+Mean over scored T1-T9: 0.834. T10 was a stable greedy one-shot-quit: the
+first turn batches four well-formed Read calls as {"function": "Read",
+"arguments": {...}} (string-valued alias key) behind a dangling {"name":
+line -- no rescue mode matched, all calls dropped, CC quit (metrics 0.9:
+the model was fine). Fixed as drift mode 8 (resolve_aliased_call,
+registered-name-validated; dfd3b12); live T10 revalidation pending an
+eval-server restart onto the new binary.
+
+Live throughput across the whole campaign (344 requests): decode 168.0 t/s
+aggregate (179K tokens), 5.29 tok/round, prefix cache serving 95% of prompt
+tokens; per-request median 166 t/s, p75 186, peak 254.
