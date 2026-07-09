@@ -17,8 +17,8 @@
 set -u
 BIN=${1:-build/q27-server}
 PORT=${2:-8198}
-MODEL=${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}
-TOK=${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}
+MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
+TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
 SRV=""
 
 start_server() { # args: logfile, extra flags...

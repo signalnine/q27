@@ -13,8 +13,8 @@
 
 set -u
 cd "$(dirname "$0")/.."
-MODEL=${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}
-TOK=${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}
+MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
+TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
 PORT=${PORT:-8199}
 CTX=${CTX:-32768}
 LEGS=${LEGS:-"4 5 auto"}

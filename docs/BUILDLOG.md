@@ -2674,9 +2674,31 @@ states after commas, 4-hex key-escape states. Regression R2 (25 cases).
 
 **Gates:** canonical 4c4120c7 EXACT at MAXD 4/5/6/7/auto/auto7 (+ auto/auto7
 with Q27_MAXD_RESET=1); base-model canonical a2982c51 EXACT; test_kernels
-ALL PASS (incl. new high-T nucleus); test_depthctl 46 PASS; test_toolconstrain
+ALL PASS (incl. new high-T nucleus); test_depthctl 43 PASS; test_toolconstrain
 ALL PASS (incl. R1/R2); test_tokenizer suite PASS (incl. both-boundary
 sanitize); compute-sanitizer clean on the ctx-boundary rig (fp16 + fp8 KV).
 
 Out of this pass: Makefile wiring for test_toolconstrain (pending approval --
 build/run documented in the test header meanwhile).
+
+## 2026-07-09 (baseline switch) -- vanilla Qwen3.6-27B-MTP is the benchmark standard; fine-tunes stay supported
+
+Policy: `qwen36-27b-mtp` (canonical a2982c51...) is now the default MODEL/TOK
+and CANON_MD5 in every bench/gate rig (shortbench_suite, accept_ab,
+constrain_gate, sampling_gate, reqlog_gate, interleave_gate); fine-tunes ride
+the same rigs via MODEL/TOK/CANON_MD5 env overrides (Qwopus: 4c4120c7...).
+Historical numbers in README/BUILDLOG were measured on Qwopus unless noted.
+
+Baseline numbers on the standard model (post-review binary, all gates green
+on the new defaults):
+- shortbench suite 161.8 t/s (canonical leg 131.5, 2.61 tok/round);
+  sampling gate ALL PASS; constrain gate ALL PASS (canonical a2982c51 EXACT,
+  test_kernels PASS).
+- cctx same-harness server replay @25.8K (Q27_KV=fp8 Q27_PMIN=0.5
+  Q27_DEXIT=1): d5 161.2 vs auto 163.5 = +1.4%. The base model saturates
+  less than Qwopus (y5 .611/fired5 .49 vs .81/.84), so the ladder promotes
+  less and pays less -- the ~8% acceptance gap vs the fine-tune shows up as
+  both lower absolute t/s and a smaller auto edge.
+
+Also corrected here: the review-fixes entry claimed 46 DepthCtl checks; the
+suite has 43 (external re-count caught it).

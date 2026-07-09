@@ -4,13 +4,14 @@
 #     zero disengages, closer present, engage fired (C9/C13)
 #  2. round-phase invariance: output bytes identical across Q27_PMIN unset /
 #     0.5 / 1.0 (the marker lands at different in-round offsets) (C10)
-#  3. canonical bitwise gate 4c4120c72056aba2bc2d2561471eafce (C11)
+#  3. canonical bitwise gate (C11; baseline qwen36 a2982c51..., CANON_MD5
+#     env overrides for fine-tunes -- Qwopus: 4c4120c7...)
 #  4. test_kernels PASS (C12; sanitizer run is a separate manual step)
 # Needs the GPU free (stops nothing itself). Run from the repo root.
 set -u
 cd "$(dirname "$0")/.."
-MODEL=${MODEL:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.q27}
-TOK=${TOK:-/mnt/ai/models/qwopus-27b-mtp/qwopus-27b-mtp.tok}
+MODEL=${MODEL:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}
+TOK=${TOK:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok}
 NVCC=${NVCC:-/usr/local/cuda/bin/nvcc}
 OUT=${OUT:-/tmp/constrain_gate.$$}
 mkdir -p "$OUT"
@@ -86,7 +87,7 @@ fi
 sleep 12
 MD5=$(./build/q27 "$MODEL" --tokens "760,6511,314,9338,369" --ctx 2048 -n 128 --spec 2>/dev/null \
     | grep '^generated:' | md5sum | cut -d' ' -f1)
-if [ "$MD5" = "4c4120c72056aba2bc2d2561471eafce" ]; then
+if [ "$MD5" = "${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}" ]; then
     note "canonical OK ($MD5)"
 else
     bad "canonical changed: $MD5"
