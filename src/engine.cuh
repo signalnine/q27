@@ -1024,7 +1024,12 @@ struct Engine {
             // ceiling). Under Q27_DEXIT=0 the monolithic gated draft has no
             // depth-5 graph beneath a depth-6 ceiling, so auto clamps to the
             // shipped 4..5 ladder there (dexit is default-on; A/B knob only).
-            if (!strcmp(md, "auto")) { maxd_auto = true; gate_maxd = dexit_on ? 7 : 5; }
+            // auto = the 4..6 ladder (maxd7 A/B: depth-7 LOSES ~6% vs d6 even at
+            // y7 .77/fired .73 -- the width-8 round costs +3.0 ms, ~2x the
+            // extrapolation; cost attribution owed before any default). auto7
+            // opts into the 4..7 ladder for that future retune.
+            if (!strcmp(md, "auto")) { maxd_auto = true; gate_maxd = dexit_on ? 6 : 5; }
+            else if (!strcmp(md, "auto7")) { maxd_auto = true; gate_maxd = dexit_on ? 7 : 5; }
             else gate_maxd = atoi(md);
         }
         if (gate_maxd < 4) gate_maxd = 4;
@@ -1034,6 +1039,8 @@ struct Engine {
         if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI6")) dctl.hi6 = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_HI7")) dctl.hi7 = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_FLO7")) dctl.flo7 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_FLO6")) dctl.flo6 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6, z7 = 7;
