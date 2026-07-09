@@ -287,6 +287,37 @@ static void test_r1_allowlist_in_cache_key() {
     CHECK(gc.signature() == gd.signature());
 }
 
+// R3 (review follow-up 2026-07-09 #2): allowlist isolation must not duplicate
+// allowlist-independent masks. Argument-state signatures carry no allowlist
+// component (token legality past NAME_VAL cannot depend on names_), and the
+// content-dedupe backstop collapses identical bitsets -- so N tool sets share
+// one pool entry per argument state instead of exhausting the 512-entry pool.
+static void test_r3_no_mask_duplication_across_allowlists() {
+    FakeTok tok = mk_tok();
+    q27::ToolMaskCache cache;
+    cache.init(&tok.vocab, T_CLOSER);
+    q27::ToolGrammar ga, gb;
+    ga.reset({"get_project"});
+    gb.reset({"run_tests"});
+    CHECK(ga.advance_str("{\"name\": \"get_project\", \"arguments\": {\"x\": "));
+    CHECK(gb.advance_str("{\"name\": \"run_tests\", \"arguments\": {\"x\": "));
+    // identical argument state -> identical signature -> same cache entry
+    CHECK(ga.signature() == gb.signature());
+    int ia = cache.get(ga);
+    size_t n_masks = cache.size();
+    int ib = cache.get(gb);
+    CHECK(ia == ib);
+    CHECK(cache.size() == n_masks); // pool did not grow for the second tool set
+    // name-phase states still keyed by allowlist (isolation preserved)
+    q27::ToolGrammar na, nb;
+    na.reset({"get_project"});
+    nb.reset({"run_tests"});
+    CHECK(na.advance_str("{\"name\": \""));
+    CHECK(nb.advance_str("{\"name\": \""));
+    CHECK(na.signature() != nb.signature());
+    CHECK(cache.get(na) != cache.get(nb));
+}
+
 // R2 (review 2026-07-09 P1 #6): the grammar must reject malformed JSON that
 // json::parse downstream would reject -- otherwise constrained decode can
 // still produce an unparseable tool call.
@@ -342,6 +373,7 @@ int main() {
     test_closer_disengages();
     test_r1_allowlist_in_cache_key();
     test_r2_strict_json();
+    test_r3_no_mask_duplication_across_allowlists();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

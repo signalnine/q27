@@ -2702,3 +2702,37 @@ on the new defaults):
 
 Also corrected here: the review-fixes entry claimed 46 DepthCtl checks; the
 suite has 43 (external re-count caught it).
+
+## 2026-07-09 (review follow-up) -- 4 residual findings fixed; DepthCtl gets lineage-aware reset
+
+Reviewer re-audit of the review-fixes range surfaced 5 more (1 High, 3
+Medium, 1 Low). All verified and fixed; the Low (Makefile header deps) plus
+the earlier check-count slip (46 -> 43, fixed in the baseline entry) round
+it out.
+
+1. HIGH, CLI diagnostic budgets: --burst-stats/--stats/--pfdbg bypassed the
+   P0 #2 prompt+n_gen bound and still overran KV/MTP-KV/d_gen (burst probes
+   chain 10 positions past the step). Per-mode refusals incl. lookahead;
+   all three verified firing at --ctx 256.
+2. MEDIUM, mask-pool exhaustion: the P1 #3 allowlist key went on EVERY
+   state signature (and stale name_pref_ came along), duplicating identical
+   argument-state masks per tool set/name until the 512-entry pool filled
+   -> constraint silently off. Legality can only depend on names up to
+   NAME_VAL, so the key is now name-phase-only + ToolMaskCache dedupes by
+   bitset content. R3 regression: pool does not grow for a second tool set.
+3. MEDIUM, empty-200 near the limit: preflights now share one
+   reserve-aware max_prompt across all three routes, and claim_slot skips
+   zero-budget slots. Live-verified at --ctx 512 (400s at 504+).
+4. MEDIUM, fp8 dispatch: gate keys on k_arch_probe (__CUDA_ARCH__ of the
+   LOADED image) instead of the device attribute -- an Ada card running the
+   sm_86 image can no longer enable the mma_e4m3 no-op stub. 5090
+   unaffected (test_kernels fp8q PASS).
+5. DepthCtl lifecycle (reviewer suggestion adopted): claim_slot resets the
+   ladder when a non-prefix-restoring request takes the slot over; warm
+   carry preserved within a conversation lineage. Q27_MAXD_RESET=1 stays as
+   the strict knob.
+
+Gates: canonical a2982c51 (base, default) + 4c4120c7 (Qwopus, auto7 leg)
+both EXACT; test_kernels/test_depthctl/test_toolconstrain/test_tokenizer
+ALL PASS; F3 server smoke live (400/400/normal). Makefile dep wiring
+(finding 5) pending approval.

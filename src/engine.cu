@@ -89,6 +89,14 @@ int main(int argc, char** argv) {
     if (spec) e.build_spec_graphs();
 
     if (burst_n > 0) {
+        // ctx budget (review follow-up 2026-07-09 #1): the rig steps
+        // prompt+burst_n positions AND chains SD MTP probes ahead of each --
+        // all land in caches sized --ctx
+        if ((int)toks.size() + burst_n + 10 > ctx) {
+            fprintf(stderr, "--burst-stats: prompt %zu + N %d + probe depth 10 > --ctx %d -- "
+                            "refusing (raise --ctx)\n", toks.size(), burst_n, ctx);
+            return 1;
+        }
         // Burst-depth gate rig (2026-07-04, path-1 decision): chain SD MTP
         // draft passes per FREE-region position on the plain serial path and
         // dump drafts + top1-top2 margins to CSV for offline gate analysis
@@ -176,6 +184,14 @@ int main(int argc, char** argv) {
     }
 
     if (stats_n > 0) {
+        // ctx budget (review follow-up 2026-07-09 #1): steps prompt+N
+        // positions with up-to-5-deep MTP probe chains (pend arrays carry a
+        // +8 margin; use the same bound here)
+        if ((int)toks.size() + stats_n + 8 > ctx) {
+            fprintf(stderr, "--stats: prompt %zu + N %d + probe margin 8 > --ctx %d -- "
+                            "refusing (raise --ctx)\n", toks.size(), stats_n, ctx);
+            return 1;
+        }
         // E3 instrumentation: draft acceptance vs margin, rank-2 capture,
         // Q4-vs-Q8 draft-head agreement. Host-driven on the plain path.
         int N = stats_n;
@@ -782,6 +798,12 @@ int main(int argc, char** argv) {
     }
 
     if (pfdbg_n > 0) {
+        // ctx budget (review follow-up 2026-07-09 #1): synthesizes N tokens
+        // into caches sized --ctx
+        if (pfdbg_n > ctx) {
+            fprintf(stderr, "--pfdbg %d > --ctx %d -- refusing (raise --ctx)\n", pfdbg_n, ctx);
+            return 1;
+        }
         // state diff: serial vs batched prefill of the SAME N-1 tokens
         int N = pfdbg_n;
         std::vector<int> prompt;

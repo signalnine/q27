@@ -255,13 +255,15 @@ struct Engine {
     bool maxd_auto = false;
     cudaGraphExec_t draft_graph_lo[8] = {}; // depth-4 draft (auto mode only)
     DepthCtl dctl; // ceiling + EMAs + counters, extracted to depthctl.h for
-                   // CPU tests (tools/test_depthctl.cpp). ENGINE-lifetime
-                   // state, deliberately (review 2026-07-09): warm start
-                   // across same-conversation turns beats per-request
-                   // re-earning by a measured 1.6% on short requests, and
-                   // multi-tenant isolation is out of scope
-                   // (SECURITY-MODEL.md). Q27_MAXD_RESET=1 flips to
-                   // per-request reset at generate() entry.
+                   // CPU tests (tools/test_depthctl.cpp). Lifetime =
+                   // conversation lineage (review 2026-07-09 + follow-up):
+                   // warm state carries across same-conversation turns (a
+                   // measured +1.6% on short requests vs per-request
+                   // re-earning), and the server's claim_slot resets it when
+                   // a non-prefix-restoring request takes the slot over (new
+                   // lineage must not inherit the previous tenant's state).
+                   // Q27_MAXD_RESET=1 is the stricter every-request reset at
+                   // generate() entry.
     bool maxd_reset = false; // Q27_MAXD_RESET=1: reset dctl per request
     // maxd6 GO-IF telemetry (host-side counters only; decode/graphs untouched):
     // per-round margin-run depth (cap, 0..gate_maxd) and accepted length
@@ -1861,13 +1863,12 @@ struct Engine {
         int NP = (int)prompt.size();
         gs = GenStats{};
         gs.prompt = NP;
-        // Depth-controller lifetime (review 2026-07-09): by default the
-        // ladder CARRIES across requests -- this is a single-user rig
-        // (multi-tenant is out of scope per SECURITY-MODEL.md) and
-        // consecutive requests are usually turns of the same conversation,
-        // where re-earning depth from k_min costs a measured -1.6% on
-        // 256-token requests (BUILDLOG 2026-07-09). Q27_MAXD_RESET=1 opts
-        // into per-request isolation (each request starts at k_min).
+        // Depth-controller lifetime (review 2026-07-09 + follow-up): the
+        // ladder carries across same-lineage turns (re-earning depth from
+        // k_min costs a measured -1.6% on 256-token requests, BUILDLOG
+        // 2026-07-09); the server's claim_slot resets it when a new lineage
+        // takes the slot over. Q27_MAXD_RESET=1 is the stricter
+        // every-request reset.
         if (maxd_auto && maxd_reset) dctl.reset();
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against

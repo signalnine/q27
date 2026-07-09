@@ -366,10 +366,20 @@ struct ToolGrammar {
         s += std::to_string(lit_);
         s += '|';
         s += lit_word_;
-        s += '|';
-        s += name_pref_;
-        s += '|';
-        s += names_key_;
+        // The name-prefix and allowlist components only matter where token
+        // legality can depend on them: a token from any state up to NAME_VAL
+        // can span into name-prefix matching, but from ARG_COMMA onward the
+        // grammar can never re-enter NAME_VAL (one name, then arguments) and
+        // name_pref_ is dead state. Keying them on EVERY state duplicated
+        // identical argument-state masks per tool set (and per chosen name)
+        // and exhausted the 512-entry device pool (review follow-up
+        // 2026-07-09 #2).
+        if (st_ <= NAME_VAL) {
+            s += '|';
+            s += name_pref_;
+            s += '|';
+            s += names_key_;
+        }
         return s;
     }
 };
@@ -405,8 +415,19 @@ struct ToolMaskCache {
                 ok = g.token_ok(v[id]);
             if (ok) m[id >> 5] |= 1u << (id & 31);
         }
+        // content dedupe (review follow-up 2026-07-09 #2): distinct
+        // signatures with identical bitsets share one entry, so the
+        // append-only device pool holds unique masks only (backstop behind
+        // the state-conditional allowlist key above)
+        std::string key((const char*)m.data(), (size_t)words_ * 4);
+        auto ct = content_.find(key);
+        if (ct != content_.end()) {
+            index_.emplace(std::move(sig), ct->second);
+            return ct->second;
+        }
         int idx = (int)masks_.size();
         masks_.push_back(std::move(m));
+        content_.emplace(std::move(key), idx);
         index_.emplace(std::move(sig), idx);
         return idx;
     }
@@ -420,6 +441,7 @@ struct ToolMaskCache {
     int closer_id_ = -1;
     int words_ = 0;
     std::unordered_map<std::string, int> index_;
+    std::unordered_map<std::string, int> content_; // bitset bytes -> index
     std::vector<std::vector<uint32_t>> masks_;
 };
 

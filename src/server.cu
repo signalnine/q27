@@ -196,6 +196,14 @@ int main(int argc, char** argv) {
     // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
     int max_slot_ctx = 0;
     for (auto& s : slots) max_slot_ctx = std::max(max_slot_ctx, s.eng->max_ctx);
+    // Largest prompt ANY route admits: the largest slot must retain a
+    // positive decode budget past the spec-round reserve (review follow-up
+    // 2026-07-09 #3: the old hardcoded -7 was the depth-5 reserve, so at
+    // gate_maxd 6/7 a prompt inside the stale bound could clamp n_max to 0
+    // and return an empty 200 instead of the context-limit 400). Every
+    // engine parses the same env, so slot 0's reserve speaks for all; all
+    // three routes preflight against this before claiming a slot.
+    const int max_prompt = max_slot_ctx - slots[0].eng->ctx_round_reserve();
     const int EOS = tok.eos();
     // P7 shared mask cache (mutated only from generation callbacks, which
     // run while holding the GPU gate; pool ids are per-slot)
@@ -356,7 +364,12 @@ int main(int argc, char** argv) {
     long slot_use_counter = 0;
     auto claim_slot = [&](const std::vector<int>& prompt) -> Slot& {
         std::unique_lock<std::mutex> lk(route_m);
-        const bool fits_any = (int)prompt.size() <= max_slot_ctx;
+        // eligibility requires a POSITIVE decode budget on the slot, not
+        // just prompt-fits (review follow-up 2026-07-09 #3): a slot whose
+        // clamp would floor n_max to 0 must not take the request. The route
+        // preflights guarantee at least the largest slot qualifies, so this
+        // never deadlocks.
+        const bool fits_any = (int)prompt.size() <= max_prompt;
         for (;;) {
             Slot* best = nullptr;
             int best_tier = -1, best_key = 0;
@@ -366,7 +379,7 @@ int main(int argc, char** argv) {
                     if (!best || s.eng->max_ctx > best->eng->max_ctx) best = &s;
                     continue;
                 }
-                if ((int)prompt.size() > s.eng->max_ctx) continue;
+                if ((int)prompt.size() + s.eng->ctx_round_reserve() > s.eng->max_ctx) continue;
                 int rl = s.eng->reuse_len(prompt);
                 int tier = rl > 0 ? 2 : s.eng->cache_empty() ? 1 : 0;
                 bool better;
@@ -384,6 +397,14 @@ int main(int argc, char** argv) {
                 // invisible to routing anyway -- busy slots are never scanned.
                 // Refused-class claims (fits nowhere) keep the old stamp.
                 best->stamp_on_free = fits_any;
+                // Lineage-aware DepthCtl reset (review follow-up 2026-07-09):
+                // tier 2 = this slot restores a prefix of the prompt (same
+                // conversation) -> the ladder carries its warm state; any
+                // other claim is a new lineage taking the slot over, so it
+                // must not inherit the previous tenant's ceiling/EMAs.
+                // Q27_MAXD_RESET=1 remains the stricter every-request reset.
+                if (fits_any && best_tier < 2 && best->eng->maxd_auto)
+                    best->eng->dctl.reset();
                 return *best;
             }
             route_cv.wait(lk);
@@ -485,6 +506,20 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = build_prompt(body);
         ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
                     std::chrono::steady_clock::now(), ms_since(tk0)};
+        // context-limit preflight BEFORE slot claim / SSE commit (review
+        // follow-up 2026-07-09 #3): past this bound the routed slot's
+        // n_max clamp floors at 0 -> empty 200
+        if ((int)prompt.size() > max_prompt) {
+            res.status = 400;
+            res.set_content(json{{"error",
+                                  {{"message", q27::ctx_limit_error_message(
+                                                   (int)prompt.size(), max_prompt)},
+                                   {"type", "invalid_request_error"},
+                                   {"code", "context_length_exceeded"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
         if ((int)prompt.size() + n_max > max_slot_ctx)
             n_max = max_slot_ctx - (int)prompt.size();
         long created = std::chrono::duration_cast<std::chrono::seconds>(
@@ -639,9 +674,8 @@ int main(int argc, char** argv) {
         // SSE provider: the old path (engine end=refused inside a 200) reads
         // as retryable to Claude Code, which then loops the oversized prompt
         // instead of compacting. "prompt is too long" is CC's compact-now
-        // signal. Ceiling is the largest slot minus decode headroom (n_max>=1
-        // plus spec rows P+1..P+6 -- the line-below clamps' combined floor).
-        const int max_prompt = max_slot_ctx - 7;
+        // signal. Ceiling is the shared max_prompt (largest slot minus the
+        // depth-derived spec-round reserve, keeping n_max >= 1).
         if ((int)prompt.size() > max_prompt) {
             fprintf(stderr, "[ctx-limit] prompt=%zu max=%d -> 400\n", prompt.size(),
                     max_prompt);
@@ -1010,14 +1044,17 @@ int main(int argc, char** argv) {
             tok.encode(q27::chatml_prompt(merged, tools, !no_think_srv));
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),
                     ms_since(tk0)};
-        if ((int)prompt.size() + n_max > max_slot_ctx)
-            n_max = max_slot_ctx - (int)prompt.size();
-        if (n_max <= 0) {
+        // review follow-up 2026-07-09 #3: the bound includes the spec-round
+        // reserve (max_prompt), so a prompt that passes can never have its
+        // n_max floored to 0 by the routed slot's clamp (empty 200/stream)
+        if ((int)prompt.size() > max_prompt) {
             res.status = 400; // context_length_exceeded is fatal-class for codex, correctly
             res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}",
                             "application/json");
             return;
         }
+        if ((int)prompt.size() + n_max > max_slot_ctx)
+            n_max = max_slot_ctx - (int)prompt.size();
         bool stream = body.value("stream", false);
 
         // shared generation -> output items
