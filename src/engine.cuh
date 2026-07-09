@@ -997,6 +997,8 @@ struct Engine {
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
         if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_HI6")) dctl.hi6 = (float)atof(e);
+        if (const char* e = getenv("Q27_MAXD_FLO6")) dctl.flo6 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6;
         auto seed_positions = [&]() {

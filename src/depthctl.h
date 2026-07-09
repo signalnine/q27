@@ -27,14 +27,29 @@ struct DepthCtl {
     float sat[7] = {};        // [level]; only the live level's entries update
     float yld[7] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
     float ema_a = 1.f / 16.f; // EMA weight (~11-round half-life)
-    float hi = 0.50f;         // promote bar on sat (Q27_MAXD_HI)
+    float hi = 0.50f;         // 4->5 promote bar on sat (Q27_MAXD_HI)
+    // 5->6 promote bar (Q27_MAXD_HI6), deliberately ABOVE hi: bursty ~50%-sat
+    // level-5 traffic (docs flavor, sat5 ~.46) pays a level-6 drafting tax the
+    // conditional-yield demote bar cannot see (lane 6 fires too rarely to
+    // amortize the 6th draft step on cap>=5 rounds; measured -1.9%), while
+    // sustained deep saturation (cctx .71) wins +4.1%. 0.60 separates them.
+    float hi6 = 0.60f;
     float lo = 0.35f;         // demote bar on conditional yield (Q27_MAXD_LO)
+    // Level-6 fired-rate bar (Q27_MAXD_FLO6): the 6th draft step runs on every
+    // cap>=5 round, but lane 6 only pays when the margin run REACHES 6. Traffic
+    // that promotes yet rarely fires 6-deep (docs: fired6 ~.3 at y6 ~.70,
+    // measured -2%) is invisible to the conditional-yield bar; cctx fires .6+.
+    // Applies at level 6 only: at level 5 low-fired/high-yield flavors WIN
+    // (testgen: fired .30, +3.9%), so a fired bar there would be wrong.
+    float flo6 = 0.45f;
+    float fired_ema = 0.f;    // level-6 stint: EMA of (cap reached 6)
     long rounds[7] = {};      // gated rounds run at each level
     long promotes = 0, demotes = 0;
 
     void enter(int k) {
         sat[k] = 0.f;
         yld[k] = 2.f * lo > 1.f ? 1.f : 2.f * lo;
+        if (k == 6) fired_ema = 2.f * flo6 > 1.f ? 1.f : 2.f * flo6;
     }
 
     // Fold one gated greedy round into the ceiling. md = ceiling the round
@@ -46,11 +61,23 @@ struct DepthCtl {
         rounds[md]++;
         float hit = (n >= md + 1) ? 1.f : 0.f;
         sat[md] += ema_a * (hit - sat[md]);
-        if (md < k_max && sat[md] >= hi) {
+        if (md < k_max && sat[md] >= (md >= 5 ? hi6 : hi)) {
             cur = md + 1;
             enter(cur);
             promotes++;
             return; // this round's evidence went into the promote
+        }
+        // Level-6 fired-rate bar: every round updates it (fired = margin run
+        // reached the ceiling); demote when 6-deep confidence is too rare to
+        // amortize the 6th draft step (see flo6 above).
+        if (md == 6) {
+            fired_ema += ema_a * ((cap >= 6 ? 1.f : 0.f) - fired_ema);
+            if (fired_ema < flo6) {
+                cur = 5;
+                enter(cur);
+                demotes++;
+                return;
+            }
         }
         // yield evidence is CONDITIONAL on the top lane firing (accept-gate
         // Phase 1): unfired rounds say nothing about the deep lane and, under

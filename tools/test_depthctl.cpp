@@ -120,7 +120,8 @@ int main() {
         CHECK(c.cur == 5, "k_max=5 (default): saturated stream tops out at 5");
     }
     { // full promote path 4->5->6: entering a level resets its sat, so level 6
-      // needs a fresh 11-round saturated stint AT level 5 (cctx-like traffic)
+      // needs a fresh saturated stint AT level 5; the 5->6 bar is hi6=0.60
+      // (15 rounds: 1-(15/16)^15 >= .6), not hi=0.50 (11 rounds).
         DepthCtl c;
         c.k_max = 6;
         int at5 = -1, at6 = -1, i = 0;
@@ -129,13 +130,13 @@ int main() {
             if (c.cur == 5 && at5 < 0) at5 = i;
             if (c.cur == 6 && at6 < 0) at6 = i;
         }
-        CHECK(at5 == 11 && at6 == 22, "promote 4->5 on round 11, 5->6 on round 22 (fresh sat stint)");
+        CHECK(at5 == 11 && at6 == 26, "promote 4->5 on round 11, 5->6 on round 26 (hi6)");
         CHECK(c.promotes == 2, "two promotes counted");
     }
     { // demote 6->5 on dead lane-6 yield; fresh level-5 seed prevents a cascade
         DepthCtl c;
         c.k_max = 6;
-        for (int i = 0; i < 22; i++) c.update(c.cur, c.cur, c.cur + 1); // reach 6
+        for (int i = 0; i < 26; i++) c.update(c.cur, c.cur, c.cur + 1); // reach 6 (11 + hi6's 15)
         CHECK(c.cur == 6, "(pre) at 6");
         int demoted_at = -1;
         for (int i = 1; i <= 16 && demoted_at < 0; i++) {
@@ -154,6 +155,52 @@ int main() {
         float y6 = c.yld[6], s6 = c.sat[6];
         for (int i = 0; i < 8; i++) c.update(5, 5, 5);
         CHECK(c.yld[6] == y6 && c.sat[6] == s6, "level-5 rounds leave level-6 EMAs untouched");
+    }
+    { // 5->6 promote bar is HIGHER (hi6=0.60): bursty ~50%-sat level-5 traffic
+      // (docs flavor) stays at 5; only sustained deep saturation promotes.
+      // Measured: docs sat5 ~.46 bursty lost -1.9% at level 6 (drafting tax the
+      // conditional yield bar cannot see); cctx sat5 .71 wins +4.1%.
+        DepthCtl c;
+        c.k_max = 6;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5); // reach 5
+        for (int i = 1; i <= 128; i++) c.update(5, 5, (i % 2 == 0) ? 6 : 5); // 50% sat
+        CHECK(c.cur == 5 && c.promotes == 1, "50%-sat level-5 stream never promotes to 6");
+        DepthCtl d;
+        d.k_max = 6;
+        for (int i = 0; i < 11; i++) d.update(4, 4, 5);
+        int at6 = -1;
+        for (int i = 1; i <= 32 && at6 < 0; i++) {
+            d.update(5, 5, 6); // fully saturated level-5 stream (cctx flavor)
+            if (d.cur == 6) at6 = i;
+        }
+        CHECK(at6 == 15, "sustained saturation promotes 5->6 on round 15 (1-(15/16)^15 >= .6)");
+    }
+    { // level-6 fired-rate bar (flo6): docs-flavor traffic whose margins rarely
+      // run 6-deep (fired ~0.3) pays the 6th draft step without landing lane-6
+      // tokens -- conditional yield can't see it (y6 ~0.70 when it DOES fire,
+      // measured). cctx fires 0.6+. flo6=0.45 separates them.
+        DepthCtl c;
+        c.k_max = 6;
+        for (int i = 0; i < 11; i++) c.update(4, 4, 5);
+        for (int i = 0; i < 15; i++) c.update(5, 5, 6); // sustained sat -> promote to 6
+        CHECK(c.cur == 6, "(pre) at 6 via sustained sat");
+        int demoted_at = -1;
+        for (int i = 1; i <= 64 && demoted_at < 0; i++) {
+            // fired 1-in-3 (cap=6 every 3rd round); accepted whenever fired
+            bool fired = (i % 3 == 0);
+            c.update(6, fired ? 6 : 5, fired ? 7 : 6);
+            if (c.cur == 5) demoted_at = i;
+        }
+        CHECK(demoted_at > 0 && demoted_at <= 40, "low-fired level-6 stream demotes via flo6");
+        DepthCtl d;
+        d.k_max = 6;
+        for (int i = 0; i < 11; i++) d.update(4, 4, 5);
+        for (int i = 0; i < 15; i++) d.update(5, 5, 6);
+        for (int i = 1; i <= 128; i++) {
+            bool fired = (i % 3 != 0); // fired 2-in-3, accepted whenever fired (cctx flavor)
+            d.update(6, fired ? 6 : 5, fired ? 7 : 6);
+        }
+        CHECK(d.cur == 6 && d.demotes == 0, "cctx-like 0.67-fired level-6 stream holds");
     }
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;
