@@ -2951,3 +2951,63 @@ constraint, not either engine.
 3090 box score (base model, same day): decode ~58-60 t/s both engines;
 q27 completes 2/3 trials at identical-to-5090 scores; llama 0/2 at this
 window. vox transcribers were stopped for the runs.
+
+## 2026-07-09 (levers survey, post-DFlash-kill) -- deep-chain data flips the decode roadmap: GEMM-verify deep ladder is the new #1
+
+**Keystone measurement (rig: --burst-stats SD=10 on cctx, 1488 positions,
+scored vs the .seq stream):** the trained-in MTP chain's CONDITIONAL
+acceptance is FLAT to depth 10 -- p(dk | prefix ok) = .845/.790/.765/.775/
+.800/.775/.781/.796/.833/.862 for k=1..10. It does not decay; it RISES in
+deep echo regions. Depth was never acceptance-limited -- only our GEMV
+verify machinery capped it (width-8 lane exhaustion, +2.33ms marginal).
+
+**Lever A -- GEMM-verify deep ladder (NEW #1).** Replace GEMV lanes with a
+dedicated batched T<=16 GEMM verify (prefill-class kernels shaped for
+small T) and raise the ladder ceiling to 10+. Gated round sim on the
+burst data (theta .5, sim-vs-sim so the known -27% cctx bias cancels):
+
+    GEMV c7 vs c5:      +1%   (matches the measured d7 wash -- sim sane)
+    GEMM c10 @13ms:    +46%
+    GEMM c10 @15ms:    +31%
+    GEMM c10 @18ms:    +13%
+    GEMM c10 @22ms:     -4%   (breakeven ~21ms)
+
+Everything rides on ONE number: dedicated small-T verify cycle cost.
+P0b showed the current path's 47ms is kernel shape, flat in depth;
+floor math says 12-16ms is plausible (10ms weight floor + fd2-class
+16-row attention ~4ms + head ~1ms). External proof of mechanism: llama's
+batch verify at chain depth 10 does 180 t/s LIVE on this model (vs our
+168) with far weaker per-token kernels. NEXT STEP: 1-day spike -- extend
+width_bench with T=8/16 GEMM sweeps over the layer shapes + fd2 ntok=16
+to bound the cycle; build only if <=~16ms. Also: fixed-cost verify wants
+a different gate (fire deep at moderate confidence) -- more upside than
+the sim shows, which reuses the GEMV-era theta gate.
+
+**Ranked levers behind it:**
+- B. Prefill Phase-3 / FA2-class smem relayout (standing, Gabe-gated):
+  externally validated by FlashRT (~2900 t/s @256K vs our 2206 @128K).
+  +6% LIVE wall (prefix cache already eats 95% of prompts) but +16% on
+  cold long-context / TTFT. 2-4 sessions, tolerance-class precedent.
+- C. fd3-mma tensor-core decode attention (filed): kills fd2's
+  +15-17%/lane KV re-read growth and the 26K->61K decode sag; COMPOUNDS
+  with A (deep verify wants cheap 16-row attention -- the fd2 ntok=16
+  number from the A-spike doubles as C's motivation data). Untested MMA
+  thesis; the two fd3 kills were smem-sharing, not MMA.
+- D. Small-window CC compaction shim (new, from the 3090 runs): find why
+  CC compacts at 131K but terminates at 32K (request-tap forensics),
+  serve the shape that triggers compaction. <=1 session, unlocks
+  3090/32K agentic serving. Robustness, not throughput.
+- E. Relaxed think-phase acceptance (FlashRT +43% think-heavy):
+  tolerance-class, ~1 session, margins already computed -- but we serve
+  no-think; park until a thinking workload exists.
+- F. Constrain-tools bare-JSON engage (quality): closes the grammar
+  bypass (T8 hidden 0.94->0.22 case), makes strict+constrain the
+  zero-rescue config. ~1 session.
+- G. KV pruning (quality-class), H. ladder churn polish (~1-3% bursty
+  flavors): behind A-C.
+
+Sequencing: A-spike first (1 day, pure measurement); if GO, A build
+(3-5 sessions, P15-class GDN-state risk at verify widths >8 -- the
+mod-8 role-buffer machinery caps at 8 lanes, so >8 needs chunked-scan
+GDN with checkpoint/replay, the DFlash Phase-2 problem inherited). B
+next for TTFT. C rides A's spike data.
