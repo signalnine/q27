@@ -3344,3 +3344,39 @@ Smoke (echo completion): 200 tok / 18 rounds = 11.1 tok/rnd avg, suffix
 this engine (prior per-req peak 254). P2 next: live CC/T8 trial (does
 real traffic reach AL ~10.5? wall delta vs 249 t/s stack?), fdmma W<=16
 lift, width-curve at 12 via sfxm/sfxn.
+
+## 2026-07-10 -- width-12 P2 DONE: LIVE T8 CONFIRMS THE THESIS -- suffix AL 10.61 on 61.6% of decode, good basin, per-req peak 294 t/s
+
+fdmma W<=16 lift shipped (7b85f06: s_geo re-stride, cases 9..12, honored
+launch return; fdmma_test W=4..12 modeled-EXACT; the test's own p[8]
+combine-fork P3 was the W=9 crash -- fixed). Wide suffix rounds now run
+the MMA kernel. Documented: wide-vs-narrow round grouping stays
+tolerance-class under mma (union-window tile phase p_beg is a function of
+the round's lane set) -- inherent to shared-KV scoring, same regime the
+basin matrix cleared for mma itself.
+
+LIVE T8 TRIAL (widened single-slot stack: fp8+PMIN0.5+auto7+SUFFIX_W=12
++FD=mma+PHASE_STATS, thunderdome claude-code-q27-haight, concurrent
+openrouter campaign on host = CPU-contended wall):
+- score 0.84 @ 210s, hidden_tests 0.9375, agent_tests/code_metrics 1.0
+  = GOOD basin (this morning's mma legs went 0/2 bad at 0.56; n=1 draw
+  on the new binary landed well -- tie-lottery neutral-in-expectation
+  holds).
+- **suffix AL 10.61** (1953 fired rounds, 20721 tok) = 61.6% of ALL
+  decode (33635 tok, 71 reqs) -- plan predicted ~10.5-10.7 uncapped, live
+  traffic DELIVERS it (was 6.48 @W7-cap, 7.49 @W8).
+- aggregate 7.09 tok/round; decode 224.9 t/s aggregate SINGLE-slot
+  (2-slot baseline was 249/233 aggregate with overlap; per-req median
+  211 / p75 248 / **peak 294** vs prior per-req peak 254).
+- width-12 cost point (sfxm/sfxn, mixed T8 ctx): 39.0 ms/wide-round =
+  3.68 ms/token committed, vs gated rounds' 26.3 ms at 4.62 tok/rnd =
+  5.68 ms/token -- wide suffix rounds are 1.5x more wall-efficient per
+  token. Suffix rounds carried 51% of decode wall for 62% of tokens.
+- fire rate unchanged vs width-8 trial (~1950 rounds/trajectory): the
+  widening converts the SAME fires into +63% tokens each, exactly the
+  cap-release mechanism the plan bet on.
+VERDICT: width-12 GO for the CC serving env. q27-eval stays on the
+widened single-slot config (27.0/32.6GB). Replay accept_ab deferred --
+live trial is the venue of record (and the CLI can now fire suffix for
+future replay work). P3 (MTP ceilings 8..10 pricing, GDN deferred-
+snapshot) remains optional per plan.
