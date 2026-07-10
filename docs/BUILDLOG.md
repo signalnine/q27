@@ -3168,3 +3168,42 @@ exists ONLY on genuinely saturating traffic (y flat >= ~.82); even
 shipped hi6/flo bars enforce (docs stays ceiling 5, cold cctx 4) --
 auto7's safety case rests on those bars staying strict, and all three
 measured poles now validate their calibration.
+
+## 2026-07-10 -- full-stack live-CC trials (mma + auto7 + suffix), T8 x2
+
+Config: Q27_FD=mma Q27_MAXD=auto7 Q27_SUFFIX=1, qwopus, fp8, fresh server
+per trial.
+
+PERF (both trials, within-run telemetry): trial 1: 249.3 t/s aggregate
+decode (75 reqs, 34K tok) -- +27% over the suffix-only trial (195.8),
++42% over base; suffix 7.49 tok/rnd on 63.3% of decode (width-8 uncap
+from 6.48@W7); ladder promoted to ceiling 7 on 66% of auto rounds
+(md7=3407) -- LIVE traffic clears the strict bars that no replay payload
+ever has. Trial 2: 232.9 t/s, suffix 7.15/rnd on 48.7%, md7=1728. The
+stack composes exactly as priced.
+
+QUALITY: 0/2 good basins (0.560, 0.561; hidden_tests 0.219 both) vs 2/2
+good without mma (0.815, 0.834; hidden_tests 0.906 both). agent_tests
+1.000 / code_metrics 1.000 / coverage ~0.8 in ALL FOUR trials -- the
+code works; the failure is the T8 auth-chain hidden gate. Forensics:
+register returns 500 on the hidden test's spec payload (reproduced
+locally in the archived workspace; contract itself is spec-compliant
+and identical across good/bad trials -- the 500 is an internal handler/
+schema design choice, likely tenant-FK-class, that the agent's own
+tests don't exercise). Attribution is CLEAN by construction: suffix is
+token-identical, auto7 is width-invariant -- any behavioral shift is
+Q27_FD=mma's tolerance-class attention numerics steering early design
+decisions into a punished fork on this task. n=2v2 on a bimodal gate
+(P ~ 0.1-0.2 under no-effect), suggestive not conclusive.
+
+VERDICT:
+- Q27_SUFFIX=1 + Q27_MAXD=auto7: quality-safe BY CONSTRUCTION; their
+  wins (suffix 63% coverage at 7.5/rnd; ceiling-7 residency 66%) are
+  real on live traffic. GO for CC serving env alongside whatever
+  attention kernel is active.
+- Q27_FD=mma: perf validated (+18.7% replay, +27% live compound) but
+  stays OPT-IN. Before any flip: (a) broaden the task sample (T2 +
+  2-3 other benches, mma-only vs off) to separate basin-lottery from
+  systematic steering; (b) if steering is real, trial the fp8q-PV
+  fallback (f16 PV halves the numerics perturbation) which the design
+  doc specified for exactly this contingency.
