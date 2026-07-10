@@ -27,6 +27,9 @@ build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 build/test_toolconstrain: tools/test_toolconstrain.cpp src/toolconstrain.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_toolconstrain.cpp -o $@
 
+build/test_suffixdraft: tools/test_suffixdraft.cpp src/suffixdraft.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_suffixdraft.cpp -o $@
+
 build/width_bench: tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
 	$(NVCC) $(NVCCFLAGS) tools/width_bench.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
 

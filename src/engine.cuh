@@ -18,6 +18,7 @@
 #include "prefill.cuh"
 #include "cuda_common.h"
 #include "depthctl.h"
+#include "suffixdraft.h"
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
@@ -298,8 +299,28 @@ struct Engine {
     // syncs, tokens unaffected. Draft bucket = prep + MTP chain + margin
     // reads (the critical-path cost off-path drafting would hide); verify
     // bucket = width-floor top-up (cap==0 rounds only, slight draft
-    // undercount) + verify graph + finish + outcome read.
+    // undercount) + verify graph + finish + outcome read. Suffix rounds are
+    // deliberately NOT phase-stamped (own sfx counters; they'd pollute the
+    // per-width verify curve).
     bool phase_stats = false;
+    // Q27_SUFFIX=1: zero-model echo drafter (suffixdraft.h). When the
+    // committed stream's suffix (incl the pending token) recurs earlier with
+    // match >= sfx_L, the earlier continuation fills the draft lanes and the
+    // round runs prep + verify only -- NO MTP passes. Correctness-invariant
+    // by construction (greedy verify decides every emitted token); trades
+    // round count only. Phase-0 (tools/suffix_sim.py): cctx fire ~35% @ AL
+    // 11.5 with L=12, docs fire 0% -- silent on neutral traffic. Known
+    // Phase-1 gap, measure-first: suffix-committed positions get no MTP KV
+    // rows, so the FIRST MTP round after a suffix burst drafts against
+    // stale rows (acceptance dip, not correctness); batched MTP re-warm
+    // from resident lane hiddens is the Phase-2 fix if replay A/B says so.
+    bool suffix_on = false;
+    int sfx_L = 12;              // Q27_SUFFIX_L: min match length to fire
+    q27::SuffixDraft sfx;
+    bool sfx_valid = false;      // last_pending valid (>=1 round this request)
+    long sfx_fired = 0, sfx_tok = 0; // engine-cumulative, like glf/gla
+    int h_sfx_prop[8];           // host staging for the H2D draft copies
+    bool sfx_dbg = false;        // Q27_SUFFIX_DBG: per-round propose trace
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 8;
@@ -1261,6 +1282,12 @@ struct Engine {
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
         phase_stats = getenv("Q27_PHASE_STATS") != nullptr;
+        suffix_on = getenv("Q27_SUFFIX") != nullptr;
+        sfx_dbg = getenv("Q27_SUFFIX_DBG") != nullptr;
+        if (const char* sl = getenv("Q27_SUFFIX_L")) sfx_L = atoi(sl);
+        if (suffix_on)
+            fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
+                    sfx_L, gate_maxd + 1);
         fprintf(stderr,
                 "spec graphs captured (8 perms, depth-4; +split D/V; +per-width verify "
                 "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
@@ -1279,6 +1306,7 @@ struct Engine {
     int spec_round(int* emit) {
         int md_used = -1;  // P13: draft-depth ceiling actually used this round
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
+        bool sfx_round = false; // suffix-drafted round (own stats class)
         std::chrono::steady_clock::time_point ph_t0, ph_t1;
         bool ph_timed = false; // set once the draft half is stamped (gated branches)
         int ph_W = 0;          // this round's verify width (gated branches)
@@ -1298,6 +1326,25 @@ struct Engine {
             CUDA_CHECK(cudaStreamSynchronize(stm));
             on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
             CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
+        } else if (suffix_on && sfx_valid && pmin_theta > 0.f && h_mask_id0 < 0 &&
+                   sfx.propose_with(last_pending, gate_maxd, h_sfx_prop) >= sfx_L) {
+            // Suffix round: the committed stream's suffix recurs -- fill the
+            // draft lanes from the earlier continuation and skip the MTP
+            // chain entirely (zero draft cost). prep_round is the same
+            // launch that opens draft step 0; the verify graph, finish walk
+            // and outcome path are the standard gated-round machinery, so
+            // emitted tokens stay greedy-identical regardless of proposal
+            // quality. h_next for the next round comes from the verify's
+            // resident role buffers, unaffected by how drafts were made.
+            sfx_round = true;
+            q27k::prep_round(d_P, d_token, d_pos_a, d_pos_b, d_pos_c, d_pos_d, d_pos_e,
+                             d_pos_f, d_pos_g, d_pos_h, d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4,
+                             d_pos_m5, d_pos_m6, d_pos_m7, d_outcome, stm);
+            int* ds[7] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6, d_draft7};
+            for (int k = 0; k < gate_maxd; k++)
+                CUDA_CHECK(cudaMemcpyAsync(ds[k], &h_sfx_prop[k], 4, cudaMemcpyHostToDevice,
+                                           stm));
+            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[gate_maxd + 1][perm], stm));
         } else if (pmin_theta > 0.f && h_mask_id0 < 0) {
             // P12/P12b confidence-gated depth (unconstrained decode only): draft to
             // the ceiling + per-draft margins, cap depth at the leading run with
@@ -1382,6 +1429,10 @@ struct Engine {
             if (ph_W >= 2 && ph_W <= 8) { gs.vw_ms[ph_W] += v; gs.vw_n[ph_W]++; }
         }
         int n = oc[0];
+        if (sfx_round) {
+            sfx_fired++;
+            sfx_tok += n;
+        }
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
             for (int j = 1; j <= gate_cap; j++) {
@@ -1391,9 +1442,30 @@ struct Engine {
         }
         // P13 adaptive maxd: fold this round's realized accept into the ceiling
         // (extracted to depthctl.h; semantics + comments live there).
-        if (maxd_auto) dctl.update(md_used, gate_cap, n);
+        if (maxd_auto) {
+            if (sfx_round) {
+                // Suffix rounds consume exactly the saturating echo stretches
+                // that drive ladder promotion (measured on repro: suffix-on
+                // starved the ladder, md5 113 -> 0, and the non-echo rounds
+                // lost the depth-5 edge = the whole win). A suffix round
+                // committing past the current ceiling is ceiling-saturation
+                // evidence -- the MTP chain saturates on those same echo
+                // tokens (baseline's n=6 rounds). A non-saturating suffix
+                // round says nothing about the MTP drafter (it wasn't
+                // consulted): skip, don't push demotion.
+                if (n >= dctl.cur + 1) dctl.update(dctl.cur, dctl.cur, n);
+            } else {
+                dctl.update(md_used, gate_cap, n);
+            }
+        }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         last_pending = oc[9];
+        sfx_valid = true; // pending now known on host; suffix may fire next round
+        if (sfx_dbg) {
+            fprintf(stderr, "[sfxdbg-oc] n=%d em=", n);
+            for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
+            fprintf(stderr, " pend=%d sfx_round=%d\n", oc[9], sfx_round ? 1 : 0);
+        }
         perm = (perm + (n - 1)) % 8;
         return n;
     }
@@ -1927,6 +1999,14 @@ struct Engine {
         // takes the slot over. Q27_MAXD_RESET=1 is the stricter
         // every-request reset.
         if (maxd_auto && maxd_reset) dctl.reset();
+        // Suffix drafter: rebuild the match index over this request's full
+        // prompt (multi-turn re-renders arrive whole, so reset covers
+        // history). ~2-4ms host at 25K tokens, once per request, off the
+        // decode path. sfx_valid arms after round 1 (host learns pending).
+        if (suffix_on) {
+            sfx.reset(prompt);
+            sfx_valid = false;
+        }
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -2142,6 +2222,10 @@ struct Engine {
                     n = m;
                 }
             }
+            // suffix index tracks the committed stream (post-truncation n);
+            // the pending token rides along virtually in propose_with.
+            if (suffix_on)
+                for (int k = 0; k < n; k++) sfx.append(em[k]);
             Ph += n;
             for (int k = 0; k < n && emitted < n_max; k++) {
                 if (em[k] == eos) { done("eos"); return emitted; }

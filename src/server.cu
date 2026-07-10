@@ -306,7 +306,13 @@ int main(int argc, char** argv) {
                        const std::string& extra = std::string()) {
         const auto& g = e.gs;
         double tps = g.dec_ms > 0 ? g.dec * 1000.0 / g.dec_ms : 0.0;
-        char p13buf[96], gatebuf[512], phbuf[352];
+        char p13buf[96], gatebuf[512], phbuf[352], sfxbuf[48];
+        // Q27_SUFFIX: engine-cumulative suffix-round counters (fired, tokens
+        // committed by suffix rounds), appended after end= like gch/glf.
+        if (e.suffix_on)
+            snprintf(sfxbuf, sizeof sfxbuf, " sfx=%ld,%ld", e.sfx_fired, e.sfx_tok);
+        else
+            sfxbuf[0] = '\0';
         // Q27_PHASE_STATS: per-request gated-round wall split, appended after
         // end= like the P13/gate fields (reqlog_gate's parse is unaffected).
         // phwn/phwm: per-verify-width round counts and summed verify ms, W=2..8.
@@ -324,7 +330,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "[req] rid=%ld api=%s conv=%08llx qw_ms=%.0f tok_ms=%.0f prompt=%d hit=%d "
                 "ckpt=%d pf=%d pf_ms=%.0f dec=%d dec_ms=%.0f cb_ms=%.0f rounds=%d tps=%.1f "
-                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s\n",
+                "end=%s gw=%.0f yields=%d slot=%d t=%.0f%s%s%s%s%s\n",
                 rt.rid, rt.api, rt.conv, qw_ms, rt.tok_ms, g.prompt, g.hit, g.ckpt, g.pf,
                 g.pf_ms, g.dec, g.dec_ms, g.cb_ms, g.rounds, tps,
                 (g.end && g.end[0]) ? g.end : "?", g.gw_ms, g.yields, slot_id,
@@ -361,7 +367,7 @@ int main(int argc, char** argv) {
                                 e.gate_lane_acc[6], e.gate_lane_acc[7]),
                        gatebuf)
                     : "",
-                phbuf, extra.c_str());
+                phbuf, sfxbuf, extra.c_str());
     };
     // R1b routing: claim a FREE engine (Slot::busy=false) that can take the
     // prompt, or block until one frees. Tiers among free engines unchanged
