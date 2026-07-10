@@ -477,7 +477,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // below); everything else falls through to fd2, so W=2..3 rounds and
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
-    if (fd && strcmp(fd, "mma") == 0 && fp8 && ntok >= 4 && ntok <= 8) {
+    if (fd && strcmp(fd, "mma") == 0 && fp8 && ntok >= 4 && ntok <= 12) {
         static int arch = -1;
         if (arch < 0) {
             int dev, mj, mn;
@@ -490,13 +490,18 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             fdmma::FCP3 mq;
             fdmma::FIP3 mp;
             for (int t = 0; t < 16; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
-            fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
-                                n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok, st);
-            dim3 g2(n_q_heads, ntok);
-            k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD2_NS,
-                                                  pos);
-            CUDA_CHECK(cudaGetLastError());
-            return;
+            // width-12 P2 (review): honor the dispatch's return -- an
+            // uninstantiated width must FALL THROUGH to fd2, not silently
+            // combine unwritten partials.
+            if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
+                                    n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok,
+                                    st)) {
+                dim3 g2(n_q_heads, ntok);
+                k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
+                                                      FD2_NS, pos);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
         }
     }
     if (!fd || strcmp(fd, "v1") != 0) {

@@ -73,7 +73,7 @@ constexpr size_t fdmma_smem_bytes() {
            + 2 * FDMMA_PP * FDMMA_HD              // s_vraw ping-pong
            + (size_t)FDMMA_HD * FDMMA_PP          // s_vt
            + 6 * FDMMA_TT * FDMMA_PP              // s_P
-           + 3 * 8 * sizeof(int) + 4 * sizeof(int); // s_geo: lo/hi/seq[8] + {any,beg,end,pad}
+           + 3 * 16 * sizeof(int) + 4 * sizeof(int); // s_geo: lo/hi/seq[16] + {any,beg,end,pad}
 }
 
 template <int W>
@@ -83,8 +83,10 @@ __global__ void __launch_bounds__(192, 1)
                  int n_kv_heads, int gqa, int head_dim, float scale) {
     constexpr int TT = FDMMA_TT, PP = FDMMA_PP, HD = FDMMA_HD, LDQ = FDMMA_LDQ, LDK = FDMMA_LDK;
     constexpr int M = 6 * W;                      // live rows (dense r = j*W + t)
-    constexpr int LIVE_WARPS = (M + TT - 1) / TT; // W=4 -> 2, W=5..8 -> 2..3
-    static_assert(W >= 2 && W <= 8, "W>8 needs s_geo re-stride + dispatch cases (plan P2)");
+    constexpr int LIVE_WARPS = (M + TT - 1) / TT; // W=4 -> 2 .. W=12 -> 5
+    // width-12 P2: geometry is 16-ready (M = 6W <= 96 s_q rows, LIVE_WARPS
+    // <= 6 = the 192-thread launch); s_geo strides at 16 lanes.
+    static_assert(W >= 2 && W <= 16, "s_q is 96 rows = 6*16 lanes max");
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int nsp = gridDim.x; // == ns fed to k_attn_fd_combine (single source, no split-brain)
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -107,30 +109,30 @@ __global__ void __launch_bounds__(192, 1)
         const int ch = (seq + nsp - 1) / nsp;
         const int lo = sp * ch, hi = min(seq, lo + ch);
         s_geo[t] = lo;
-        s_geo[8 + t] = hi;
-        s_geo[16 + t] = seq;
+        s_geo[16 + t] = hi;
+        s_geo[32 + t] = seq;
     }
-    if (threadIdx.x >= W && threadIdx.x < 8) {
-        s_geo[threadIdx.x] = 0; s_geo[8 + threadIdx.x] = 0; s_geo[16 + threadIdx.x] = 0;
+    if (threadIdx.x >= W && threadIdx.x < 16) {
+        s_geo[threadIdx.x] = 0; s_geo[16 + threadIdx.x] = 0; s_geo[32 + threadIdx.x] = 0;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
         int beg = INT_MAX, end = 0, any = 0;
         for (int t = 0; t < W; t++)
-            if (s_geo[t] < s_geo[16 + t]) { // live: lo < seq (fd2's rule)
+            if (s_geo[t] < s_geo[32 + t]) { // live: lo < seq (fd2's rule)
                 any = 1;
                 beg = min(beg, s_geo[t]);
-                end = max(end, s_geo[8 + t]);
+                end = max(end, s_geo[16 + t]);
             }
-        s_geo[24] = any;
-        s_geo[25] = any ? (beg & ~(PP - 1)) : 0;
-        s_geo[26] = end;
+        s_geo[48] = any;
+        s_geo[49] = any ? (beg & ~(PP - 1)) : 0;
+        s_geo[50] = end;
     }
     __syncthreads();
     // uniform early-out BEFORE any cp.async is issued (pending-async at
     // kernel exit is UB); combine never reads the unwritten slots.
-    if (!s_geo[24]) return;
-    const int p_beg = s_geo[25], p_end = s_geo[26];
+    if (!s_geo[48]) return;
+    const int p_beg = s_geo[49], p_end = s_geo[50];
 
     // ---- stage Q once: rows [0, LIVE_WARPS*TT). Rows < M from lane t = r%W,
     // head j = r/W (bare e4m3 cast, no scale -- prefill precedent); rows >= M
@@ -155,8 +157,8 @@ __global__ void __launch_bounds__(192, 1)
 
     // this thread's two rows and their causal windows (smem-read once)
     const int R0 = warp * TT + gid, R1 = R0 + 8;
-    const int lo0 = R0 < M ? s_geo[R0 % W] : 0, hi0 = R0 < M ? s_geo[8 + R0 % W] : 0;
-    const int lo1 = R1 < M ? s_geo[R1 % W] : 0, hi1 = R1 < M ? s_geo[8 + R1 % W] : 0;
+    const int lo0 = R0 < M ? s_geo[R0 % W] : 0, hi0 = R0 < M ? s_geo[16 + R0 % W] : 0;
+    const int lo1 = R1 < M ? s_geo[R1 % W] : 0, hi1 = R1 < M ? s_geo[16 + R1 % W] : 0;
 
     // ---- prologue prefetch (tile p_beg) into buffer 0
     int cur = 0;
@@ -309,7 +311,7 @@ __global__ void __launch_bounds__(192, 1)
         const int R = rr ? R1 : R0;
         if (R >= M) continue;
         const int t = R % W, j = R / W;
-        if (s_geo[t] >= s_geo[16 + t]) continue; // lane empty at this split
+        if (s_geo[t] >= s_geo[32 + t]) continue; // lane empty at this split
         const float m = rr ? m1 : m0, l = rr ? l1 : l0;
         const size_t pair = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
         float* dst = part + (pair * nsp + sp) * FDMMA_ST;
@@ -350,7 +352,14 @@ inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, 
         case 6: launch_fdmma_w<6>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
         case 7: launch_fdmma_w<7>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
         case 8: launch_fdmma_w<8>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
-        default: return false; // W<4 stays on fd2
+        // width-12 P2: the suffix drafter's wide verify (Q27_SUFFIX_W).
+        // 13..16 compile (kernel is 16-ready) but stay uninstantiated until
+        // something launches them; caller MUST honor the false return.
+        case 9: launch_fdmma_w<9>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        case 10: launch_fdmma_w<10>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        case 11: launch_fdmma_w<11>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        case 12: launch_fdmma_w<12>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, scale, ns, st); return true;
+        default: return false; // W<4 (and 13..16) stay on fd2
     }
 }
 

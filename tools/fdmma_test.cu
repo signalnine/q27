@@ -42,7 +42,7 @@ static int fails = 0;
     } while (0)
 
 // combine fork (verbatim src/spec3.cu k_attn_fd_combine)
-struct P3 { float* p[8]; };
+struct P3 { float* p[16]; }; // width-12 P2: 12 live lanes
 __global__ void k_attn_fd_combine(const float* __restrict__ part, P3 outp, int n_heads,
                                   int head_dim, int ns, fdmma::FIP3 pos) {
     const int h = blockIdx.x, t = blockIdx.y;
@@ -96,15 +96,15 @@ int main() {
     CUDA_CHECK(cudaMemcpy(vc, hv.data(), kvn, cudaMemcpyHostToDevice));
 
     const int QSTRIDE = 2 * HD; // engine q_stride
-    std::vector<float> hq(8 * (size_t)NQH * QSTRIDE);
+    std::vector<float> hq(12 * (size_t)NQH * QSTRIDE); // width-12 P2: 12 lanes
     for (auto& v : hq) {
         s = s * 1664525u + 1013904223u;
         v = ((s >> 8) & 0xFFFF) / 65536.0f - 0.5f;
     }
-    float* d_q[8];
-    int* d_pos[8];
-    float* d_out[8];
-    for (int t = 0; t < 8; t++) {
+    float* d_q[12];
+    int* d_pos[12];
+    float* d_out[12];
+    for (int t = 0; t < 12; t++) {
         CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)NQH * QSTRIDE * 4));
         CUDA_CHECK(cudaMemcpy(d_q[t], hq.data() + t * (size_t)NQH * QSTRIDE,
                               (size_t)NQH * QSTRIDE * 4, cudaMemcpyHostToDevice));
@@ -112,7 +112,7 @@ int main() {
         CUDA_CHECK(cudaMalloc(&d_out[t], (size_t)NQH * HD * 4));
     }
     float* part;
-    const size_t partn = (size_t)8 * NQH * NS * ST;
+    const size_t partn = (size_t)12 * NQH * NS * ST; // width-12 P2: 12 lanes
     CUDA_CHECK(cudaMalloc(&part, partn * 4));
 
     const float scale = 1.0f / sqrtf((float)HD);
@@ -120,7 +120,7 @@ int main() {
 
     // seq bases: straddle k*NS so per-lane chunk_t DISAGREE within a block
     // (design risk #1) plus a short-seq case with many empty splits.
-    for (int W : {4, 5, 6, 8}) {
+    for (int W : {4, 5, 6, 8, 9, 11, 12}) { // width-12 P2: the Q27_SUFFIX_W range
         for (int base : {NS * 7 - 2 /*894: straddles 896=7*128*/, 800, 130}) {
             // lane t position = base - 1 + t  (seq_t = base + t)
             fdmma::FCP3 qp{};
@@ -134,7 +134,7 @@ int main() {
                 op.p[t] = d_out[t];
             }
             // poison t >= W slots: kernel must never dereference them
-            for (int t = W; t < 8; t++) {
+            for (int t = W; t < 16; t++) {
                 qp.p[t] = (const float*)0xdeadbeef00ull;
                 pp.p[t] = (const int*)0xdeadbeef00ull;
             }
