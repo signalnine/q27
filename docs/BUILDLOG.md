@@ -3160,3 +3160,11 @@ token-walk completes). Historical footnote: the fp16-vs-fp8 basin split
 of the SAME cctx payload (echo-heavy vs cold, 35% vs 0.8% suffix fire,
 3.9-4.6 vs 2.6 tok/rnd) is the sharpest tie-lottery exhibit yet -- any
 acceptance-sensitive decision MUST name its basin.
+
+Addendum (docs61k fp8 chains completed): the MID pole (3.52-3.79 tok/rnd)
+also prefers shallow -- mma@61K c5 158.9 -> c8 150.2 (-5.5%). The c8 win
+exists ONLY on genuinely saturating traffic (y flat >= ~.82); even
+3.5-3.8 tok/rnd flavors shouldn't promote to 7. This is exactly what the
+shipped hi6/flo bars enforce (docs stays ceiling 5, cold cctx 4) --
+auto7's safety case rests on those bars staying strict, and all three
+measured poles now validate their calibration.
