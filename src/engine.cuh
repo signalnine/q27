@@ -316,13 +316,15 @@ struct Engine {
     // (n, 1..gate_maxd+1) over gated greedy rounds. At a fixed depth-5 ceiling:
     // fired fraction = cap_hist[5]/sum(cap_hist), depth-5 saturation =
     // n_hist[6]/sum(n_hist), p(5th lane accepted | fired) = n_hist[6]/cap_hist[5].
-    long gate_cap_hist[8] = {}; // [cap 0..7]
-    long gate_n_hist[9] = {};   // [n 1..8]; index 0 unused
+    // width-12 P3 (review pre-req): sized for ANY future ladder ceiling
+    // <= W_MAX-1 -- the old [8]/[9] were safe only under the 4..7 policy.
+    long gate_cap_hist[W_MAX] = {};    // [cap 0..W_MAX-1]
+    long gate_n_hist[W_MAX + 1] = {};  // [n 1..W_MAX]; index 0 unused
     // acceptance-gate Phase 0: per-draft-lane conditional acceptance on gated
     // rounds. Lane j (1..gate_maxd) FIRED iff cap >= j; ACCEPTED iff n >= j+1.
     // Gives the live yields p(acc_j | fired_j) that the two marginals above
     // cannot reconstruct (docs/acceptance-gate-design.md).
-    long gate_lane_fired[8] = {}, gate_lane_acc[8] = {}; // [j 1..7]; index 0 unused
+    long gate_lane_fired[W_MAX] = {}, gate_lane_acc[W_MAX] = {}; // [j 1..W_MAX-1]; 0 unused
     // Phase 2 (sampling): 2nd fused perm set -- identical draft half, sampled
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph[W_MAX] = {};

@@ -3518,3 +3518,43 @@ Engine telemetry per task ([req] segmented by journal marks):
 - Per-request peaks: T8 320 t/s (NEW RECORD; 294 this morning, 254
   before today), T5 296, T2 280. Wide-round wall 35.7-36.6ms
   consistent across tasks.
+
+## 2026-07-10 -- width-12 P3 DONE: MTP ceilings 9/10 NO-GO, ceiling 8 NO-BUILD (suffix-shadowed), GDN deferred-snapshot stays shelved (wide marginal is GEMV-N-bound)
+
+Pre-req shipped: gate_cap_hist/gate_n_hist/gate_lane_* widened to W_MAX
+sizes (the review's only-safe-under-4..7 landmine).
+
+NEW INSTRUMENT: engine-true wide-round curve via suffix legs (server,
+Q27_MAXD=4 + Q27_SUFFIX_W=W, open-cut echo payload at 26K/61K -- the
+first run EOS'd instantly on a cleanly-terminated prompt, the known
+open-continuation gotcha). Verify-only rounds, ms/round:
+  W=5/8/10/12 @26K: 18.63 / 23.41 / 28.83 / 35.31
+  W=5/8/10/12 @61K: 19.56 / 24.49 / 30.02 / 36.30
+Curve is nearly CTX-INDEPENDENT (+~1ms at 61K, every width: post-tuning
+fdmma is that flat) and the marginal lane ACCELERATES: ~1.6ms/lane thru
+W8, 2.7 at W9-10, 3.2 at W11-12. Attribution: attention flat (kernel
+bench), GDN chains ~0.32ms/lane linear -> the accelerating term is
+GEMV-N (width_bench: q4 per-call +12..28%/step past N=8). Per-token at
+full accept flattens: W8 2.93 / W10 2.88 / W12 2.94 ms/tok.
+
+PRICING (ladder_price.py extended to ceilings 9/10 + --curve flag; real
+d10 chains; W2..4 spliced from old curves -- common across ceilings so
+splice precision cannot affect the ranking):
+- HOT cctx (fp16-basin): c5 176.4 -> c7 179.5 -> c8 184.3 (+2.7% over
+  c7) -> c9 181.7 -> c10 178.0. CEILINGS 9/10 NEGATIVE even here (chain
+  acceptance saturates at 4.79 tok/rnd; W10/11 lanes cost 2.7-3.2ms).
+- COLD cctx + docs61k: monotonically negative past 5-6, as always.
+LIVE CHECK (today's cumulative gch/gnh on the tuned stack): cap=7 fires
+16% of gated rounds, n=8 commits 10%, sat7 ~= 25% -- far under any hi8
+promotion bar, and the saturating stretches are suffix-owned (AL ~10 on
+32-52% of decode). Ceiling 8's hot-chain +2.7% (MTP-wall-only) shrinks
+under the live cap mix to <1% engine.
+
+VERDICTS: ceilings 9/10 NO-GO (priced negative everywhere); ceiling 8
+NO-BUILD (reopen if live gnh[8] share rises materially or a suffix-off
+deployment appears); GDN deferred-snapshot SHELVED (the curve says the
+wide marginal is GEMV-N-bound, not GDN-bound -- the honest reopening
+lever for cheaper wide rounds is the mma16 NT=16 GEMM pivot, tools/
+mma16_bench.cu, 76% SOL flat W2..16). Width-12 plan fully closed:
+P0/P1/P2 shipped, P3 priced and resolved. q27-eval restored (widened
+single-slot full stack).

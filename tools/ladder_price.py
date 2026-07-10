@@ -83,16 +83,26 @@ def main():
         # extrapolate W9 with the W7->W8 marginal
         c = CURVES['mma@26k']
         c[9] = c[8] + (c[8] - c[7])
+    # width-12 P3: generic measured-curve flag, name:v2,v3,...,vNN (W from 2)
+    for arg in sys.argv[4:]:
+        if arg.startswith('--curve='):
+            name, vals_s = arg.split('=', 1)[1].split(':', 1)
+            vals = [float(x) for x in vals_s.split(',')]
+            CURVES[name] = dict(zip(range(2, 2 + len(vals)), vals))
     print(f"chains: {len(rows)} decode positions from {chains_csv}")
-    print(f"{'curve':>9} | " + " | ".join(f"ceil {c}: t/s (tok/rnd)" for c in (5, 6, 7, 8)))
+    ceils = (5, 6, 7, 8, 9, 10)  # width-12 P3: price the deep ceilings
+    print(f"{'curve':>12} | " + " | ".join(f"ceil {c}: t/s (tok/rnd)" for c in ceils))
     for cname, curve in CURVES.items():
         if curve is None:
             continue
         cells = []
-        for ceil in (5, 6, 7, 8):
+        for ceil in ceils:
+            if ceil + 1 not in curve:  # curve doesn't cover this width
+                cells.append(f"{'--':>14}")
+                continue
             tok, ms, rnd = simulate(rows, actual, ceil, curve)
             cells.append(f"{tok * 1000 / ms:7.1f} ({tok / rnd:4.2f})")
-        print(f"{cname:>9} | " + " | ".join(cells))
+        print(f"{cname:>12} | " + " | ".join(cells))
 
 
 if __name__ == "__main__":
