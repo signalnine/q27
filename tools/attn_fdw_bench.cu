@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "fdmma_kernel.cuh"
+#include "../src/fdmma.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "fdmma_kernel.cuh"
+#include "../src/fdmma.cuh"
 
 #define CUDA_CHECK(x)                                                          \
     do {                                                                       \

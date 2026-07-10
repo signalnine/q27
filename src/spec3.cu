@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "cuda_common.h"
+#include "fdmma.cuh"
 #include "spec3.cuh"
 
 namespace q27k {
@@ -469,6 +470,35 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // old behavior, incl. the retired bitwise canonical). Read at launch
     // time: graph capture bakes the choice for the process lifetime.
     const char* fd = getenv("Q27_FD");
+    // Q27_FD=mma: fp8-MMA shared-KV verify attention (src/fdmma.cuh; plan
+    // docs/plans/2026-07-10-fdmma-verify-attn.md). One KV pass scores all
+    // lanes -- measured 3.65x over fd2 at 61K W=8, near-flat in W. Engages
+    // only for fp8 KV, width 4..8, sm_89+ (the e4m3 MMA is a no-op stub
+    // below); everything else falls through to fd2, so W=2..3 rounds and
+    // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
+    // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
+    if (fd && strcmp(fd, "mma") == 0 && fp8 && ntok >= 4 && ntok <= 8) {
+        static int arch = -1;
+        if (arch < 0) {
+            int dev, mj, mn;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            CUDA_CHECK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev));
+            CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
+            arch = mj * 10 + mn;
+        }
+        if (arch >= 89) {
+            fdmma::FCP3 mq;
+            fdmma::FIP3 mp;
+            for (int t = 0; t < 8; t++) { mq.p[t] = q.p[t]; mp.p[t] = pos.p[t]; }
+            fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
+                                n_q_heads / n_kv_heads, head_dim, scale, FD2_NS, ntok, st);
+            dim3 g2(n_q_heads, ntok);
+            k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim, FD2_NS,
+                                                  pos);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     if (!fd || strcmp(fd, "v1") != 0) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, fp8);
