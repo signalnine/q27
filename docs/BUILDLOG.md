@@ -3417,3 +3417,31 @@ test_kernels ALL PASS. q27-eval restarted on the tuned binary.
 Remaining headroom: 282us vs ~130us floor at 61K W12 -- next lever
 would be the d-split O-accumulator halving (warp-pair PV, 3-CTA
 territory) or cross-CTA split-count retune; neither commissioned.
+
+## 2026-07-10 -- fdmma warp-pair PV (d-split) = NEGATIVE; reverted, attribution clean
+
+Built k_attn_fdmma<W, STAGES, PAIRED>: 384 threads, even warp scores
+(QK^T + softmax + s_P relayout) and takes PV dims 0..127, odd partner
+takes 128..255 of the same rows -- o[16][4] = 64 regs (half), sc factors
+transported per-gid through s_sc, pair-scoped bar.sync (id 1+rowblock,
+64 threads), per-tile CTA barriers proven sufficient to fence s_P slab
+reuse. Bitwise-equal outputs CONFIRMED at every (ctx, W, staging) --
+the correctness design was right.
+
+PERF: NO-GO. vs the shipped S1 2-CTA kernel at 61K: W=8 247/278us
+(P2/P1) vs 194.6; W=12 300.7/330.8 vs 282.8. Only cell that won: 26K
+W=12 P2 = 174.7 vs 186.1 (+6%) -- not worth a seq-dispatched variant
+for ~15% of wide-round wall. ATTRIBUTION: the S1 win was INDEPENDENT
+BARRIER DOMAINS (two CTAs interleaving each other's stalls), not warp
+count -- pairing doubles warps inside ONE domain, adds a pair-bar per
+tile, and idles the partner through the score phase. Register relief
+(168 -> ~120) bought nothing: regs were not binding after S1.
+
+DO-NOT-RETRY unless the kernel first moves to a structure where the
+partner warp has score-phase work (e.g. warp-specialized K-transpose or
+software-pipelined QK of tile i+1) -- i.e. as part of a full
+producer/consumer rewrite, not as a bolt-on split. Machinery REVERTED
+to 1f8f3d3 (fdmma.cuh + bench); fdmma_test re-verified ALL PASS on the
+reverted tree. Remaining headroom at 61K W=12: 282.8us vs ~130 floor;
+next candidates: cross-CTA split-count retune (ns as an fdmma-only
+knob), or the full warp-specialized rewrite -- neither commissioned.
