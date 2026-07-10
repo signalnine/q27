@@ -166,3 +166,33 @@ measured on the real kernel. Frees s_v's 16.5KB -> deeper cp.async ring
 as a bonus. Gates: fp8q tolerance battery (cosine/argmax/top5 @131K +
 needle 6/6 + --pf continuation) + TTFT ladder 8/32/128K + canonical
 (fp16 path untouched). Rigs kept: Q27_PV8_PROBE, Q27_PV_CONVX.
+
+---
+
+## fp8-PV IMPLEMENTED (Q27_PF_PV8) -- CORRECT + tolerance-safe, but net ~0%: NEGATIVE
+
+Built the true m16n8k32.e4m3 PV kernel k_attn_prefill_mma_pv8 (opt-in;
+canonical a2982c51 EXACT by default). Layout de-risked first via a
+standalone microtest (tools/pv8_mma_test.cu, max abs err 0.00000 vs CPU
+ref): P relaid from QK^T accumulator -> A-frag via per-warp s_P +
+__syncwarp; V consumed raw as the strided e4m3 B operand; V double-buffered
+in s_vraw; s_v + the convert phase deleted.
+
+**Correctness:** logits @131K cosine 0.99996543 / argmax MATCH / top5 4/5 --
+matches the isolated Q27_PV8_PROBE (0.99996269) to 5 digits, confirming the
+layout. Tolerance passes the Phase-B bar.
+
+**Perf:** 128K 59.66 -> 59.30s (+0.6%), 32K 10.68 -> 10.64s (+0.4%). The
+measured 6.6% convert-phase saving is ~entirely offset by the strided-V
+B-operand gather (256 scattered byte-reads/thread/tile, HD-strided ->
+bank-conflicted, INSIDE the MMA loop). LESSON: getting V from [key][dim]
+into the PV B-operand layout is an IRREDUCIBLE data-movement cost; fp8-PV
+relocates the layout transform (convert -> gather) rather than removing it.
+
+**The one variant that could still win: transpose-V.** A phase that writes
+s_vt[dim][key] fp8 (8KB, HALF the convert's 16KB half-write) makes the B
+reads clean contiguous uint32 (no in-loop scatter). Predicted ceiling
+~+3% (half the convert cost + scatter moved out of the MMA loop). That is
+the next attempt if prefill TTFT becomes the priority; kernel + microtest
+kept as its scaffold (proven-correct P-relayout + fp8 PV MMA). Q27_PF_PV8
+stays opt-in, documented negative. Do-not-ship as default (no win).
