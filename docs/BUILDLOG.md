@@ -3467,3 +3467,33 @@ cleared for mma. Gates: fdmma_test parameterized over ns {128, 85} =
 NS -- caught by 56 honest failures before the fix); canonical
 a2982c51 EXACT; same-binary repeat identical; Q27_FDMMA_NS=128 escape
 verified; sanitizer 0. q27-eval restarted on the retuned binary.
+
+## 2026-07-10 -- fdmma warp-specialized rewrite = NEGATIVE (0.49-0.61x vs S1@ns85); occupancy story CLOSED
+
+Prototype (tools/attn_fdw_bench.cu k_attn_fdmma_ws, kept as rig): 224
+threads = 6 consumers + 1 producer warp owning cp.async K/V staging +
+the V transpose into a double-buffered s_vt ring; stage handoff via
+named-barrier arrive/sync pairs (ready/consumed ids 1..4, count 224);
+consumers hit ZERO CTA-wide barriers in the tile loop; per-row math =
+fdmma_tile_compute verbatim. Choreography CORRECT: bitwise-equal
+outputs at every leg. Perf: 61K W12 353.3us vs champion 202.4 (0.57x),
+61K W8 306.7 vs 150.8 (0.49x), 26K similar.
+
+ATTRIBUTION (closes the day's occupancy arc): the WS CTA has 7 warps
+in ONE barrier domain vs the champion's 12 across TWO independent
+domains -- multi-CTA interleave hides staging strictly better than a
+dedicated producer once smem permits 2 CTAs, and WS's fat smem (double
+K/V raw + double vt = ~74KB @W12) forbids the second CTA. Same
+conclusion as the prefill Phase-A EV-cut and the warp-pair PV
+negative, now measured three ways: for THIS kernel family, occupancy
+(CTA count) dominates intra-CTA orchestration. DO-NOT-RETRY unless a
+redesign gets specialized staging under ~49KB smem AND <=85 regs
+(PP=16 half-tiles would be the entry point -- changes mask/softmax
+tile granularity, tolerance-class, unpriced).
+
+fdmma day summary (61K W=12, 126MB stream): 354.7 (morning W12 lift)
+-> 282.4 (S1 2-CTA) -> 202.6 (ns=85) = 1.75x tuning day, 5.6x over
+fd2, vs ~130-140us modeled floor. Shipped: S1 default + computed
+fdmma_ns. Rejected with attribution: prefetch reorder (wash),
+warp-pair PV (barrier-domain insight), warp-specialized producer
+(this entry).

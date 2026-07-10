@@ -547,6 +547,176 @@ template <typename F> static double timeit(F&& fn, int reps) {
     return (double)ms / reps;
 }
 
+
+// ---- warp-specialized fdmma prototype (tuning 2026-07-10, task: beat the
+// ns-retuned S1 2-CTA champion). 224 threads = 6 consumer warps + 1
+// producer warp. Producer owns cp.async K/V staging + the V transpose
+// (double-buffered vt ring); consumers never hit a CTA-wide barrier in
+// the tile loop -- stage handoff via named-barrier arrive/sync pairs
+// (ready[s] = ids 1,2; consumed[s] = ids 3,4; count 224 both sides).
+// Per-row arithmetic = fdmma::fdmma_tile_compute verbatim -> outputs
+// bitwise-equal to S1/S2 by construction. 1 CTA/SM (smem ~74KB @W12).
+static __device__ __forceinline__ void ws_bar_sync(int id) {
+    asm volatile("bar.sync %0, 224;" ::"r"(id));
+}
+static __device__ __forceinline__ void ws_bar_arrive(int id) {
+    asm volatile("bar.arrive %0, 224;" ::"r"(id));
+}
+template <int W>
+__global__ void __launch_bounds__(224, 1)
+    k_attn_fdmma_ws(fdmma::FCP3 qp, int q_stride, const __nv_fp8_e4m3* __restrict__ kc,
+                    const __nv_fp8_e4m3* __restrict__ vc, float* __restrict__ part,
+                    fdmma::FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale) {
+    constexpr int TT = fdmma::FDMMA_TT, PP = fdmma::FDMMA_PP, HD = fdmma::FDMMA_HD;
+    constexpr int LDQ = fdmma::FDMMA_LDQ, LDK = fdmma::FDMMA_LDK;
+    constexpr int M = 6 * W;
+    constexpr int LIVE_WARPS = (M + TT - 1) / TT;
+    constexpr int QROWS = fdmma::fdmma_qrows(W);
+    const int sp = blockIdx.x, kvh = blockIdx.y;
+    const int nsp = gridDim.x;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tg = lane & 3;
+
+    extern __shared__ unsigned char smem_ws[];
+    __nv_fp8_e4m3* s_q = (__nv_fp8_e4m3*)smem_ws;                    // [QROWS][LDQ]
+    __nv_fp8_e4m3* s_kraw = s_q + (size_t)QROWS * LDQ;               // [2][PP][LDK]
+    __nv_fp8_e4m3* s_vraw = s_kraw + 2 * PP * LDK;                   // [2][PP][HD]
+    __nv_fp8_e4m3* s_vt = s_vraw + 2 * PP * HD;                      // [2][HD][PP]
+    __nv_fp8_e4m3* s_P = s_vt + 2 * (size_t)HD * PP;                 // [6][TT][PP]
+    int* s_geo = (int*)(s_P + 6 * TT * PP);
+
+    if (threadIdx.x < W) {
+        const int t = threadIdx.x;
+        const int seq = *pos.p[t] + 1;
+        const int ch = (seq + nsp - 1) / nsp;
+        const int lo = sp * ch, hi = min(seq, lo + ch);
+        s_geo[t] = lo;
+        s_geo[16 + t] = hi;
+        s_geo[32 + t] = seq;
+    }
+    if (threadIdx.x >= W && threadIdx.x < 16) {
+        s_geo[threadIdx.x] = 0; s_geo[16 + threadIdx.x] = 0; s_geo[32 + threadIdx.x] = 0;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int beg = INT_MAX, end = 0, any = 0;
+        for (int t = 0; t < W; t++)
+            if (s_geo[t] < s_geo[32 + t]) {
+                any = 1;
+                beg = min(beg, s_geo[t]);
+                end = max(end, s_geo[16 + t]);
+            }
+        s_geo[48] = any;
+        s_geo[49] = any ? (beg & ~(PP - 1)) : 0;
+        s_geo[50] = end;
+    }
+    __syncthreads();
+    if (!s_geo[48]) return;
+    const int p_beg = s_geo[49], p_end = s_geo[50];
+
+    for (int idx = threadIdx.x; idx < LIVE_WARPS * TT * HD; idx += 224) {
+        const int r = idx / HD, d = idx % HD;
+        float v = 0.f;
+        if (r < M) {
+            const int t = r % W, j = r / W;
+            v = qp.p[t][(size_t)(kvh * gqa + j) * q_stride + d];
+        }
+        s_q[(size_t)r * LDQ + d] = __nv_fp8_e4m3(v);
+    }
+    __syncthreads(); // Q staged for everyone; ring barriers take over below
+
+    const int ntiles = (p_end - p_beg + PP - 1) / PP;
+
+    if (warp == 6) {
+        // ---- producer: stage tile i into ring slot i&1, transpose V,
+        // publish. Reuse of slot s waits for consumed[s] (from tile i-2).
+        for (int i = 0; i < ntiles; i++) {
+            const int st = i & 1;
+            if (i >= 2) ws_bar_sync(3 + st);
+            __nv_fp8_e4m3* kb = s_kraw + st * PP * LDK;
+            __nv_fp8_e4m3* vb = s_vraw + st * PP * HD;
+            const int p0 = p_beg + i * PP;
+            for (int idx = lane; idx < PP * (HD / 16); idx += 32) {
+                const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+                const int gpos = p0 + pp;
+                const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+                fdmma::cpasync16(kb + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
+                fdmma::cpasync16(vb + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+            }
+            fdmma::cpasync_commit();
+            fdmma::cpasync_wait_all();
+            __nv_fp8_e4m3* vt = s_vt + st * (size_t)HD * PP;
+            for (int idx = lane; idx < PP * HD; idx += 32)
+                vt[(idx % HD) * PP + (idx / HD)] = vb[idx];
+            __syncwarp();
+            ws_bar_arrive(1 + st);
+        }
+        return;
+    }
+
+    // ---- consumers
+    float o[32][4];
+#pragma unroll
+    for (int i = 0; i < 32; i++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[i][e] = 0.f;
+    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
+    const int R0 = warp * TT + gid, R1 = R0 + 8;
+    const int lo0 = R0 < M ? s_geo[R0 % W] : 0, hi0 = R0 < M ? s_geo[16 + R0 % W] : 0;
+    const int lo1 = R1 < M ? s_geo[R1 % W] : 0, hi1 = R1 < M ? s_geo[16 + R1 % W] : 0;
+
+    for (int i = 0; i < ntiles; i++) {
+        const int st = i & 1;
+        ws_bar_sync(1 + st);
+        if (warp < LIVE_WARPS)
+            fdmma::fdmma_tile_compute(s_q, s_kraw + st * PP * LDK,
+                                      s_vt + st * (size_t)HD * PP, s_P, p_beg + i * PP, scale,
+                                      warp, gid, tg, R0, R1, lo0, hi0, lo1, hi1, m0, m1, l0,
+                                      l1, o);
+        ws_bar_arrive(3 + st);
+    }
+
+    if (warp >= LIVE_WARPS) return;
+#pragma unroll
+    for (int rr = 0; rr < 2; rr++) {
+        const int R = rr ? R1 : R0;
+        if (R >= M) continue;
+        const int t = R % W, j = R / W;
+        if (s_geo[t] >= s_geo[32 + t]) continue;
+        const float m = rr ? m1 : m0, l = rr ? l1 : l0;
+        const size_t pr = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
+        float* dst = part + (pr * nsp + sp) * fdmma::FDMMA_ST;
+        if (tg == 0) { dst[0] = m; dst[1] = l; }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const int c = n * 8 + tg * 2;
+            dst[2 + c] = o[n][rr ? 2 : 0];
+            dst[2 + c + 1] = o[n][rr ? 3 : 1];
+        }
+    }
+}
+
+template <int W>
+static void launch_fdmma_ws(fdmma::FCP3 qp, int q_stride, const void* kc, const void* vc,
+                            float* part, fdmma::FIP3 pos, int n_kv_heads, int gqa, int head_dim,
+                            float scale, int ns) {
+    constexpr size_t sm = (size_t)fdmma::fdmma_qrows(W) * fdmma::FDMMA_LDQ
+                          + 2 * fdmma::FDMMA_PP * fdmma::FDMMA_LDK
+                          + 2 * fdmma::FDMMA_PP * fdmma::FDMMA_HD
+                          + 2 * (size_t)fdmma::FDMMA_HD * fdmma::FDMMA_PP
+                          + 6 * fdmma::FDMMA_TT * fdmma::FDMMA_PP + 52 * sizeof(int);
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(k_attn_fdmma_ws<W>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             sm);
+        attr = true;
+    }
+    dim3 g((unsigned)ns, (unsigned)n_kv_heads);
+    k_attn_fdmma_ws<W><<<g, 224, sm>>>(qp, q_stride, (const __nv_fp8_e4m3*)kc,
+                                       (const __nv_fp8_e4m3*)vc, part, pos, n_kv_heads, gqa,
+                                       head_dim, scale);
+}
+
 int main() {
     for (int CTX : {26000, 61000}) {
         // synthetic fp8 KV + fp32 q; W lanes at positions CTX-1 .. CTX+W-2
@@ -801,6 +971,42 @@ int main() {
                        s1_mismatch == 0 ? "OK" : "FAIL");
             else
                 printf("\n");
+            // warp-specialized prototype leg (ns=85 champion-fair A/B)
+            if (W >= 8) {
+                const int nsx = 85;
+                auto s1_85 = [&] {
+                    fdmma::launch_fdmma(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale,
+                                        nsx, W, 0, /*stages=*/1);
+                    dim3 g2(NQH, W);
+                    k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, nsx, pp);
+                };
+                auto ws_85 = [&] {
+                    if (W == 8) launch_fdmma_ws<8>(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale, nsx);
+                    else launch_fdmma_ws<12>(mqp, HD, kc, vc, part, mpp, N_KV, GQA, HD, scale, nsx);
+                    dim3 g2(NQH, W);
+                    k_attn_fd_combine<<<g2, 256>>>(part, owp, NQH, HD, nsx, pp);
+                };
+                // bitwise: ws vs s1 at the same ns
+                CUDA_CHECK(cudaMemset(part, 0, (size_t)MAXW * NQH * 192 * FD_ST * 4));
+                s1_85(); CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<std::vector<float>> ref(W);
+                for (int t = 0; t < W; t++) {
+                    ref[t].resize(NQH * HD);
+                    CUDA_CHECK(cudaMemcpy(ref[t].data(), ow[t], NQH * HD * 4, cudaMemcpyDeviceToHost));
+                }
+                CUDA_CHECK(cudaMemset(part, 0, (size_t)MAXW * NQH * 192 * FD_ST * 4));
+                ws_85(); CUDA_CHECK(cudaDeviceSynchronize());
+                int ws_mm = 0;
+                for (int t = 0; t < W; t++) {
+                    std::vector<float> b(NQH * HD);
+                    CUDA_CHECK(cudaMemcpy(b.data(), ow[t], NQH * HD * 4, cudaMemcpyDeviceToHost));
+                    for (size_t i = 0; i < b.size(); i++)
+                        if (memcmp(&ref[t][i], &b[i], 4) != 0) ws_mm++;
+                }
+                double t1 = timeit(s1_85, 100), tw = timeit(ws_85, 100);
+                printf("    WS@ns85: S1 %.1f | WS %.1f (%.2fx) bitwise=%s\n", t1 * 1e3,
+                       tw * 1e3, t1 / tw, ws_mm == 0 ? "OK" : "FAIL");
+            }
             // split-count retune (tuning 2026-07-10): sweep ns for the S1
             // kernel. Wave math: grid = ns*4 CTAs vs SMs*2 resident slots.
             // NOT bitwise across ns (split boundaries move -> combine fp
