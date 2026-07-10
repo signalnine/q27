@@ -292,6 +292,14 @@ struct Engine {
     // restores the monolithic draft (A/B lever); default ON when gated.
     cudaGraphExec_t draft_step_graph[7][8] = {}; // [step 0..6][perm 0..7]
     bool dexit_on = true; // Q27_DEXIT (only reached when pmin_theta > 0)
+    // Q27_PHASE_STATS=1: per-round draft/verify wall split (Saguaro draft-
+    // fraction measurement, survey 2026-07-09). Host steady_clock stamps at
+    // the gated round's existing sync boundaries -- no device work, no new
+    // syncs, tokens unaffected. Draft bucket = prep + MTP chain + margin
+    // reads (the critical-path cost off-path drafting would hide); verify
+    // bucket = width-floor top-up (cap==0 rounds only, slight draft
+    // undercount) + verify graph + finish + outcome read.
+    bool phase_stats = false;
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % 8;
@@ -1252,6 +1260,7 @@ struct Engine {
         // unset = off (always full width 5 = the canonical depth-4 round).
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
+        phase_stats = getenv("Q27_PHASE_STATS") != nullptr;
         fprintf(stderr,
                 "spec graphs captured (8 perms, depth-4; +split D/V; +per-width verify "
                 "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
@@ -1270,6 +1279,8 @@ struct Engine {
     int spec_round(int* emit) {
         int md_used = -1;  // P13: draft-depth ceiling actually used this round
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
+        std::chrono::steady_clock::time_point ph_t0, ph_t1;
+        bool ph_timed = false; // set once the draft half is stamped (gated branches)
         if (tool_split_active && on_drafts) {
             // P11 constrained path: run drafts, read them back, let the host
             // stage per-lane grammar masks (uncapped), then verify. Full spec
@@ -1297,6 +1308,7 @@ struct Engine {
             // serve every ceiling; the monolithic fallback below only knows
             // depth-4 (draft_graph_lo) and depth-gate_maxd (draft_graph).
             md_used = maxd_auto ? dctl.cur : gate_maxd;
+            if (phase_stats) ph_t0 = std::chrono::steady_clock::now();
             if (dexit_on) {
                 // P14 draft early-exit: launch draft steps one at a time and
                 // stop at the first sub-theta margin (that step still ran --
@@ -1312,6 +1324,13 @@ struct Engine {
                     CUDA_CHECK(cudaStreamSynchronize(stm));
                     if (h_draft_margin[k] < pmin_theta) break;
                     cap++;
+                }
+                if (phase_stats) {
+                    ph_t1 = std::chrono::steady_clock::now();
+                    gs.draft_ms +=
+                        std::chrono::duration<double, std::milli>(ph_t1 - ph_t0).count();
+                    gs.draft_steps += launched;
+                    ph_timed = true;
                 }
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 // Width-floor top-up: a width-W verify can commit up to n=W
@@ -1332,6 +1351,13 @@ struct Engine {
                 CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, 7 * 4,
                                            cudaMemcpyDeviceToHost, stm));
                 CUDA_CHECK(cudaStreamSynchronize(stm));
+                if (phase_stats) {
+                    ph_t1 = std::chrono::steady_clock::now();
+                    gs.draft_ms +=
+                        std::chrono::duration<double, std::milli>(ph_t1 - ph_t0).count();
+                    gs.draft_steps += md_used;
+                    ph_timed = true;
+                }
                 int cap = 0;
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
@@ -1345,6 +1371,10 @@ struct Engine {
         int oc[10];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 40, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
+        if (ph_timed)
+            gs.verify_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - ph_t1)
+                                .count();
         int n = oc[0];
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;
@@ -1856,6 +1886,11 @@ struct Engine {
         // chunks), and how many handovers. pf_ms/dec_ms stay wall-inclusive
         // of yields; analyzers subtract gw_ms for GPU-busy accounting.
         double gw_ms = 0;
+        // Q27_PHASE_STATS: summed gated-round draft/verify wall (ms) and MTP
+        // draft steps launched, this request. dec_ms - draft_ms - verify_ms =
+        // host round-gap + any unattributed (constrained/ungated) rounds.
+        double draft_ms = 0, verify_ms = 0;
+        long draft_steps = 0;
         int dec = 0, rounds = 0, yields = 0;
         const char* end = "";
     };
