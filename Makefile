@@ -50,3 +50,6 @@ build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/
 
 clean:
 	rm -rf build
+
+build/gdn_chunk_bench: tools/gdn_chunk_bench.cu | build
+	$(NVCC) $(NVCCFLAGS) tools/gdn_chunk_bench.cu -o $@
