@@ -3069,3 +3069,44 @@ target metric now: Eligible Warps/scheduler (0.44 today), not occupancy.
 Kernel + launcher reverted per kill protocol (canonical a2982c51 EXACT
 post-revert); plan doc carries the verdict + do-not-retry (register cuts,
 CTA repackaging, split-kk all preserve the binding barrier structure).
+
+## 2026-07-10 -- suffix drafter LIVE-CC trial (GO for CC serving) + GDN chunk P0 (STOP -> attention re-attribution)
+
+Suffix trial, T8 x claude-code-q27-haight, qwopus, production env
+(Q27_KV=fp8 PMIN=0.5 MAXD=auto) +- Q27_SUFFIX=1, fresh server per leg:
+
+- ON leg: score 0.815 @ 167s (the known matched basin), 53 reqs,
+  22,057 decode tok, 4,006 rounds. **sfx = 1,964 rounds / 12,734 tok =
+  6.48 tok/round fired, 57.7% of ALL decode via suffix rounds, 49% of
+  rounds.** MTP rounds 4.57 tok/rnd (composition: suffix takes the echo
+  cream). Ladder NOT starved live: 81% of auto rounds at ceiling 6
+  (md6=2954, mprom=11) -- the repro-payload starvation was small-sample.
+- OFF leg: score 0.834, hidden_tests identical (0.906 both), 100% pass
+  both. 54 reqs / 16,324 tok / 5.00 tok/rnd blended.
+- PAIRING IS IMPOSSIBLE cross-run: legs forked at request 5 -- same conv,
+  same prompt SIZE (33,188), different bytes (tool output carries
+  wall-clock-dependent content; pytest timings etc). Same class as the
+  cross-build tie-lottery: within-run telemetry is the only currency for
+  CC trials. Byte-identity of the engine itself is construction-level +
+  5-payload gated; the fork is environmental.
+- Within-leg value estimate: rounds saved vs MTP-at-saturating-rate on
+  the same stretches (~158 rounds, ~4%) + zero draft cost on 49% of
+  rounds (~4-5% of decode wall) ~= 6-9% decode-wall win on this
+  trajectory, CAPPED at width 7 (fired AL 6.48 = ceiling; offline sim
+  says the same fires reach AL 10-12 uncapped). Deep verify multiplies
+  this. RECOMMENDATION: Q27_SUFFIX=1 in the CC serving env (binary
+  default stays off); revisit default-on after the width work.
+
+GDN chunked-scan P0 (tools/gdn_chunk_bench.cu, 3090): STOP-rule fired.
+delta chunk 1.21-1.29x (state-WRITE-bound: the 3.1MB/step role snapshot
+is contractual; smem residency only removes the read); conv chunk
+2.9-7.1x but ~0.05ms/lane component. Bitwise identity on every leg
+(identical per-step arithmetic + reduction order) -- numerics approach
+validated for future GDN work. WIDTH-COST RE-ATTRIBUTION: ~1.4ms/lane =
+attention ~0.6 (fd2 re-reads full KV per lane; 16 layers x ~53MB fp8 @
+26K ctx, grows with ctx) + delta ~0.23 + conv ~0.05 + batched per-lane
+compute ~0.3-0.5. Ceiling-8+ target REVISED to a shared-KV W-query
+verify attention kernel (one KV pass scores all W lanes, split-KV; the
+tokenspeed-MLA/FlashRT verify shape; NOT the retired Task-6 lane-pair
+fusion). Falsifiable check queued: per-lane marginal should ~double at
+61K ctx (phase-width run on docs61k). Plan: docs/plans/2026-07-10-gdn-chunk.md.
