@@ -62,13 +62,13 @@ int main(int argc, char** argv) {
 
     // ---- (a) batched GEMV width sweep on real weights ----
     const int64_t cols = 5120;
-    q27k::XQuant qs[8];
-    float* ys[8];
+    q27k::XQuant qs[12]; // width-12 P1: lanes for the nb=9..12 sweep
+    float* ys[12];
     std::vector<float> x = rand_vec(cols, 91);
     float* d_x;
     CUDA_CHECK(cudaMalloc(&d_x, cols * 4));
     CUDA_CHECK(cudaMemcpy(d_x, x.data(), cols * 4, cudaMemcpyHostToDevice));
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 12; i++) {
         qs[i] = q27k::xquant_alloc(cols);
         q27k::quantize_x(d_x, cols, qs[i]);
         CUDA_CHECK(cudaMalloc(&ys[i], 248320 * 4));
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     const q27::DevTensor& hd = dm.upload("output.weight");
     int64_t hrows = m.get("output.weight").rows();
     double prev4 = 0, prev8 = 0;
-    for (int nb = 5; nb <= 8; nb++) {
+    for (int nb = 5; nb <= 12; nb++) { // width-12 P1: sweep through the new N=9..12 instantiations
         int rot = 0;
         double q4 = timeit(
             [&] {

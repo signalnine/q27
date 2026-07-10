@@ -3301,3 +3301,46 @@ Re-gated after fixes: canonical a2982c51 + qwopus 4c4120c7 EXACT, full-CC
 replay leg byte-identical vs pre-widen binary, test_kernels ALL PASS,
 sanitizer memcheck 0 errors. conclave auto-review attempted, hung on
 external CLIs (timed out) -- workflow review is the pass of record.
+
+## 2026-07-10 -- width-12 P1 DONE: suffix width 12 LIVE (Q27_SUFFIX_W), gemv N=12 no-cliff, eval flipped to single-slot widened
+
+Q27_SUFFIX_W knob decouples the SUFFIX verify width from the MTP gated
+width (ladder stays 4..7): envs parsed pre-capture, warm runs at the
+widest width, ONE extra per-perm verify graph captured at exactly sfx_w
+(12 graphs, not 4 widths x 12), suffix branch proposes sfx_w-1 and
+launches verify_graph_w[sfx_w], reserve rides verify_w_max(). Suffix
+rounds now phase-stamped into their OWN GenStats bucket (sfx_ms/
+sfx_rounds; server [req] appends sfxm/sfxn under Q27_PHASE_STATS --
+phwn/phwm untouched, parsers safe). gemv_q4_n/q8_n N=9,11,12
+instantiated (10 existed); width_bench sweep extended 5..12.
+
+CLI FIX in passing: the --tokens --spec loop drove spec_round with an
+EMPTY suffix index (only Engine::generate wired sfx.reset/append) --
+Q27_SUFFIX could never fire on CLI replays, zero-fire by construction.
+Now wired; CLI is a valid suffix venue for the first time (explains a
+chunk of the 07-09 'replay payloads cannot evaluate this drafter').
+
+MEASURED (5090):
+- gemv width sweep (L2-rotated q4 ffn / resident q8 head): N=12 per-lane
+  cost only +9% vs N=8 (5.98 vs 5.48 us/lane); q8 head +18.6% total for
+  +50% lanes. NO register cliff -- mma16 GEMM contingency NOT needed.
+- CLI echo leg (6x5-tok periodic prompt, fp8+PMIN+auto7+SUFFIX_W=12):
+  suffix fires 17-20 rounds x 12 tok = ~80% of decode at 12 tok/round.
+- BYTE-IDENTITY: under fd2, wide-suffix leg is byte-identical to both
+  the suffix-off leg and the PRE-WIDEN binary (width-invariance holds
+  bitwise, 20 wide rounds live). Under Q27_FD=mma the wide leg FORKS
+  (~token 100): W=12 rounds fall through to fd2 while W<=8 rounds run
+  mma, so round grouping selects the attention kernel per position --
+  the documented mma tolerance-class regime, now width-coupled. NOT a
+  widening bug; P2's fdmma W<=16 lift removes the fork.
+- canonical a2982c51 EXACT on the final binary; sanitizer memcheck 0
+  errors on the wide leg; test_kernels ALL PASS.
+
+SERVING (Gabe: "let's do one slot"): q27-eval RECREATED on the WIDENED
+binary, single slot 131072, full stack + Q27_SUFFIX_W=12 +
+Q27_PHASE_STATS=1: 27.0GB/32.6GB = 5.6GB headroom (2-slot OOM resolved).
+Smoke (echo completion): 200 tok / 18 rounds = 11.1 tok/rnd avg, suffix
+17x12, **tps=326.5** -- highest live per-request decode ever recorded on
+this engine (prior per-req peak 254). P2 next: live CC/T8 trial (does
+real traffic reach AL ~10.5? wall delta vs 249 t/s stack?), fdmma W<=16
+lift, width-curve at 12 via sfxm/sfxn.

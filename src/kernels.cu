@@ -362,7 +362,10 @@ void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float
         case 6: k_gemv_q4_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 7: k_gemv_q4_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd6 width-7
         case 8: k_gemv_q4_n<8><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd7 width-8
+        case 9: k_gemv_q4_n<9><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;  // width-12:
         case 10: k_gemv_q4_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 11: k_gemv_q4_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
+        case 12: k_gemv_q4_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 9..12
         default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -385,7 +388,10 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float*
         case 6: k_gemv_q8_n<6><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 7: k_gemv_q8_n<7><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd6 width-7
         case 8: k_gemv_q8_n<8><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // maxd7 width-8
+        case 9: k_gemv_q8_n<9><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;  // width-12:
         case 10: k_gemv_q8_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 11: k_gemv_q8_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
+        case 12: k_gemv_q8_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 9..12
         default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());

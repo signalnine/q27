@@ -1131,6 +1131,15 @@ int main(int argc, char** argv) {
             fprintf(stderr, "sampling: T=%.3f top_p=%.3f seed=%llu path=%s\n", temp, top_p, seed,
                     plain_sample ? "plain" : "spec");
         }
+        // width-12 P1: arm the suffix drafter like Engine::generate does --
+        // the CLI drove spec_round directly with an EMPTY suffix index, so
+        // Q27_SUFFIX could never fire on --tokens replays (zero-fire by
+        // construction, not by traffic). Round-grouping only; emitted
+        // tokens stay greedy-identical.
+        if (e.suffix_on) {
+            e.sfx.reset(toks);
+            e.sfx_valid = false;
+        }
         int total_emitted = 0, rounds = 0, hist[W_MAX] = {0}; // width-12: up to 12-tok rounds
         while ((int)out.size() < n_gen) {
             if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
@@ -1138,6 +1147,8 @@ int main(int argc, char** argv) {
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
+            if (e.suffix_on)
+                for (int k = 0; k < n; k++) e.sfx.append(em[k]);
             rounds++;
             total_emitted += n;
             hist[n - 1]++;

@@ -9,7 +9,7 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 all: build/inspect build/test_kernels build/q27 build/q27-server build/test_tokenizer build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/device_model.cu src/loader.cpp \
-           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h | build
+           src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h | build
 	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/device_model.cu src/loader.cpp -o $@
 
 build:
@@ -37,13 +37,13 @@ build/mma16_bench: tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/l
 	$(NVCC) $(NVCCFLAGS) tools/mma16_bench.cu src/kernels.cu src/device_model.cu src/loader.cpp -o $@
 
 build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp \
-                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/device_model.h src/loader.h src/cuda_common.h | build
+                    src/kernels.cuh src/prefill.cuh src/blocks.cuh src/spec3.cuh src/fdmma.cuh src/device_model.h src/loader.h src/cuda_common.h | build
 	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/device_model.cu src/loader.cpp -o $@
 
 
 build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
-                  src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/cuda_common.h src/toolgram.h \
+                  src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@

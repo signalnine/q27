@@ -285,7 +285,10 @@ struct Engine {
     // (verify_w_max), not the draft ceiling -- a suffix round wider than
     // gate_maxd+1 (P1) would otherwise overrun the caches, the exact
     // depth-5-era bug class again.
-    int verify_w_max() const { return gate_maxd + 1; } // P1: max with the suffix width knob
+    // widest LAUNCHABLE verify: the gated width, or the suffix width when
+    // the drafter is armed wider (Q27_SUFFIX_W; sfx_width() is declared
+    // further down -- in-class bodies see the complete class).
+    int verify_w_max() const { return suffix_on ? sfx_width() : gate_maxd + 1; }
     int ctx_round_reserve() const { return std::max(gate_maxd, verify_w_max() - 1) + 2; }
     // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
     // between 4 and 5 from realized acceptance, so agentic streaks get depth-5
@@ -358,6 +361,13 @@ struct Engine {
     // from resident lane hiddens is the Phase-2 fix if replay A/B says so.
     bool suffix_on = false;
     int sfx_L = 12;              // Q27_SUFFIX_L: min match length to fire
+    // Q27_SUFFIX_W (width-12 P1): decouple the SUFFIX verify width from the
+    // MTP gated width. 0/unset or <= gate_maxd+1 = legacy (suffix rides the
+    // gated width); 9..12 = wide suffix rounds (one extra per-perm graph at
+    // exactly that width -- suffix rounds always launch full width). The
+    // MTP ladder stays 4..gate_maxd regardless.
+    int sfx_w = 0;
+    int sfx_width() const { return sfx_w > gate_maxd + 1 ? sfx_w : gate_maxd + 1; }
     q27::SuffixDraft sfx;
     bool sfx_valid = false;      // last_pending valid (>=1 round this request)
     long sfx_fired = 0, sfx_tok = 0; // engine-cumulative, like glf/gla
@@ -1310,6 +1320,17 @@ struct Engine {
         if (const char* e = getenv("Q27_MAXD_FLO7")) dctl.flo7 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_FLO6")) dctl.flo6 = (float)atof(e);
         if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
+        // width-12 P1: suffix envs parsed BEFORE the warm/capture section --
+        // Q27_SUFFIX_W shapes the warm width and adds one per-perm verify
+        // graph at exactly that width. <= gate_maxd+1 (or unset) = legacy.
+        suffix_on = getenv("Q27_SUFFIX") != nullptr;
+        sfx_dbg = getenv("Q27_SUFFIX_DBG") != nullptr;
+        if (const char* sl = getenv("Q27_SUFFIX_L")) sfx_L = atoi(sl);
+        if (const char* sw = getenv("Q27_SUFFIX_W")) {
+            sfx_w = atoi(sw);
+            if (sfx_w < gate_maxd + 1) sfx_w = 0;      // narrower than gated = legacy
+            if (sfx_w > W_MAX) sfx_w = W_MAX;
+        }
         int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6, z7 = 7;
         int z8 = 8, z9 = 9, z10 = 10, z11 = 11; // width-12 lanes i..l
         auto seed_positions = [&]() {
@@ -1367,10 +1388,11 @@ struct Engine {
             CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
             CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         };
-        // P12b: warm the WIDEST kernels (6-lane verify + 5th draft = distinct
-        // gemv<6>/ntok=6 instantiations) so graph capture never triggers a lazy
-        // module load. Output is discarded and reset below.
-        perm = 0; dmax = gate_maxd; vw = gate_maxd + 1;
+        // P12b: warm the WIDEST kernels (distinct gemv<N>/ntok instantiations)
+        // so graph capture never triggers a lazy module load. Output is
+        // discarded and reset below. width-12 P1: the suffix width (when
+        // wider than the gated width) is the widest thing captured.
+        perm = 0; dmax = gate_maxd; vw = sfx_width();
         seed_positions();
         spec_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -1447,6 +1469,19 @@ struct Engine {
                 CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
+            // width-12 P1: the suffix drafter's wide verify. Suffix rounds
+            // always launch full width, so only sfx_w itself is captured
+            // (not every width 9..sfx_w) -- 12 extra graphs total.
+            if (sfx_w > gate_maxd + 1) {
+                vw = sfx_w;
+                cudaGraph_t gs_;
+                CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+                spec_verify_launches();
+                CUDA_CHECK(cudaStreamEndCapture(stm, &gs_));
+                CUDA_CHECK(
+                    cudaGraphInstantiate(&verify_graph_w[sfx_w][p], gs_, nullptr, nullptr, 0));
+                CUDA_CHECK(cudaGraphDestroy(gs_));
+            }
             vw = 5;
         }
         // Phase 2: sampled graph set -- identical draft half, rejection-sampling
@@ -1490,12 +1525,10 @@ struct Engine {
         const char* pm = getenv("Q27_PMIN");
         if (pm) pmin_theta = (float)atof(pm);
         phase_stats = getenv("Q27_PHASE_STATS") != nullptr;
-        suffix_on = getenv("Q27_SUFFIX") != nullptr;
-        sfx_dbg = getenv("Q27_SUFFIX_DBG") != nullptr;
-        if (const char* sl = getenv("Q27_SUFFIX_L")) sfx_L = atoi(sl);
+        // (suffix envs parsed above, pre-capture -- width-12 P1)
         if (suffix_on)
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
-                    sfx_L, gate_maxd + 1);
+                    sfx_L, sfx_width());
         fprintf(stderr,
                 "spec graphs captured (12 perms, depth-4; +split D/V; +per-width verify "
                 "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
@@ -1535,7 +1568,7 @@ struct Engine {
             on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
             CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
         } else if (suffix_on && sfx_valid && pmin_theta > 0.f && h_mask_id0 < 0 &&
-                   sfx.propose_with(last_pending, gate_maxd, h_sfx_prop) >= sfx_L) {
+                   sfx.propose_with(last_pending, sfx_width() - 1, h_sfx_prop) >= sfx_L) {
             // Suffix round: the committed stream's suffix recurs -- fill the
             // draft lanes from the earlier continuation and skip the MTP
             // chain entirely (zero draft cost). prep_round is the same
@@ -1545,14 +1578,16 @@ struct Engine {
             // quality. h_next for the next round comes from the verify's
             // resident role buffers, unaffected by how drafts were made.
             sfx_round = true;
+            const int sw = sfx_width(); // wide when Q27_SUFFIX_W > gate_maxd+1 (P1)
+            if (phase_stats) ph_t0 = std::chrono::steady_clock::now();
             q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
                              stm);
             int* ds[W_MAX - 1] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
                                   d_draft7, d_draft8, d_draft9, d_draft10, d_draft11};
-            for (int k = 0; k < gate_maxd; k++)
+            for (int k = 0; k < sw - 1; k++)
                 CUDA_CHECK(cudaMemcpyAsync(ds[k], &h_sfx_prop[k], 4, cudaMemcpyHostToDevice,
                                            stm));
-            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[gate_maxd + 1][perm], stm));
+            CUDA_CHECK(cudaGraphLaunch(verify_graph_w[sw][perm], stm));
         } else if (pmin_theta > 0.f && h_mask_id0 < 0) {
             // P12/P12b confidence-gated depth (unconstrained decode only): draft to
             // the ceiling + per-draft margins, cap depth at the leading run with
@@ -1635,6 +1670,16 @@ struct Engine {
                            .count();
             gs.verify_ms += v;
             if (ph_W >= 2 && ph_W <= W_MAX) { gs.vw_ms[ph_W] += v; gs.vw_n[ph_W]++; }
+        } else if (sfx_round && phase_stats) {
+            // width-12 P1: suffix rounds are pure verify (prep + H2D + wide
+            // graph); their wall gets its OWN bucket instead of polluting
+            // the gated per-width curve -- every suffix round runs one
+            // width (sfx_width()), so sfx_ms/sfx_rounds IS the wide-width
+            // cost point the P2 curve needs.
+            gs.sfx_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - ph_t0)
+                             .count();
+            gs.sfx_rounds++;
         }
         int n = oc[0];
         if (sfx_round) {
@@ -2204,6 +2249,11 @@ struct Engine {
         // stamped; server [req] prints phwn/phwm for 2..8 only.
         double vw_ms[W_MAX + 1] = {};
         long vw_n[W_MAX + 1] = {};
+        // width-12 P1: suffix-round wall + count (per request). All suffix
+        // rounds run one width (sfx_width()), so sfx_ms/sfx_rounds is the
+        // per-round cost at that width; server appends sfxm/sfxn.
+        double sfx_ms = 0;
+        long sfx_rounds = 0;
         int dec = 0, rounds = 0, yields = 0;
         const char* end = "";
     };
