@@ -4181,3 +4181,30 @@ real catch of the trial (it protects EVERY leg on the modern CC registry).
 Gates: test_tokenizer (incl. new ok12/ok13) + test_toolconstrain PASS;
 parser is host-side only (canonical CLI legs unaffected); live E2E = the
 round-2 legs themselves (100-turn sessions through the patched path).
+
+## 2026-07-11 -- turbo3 ctx-ceiling sweep: allocates to 655K, quality FLAT to 297K, needle 6/6 at a 361K prompt
+
+Ladder (5090, CLI --spec boot + decode, W_MAX=12 build, explicit --ctx):
+196608 / 262144 / 327680 / 393216 / 458752 / 524288 / 589824 / 655360 ALL
+OK -- no OOM through the top rung (KV 8.9GB + fixed ~22.6GB = 31.5 of
+32.6GB). turbo3's ceiling is VRAM-bound around ~660K, 2.5x the 262K native
+window and ~2.3x fp8's practical max (fp8 --nll-long fit at 262144;
+297054 did not).
+
+Position-bucket NLL (--nll-long, wikitext-2 297054 tokens, ONE pass, no
+resets): turbo3 buckets 5.02-6.13 PPL from 0-2k through 256k-320k -- FLAT
+(the 256-320K bucket reads 5.431, indistinguishable from mid-range; bucket
+wiggle is corpus content). fp8 overlay at its 262144 max: turbo3 tracks
+fp8 within +0.65-1.2% in EVERY bucket -- the short-ctx quality delta does
+NOT compound with depth.
+
+Needle (turbo3 server --ctx 372736 on :8080, original 355K-haystack
+needle_deep protocol): 6/6 EXACT at prompt=361,513 tokens, including the
+two beyond-native depths (78%, 95%) -- the deepest validated retrieval on
+this engine (fp8's record was 301K).
+
+READ: at 13.4 KB/token the 131072 auto-ctx cap is pure policy for turbo3.
+Raising the auto cap for Q27_KV=turbo3 (e.g. to 262144 native) is a
+one-line change -- left for a deliberate default decision, since serving
+wall at depth and needle latency (355K prefill ~458s first-hit) belong in
+that conversation.
