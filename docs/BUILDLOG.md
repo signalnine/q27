@@ -4057,3 +4057,42 @@ byte reads; cp.async-style block prefetch if profiles say it matters at
 128K), fdmma turbo3 verify leg (dequant-to-e4m3 smem) still deferred,
 accept-rate A/B on real CC traffic before any serving-default discussion
 (decode smoke saw 3.05 vs 3.42 tok/rnd).
+
+## 2026-07-11 -- turbo3 accept-rate A/B on real CC traffic: acceptance TIES fp8 (basin-matched); wall gap is KERNEL-side (no fdmma leg)
+
+tools/accept_kv_ab.sh (new; accept_ab.sh with KV/kernel legs at the fixed CC
+serving point PMIN=0.5/auto7/profile-suffix): fp8-as-served (mma), fp8+fd2
+(kernel control), turbo3 (fd2 fallthrough). 1 cold + 3 warm replays each,
+qwopus, ctx 32K. Payloads: cctx/cctx2 (real CC transcripts) + repro.
+
+RESULTS (~27K prompts):
+  cctx2 (BASIN-ALIGNED: all legs dec=256, rounds ~44 -- the only clean read):
+    fp8/mma  250.8 t/s  5.818 tok/rnd  23.20 ms/rnd  fired5 .598
+    fp8/fd2  206.0 t/s  5.689 tok/rnd  27.62 ms/rnd  fired5 .595
+    turbo3   184.9 t/s  5.818 tok/rnd  31.48 ms/rnd  fired5 .692
+    => turbo3 ACCEPTANCE == fp8 EXACTLY (5.818 both; ladder fires MORE at
+    depth 5+). The phase-1 canonical-smoke worry (3.05 vs 3.42 tok/rnd) does
+    NOT reproduce on real traffic -- it was a 64-token basin artifact.
+    => the -26%% wall is kernel: mma->fd2 = 4.4 ms/rnd, fd2->fd2-t3 dequant
+    = 3.9 ms/rnd. The deferred fdmma turbo3 verify leg is THE lever.
+  cctx / repro: legs FORK BASINS (rounds 27/88/30 and 83/69/58; the
+  documented tie-lottery on these payloads) -- cross-leg deltas there are
+  basin artifacts, not acceptance signal. FWIW turbo3 landed favorable
+  basins in both (8.53 tok/rnd cctx, 4.41 repro, beating fp8's own legs).
+  Determinism: warm replays byte-identical everywhere; cctx2 round-count
+  drift across replays ([44,44,41], dec identical) = dctl carry, known.
+
+61K DEPTH LEG (docs61k, fp8 vs turbo3; basin caveat applies):
+  fp8/mma  128.6 t/s  2.535 tok/rnd  19.70 ms/rnd  rounds=101 fired5 .000
+  turbo3    99.7 t/s  2.876 tok/rnd  28.84 ms/rnd  rounds=89  fired5 .154
+  => basins forked (rounds 101 vs 89) so tok/rnd is not attributable, but
+  the wall story is clear: NO claw-back at depth vs fp8-AS-SERVED, because
+  the mma shared-KV verify advantage grows with ctx just as fast as the
+  KV-byte savings do (fdmma was 3.65x over fd2 at 61K). -22%% wall at 61K.
+
+VERDICT: turbo3's KV quality costs ZERO acceptance on basin-matched real
+traffic. Serving default stays fp8 (mma wall advantage); turbo3 is cleared
+as the long-context/memory option (2.56x KV, ~1%% PPL, needle 6/6). Next
+perf lever: fdmma turbo3 verify (dequant-to-e4m3 smem) to close the
+kernel gap; fd2-t3 read cost (+3.9 ms/rnd @27K) shrinks in relative terms
+as ctx deepens (2.56x fewer KV bytes).
