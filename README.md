@@ -58,6 +58,60 @@ tables in BUILDLOG):
   cctx replay, 219.0 vs 162.1 at auto). Its live triplet (pre-
   `__grid_constant__`): 197-222 t/s aggregate, peak 320.
 
+## Quickstart
+
+Requirements: an NVIDIA GPU with 24GB+ VRAM (built for the RTX 5090 /
+sm_120; runs on sm_86+ with automatic fallbacks -- the fp8-KV + MMA fast
+paths need sm_89+, and 24GB cards serve at reduced context), CUDA
+toolkit 12.x at `/usr/local/cuda`, and gcc.
+
+```bash
+# 1. model + tokenizer from Hugging Face (~17GB; Apache-2.0)
+huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
+  --local-dir models/qwen36-27b-mtp
+# fine-tune variant: signalnine/Qwopus3.6-27B-v2-MTP-q27
+# verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5)
+
+# 2. build (CLI + server + test suites)
+git clone https://github.com/signalnine/q27 && cd q27
+make
+
+# 3. smoke test the CLI (should print 128 tokens; md5 of the output
+#    line is the bitwise canonical a2982c51...)
+./build/q27 ../models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
+  --tokens "760,6511,314,9338,369" -n 128 --ctx 2048 --spec
+
+# 4. serve -- zero config; defaults resolve the full measured stack
+#    and --ctx auto-sizes to your VRAM (see Serving for escapes)
+./build/q27-server ../models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
+  ../models/qwen36-27b-mtp/qwen36-27b-mtp.tok --port 8080
+```
+
+Sanity-check the server (native Anthropic Messages API; OpenAI
+`/v1/chat/completions` and `/v1/completions` also served):
+
+```bash
+curl -s localhost:8080/v1/messages -H 'content-type: application/json' \
+  -d '{"model":"q27","max_tokens":32,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
+Point Claude Code at it:
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8080"
+export ANTHROPIC_API_KEY="placeholder"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="q27"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="q27"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="q27"
+claude
+```
+
+The server is single-model, so the model name in requests is accepted
+as-is. Expect ~170-230 t/s decode on a 5090 depending on traffic shape
+(see Reference numbers), warm multi-turn prefills served from the
+prefix cache, and `count_tokens` + Anthropic-shaped context-limit
+errors so Claude Code compacts correctly.
+
 ## State of the engine (2026-07-10)
 
 One day, five shipped stages -- each gated (canonical EXACT / byte-identity
