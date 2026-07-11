@@ -18,17 +18,29 @@ tables in BUILDLOG):
 - Decode @26K (server replay, constructed cctx payload, fp8 basin):
   classic config 143.0 / **full default stack 176.3 t/s** (+23%).
 - Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
-  server 400.6 t/s** -- the engine record.
+  server 400.6 t/s** -- the degenerate-echo CEILING, quoted as a bound,
+  never a headline.
 - Live Claude-Code traffic (vanilla triplet, T2/T5/T8): 213-227 t/s
   aggregate per task, per-request median 209-264, **peak 362 t/s**;
   suffix drafter AL 8.4-9.6 on 24-31% of decode.
 - Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (~2200 t/s).
-- Cross-engine (same model, GPU, harness, day -- 2026-07-10 A/B):
+- Cross-engine (same model, GPU, harness, day -- 2026-07-10 A/B, no-think
+  greedy CC harness, n=1 per task pending the standing n>=3 protocol):
   **q27 +40% decode vs llama.cpp's best config** (221 vs 157 t/s aggregate;
   draft-mtp10/p-min0.5/fa on Q5_K_M), 1.8-3.5x end-to-end task wall at
-  matched scores. llama's one winning cell: ngram speculation on a pure
-  token loop (889 t/s -- degenerate case; q27's suffix cap of 12 does not
-  bind on real traffic).
+  matched scores. Caveats carried from the log: wall is
+  trajectory-confounded (llama generated ~1.8x tokens on its own
+  trajectories; T8's llama wall excluded -- bad basin), so within-leg
+  decode telemetry is the rate currency. Decomposition: q27 reads ~15.8GB
+  weights/step at 5.25bpw vs Q5_K_M's ~18.2GB -- ~15% of the gap is
+  bit-width on a bandwidth-bound decode, ~+22% is mechanism (suffix +
+  ladder + fdmma + prefix cache); the Thunderdome quality tie (0.786 ==
+  0.786, 30 trials/leg) already cleared the quant side. llama's one
+  winning cell: ngram speculation on a pure token loop (889 t/s --
+  degenerate case; q27's suffix cap of 12 does not bind on real traffic).
+  Historical note: the 07-09 shootout's llama 65K segv was a 24GB/3090
+  ctx-create OOM path, not a model or engine defect -- today's 5090 legs
+  ran -c 65536 clean.
 - Fine-tune headroom: Qwopus +35% on acceptance alone (07-09 same-binary
   cctx replay, 219.0 vs 162.1 at auto). Its live triplet (pre-
   `__grid_constant__`): 197-222 t/s aggregate, peak 320.
@@ -46,7 +58,13 @@ One day, five shipped stages -- each gated (canonical EXACT / byte-identity
   suffixes at zero model cost. Live T8: **AL 10.61 on 61.6% of decode**
   (same fire rate as width-8, +63% tokens per fire -- the cap-release
   mechanism the plan predicted), good-basin score 0.84. Byte-identical to
-  the pre-widen binary under fd2 by construction.
+  the pre-widen binary under fd2 by construction. Framing: stream-lookup
+  self-speculation is an old family (llama's ngram spec is a sibling, and
+  beats us on the degenerate pure loop); what is ours is the COMPOSITION
+  -- per-round arbitration between the trained MTP ladder and the free
+  suffix drafter, both verified through one shared-KV width-12 MMA
+  kernel, with the suffix taking the echo cream so the ladder is not
+  starved (auto rounds still promote to their ceiling on live traffic).
 - **fdmma verify attention, tuned 1.75x in a day.** The fp8-MMA shared-KV
   verify kernel went 354.7 -> 282.4 (STAGES=1: single-buffered K/V at
   **2 CTAs/SM** -- ncu showed the 1-CTA kernel 89% no-eligible) -> **202.6us
@@ -205,6 +223,17 @@ These numbers are NOT interchangeable -- each answers a different question:
   else. It gates the CLI's reference defaults; the server's CC defaults are
   deliberately tolerance-class (fp8+mma) -- `Q27_PROFILE=ref` restores
   reference behavior there.
+- **Tie-lottery methodology** (the project's most subtle measurement
+  concept): tolerance-class numerics changes (fp8 paths, mma, split-count)
+  re-roll greedy argmax ties -- **neutral in expectation, deterministic
+  per build**. A quality flip on ONE benchmark basin (the T8 auth-gate)
+  is therefore read via a basin MATRIX across tasks plus a re-roll on the
+  next binary, not via a single retrial: mma flipped T8 bad on the 07-10
+  morning binaries and re-rolled GOOD (0.84-0.85) on the width-12
+  binaries with the identical kernel -- per-binary lottery, not
+  kernel-class steering. Acceptance-sensitive decisions must name their
+  basin; cross-BUILD text comparisons are invalid (same-binary legs
+  only).
 - **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
   STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
   short-ctx split tax). Headline for agentic reply-length outputs.
