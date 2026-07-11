@@ -168,6 +168,14 @@ int main(int argc, char** argv) {
         setenv("Q27_SUFFIX_W", "12", 0);
         setenv("Q27_PHASE_STATS", "1", 0);
     }
+    if (getenv("Q27_KV") && !strncmp(getenv("Q27_KV"), "turbo3", 6)) {
+        // phase 1 is decode-only: every request prefills its prompt, and the
+        // batched prefill has no turbo3 leg yet (Engine::prefill_chunk aborts)
+        fprintf(stderr, "Q27_KV=%s: turbo3 is phase-1 decode-only (no batched prefill); "
+                        "serving unsupported -- use the q27 CLI serial paths\n",
+                getenv("Q27_KV"));
+        return 1;
+    }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
             "think=%d\n",

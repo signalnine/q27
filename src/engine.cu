@@ -583,6 +583,11 @@ int main(int argc, char** argv) {
         // P2 design probe: prefill real text at fp16, then scan the attention
         // KV caches for value magnitudes. Decides scale-free E4M3 vs per-row
         // scales (E4M3: max 448, min denormal 2^-9).
+        // format guard up front: the scan (and its prefill) is fp16-only
+        if (e.kv_fp8 || e.kv_kind >= KV_T3) {
+            fprintf(stderr, "--kvstats reads fp16 caches; unset Q27_KV\n");
+            return 1;
+        }
         if (nll_path.empty()) { fprintf(stderr, "--kvstats needs --nll FILE for tokens\n"); return 1; }
         FILE* f = fopen(nll_path.c_str(), "rb");
         if (!f) { fprintf(stderr, "cannot open %s\n", nll_path.c_str()); return 1; }
@@ -630,7 +635,6 @@ int main(int argc, char** argv) {
                    "sub2^-10 %ld (%.2f%%)\n", tag, layer, amax, asum / n, sat,
                    100.0 * sat / n, sub, 100.0 * sub / n);
         };
-        if (e.kv_fp8) { fprintf(stderr, "--kvstats reads fp16 caches; unset Q27_KV\n"); return 1; }
         for (size_t s = 0; s < e.kcache.size(); s++) {
             int layer = -1;
             for (int il = 0; il < N_LAYER; il++)

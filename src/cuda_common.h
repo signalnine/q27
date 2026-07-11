@@ -15,6 +15,13 @@
         }                                                                              \
     } while (0)
 
+// KV-cache format kind (Q27_KV): scalar fp16 (default) / fp8 E4M3 ("fp8") /
+// turbo3 3-bit blocks ("turbo3", src/turbo3.cuh) / turbo3 V with plain fp16 K
+// ("turbo3v" -- the GQA=6 escape hatch if turbo3-K craters, port spec risk
+// section). Values 0/1 keep the old `bool fp8` call sites meaning-compatible
+// (false->KV_F16, true->KV_FP8) where the parameter widened to int.
+enum KvKind : int { KV_F16 = 0, KV_FP8 = 1, KV_T3 = 2, KV_T3V = 3 };
+
 #ifdef __CUDACC__
 #include <cuda_fp8.h>
 // KV-cache element conversions (P2): fp16 default, fp8 E4M3 opt-in (Q27_KV=fp8).

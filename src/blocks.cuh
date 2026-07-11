@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "cuda_common.h" // KvKind
+
 // VERIFY-1/3/4/5 all resolved against ggml source (workflow wf_b19a6dde, high confidence):
 // head expansion = tile/modulo (converter pre-permutes V heads to tiled order),
 // imrope == neox for text, conv oldest-first, l2norm eps floors the norm.
@@ -30,12 +32,13 @@ void rope_neox_partial(float* x, int n_heads, int head_dim, int n_rot, int strid
 
 // Causal decode attention for one new token; seq_len = *d_pos + 1 read on device.
 // Q strided (interleaved qg), caches contiguous [pos][n_kv][head_dim], fp16 or
-// fp8 E4M3 elements (fp8 = true selects fp8; P2, opt-in via Q27_KV=fp8).
+// fp8 E4M3 elements. kvk = KvKind (cuda_common.h; widened from `bool fp8`,
+// 0/1 keep the old meaning; KV_T3/KV_T3V = turbo3 block cache, fd2-only).
 // scratch: [n_q_heads][FD_NS][FD_ST] floats (flash-decode partials, spec3.cuh).
 void attn_decode(const float* q, int q_stride, const void* kcache, const void* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
                  int n_kv_heads, int head_dim, float scale, cudaStream_t st = 0,
-                 bool fp8 = false);
+                 int kvk = KV_F16);
 
 // Store this token's K/V rows into the caches at position *d_pos.
 void kv_store(const float* kbuf, const float* vbuf, void* kcache, void* vcache,

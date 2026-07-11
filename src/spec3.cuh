@@ -4,6 +4,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include "cuda_common.h" // KvKind
+
 #include "kernels.cuh" // P3/CP3
 
 namespace q27k {
@@ -40,6 +42,23 @@ void rope3(P3 x, int n_heads, int head_dim, int n_rot, int stride, IP3 pos, floa
 void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream_t st = 0,
                int ntok = 3, bool fp8 = false);
 
+// turbo3 KV (Q27_KV=turbo3|turbo3v; format src/turbo3.cuh, port spec
+// docs/plans/2026-07-11-turbo3-kv-port-spec.md). Cooperative per-128-group
+// store: L2-normalize -> forward WHT -> 3-bit nearest-centroid pack with
+// corrected fp16 norm, written block-addressed (row = n_kv_heads *
+// head_dim/128 blocks of 50 B). k_plain: the K side is stored as plain fp16
+// rows instead (turbo3v = fp16 K + turbo3 V). K must already be rope'd.
+void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,
+                 cudaStream_t st = 0, int ntok = 3, bool k_plain = false);
+
+// Per-128-group Walsh-Hadamard rotate, in place, ntok tokens: forward on Q
+// after rope (inv=false), inverse on attention output after the combine
+// (inv=true). stride = floats between consecutive heads (2*head_dim for the
+// q||gate layout, head_dim for attnout); only the first head_dim floats of
+// each head are touched, so the gate half of qg is preserved.
+void wht3(P3 x, int n_heads, int head_dim, int stride, bool inv, cudaStream_t st = 0,
+          int ntok = 3);
+
 // Flash-decode split-K partial layout: NS position splits per (token, head)
 // pair, each partial = {m, l, acc[256]} = FD_ST floats. Every split writes its
 // full partial (even when its position range is empty), so scratch must hold
@@ -58,14 +77,17 @@ static constexpr int FD_ST = 258;   // per-partial stride: m, l, acc[256]
 // Default path = fd2 (register-accumulator kernel, docs/attn-fd2-design.md);
 // Q27_FD=v1 selects the original kernel. The env is read at LAUNCH time, so
 // graph capture bakes the choice per process.
+// kvk (KvKind, cuda_common.h): widened from `bool fp8` -- 0/1 keep the old
+// meaning bit-for-bit; KV_T3/KV_T3V route to the fd2 turbo3 kernel (v1 and
+// mma have no turbo3 path and fall through to fd2 silently).
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st = 0, int ntok = 3, bool fp8 = false);
+                  cudaStream_t st = 0, int ntok = 3, int kvk = KV_F16);
 // explicit fd2 entry point (unit gate compares this against Q27_FD=v1)
 void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
                       float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
                       int head_dim, float scale, cudaStream_t st = 0, int ntok = 3,
-                      bool fp8 = false);
+                      int kvk = KV_F16);
 
 // embedding row lookup for ntok device tokens.
 void embed3(const int8_t* W, const __half* S, IP3 tok, int64_t cols, P3 out, cudaStream_t st = 0,

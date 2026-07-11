@@ -15,6 +15,7 @@
 #include "loader.h"
 #include "prefill.cuh"
 #include "spec3.cuh"
+#include "turbo3.cuh"
 
 using q27::DType;
 
@@ -997,6 +998,416 @@ static void test_attn_fd2() {
     CUDA_CHECK(cudaFree(d_scr));
 }
 
+// ---- turbo3 KV (phase 1; port spec docs/plans/2026-07-11-turbo3-kv-port-spec.md)
+// Host oracle: serial restatement of the TurboQuant CPU reference
+// (quantize_row_turbo3_0_ref / dequantize_row_turbo3_0 / turbo_cpu_fwht*)
+// over the sign/centroid tables from turbo3.cuh -- tools/turbo3_test.cu
+// already proved those tables bit-match the fork.
+using q27turbo::block_turbo3;
+
+static void t3_fwht(float* x) {
+    for (int i = 0; i < 128; i++) x[i] *= q27turbo::TURBO_S1_HOST[i];
+    for (int h = 1; h < 128; h *= 2)
+        for (int i = 0; i < 128; i += h * 2)
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+    for (int i = 0; i < 128; i++)
+        x[i] *= q27turbo::TURBO_INV_SQRT_128 * q27turbo::TURBO_S2_HOST[i];
+}
+static void t3_fwht_inv(float* x) {
+    for (int i = 0; i < 128; i++) x[i] *= q27turbo::TURBO_S2_HOST[i];
+    for (int h = 1; h < 128; h *= 2)
+        for (int i = 0; i < 128; i += h * 2)
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+    for (int i = 0; i < 128; i++)
+        x[i] *= q27turbo::TURBO_INV_SQRT_128 * q27turbo::TURBO_S1_HOST[i];
+}
+static void t3_quant(const float* x, block_turbo3* y) {
+    float buf[128], nsq = 0.f;
+    for (int j = 0; j < 128; j++) { buf[j] = x[j]; nsq += buf[j] * buf[j]; }
+    float gn = sqrtf(nsq), inv = gn > 1e-10f ? 1.f / gn : 0.f;
+    for (int j = 0; j < 128; j++) buf[j] *= inv;
+    t3_fwht(buf);
+    memset(y->qs, 0, 32);
+    memset(y->signs, 0, 16);
+    float rsq = 0.f;
+    for (int j = 0; j < 128; j++) {
+        int idx = q27turbo::turbo3_nearest(buf[j]);
+        y->qs[j / 4] |= (idx & 3) << ((j % 4) * 2);
+        if (idx & 4) y->signs[j / 8] |= 1 << (j % 8);
+        rsq += q27turbo::TURBO_CENTROIDS_HOST[idx] * q27turbo::TURBO_CENTROIDS_HOST[idx];
+    }
+    float rn = sqrtf(rsq), corr = rn > 1e-10f ? gn / rn : gn;
+    y->norm = __float2half(corr);
+}
+static void t3_dequant(const block_turbo3* x, float* y) {
+    float norm = __half2float(x->norm);
+    for (int j = 0; j < 128; j++) {
+        uint8_t l = (x->qs[j / 4] >> ((j % 4) * 2)) & 3;
+        uint8_t h = (x->signs[j / 8] >> (j % 8)) & 1;
+        y[j] = q27turbo::TURBO_CENTROIDS_HOST[l | (h << 2)] * norm;
+    }
+}
+
+// C2: cooperative store kernel vs the serial CPU quantizer. The kernel's
+// L2/recon-norm reductions are fixed-order trees (run-to-run deterministic)
+// but not the CPU's serial sum order, so ULP-level norm skew can flip
+// elements sitting exactly on a centroid midpoint -- budget 0.2% of elements;
+// norms <=1 fp16 ULP whenever a block's indices all match.
+static void test_kv_turbo3_store() {
+    const int NKV = 4, HD = 256, ROW = NKV * HD, T = 16, CAP = 64;
+    const int BPR = NKV * (HD / 128); // 8 blocks/row
+    std::vector<float> kf = rand_vec((size_t)T * ROW, 71), vf = rand_vec((size_t)T * ROW, 72);
+    kf[3] = 0.f; // exact zero inside a group (nearest-centroid boundary)
+    float *d_kt[16], *d_vt[16];
+    int* d_pos[16];
+    q27k::CP3 kp{}, vp{};
+    q27k::IP3 pp{};
+    for (int t = 0; t < T; t++) {
+        CUDA_CHECK(cudaMalloc(&d_kt[t], ROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_vt[t], ROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_pos[t], 4));
+        CUDA_CHECK(cudaMemcpy(d_kt[t], kf.data() + (size_t)t * ROW, ROW * 4,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_vt[t], vf.data() + (size_t)t * ROW, ROW * 4,
+                              cudaMemcpyHostToDevice));
+        int pos = 3 + t; // disjoint slots, offset from 0 to catch pos addressing
+        CUDA_CHECK(cudaMemcpy(d_pos[t], &pos, 4, cudaMemcpyHostToDevice));
+        kp.p[t] = d_kt[t];
+        vp.p[t] = d_vt[t];
+        pp.p[t] = d_pos[t];
+    }
+    block_turbo3 *d_kc, *d_vc;
+    CUDA_CHECK(cudaMalloc(&d_kc, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    q27k::kv_store_t3(kp, vp, d_kc, d_vc, pp, NKV, HD, 0, T, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
+    CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(vc.data(), d_vc, vc.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    long elem_mism = 0, norm_bad = 0, total = 0, blk_n = 0, blk_match = 0;
+    auto blk_cmp = [&](const block_turbo3& dev, const float* src) {
+        block_turbo3 ref;
+        t3_quant(src, &ref);
+        bool idx_same = !memcmp(ref.qs, dev.qs, 32) && !memcmp(ref.signs, dev.signs, 16);
+        blk_n++;
+        if (idx_same) {
+            blk_match++;
+            uint16_t a, b;
+            memcpy(&a, &ref.norm, 2);
+            memcpy(&b, &dev.norm, 2);
+            if (abs((int)a - (int)b) > 1) norm_bad++;
+        } else {
+            for (int j = 0; j < 128; j++) {
+                uint8_t rl = (ref.qs[j / 4] >> ((j % 4) * 2)) & 3;
+                uint8_t dl = (dev.qs[j / 4] >> ((j % 4) * 2)) & 3;
+                uint8_t rh = (ref.signs[j / 8] >> (j % 8)) & 1;
+                uint8_t dh = (dev.signs[j / 8] >> (j % 8)) & 1;
+                if (rl != dl || rh != dh) elem_mism++;
+            }
+        }
+        total += 128;
+    };
+    for (int t = 0; t < T; t++)
+        for (int b = 0; b < BPR; b++) {
+            int pos = 3 + t;
+            blk_cmp(kc[(size_t)pos * BPR + b], kf.data() + (size_t)t * ROW + (size_t)b * 128);
+            blk_cmp(vc[(size_t)pos * BPR + b], vf.data() + (size_t)t * ROW + (size_t)b * 128);
+        }
+    check("turbo3 store idx vs CPU ref (<=0.2% ties)", (double)elem_mism / total, 2e-3);
+    // non-vacuous guard (stub RED run matched 0 blocks and the ULP check
+    // passed empty): the vast majority of blocks must bit-match outright
+    check("turbo3 store blocks bit-matching CPU (>=95%)",
+          1.0 - (double)blk_match / blk_n, 0.05);
+    check("turbo3 store norm ULP (idx-matching blocks)", (double)norm_bad, 1);
+    // k_plain (turbo3v): K side bitwise fp16 rows; V side stays turbo3
+    __half* d_kh;
+    CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
+    CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
+    q27k::kv_store_t3(kp, vp, d_kh, d_vc, pp, NKV, HD, 0, T, true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<__half> kh((size_t)CAP * ROW);
+    CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
+    std::vector<block_turbo3> vc2(CAP * BPR);
+    CUDA_CHECK(cudaMemcpy(vc2.data(), d_vc, vc2.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    long kbad = 0, vdrift = 0;
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < ROW; i++) {
+            __half w = __float2half_rn(kf[(size_t)t * ROW + i]);
+            if (memcmp(&kh[(size_t)(3 + t) * ROW + i], &w, 2)) kbad++;
+        }
+    for (size_t b = 0; b < vc.size(); b++)
+        if (memcmp(&vc[b], &vc2[b], sizeof(block_turbo3))) vdrift++;
+    check("turbo3v k_plain fp16 K rows (bitwise)", (double)kbad, 1);
+    check("turbo3v V blocks unchanged vs turbo3 leg", (double)vdrift, 1);
+    for (int t = 0; t < T; t++) {
+        CUDA_CHECK(cudaFree(d_kt[t]));
+        CUDA_CHECK(cudaFree(d_vt[t]));
+        CUDA_CHECK(cudaFree(d_pos[t]));
+    }
+    CUDA_CHECK(cudaFree(d_kc));
+    CUDA_CHECK(cudaFree(d_vc));
+    CUDA_CHECK(cudaFree(d_kh));
+}
+
+// C4: device wht3 == CPU fwht bitwise (same operand order), the qg gate half
+// (stride 2*HD) is untouched, and inv(fwd(x)) round-trips.
+static void test_wht3() {
+    const int NH = 24, HD = 256, GPH = HD / 128;
+    const int QROW = NH * 2 * HD, OROW = NH * HD;
+    std::vector<float> q0 = rand_vec(QROW, 81), o0 = rand_vec(OROW, 82);
+    float *d_q, *d_o;
+    CUDA_CHECK(cudaMalloc(&d_q, QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_o, OROW * 4));
+    CUDA_CHECK(cudaMemcpy(d_q, q0.data(), QROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_o, o0.data(), OROW * 4, cudaMemcpyHostToDevice));
+    q27k::P3 qp{{d_q}};
+    q27k::P3 op{{d_o}};
+    q27k::wht3(qp, NH, HD, 2 * HD, false, 0, 1);
+    q27k::wht3(op, NH, HD, HD, false, 0, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> qd(QROW), od(OROW);
+    CUDA_CHECK(cudaMemcpy(qd.data(), d_q, QROW * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(od.data(), d_o, OROW * 4, cudaMemcpyDeviceToHost));
+    std::vector<float> qr = q0, orf = o0; // host: q halves rotated, gate untouched
+    for (int h = 0; h < NH; h++)
+        for (int g = 0; g < GPH; g++) {
+            t3_fwht(&qr[(size_t)h * 2 * HD + g * 128]);
+            t3_fwht(&orf[(size_t)h * HD + g * 128]);
+        }
+    long bad = 0;
+    for (int i = 0; i < QROW; i++)
+        if (memcmp(&qd[i], &qr[i], 4)) bad++;
+    for (int i = 0; i < OROW; i++)
+        if (memcmp(&od[i], &orf[i], 4)) bad++;
+    check("wht3 fwd vs CPU fwht (bitwise, gate kept)", (double)bad, 1);
+    q27k::wht3(qp, NH, HD, 2 * HD, true, 0, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(qd.data(), d_q, QROW * 4, cudaMemcpyDeviceToHost));
+    double err = 0;
+    for (int i = 0; i < QROW; i++) err = std::max(err, (double)std::fabs(qd[i] - q0[i]));
+    check("wht3 inv(fwd(x)) == x", err, 1e-5);
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_o));
+}
+
+// C5: end-to-end turbo3 attention (rotated Q + block cache + fd2-t3 + combine
+// + inverse-WHT out) vs a double-precision host reference over the SAME
+// CPU-built blocks in the rotated basis -- isolates kernel indexing/algebra
+// from the 3-bit quality floor. The floor itself is checked against the
+// fp16-cache output (cosine). Both cache modes: KV_T3 and KV_T3V (fp16 K).
+static void test_attn_fd2_turbo3() {
+    const int NKV = 4, GQA = 6, HD = 256, NH = NKV * GQA;
+    const int SEQMAX = 8192, ROW = NKV * HD, BPR = NKV * (HD / 128);
+    const int QROW = NH * 2 * HD, OROW = NH * HD;
+    std::vector<float> kf = rand_vec((size_t)SEQMAX * ROW, 91),
+                       vf = rand_vec((size_t)SEQMAX * ROW, 92);
+    std::vector<float> qh = rand_vec((size_t)5 * QROW, 93);
+    // CPU-quantize the caches; [pos][kvh][g] blocks cover elements [b*128,..)
+    std::vector<block_turbo3> kb((size_t)SEQMAX * BPR), vb((size_t)SEQMAX * BPR);
+    std::vector<__half> khalf(kf.size()), vhalf(vf.size());
+    for (size_t b = 0; b < kb.size(); b++) {
+        t3_quant(kf.data() + b * 128, &kb[b]);
+        t3_quant(vf.data() + b * 128, &vb[b]);
+    }
+    for (size_t i = 0; i < kf.size(); i++) {
+        khalf[i] = __float2half_rn(kf[i]);
+        vhalf[i] = __float2half_rn(vf[i]);
+    }
+    block_turbo3 *d_kb, *d_vb;
+    __half *d_kh, *d_vh;
+    float *d_q[5], *d_qr[5], *d_oa[5], *d_ob[5], *d_scr;
+    int* d_pos[5];
+    CUDA_CHECK(cudaMalloc(&d_kb, kb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_kh, khalf.size() * 2));
+    CUDA_CHECK(cudaMalloc(&d_vh, vhalf.size() * 2));
+    CUDA_CHECK(cudaMemcpy(d_kb, kb.data(), kb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vb, vb.data(), vb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kh, khalf.data(), khalf.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vh, vhalf.data(), vhalf.size() * 2, cudaMemcpyHostToDevice));
+    for (int t = 0; t < 5; t++) {
+        CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)QROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_ob[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_pos[t], 4));
+        CUDA_CHECK(cudaMemcpy(d_q[t], qh.data() + (size_t)t * QROW, (size_t)QROW * 4,
+                              cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)5 * NH * q27k::FD_MAXNS * q27k::FD_ST * 4));
+    // host double reference in the rotated basis (k_t3: q rotated, K from
+    // dequantized blocks; else fp16 K with raw q); V always dequantized
+    // blocks, pooled output inverse-rotated per 128-group.
+    auto host_ref_t3 = [&](int t, int p_t, bool k_t3, std::vector<float>& out) {
+        out.assign(OROW, 0.f);
+        float qw[256], dq[256];
+        for (int hh = 0; hh < NH; hh++) {
+            int kvh = hh / GQA;
+            const float* qv = qh.data() + (size_t)t * QROW + (size_t)hh * 2 * HD;
+            for (int i = 0; i < HD; i++) qw[i] = qv[i];
+            if (k_t3) {
+                t3_fwht(qw);
+                t3_fwht(qw + 128);
+            }
+            std::vector<double> sc(p_t + 1);
+            double mx = -1e300;
+            for (int p = 0; p <= p_t; p++) {
+                double d = 0;
+                if (k_t3) {
+                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
+                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    for (int i = 0; i < HD; i++) d += (double)qw[i] * dq[i];
+                } else {
+                    for (int i = 0; i < HD; i++)
+                        d += (double)qw[i] *
+                             (double)__half2float(khalf[((size_t)p * NKV + kvh) * HD + i]);
+                }
+                sc[p] = d / sqrt((double)HD);
+                mx = std::max(mx, sc[p]);
+            }
+            double lsum = 0;
+            for (int p = 0; p <= p_t; p++) {
+                sc[p] = exp(sc[p] - mx);
+                lsum += sc[p];
+            }
+            std::vector<double> acc(HD, 0.0);
+            for (int p = 0; p <= p_t; p++) {
+                double w = sc[p] / lsum;
+                t3_dequant(&vb[((size_t)p * NKV + kvh) * 2], dq);
+                t3_dequant(&vb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                for (int i = 0; i < HD; i++) acc[i] += w * dq[i];
+            }
+            float accf[256];
+            for (int i = 0; i < HD; i++) accf[i] = (float)acc[i];
+            t3_fwht_inv(accf);
+            t3_fwht_inv(accf + 128);
+            for (int i = 0; i < HD; i++) out[(size_t)hh * HD + i] = accf[i];
+        }
+    };
+    const float scale = 1.0f / sqrtf((float)HD);
+    std::vector<float> ref(OROW), got(OROW), gfp(OROW);
+    char label[96];
+    for (int kvk : {KV_T3, KV_T3V}) {
+        const void* kc = kvk == KV_T3 ? (const void*)d_kb : (const void*)d_kh;
+        for (int seq : {1, 47, 1024, SEQMAX}) {
+            for (int ntok : {1, 5}) {
+                q27k::CP3 qr{{d_qr[0], d_qr[1], d_qr[2], d_qr[3], d_qr[4]}};
+                q27k::P3 qrw{{d_qr[0], d_qr[1], d_qr[2], d_qr[3], d_qr[4]}};
+                q27k::P3 va{{d_oa[0], d_oa[1], d_oa[2], d_oa[3], d_oa[4]}};
+                q27k::P3 vb2{{d_ob[0], d_ob[1], d_ob[2], d_ob[3], d_ob[4]}};
+                q27k::IP3 P{{d_pos[0], d_pos[1], d_pos[2], d_pos[3], d_pos[4]}};
+                for (int t = 0; t < ntok; t++) {
+                    int p = std::max(0, seq - 1 - (ntok - 1 - t));
+                    CUDA_CHECK(cudaMemcpy(d_pos[t], &p, 4, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(d_qr[t], d_q[t], (size_t)QROW * 4,
+                                          cudaMemcpyDeviceToDevice));
+                }
+                if (kvk == KV_T3) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
+                q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
+                                       HD, scale, 0, ntok, kvk);
+                q27k::wht3(va, NH, HD, HD, true, 0, ntok);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                // vs host reference (same blocks, double softmax)
+                double worst = 0;
+                for (int t = 0; t < ntok && seq <= 1024; t++) {
+                    int p_t;
+                    CUDA_CHECK(cudaMemcpy(&p_t, d_pos[t], 4, cudaMemcpyDeviceToHost));
+                    host_ref_t3(t, p_t, kvk == KV_T3, ref);
+                    CUDA_CHECK(cudaMemcpy(got.data(), d_oa[t], (size_t)OROW * 4,
+                                          cudaMemcpyDeviceToHost));
+                    double ss = 0;
+                    for (int i = 0; i < OROW; i++) ss += (double)ref[i] * ref[i];
+                    double rms = std::sqrt(ss / OROW) + 1e-12;
+                    for (int i = 0; i < OROW; i++) {
+                        // NaN-hardened: max(x, NaN) keeps x, so a NaN output
+                        // would silently pass (caught in the stub RED run)
+                        double d = std::fabs((double)got[i] - ref[i]) / rms;
+                        worst = std::max(worst, std::isfinite(d) ? d : 1e30);
+                    }
+                }
+                if (seq <= 1024) {
+                    snprintf(label, sizeof label, "fd2-t3 vs host-ref %s seq=%d ntok=%d",
+                             kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                    check(label, worst, 2e-4);
+                }
+                // quality floor vs fp16-cache attention on the same raw K/V
+                q27k::attn_decode3_fd2(
+                    q27k::CP3{{d_q[0], d_q[1], d_q[2], d_q[3], d_q[4]}}, 2 * HD, d_kh, d_vh,
+                    vb2, d_scr, P, SEQMAX, NH, NKV, HD, scale, 0, ntok, KV_F16);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                double cmin = 1.0;
+                for (int t = 0; t < ntok; t++) {
+                    CUDA_CHECK(cudaMemcpy(got.data(), d_oa[t], (size_t)OROW * 4,
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(gfp.data(), d_ob[t], (size_t)OROW * 4,
+                                          cudaMemcpyDeviceToHost));
+                    double nab = 0, na = 0, nb = 0;
+                    for (int i = 0; i < OROW; i++) {
+                        nab += (double)got[i] * gfp[i];
+                        na += (double)got[i] * got[i];
+                        nb += (double)gfp[i] * gfp[i];
+                    }
+                    double cs = nab / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
+                    cmin = std::min(cmin, std::isfinite(cs) ? cs : -1.0);
+                }
+                snprintf(label, sizeof label, "fd2-t3 vs fp16 cosine %s seq=%d ntok=%d",
+                         kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                check(label, 1.0 - cmin, kvk == KV_T3 ? 0.08 : 0.05);
+                // run-to-run bitwise determinism
+                for (int t = 0; t < ntok; t++)
+                    CUDA_CHECK(cudaMemcpy(d_qr[t], d_q[t], (size_t)QROW * 4,
+                                          cudaMemcpyDeviceToDevice));
+                if (kvk == KV_T3) q27k::wht3(qrw, NH, HD, 2 * HD, false, 0, ntok);
+                q27k::attn_decode3_fd2(qr, 2 * HD, kc, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV,
+                                       HD, scale, 0, ntok, kvk);
+                q27k::wht3(vb2, NH, HD, HD, true, 0, ntok);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                double dd = 0;
+                for (int t = 0; t < ntok; t++) {
+                    CUDA_CHECK(cudaMemcpy(got.data(), d_oa[t], (size_t)OROW * 4,
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(gfp.data(), d_ob[t], (size_t)OROW * 4,
+                                          cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < OROW; i++) {
+                        double d = std::fabs((double)got[i] - gfp[i]);
+                        dd = std::max(dd, std::isfinite(d) ? d : 1e30);
+                    }
+                }
+                snprintf(label, sizeof label, "fd2-t3 deterministic %s seq=%d ntok=%d",
+                         kvk == KV_T3 ? "t3 " : "t3v", seq, ntok);
+                check(label, dd, 1e-30);
+            }
+        }
+    }
+    CUDA_CHECK(cudaFree(d_kb));
+    CUDA_CHECK(cudaFree(d_vb));
+    CUDA_CHECK(cudaFree(d_kh));
+    CUDA_CHECK(cudaFree(d_vh));
+    for (int t = 0; t < 5; t++) {
+        CUDA_CHECK(cudaFree(d_q[t]));
+        CUDA_CHECK(cudaFree(d_qr[t]));
+        CUDA_CHECK(cudaFree(d_oa[t]));
+        CUDA_CHECK(cudaFree(d_ob[t]));
+        CUDA_CHECK(cudaFree(d_pos[t]));
+    }
+    CUDA_CHECK(cudaFree(d_scr));
+}
+
 // P4: split-position MMA prefill vs the exact single-split path at a deep
 // base_pos (splits change fp summation grouping -> tolerance like MMA-vs-lite),
 // plus the fp8 == fp16(dequantized-cache) bitwise identity under forced splits
@@ -1694,6 +2105,9 @@ int main(int argc, char** argv) {
     test_kv_fp8_store();
     test_attn_fp8();
     test_attn_fd2();
+    test_kv_turbo3_store();
+    test_wht3();
+    test_attn_fd2_turbo3();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

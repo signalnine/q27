@@ -3916,3 +3916,89 @@ after rope + inverse-WHT on attnout post-combine, all behind
 Q27_KV=turbo3 with fp8/fp16 BITWISE. fdmma (dequant-to-e4m3 smem)
 deferred. Then the fresh quality gate (no head_dim=256 oracle -- PPL +
 needle on the q27 model). Full port spec: wf_f94f54d8-2ab.
+
+## 2026-07-11 -- turbo3 KV phase 1 WIRED: store/read/rotate live behind Q27_KV=turbo3 (decode-only), fp8/fp16 bitwise-EXACT
+
+Phase-1 engine wiring for the TurboQuant 3-bit KV port (format validated
+last session, spec docs/plans/2026-07-11-turbo3-kv-port-spec.md -- recovered
+from workflow wf_f94f54d8-2ab into the repo).
+
+SHIPPED (all TDD'd: stubs -> failing microtests -> kernels -> green):
+- spec3.cu k_kv_store_t3: cooperative per-128-group store (one block per
+  group, 128 thr: fixed-order L2 reduce -> s1/butterfly/s2 forward WHT ->
+  nearest-centroid pack via shfl+ballot -> corrected fp16 norm). Multi-token
+  (CP3/IP3, grid (8, K|V, ntok)); k_plain leg stores K as plain fp16 rows
+  (turbo3v). Named _t3 -- k_kv_store3 was taken (verify multi-token store).
+- spec3.cu k_wht3<INV>: in-place per-128-group Walsh-Hadamard rotate;
+  operand order matches the CPU fwht exactly => device == CPU BITWISE
+  (tested). Forward on Q post-rope (only when K is turbo3), inverse on
+  attnout post-combine PRE-sigmoid-gate (elementwise gate does not commute
+  with rotation). Gate half of qg untouched (stride-aware).
+- spec3.cu k_attn_fd2_t3<KT3,NW> + fd2_ld8_t3: fd2 with block-addressed
+  turbo3 loads (row = pos*n_kv*2 blocks; lane's 4 dims = one qs byte;
+  signs[l>>1] bits (l&1)*4+i; hoisted per-block norm). Softmax/merge copied
+  byte-identical from k_attn_fd2; fp8/fp16 instantiations untouched.
+  KT3=false = turbo3v (fp16 K + turbo3 V, Q unrotated).
+- Dispatch: attn_decode/attn_decode3/attn_decode3_fd2 widened bool fp8 ->
+  int kvk (KvKind in cuda_common.h; 0/1 keep old meaning so existing call
+  sites/bools stay correct). turbo3 always routes to fd2 -- Q27_FD=v1/mma
+  fall through silently (no block-cache leg there).
+- engine.cuh: kv_kind parse (turbo3|turbo3v), kv_bytes(is_v) sizing at all
+  5 alloc/memset site-pairs (main per-layer caches + MTP + resets); K and V
+  sized separately for turbo3v. attn_block + attn_pair insertions (host
+  branches on init-fixed kv_kind => graph-capture-safe; MTP draft path
+  rides attn_block automatically). turbo3.cuh: _LIST macros share the
+  sign/centroid token sequences between device __constant__ and host oracle
+  mirrors; shared turbo3_butterfly128 helper.
+- Phase-1 guards: prefill_chunk aborts (no turbo3 leg in kv_store_T /
+  attn_prefill_T yet -> serving gated off; q27-server refuses turbo3 at
+  startup; --kvstats refuses turbo3 up front).
+- Makefile: turbo3.cuh deps + build/turbo3_test target.
+
+GATES:
+- test_kernels: +9 turbo3 checks x 32 legs ALL PASS. Store idx = 100%
+  bit-match vs CPU quantizer (0 midpoint ties in sample; budget 0.2%);
+  norms <=1 ULP; k_plain K rows bitwise fp16. wht3 fwd BITWISE == CPU;
+  inv(fwd) 5e-7. e2e turbo3 attention vs double host-ref over same blocks:
+  <=2.3e-6 (bound 2e-4) both modes, seq 1..8192, ntok 1/5; deterministic
+  bitwise. Quality floor vs fp16 attention: cosine 0.966-0.982 (t3),
+  0.982-0.984 (t3v) -- the 0.983 read contract, as expected. NaN-hardened
+  comparisons (stub RED run exposed max(0,NaN) false-pass).
+- Canonical bitwise (C6): master-W8 vs turbo3-W8 same-flag builds on the
+  5090, 3 legs (default fp16 / Q27_KV=fp8 / Q27_FD=v1): generated: lines
+  byte-IDENTICAL; fp16 leg == stored canonical a2982c51 exactly.
+- Smoke (5090, qwopus): turbo3 plain 80.2 t/s, spec 162.7 t/s @ 3.05
+  tok/rnd; turbo3v spec 182.6 t/s @ 3.42 tok/rnd with token stream
+  IDENTICAL to fp16 leg (and same rounds) over 64 tokens -- K exact + 3-bit
+  V barely perturbs; turbo3 K+V diverges only at token ~60 (tolerance
+  class). Banner sizes: ~13.4 KB/token K+V (2.56x under fp8, 5.1x under
+  fp16).
+- Sanitizer: memcheck (turbo3 spec + turbo3v plain) + racecheck (turbo3
+  spec): memcheck 0 errors both legs. racecheck: FULL-ENGINE run is a
+  HOST-RAM BOMB (sanitizer tracking ballooned q27 to 118-120 GB anon RSS,
+  global OOM killed the tmux scope TWICE) -- rerun kernel-filtered
+  (--kernel-name 'regex=kv_store_t3|wht3|attn_fd2_t3', note regex= not
+  regex:) under systemd-run -p MemoryMax=80G: 0 hazards. Standing ops rule:
+  sanitizer on q27 = kernel-filtered + memory-capped unit, always.
+- Guards verified live: --pf aborts with message; q27-server exits at
+  startup; kvstats refuses.
+
+QUALITY TRIAGE (the port-spec GQA=6 K-risk gate; wikitext-2 test, 16 chunks
+of 2048, teacher-forced serial NLL via --nll-serial, qwopus, same chunks all
+legs, 16368 predictions):
+  fp16     NLL 1.990229  PPL 7.3172   (baseline)
+  fp8      NLL 1.991537  PPL 7.3268   (+0.13%, prod default)
+  turbo3v  NLL 1.997168  PPL 7.3682   (+0.70% -- 3-bit V alone)
+  turbo3   NLL 1.998863  PPL 7.3807   (+0.87% -- 3-bit K+V)
+VERDICT: turbo3-K does NOT crater at GQA=6 -- K adds only +0.17% on top of
+V's +0.70% (the fork's 7:1 disaster was PPL 2887 vs 7.4; the baked WHT
+rotation + two independent 128-groups per 256-dim head evidently carry K
+here). SYMMETRIC turbo3 K+V CLEARS the 5% gate with room to spare => stays
+the phase-1 config; turbo3v remains a diagnostic escape and the fd2
+mixed-type refactor is NOT needed. Serving caveat (post-prefill-port):
+canonical-prompt smoke showed acceptance 3.05 vs 3.42 tok/rnd (turbo3 vs
+fp16) -- run the accept-rate A/B on real traffic before any default flip.
+
+NEXT: prefill port (kv_store_T turbo3 + attn_prefill read leg) -> unlocks
+serving + needle; fdmma turbo3 (dequant-to-e4m3 smem) deferred; InnerQ
+skipped (auto-off at head_dim>128).

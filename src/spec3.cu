@@ -5,6 +5,7 @@
 #include "cuda_common.h"
 #include "fdmma.cuh"
 #include "spec3.cuh"
+#include "turbo3.cuh"
 
 namespace q27k {
 
@@ -157,6 +158,105 @@ void kv_store3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int rowlen, cudaStream
                                        rowlen);
     else
         k_kv_store3<<<g, 256, 0, st>>>(k, v, (__half*)kc, (__half*)vc, pos, rowlen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- turbo3 KV (Q27_KV=turbo3|turbo3v; format src/turbo3.cuh; port spec
+// docs/plans/2026-07-11-turbo3-kv-port-spec.md).
+//
+// Store: one CUDA block == one 128-group; 128 threads cooperatively
+// L2-normalize (pre-rotation), forward-WHT, and 3-bit-quantize one K or V
+// group into its 50-byte block, norm corrected by grp_norm/recon_norm. All
+// reductions and the butterfly are fixed-order => run-to-run deterministic.
+// The CPU oracle sums norms serially, so tree-order skew can flip elements
+// sitting exactly on a centroid midpoint (rare; the block stays
+// self-consistent because idx and corrected norm derive from the same pass).
+// k_plain (turbo3v): the K side bypasses quantization and stores plain fp16
+// rows -- the GQA=6 escape if turbo3-K craters (port-spec risk section).
+// Assumes head_dim == 256 (two groups/head), like the whole fd2 family.
+__global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ const CP3 vp,
+                              void* __restrict__ kc, void* __restrict__ vc,
+                              __grid_constant__ const IP3 pos, int n_kv_heads, int head_dim,
+                              int k_plain) {
+    const int t = blockIdx.z, j = threadIdx.x;
+    const bool is_v = blockIdx.y == 1;
+    const int h = blockIdx.x >> 1, g = blockIdx.x & 1;
+    const int p = *pos.p[t];
+    const float* src = (is_v ? vp.p[t] : kp.p[t]) + (size_t)h * head_dim + g * 128;
+    if (!is_v && k_plain) {
+        ((__half*)kc)[(size_t)p * n_kv_heads * head_dim + (size_t)h * head_dim + g * 128 + j] =
+            __float2half_rn(src[j]);
+        return;
+    }
+    q27turbo::block_turbo3* dst = (q27turbo::block_turbo3*)(is_v ? vc : kc) +
+                                  (size_t)p * n_kv_heads * 2 + h * 2 + g;
+    __shared__ float xs[128], red[128];
+    float x = src[j];
+    xs[j] = x;
+    red[j] = x * x;
+    __syncthreads();
+#pragma unroll
+    for (int s = 64; s > 0; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        __syncthreads();
+    }
+    float gn = sqrtf(red[0]);
+    float inv = gn > 1e-10f ? 1.f / gn : 0.f;
+    xs[j] = xs[j] * inv * q27turbo::TURBO_S1[j];
+    q27turbo::turbo3_butterfly128(xs, j);
+    float w = xs[j] * (q27turbo::TURBO_INV_SQRT_128 * q27turbo::TURBO_S2[j]);
+    int idx = q27turbo::turbo3_nearest(w);
+    red[j] = q27turbo::TURBO_CENTROIDS_3BIT[idx] * q27turbo::TURBO_CENTROIDS_3BIT[idx];
+    __syncthreads();
+#pragma unroll
+    for (int s = 64; s > 0; s >>= 1) {
+        if (j < s) red[j] += red[j + s];
+        __syncthreads();
+    }
+    float rn = sqrtf(red[0]);
+    float corr = rn > 1e-10f ? gn / rn : gn;
+    // warp-cooperative pack: 4 lanes share a qs byte (shfl), ballot -> signs
+    int low2 = idx & 3;
+    unsigned bal = __ballot_sync(0xffffffffu, idx & 4);
+    int l1 = __shfl_down_sync(0xffffffffu, low2, 1);
+    int l2 = __shfl_down_sync(0xffffffffu, low2, 2);
+    int l3 = __shfl_down_sync(0xffffffffu, low2, 3);
+    if ((j & 3) == 0)
+        dst->qs[j >> 2] = (uint8_t)(low2 | (l1 << 2) | (l2 << 4) | (l3 << 6));
+    if ((j & 7) == 0) dst->signs[j >> 3] = (uint8_t)((bal >> (j & 31)) & 0xFF);
+    if (j == 0) dst->norm = __float2half(corr);
+}
+
+void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,
+                 cudaStream_t st, int ntok, bool k_plain) {
+    dim3 g(n_kv_heads * (head_dim >> 7), 2, ntok); // x: (head, group); y: K,V
+    k_kv_store_t3<<<g, 128, 0, st>>>(k, v, kc, vc, pos, n_kv_heads, head_dim, k_plain);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Per-128-group WHT rotate: forward = s1 -> butterfly -> inv_sqrt*s2 (the
+// store kernel's rotation, applied to Q so <WHT q, WHT K> == <q, K>);
+// inverse = s2 -> butterfly -> inv_sqrt*s1 (un-rotates the pooled attention
+// output; V's inverse distributes over the softmax-weighted sum). Operand
+// order matches the CPU fwht exactly => device output is bitwise CPU-equal.
+template <bool INV>
+__global__ void k_wht3(__grid_constant__ const P3 xp, int gph, int stride) {
+    const int t = blockIdx.y, j = threadIdx.x;
+    const int hh = blockIdx.x / gph, g = blockIdx.x % gph;
+    float* xh = xp.p[t] + (size_t)hh * stride + g * 128;
+    __shared__ float xs[128];
+    xs[j] = xh[j] * (INV ? q27turbo::TURBO_S2[j] : q27turbo::TURBO_S1[j]);
+    q27turbo::turbo3_butterfly128(xs, j);
+    xh[j] = xs[j] * (q27turbo::TURBO_INV_SQRT_128 *
+                     (INV ? q27turbo::TURBO_S1[j] : q27turbo::TURBO_S2[j]));
+}
+
+void wht3(P3 x, int n_heads, int head_dim, int stride, bool inv, cudaStream_t st, int ntok) {
+    dim3 g(n_heads * (head_dim >> 7), ntok);
+    if (inv)
+        k_wht3<true><<<g, 128, 0, st>>>(x, head_dim >> 7, stride);
+    else
+        k_wht3<false><<<g, 128, 0, st>>>(x, head_dim >> 7, stride);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -323,6 +423,28 @@ __device__ __forceinline__ void fd2_ld8(const CT* __restrict__ row, int lane, fl
     }
 }
 
+// fd2 lane load from a pair of turbo3 blocks: lane l owns dims {4l..4l+3}
+// (block b2[0]) and {128+4l..128+4l+3} (b2[1]) -- the fd2 lane layout maps
+// 1:1 onto the two 128-groups. One qs byte (qs[l]) covers the lane's 4 dims
+// in a block; sign byte signs[l>>1], bits (l&1)*4+i; centroid LUT scaled by
+// the block's hoisted fp16 norm.
+__device__ __forceinline__ void fd2_ld8_t3(const q27turbo::block_turbo3* __restrict__ b2,
+                                           int lane, float* o) {
+#pragma unroll
+    for (int g = 0; g < 2; g++) {
+        const q27turbo::block_turbo3* b = b2 + g;
+        float norm = __half2float(b->norm);
+        uint8_t q = b->qs[lane];
+        uint8_t s = b->signs[lane >> 1];
+        int sh = (lane & 1) * 4;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = ((q >> (2 * i)) & 3) | (((s >> (sh + i)) & 1) << 2);
+            o[4 * g + i] = q27turbo::TURBO_CENTROIDS_3BIT[idx] * norm;
+        }
+    }
+}
+
 template <typename CT, int NW>
 __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
                            const CT* __restrict__ kc,
@@ -428,6 +550,110 @@ __global__ void k_attn_fd2(__grid_constant__ const CP3 qp, int q_stride,
     }
 }
 
+// k_attn_fd2 with turbo3 K/V loads (KT3=false: plain fp16 K rows, the
+// turbo3v split). Row addressing is in 50-byte blocks (pos*n_kv_heads*2 +
+// kvh*2), so this is a separate kernel rather than a CT overload (port spec
+// item 3); the softmax / online-max / serialized warp merge / partial layout
+// are copied byte-identical from k_attn_fd2 -- only the loads differ. The
+// fp8/fp16 k_attn_fd2 instantiations are textually untouched (bitwise gate).
+// Q arrives already WHT-rotated when KT3 (engine rotates after rope);
+// VKQ accumulates in the rotated V basis -- the engine's single post-combine
+// inverse-WHT un-rotates the pooled output (linearity).
+template <bool KT3, int NW>
+__global__ void k_attn_fd2_t3(__grid_constant__ const CP3 qp, int q_stride,
+                              const void* __restrict__ kc, const void* __restrict__ vc,
+                              float* __restrict__ part, IP3 pos, int n_kv_heads, int gqa,
+                              int head_dim, float scale) {
+    const int t = blockIdx.x, sp = blockIdx.y, kvh = blockIdx.z;
+    const int seq = *pos.p[t] + 1;
+    if (sp * ((seq + FD2_NS - 1) / FD2_NS) >= seq) return;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;              // [6][256]
+    float* s_mrg = smem + 6 * 256;  // [6][256] cross-warp accumulator merge
+    __shared__ float s_ml[NW][6][2];
+
+    for (int idx = threadIdx.x; idx < gqa * head_dim; idx += blockDim.x)
+        s_q[idx] = qp.p[t][(size_t)(kvh * gqa + idx / head_dim) * q_stride + idx % head_dim];
+    for (int idx = threadIdx.x; idx < 6 * 256; idx += blockDim.x) s_mrg[idx] = 0.f;
+    __syncthreads();
+
+    const int chunk = (seq + FD2_NS - 1) / FD2_NS;
+    const int p_lo = sp * chunk, p_hi = min(seq, p_lo + chunk);
+
+    float m[6], l[6], acc[6][8];
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        m[j] = -FLT_MAX;
+        l[j] = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[j][i] = 0.f;
+    }
+
+    for (int p = p_lo + warp; p < p_hi; p += NW) {
+        float kv[8], vv[8];
+        if constexpr (KT3)
+            fd2_ld8_t3((const q27turbo::block_turbo3*)kc + ((size_t)p * n_kv_heads + kvh) * 2,
+                       lane, kv);
+        else
+            fd2_ld8((const __half*)kc + ((size_t)p * n_kv_heads + kvh) * head_dim, lane, kv);
+        fd2_ld8_t3((const q27turbo::block_turbo3*)vc + ((size_t)p * n_kv_heads + kvh) * 2,
+                   lane, vv);
+#pragma unroll
+        for (int j = 0; j < 6; j++) {
+            const float4 qa = reinterpret_cast<const float4*>(s_q + j * 256)[lane];
+            const float4 qb = reinterpret_cast<const float4*>(s_q + j * 256 + 128)[lane];
+            float d = qa.x * kv[0] + qa.y * kv[1] + qa.z * kv[2] + qa.w * kv[3] +
+                      qb.x * kv[4] + qb.y * kv[5] + qb.z * kv[6] + qb.w * kv[7];
+            for (int off = 16; off > 0; off >>= 1) d += __shfl_down_sync(0xffffffff, d, off);
+            d = __shfl_sync(0xffffffff, d, 0) * scale;
+            float mn = fmaxf(m[j], d);
+            float so = expf(m[j] - mn), w = expf(d - mn);
+            l[j] = l[j] * so + w;
+            m[j] = mn;
+#pragma unroll
+            for (int i = 0; i < 8; i++) acc[j][i] = acc[j][i] * so + w * vv[i];
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 6; j++)
+        if (lane == 0) { s_ml[warp][j][0] = m[j]; s_ml[warp][j][1] = l[j]; }
+    __syncthreads();
+
+    // serialized rescale-add (fixed warp order => bitwise-deterministic)
+    for (int w = 0; w < NW; w++) {
+        if (warp == w) {
+#pragma unroll
+            for (int j = 0; j < 6; j++) {
+                float mb = -FLT_MAX;
+#pragma unroll
+                for (int u = 0; u < NW; u++) mb = fmaxf(mb, s_ml[u][j][0]);
+                float scw = m[j] == -FLT_MAX ? 0.f : expf(m[j] - mb);
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    s_mrg[j * 256 + 4 * lane + i] += acc[j][i] * scw;
+                    s_mrg[j * 256 + 128 + 4 * lane + i] += acc[j][4 + i] * scw;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int j = warp; j < 6; j += NW) {
+        float mb = -FLT_MAX;
+        for (int u = 0; u < NW; u++) mb = fmaxf(mb, s_ml[u][j][0]);
+        float lb = 0.f;
+        for (int u = 0; u < NW; u++)
+            lb += s_ml[u][j][1] * (s_ml[u][j][0] == -FLT_MAX ? 0.f : expf(s_ml[u][j][0] - mb));
+        size_t pair = (size_t)t * (n_kv_heads * gqa) + kvh * gqa + j;
+        float* dst = part + (pair * FD2_NS + sp) * FD_ST;
+        if (lane == 0) { dst[0] = mb; dst[1] = lb; }
+        for (int d = lane; d < head_dim; d += 32) dst[2 + d] = s_mrg[j * 256 + d];
+    }
+}
+
 // per-instantiation one-shot smem-attribute raise for k_attn_fd<CT>
 template <typename CT>
 static void fd_setattr(size_t sm) {
@@ -451,7 +677,7 @@ static void fd_launch(CP3 q, int q_stride, const void* kc, const void* vc, float
 
 void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 out,
                       float* scratch, IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads,
-                      int head_dim, float scale, cudaStream_t st, int ntok, bool fp8) {
+                      int head_dim, float scale, cudaStream_t st, int ntok, int kvk) {
     (void)max_ctx;
     int gqa = n_q_heads / n_kv_heads;
     // NW=4 (128 threads): probe-favored -- more blocks/SM for latency hiding.
@@ -459,7 +685,13 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
     constexpr int NW2 = 4;
     size_t sm = (size_t)(2 * 6) * 256 * sizeof(float);
     dim3 g1(ntok, FD2_NS, n_kv_heads);  // P14: lane (x) fastest -> cross-lane KV L2 reuse
-    if (fp8)
+    if (kvk == KV_T3)
+        k_attn_fd2_t3<true, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+                                                           n_kv_heads, gqa, head_dim, scale);
+    else if (kvk == KV_T3V)
+        k_attn_fd2_t3<false, NW2><<<g1, NW2 * 32, sm, st>>>(q, q_stride, kc, vc, scratch, pos,
+                                                            n_kv_heads, gqa, head_dim, scale);
+    else if (kvk == KV_FP8)
         k_attn_fd2<__nv_fp8_e4m3, NW2><<<g1, NW2 * 32, sm, st>>>(
             q, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, scratch, pos,
             n_kv_heads, gqa, head_dim, scale);
@@ -474,7 +706,15 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
 
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
-                  cudaStream_t st, int ntok, bool fp8) {
+                  cudaStream_t st, int ntok, int kvk) {
+    // turbo3 has exactly one read path (fd2); Q27_FD=v1/mma fall through here
+    // silently -- neither kernel family has a block-cache leg.
+    if (kvk >= KV_T3) {
+        attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
+                         n_kv_heads, head_dim, scale, st, ntok, kvk);
+        return;
+    }
+    const bool fp8 = kvk == KV_FP8;
     // fd2 is the default; Q27_FD=v1 keeps the original kernel (bit-for-bit
     // old behavior, incl. the retired bitwise canonical). Read at launch
     // time: graph capture bakes the choice for the process lifetime.
@@ -544,7 +784,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     }
     if (!fd || strcmp(fd, "v1") != 0) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
-                         n_kv_heads, head_dim, scale, st, ntok, fp8);
+                         n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
     }
     (void)max_ctx;
@@ -564,11 +804,11 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
 // single-token plain-path attention through the same flash-decode kernels
 void attn_decode(const float* q, int q_stride, const void* kcache, const void* vcache,
                  float* out, float* scratch, const int* d_pos, int max_ctx, int n_q_heads,
-                 int n_kv_heads, int head_dim, float scale, cudaStream_t st, bool fp8) {
+                 int n_kv_heads, int head_dim, float scale, cudaStream_t st, int kvk) {
     CP3 qp{{q, q, q}};
     IP3 pp{{d_pos, d_pos, d_pos}};
     attn_decode3(qp, q_stride, kcache, vcache, out2p(out), scratch, pp, max_ctx, n_q_heads,
-                 n_kv_heads, head_dim, scale, st, 1, fp8);
+                 n_kv_heads, head_dim, scale, st, 1, kvk);
 }
 
 __global__ void k_embed3(const int8_t* __restrict__ W, const __half* __restrict__ S,

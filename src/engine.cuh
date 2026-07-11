@@ -22,6 +22,7 @@
 #include "device_model.h"
 #include "kernels.cuh"
 #include "loader.h"
+#include "turbo3.cuh"
 
 using q27::DevTensor;
 using q27::DType;
@@ -431,8 +432,22 @@ struct Engine {
     // P2: attention + MTP KV caches, fp16 by default; fp8 E4M3 when Q27_KV=fp8
     // (34 vs 68 KB/token). Same [pos][kv_head][head_dim] element layout, only
     // the element size changes. NOT lossless -- opt-in, tolerance-gated.
+    // turbo3 (Q27_KV=turbo3, phase 1 2026-07-11): 3-bit WHT-rotated blocks
+    // (src/turbo3.cuh), row = N_KV*(HEAD_DIM/128) 50-B blocks = 400 B (~13.4
+    // vs 68 KB/token); turbo3v = fp16 K + turbo3 V (the GQA=6 K-risk escape,
+    // port spec docs/plans/2026-07-11-turbo3-kv-port-spec.md). Phase 1 is
+    // DECODE-ONLY: batched prefill has no turbo3 leg yet (guard below), so
+    // serving is gated off; quality triage runs over --nll-serial / -n.
     bool kv_fp8 = false;
+    int kv_kind = KV_F16;
     size_t kv_esz() const { return kv_fp8 ? 1 : 2; }
+    // bytes per K/V cache buffer (one attn layer, one stream). K and V sized
+    // separately: turbo3v keeps K fp16 while V goes turbo3.
+    size_t kv_bytes(bool is_v) const {
+        size_t t3 = (size_t)max_ctx * N_KV * (HEAD_DIM / 128) * sizeof(q27turbo::block_turbo3);
+        if (kv_kind == KV_T3 || (kv_kind == KV_T3V && is_v)) return t3;
+        return (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz();
+    }
     std::vector<void*> kcache, vcache;
     std::vector<int> attn_cache_idx;
 
@@ -455,7 +470,17 @@ struct Engine {
         CUDA_CHECK(cudaStreamCreate(&stm));
         const char* kve = getenv("Q27_KV");
         kv_fp8 = kve && !strcmp(kve, "fp8");
+        kv_kind = kv_fp8                          ? KV_FP8
+                  : kve && !strcmp(kve, "turbo3") ? KV_T3
+                  : kve && !strcmp(kve, "turbo3v") ? KV_T3V
+                                                   : KV_F16;
         if (kv_fp8) fprintf(stderr, "KV cache: fp8 E4M3 (opt-in, 34 KB/token)\n");
+        else if (kv_kind == KV_T3)
+            fprintf(stderr, "KV cache: turbo3 3-bit K+V (opt-in, ~13.4 KB/token; "
+                            "phase-1 DECODE-ONLY -- no batched prefill)\n");
+        else if (kv_kind == KV_T3V)
+            fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in; phase-1 DECODE-ONLY "
+                            "-- no batched prefill)\n");
         const std::string& mj = model.meta_json;
         size_t p = mj.find("\"attn_layers\": [");
         if (p == std::string::npos) { fprintf(stderr, "no attn_layers in meta\n"); exit(1); }
@@ -500,8 +525,8 @@ struct Engine {
         A((void**)&d_am_blk2, 128 * 4);
         A((void**)&h_next, N_EMBD * 4); A((void**)&e_hn, 2 * N_EMBD * 4);
         A((void**)&x_mtp, N_EMBD * 4); A((void**)&mtp_logits, VOCAB * 4);
-        A(&mtp_k, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
-        A(&mtp_v, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
+        A(&mtp_k, kv_bytes(false));
+        A(&mtp_v, kv_bytes(true));
         A((void**)&d_pos_m, 4); A((void**)&d_draft, 4);
         A((void**)&h_b, N_EMBD * 4); A((void**)&x1_b, N_EMBD * 4); A((void**)&y_b, N_EMBD * 4);
         A((void**)&qg_b, 2 * N_HEAD * HEAD_DIM * 4);
@@ -675,8 +700,8 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_pos_k, 0, 4)); CUDA_CHECK(cudaMemset(d_pos_l, 0, 4));
         A((void**)&d_P, 4);
         A((void**)&d_outcome, OUTCOME_INTS * 4); // fixed 14: {n, t1, dr1..dr11, pending}
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+        CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
         CUDA_CHECK(cudaMemset(d_step, 0, 4));
         xq = q27k::xquant_alloc(N_FFN);
@@ -708,8 +733,8 @@ struct Engine {
         for (int il = 0; il < N_LAYER; il++) {
             if (attn_layer[il]) {
                 void *k, *v;
-                A(&k, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
-                A(&v, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz());
+                A(&k, kv_bytes(false));
+                A(&v, kv_bytes(true));
                 kcache.push_back(k); vcache.push_back(v);
                 attn_cache_idx.push_back(cache_slot++);
                 conv_ring[il] = nullptr; S[il] = nullptr;
@@ -844,10 +869,32 @@ struct Engine {
         mm(T(il, "attn_v.weight"), xin, vbuf);
         q27k::rope_neox_partial(qg, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, pos_src, FREQ_BASE, stm);
         q27k::rope_neox_partial(kbuf, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, pos_src, FREQ_BASE, stm);
-        q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, stm, kv_fp8);
+        // turbo3: Q forward-WHT after rope (K's rotation is folded into the
+        // store; <WHT q, WHT K> == <q,K>); turbo3v keeps K fp16 => Q raw.
+        // Host branches on kv_kind only -- fixed at init, graph-capture-safe.
+        if (kv_kind == KV_T3) {
+            q27k::P3 qw{{qg}};
+            q27k::wht3(qw, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, 1);
+        }
+        if (kv_kind >= KV_T3) {
+            q27k::CP3 kw{{kbuf}};
+            q27k::CP3 vw3{{vbuf}};
+            q27k::IP3 pw{{pos_src}};
+            q27k::kv_store_t3(kw, vw3, kc, vc, pw, N_KV, HEAD_DIM, stm, 1,
+                              /*k_plain=*/kv_kind == KV_T3V);
+        } else {
+            q27k::kv_store(kbuf, vbuf, kc, vc, pos_src, N_KV * HEAD_DIM, stm, kv_fp8);
+        }
         q27k::attn_decode(qg, 2 * HEAD_DIM, kc, vc, attnout, scratch, pos_src,
                           max_ctx, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM), stm,
-                          kv_fp8);
+                          kv_kind);
+        // turbo3 V accumulates in the rotated basis: one inverse-WHT on the
+        // pooled output BEFORE the sigmoid gate (elementwise gate does not
+        // commute with the rotation).
+        if (kv_kind >= KV_T3) {
+            q27k::P3 ow{{attnout}};
+            q27k::wht3(ow, N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, 1);
+        }
         q27k::sigmoid_gate_mul(attnout, qg, N_HEAD, HEAD_DIM, stm);
         qx(attnout, N_HEAD * HEAD_DIM);
         mm(T(il, "attn_output.weight"), attnout, yout);
@@ -1108,19 +1155,36 @@ struct Engine {
                       kbuf_j, kbuf_k, kbuf_l}}, N_KV, HEAD_DIM, N_ROT,
                     HEAD_DIM, P, FREQ_BASE, stm, vw);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
+        // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
+        // branch on kv_kind only (init-fixed, graph-capture-safe)
+        if (kv_kind == KV_T3)
+            q27k::wht3({{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
+                         qg_l}}, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
-        q27k::kv_store3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h, kbuf_i,
-                          kbuf_j, kbuf_k, kbuf_l}},
-                        {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h, vbuf_i,
-                          vbuf_j, vbuf_k, vbuf_l}}, kcache[ci], vcache[ci],
-                        P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
+        if (kv_kind >= KV_T3)
+            q27k::kv_store_t3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h,
+                                kbuf_i, kbuf_j, kbuf_k, kbuf_l}},
+                              {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h,
+                                vbuf_i, vbuf_j, vbuf_k, vbuf_l}}, kcache[ci], vcache[ci],
+                              P, N_KV, HEAD_DIM, stm, vw, /*k_plain=*/kv_kind == KV_T3V);
+        else
+            q27k::kv_store3({{kbuf, kbuf_b, kbuf_c, kbuf_d, kbuf_e, kbuf_f, kbuf_g, kbuf_h,
+                              kbuf_i, kbuf_j, kbuf_k, kbuf_l}},
+                            {{vbuf, vbuf_b, vbuf_c, vbuf_d, vbuf_e, vbuf_f, vbuf_g, vbuf_h,
+                              vbuf_i, vbuf_j, vbuf_k, vbuf_l}}, kcache[ci], vcache[ci],
+                            P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
         q27k::attn_decode3({{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
                              qg_l}}, 2 * HEAD_DIM, kcache[ci],
                            vcache[ci],
                            {{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
                              attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
-                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_fp8);
+                           scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_kind);
+        // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
+        if (kv_kind >= KV_T3)
+            q27k::wht3({{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
+                         attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
+                       N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
         q27k::sigmoid_gate3({{attnout, attnout_b, attnout_c, attnout_d, attnout_e, attnout_f,
                               attnout_g, attnout_h, attnout_i, attnout_j, attnout_k, attnout_l}},
                             {{qg, qg_b, qg_c, qg_d, qg_e, qg_f, qg_g, qg_h, qg_i, qg_j, qg_k,
@@ -1422,8 +1486,8 @@ struct Engine {
                     if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
                         CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
                 }
-            CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
-            CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+            CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
+            CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
         };
         // P12b: warm the WIDEST kernels (distinct gemv<N>/ntok instantiations)
         // so graph capture never triggers a lazy module load. Output is
@@ -2042,6 +2106,14 @@ struct Engine {
     // Leaves hT = final residual for each token. Updates conv rings, GDN state,
     // attention KV caches in place.
     void prefill_chunk(const int* d_toks, int base, int T) {
+        if (kv_kind >= KV_T3) {
+            // phase 1: kv_store_T / attn_prefill_T have no turbo3 leg -- a
+            // batched prefill would write scalar rows into block caches.
+            // Serial paths (--nll-serial, --tokens -n) cover the quality gate.
+            fprintf(stderr, "Q27_KV=turbo3*: batched prefill not ported (phase 1); "
+                            "use serial paths (--nll-serial, --tokens -n)\n");
+            exit(1);
+        }
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
                               N_EMBD, T, hT, stm);
@@ -2258,8 +2330,8 @@ struct Engine {
                 if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
                     CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
             }
-        CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
-        CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
+        CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
+        CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
         CUDA_CHECK(cudaStreamSynchronize(stm));
     }
 
