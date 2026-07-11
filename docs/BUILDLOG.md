@@ -4096,3 +4096,46 @@ as the long-context/memory option (2.56x KV, ~1%% PPL, needle 6/6). Next
 perf lever: fdmma turbo3 verify (dequant-to-e4m3 smem) to close the
 kernel gap; fd2-t3 read cost (+3.9 ms/rnd @27K) shrinks in relative terms
 as ctx deepens (2.56x fewer KV bytes).
+
+## 2026-07-11 -- fdmma turbo3 verify leg SHIPPED: dequant-to-e4m3 tiles, turbo3 joins the mma serving path
+
+The A/B's 4.4 ms/rnd mma->fd2 deficit is closed at the source: Q27_FD=mma
+now engages for Q27_KV=turbo3. k_attn_fdmma<W, STAGES, T3>: the STAGES==1
+tile fetch expands 3-bit blocks to e4m3 (turbo3_stage8_e4m3: 2 qs bytes +
+1 sign byte + norm -> 8 e4m3) in place of the raw cp.async copy; transpose,
+MMA, epilogue untouched. T3 is single-buffered only (the default config;
+blocking expand leans on the 2nd resident CTA like the raw variant --
+Q27_FDMMA_STAGES=2 has no turbo3 leg). turbo3v stays fd2 (diagnostic).
+
+GATES:
+- test_kernels ALL PASS on sm_120 (new fdmma-t3 checks: control-fallthrough
+  bitwise==fd2 without the env; engaged (!=fd2) with it; rel gated RELATIVE
+  to a same-harness fp8 CONTROL: the SHIPPING fp8 fdmma-vs-fd2 output rel
+  is 0.16-0.24 (e4m3 Q/P pipeline -- fdmma was only ever gated
+  modeled-ref/acceptance-class, never small-output-rel); turbo3 lands at
+  1.2-2.2x that floor = the predicted one-extra-e4m3-rounding, gate <=2.5x).
+  First absolute bound (3e-2) was wrong and is retired by the control.
+- Canonical (p3base vs new, vanilla, 5090): fp16 EXACT (a2982c51), v1
+  EXACT, fp8+mma (THE serving path) EXACT; fp8+fd2 leg RE-ROLLED
+  (51df96c1 -> 559ea54f, fork at token ~57): cuobjdump confirms the
+  k_attn_fd2<fp8> SASS changed (TU codegen drift from the new header
+  inlines), fd2-fp8 correctness checks all green (vs host-ref 1e-4, vs v1,
+  deterministic) -- the documented rebuild-class near-tie re-roll, accepted
+  per the attn-fd2-design canonical-replacement policy. Serving path
+  bitwise-stable.
+- Accept A/B rerun (cctx2 @32K, docs61k @65K; fp8-as-served vs
+  turbo3-now-mma):
+  cctx2 (basin-matched, dec=256 both, 44 rounds):
+    fp8/mma    252.2 t/s  5.818 tok/rnd  23.07 ms/rnd  fired5 .598
+    turbo3/mma 241.2 t/s  5.818 tok/rnd  24.14 ms/rnd  fired5 .689
+    => acceptance still TIES EXACTLY; wall -4.4%% (was -26%% on fd2). The
+    +1.07 ms/rnd is the in-kernel block-expand vs raw cp.async.
+  docs61k (basin fork: rounds 101 vs 84 -- tok/rnd not attributable):
+    fp8 128.4 t/s / 2.535 tok/rnd; turbo3 140.7 t/s / 3.048 tok/rnd
+    => turbo3 now FASTER at 61K (+9.6%%) in its basin (was -22%%).
+- Sanitizer (filtered + capped): memcheck 0 errors (turbo3+mma spec run), filtered racecheck
+  (k_attn_fdmma) 0 hazards.
+
+NEXT: turbo3 serving trial (live CC session on the eval box) now that the
+kernel gap is closed; prefill staging perf if profiles warrant; ctx-ceiling
+sweep (turbo3 should push far past 131K -- 13.4 KB/token).

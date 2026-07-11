@@ -13,6 +13,9 @@
 #pragma once
 #include <cstdint>
 #include <cuda_fp16.h>
+#ifdef __CUDACC__
+#include <cuda_fp8.h> // turbo3_stage8_e4m3 (fdmma verify tiles)
+#endif
 
 namespace q27turbo {
 
@@ -154,6 +157,25 @@ __device__ __forceinline__ void turbo3_stage8_h2(const block_turbo3* row2, int d
 #pragma unroll
     for (int j = 0; j < 4; j++)
         dst[j] = __halves2half2(__float2half_rn(v[2 * j]), __float2half_rn(v[2 * j + 1]));
+}
+
+// Same 8-dim stage as e4m3 bytes (the fdmma verify tiles): the MMA operands
+// become e4m3(centroid*norm) -- one extra rounding on top of the 3-bit
+// quant, same tolerance class as fdmma's own e4m3 Q/P staging.
+__device__ __forceinline__ void turbo3_stage8_e4m3(const block_turbo3* row2, int d8,
+                                                   __nv_fp8_e4m3* dst) {
+    const block_turbo3* b = row2 + (d8 >> 7);
+    int j0 = d8 & 127;
+    float norm = __half2float(b->norm);
+    uint8_t q0 = b->qs[j0 >> 2], q1 = b->qs[(j0 >> 2) + 1];
+    uint8_t s8 = b->signs[j0 >> 3];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int i0 = ((q0 >> (2 * i)) & 3) | (((s8 >> i) & 1) << 2);
+        int i1 = ((q1 >> (2 * i)) & 3) | (((s8 >> (4 + i)) & 1) << 2);
+        dst[i] = __nv_fp8_e4m3(TURBO_CENTROIDS_3BIT[i0] * norm);
+        dst[4 + i] = __nv_fp8_e4m3(TURBO_CENTROIDS_3BIT[i1] * norm);
+    }
 }
 #endif
 

@@ -23,6 +23,8 @@
 
 #include <cstdint>
 
+#include "turbo3.cuh" // T3 verify leg: block struct + stage8_e4m3
+
 namespace fdmma {
 
 // width-12 2026-07-10: p[16] plumbing (matches q27k::CP3/IP3); the kernel
@@ -199,7 +201,12 @@ static __device__ __forceinline__ void fdmma_tile_compute(
     }
 }
 
-template <int W, int STAGES = 2>
+// T3 (turbo3 KV): the STAGES==1 tile fetch expands 3-bit blocks to e4m3 in
+// place of the raw cp.async copy; everything downstream (transpose, MMA,
+// epilogue) is untouched. T3 is only instantiated with STAGES==1 (the
+// default config; the blocking expand leans on the 2nd resident CTA for
+// overlap exactly like the raw single-buffer variant).
+template <int W, int STAGES = 2, bool T3 = false>
 __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     k_attn_fdmma(__grid_constant__ const FCP3 qp, int q_stride,
                  const __nv_fp8_e4m3* __restrict__ kc,
@@ -214,6 +221,7 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
     // <= 6 = the 192-thread launch); s_geo strides at 16 lanes.
     static_assert(W >= 2 && W <= 16, "96 rows = 6*16 lanes max");
     static_assert(STAGES == 1 || STAGES == 2, "K/V staging depth");
+    static_assert(!T3 || STAGES == 1, "turbo3 leg is single-buffered only");
     const int sp = blockIdx.x, kvh = blockIdx.y;
     const int nsp = gridDim.x; // == ns fed to k_attn_fd_combine (single source, no split-brain)
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -306,16 +314,35 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
         __nv_fp8_e4m3* kbuf = s_kraw + (STAGES == 2 ? cur : 0) * PP * LDK;
         __nv_fp8_e4m3* vbuf = s_vraw + (STAGES == 2 ? cur : 0) * PP * HD;
         if (STAGES == 1) {
-            // fetch THIS tile (prior iteration's trailing barrier proved
-            // every warp is done reading the single buffer)
-            for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
-                const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
-                const int gpos = p0 + pp;
-                const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
-                cpasync16(kbuf + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
-                cpasync16(vbuf + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+            if constexpr (T3) {
+                // expand turbo3 blocks -> e4m3 into the tiles (no cp.async
+                // on this leg; the wait below has nothing pending)
+                for (int idx = threadIdx.x; idx < PP * (HD / 8); idx += 192) {
+                    const int pp = idx / (HD / 8), d8 = (idx % (HD / 8)) * 8;
+                    const int gpos = p0 + pp;
+                    if (gpos < p_end) {
+                        const size_t rb = ((size_t)gpos * n_kv_heads + kvh) * 2;
+                        q27turbo::turbo3_stage8_e4m3(
+                            (const q27turbo::block_turbo3*)kc + rb, d8, kbuf + pp * LDK + d8);
+                        q27turbo::turbo3_stage8_e4m3(
+                            (const q27turbo::block_turbo3*)vc + rb, d8, vbuf + pp * HD + d8);
+                    } else {
+                        *(uint2*)(kbuf + pp * LDK + d8) = make_uint2(0u, 0u);
+                        *(uint2*)(vbuf + pp * HD + d8) = make_uint2(0u, 0u);
+                    }
+                }
+            } else {
+                // fetch THIS tile (prior iteration's trailing barrier proved
+                // every warp is done reading the single buffer)
+                for (int idx = threadIdx.x; idx < PP * (HD / 16); idx += 192) {
+                    const int pp = idx / (HD / 16), d16 = (idx % (HD / 16)) * 16;
+                    const int gpos = p0 + pp;
+                    const size_t off = ((size_t)gpos * n_kv_heads + kvh) * head_dim + d16;
+                    cpasync16(kbuf + pp * LDK + d16, &kc[off], gpos < p_end ? 16 : 0);
+                    cpasync16(vbuf + pp * HD + d16, &vc[off], gpos < p_end ? 16 : 0);
+                }
+                cpasync_commit();
             }
-            cpasync_commit();
         }
         cpasync_wait_all();
         __syncthreads();
@@ -380,32 +407,37 @@ __global__ void __launch_bounds__(192, STAGES == 1 ? 2 : 1)
 
 // launcher: grid (ns, n_kv_heads); ns MUST equal the ns passed to
 // k_attn_fd_combine (128 = FD2_NS in the engine). One-shot smem attr raise.
-template <int W, int STAGES = 2>
+template <int W, int STAGES = 2, bool T3 = false>
 inline void launch_fdmma_w(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
                            FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
                            cudaStream_t st) {
     static bool attr = false;
     const size_t sm = fdmma_smem_bytes(W, STAGES);
     if (!attr) {
-        cudaFuncSetAttribute(k_attn_fdmma<W, STAGES>,
+        cudaFuncSetAttribute(k_attn_fdmma<W, STAGES, T3>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
         attr = true;
     }
     dim3 g((unsigned)ns, (unsigned)n_kv_heads);
-    k_attn_fdmma<W, STAGES><<<g, 192, sm, st>>>(qp, q_stride, (const __nv_fp8_e4m3*)kc,
-                                                (const __nv_fp8_e4m3*)vc, part, pos, n_kv_heads,
-                                                gqa, head_dim, scale);
+    k_attn_fdmma<W, STAGES, T3><<<g, 192, sm, st>>>(
+        qp, q_stride, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc, part, pos,
+        n_kv_heads, gqa, head_dim, scale);
 }
 
 // stages: 2 = shipped double-buffered 1-CTA kernel; 1 = single-buffered
 // 2-CTA occupancy variant (tuning 2026-07-10; bench A/B before any default
 // change). Arithmetic is shared (fdmma_tile_compute) -- staging only.
+// t3: turbo3 block caches -- always the single-buffered kernel (stages
+// forced to 1; Q27_FDMMA_STAGES=2 has no turbo3 leg).
 inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, float* part,
                          FIP3 pos, int n_kv_heads, int gqa, int head_dim, float scale, int ns,
-                         int ntok, cudaStream_t st, int stages = 2) {
+                         int ntok, cudaStream_t st, int stages = 2, bool t3 = false) {
 #define FDMMA_CASE(N)                                                                        \
     case N:                                                                                  \
-        if (stages == 1)                                                                     \
+        if (t3)                                                                              \
+            launch_fdmma_w<N, 1, true>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa,     \
+                                       head_dim, scale, ns, st);                             \
+        else if (stages == 1)                                                                \
             launch_fdmma_w<N, 1>(qp, q_stride, kc, vc, part, pos, n_kv_heads, gqa, head_dim, \
                                  scale, ns, st);                                             \
         else                                                                                 \

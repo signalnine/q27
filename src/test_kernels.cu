@@ -1408,6 +1408,177 @@ static void test_attn_fd2_turbo3() {
     CUDA_CHECK(cudaFree(d_scr));
 }
 
+// phase 3 (fdmma verify leg): Q27_FD=mma + KV_T3 must ENGAGE k_attn_fdmma
+// <W,1,true> (dequant-to-e4m3 tiles) and agree with fd2-t3 at fdmma's
+// tolerance class (e4m3 Q/P + e4m3-of-dequant K/V; the fp8 fdmma ships at
+// ~1e-2 output rel vs exact). Control leg first: WITHOUT Q27_FD=mma the
+// dispatch must fall through to fd2 bitwise -- proves the discriminator.
+// fdmma is sm_89+ (device gate in attn_decode3): SKIP below that.
+static void test_attn_fdmma_turbo3() {
+    int dev, mj, mn;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev));
+    if (mj * 10 + mn < 89) {
+        printf("  fdmma-t3: SKIP (sm_%d%d < sm_89)\n", mj, mn);
+        return;
+    }
+    const int NKV = 4, GQA = 6, HD = 256, NH = NKV * GQA;
+    const int SEQMAX = 4096, ROW = NKV * HD, BPR = NKV * (HD / 128);
+    const int QROW = NH * 2 * HD, OROW = NH * HD;
+    const int NT = 12;
+    std::vector<float> kf = rand_vec((size_t)SEQMAX * ROW, 111),
+                       vf = rand_vec((size_t)SEQMAX * ROW, 112);
+    std::vector<float> qh = rand_vec((size_t)NT * QROW, 113);
+    std::vector<block_turbo3> kb((size_t)SEQMAX * BPR), vb((size_t)SEQMAX * BPR);
+    for (size_t b = 0; b < kb.size(); b++) {
+        t3_quant(kf.data() + b * 128, &kb[b]);
+        t3_quant(vf.data() + b * 128, &vb[b]);
+    }
+    std::vector<uint8_t> k8(kf.size()), v8(vf.size());
+    for (size_t i = 0; i < kf.size(); i++) {
+        k8[i] = __nv_fp8_e4m3(kf[i]).__x;
+        v8[i] = __nv_fp8_e4m3(vf[i]).__x;
+    }
+    block_turbo3 *d_kb, *d_vb;
+    uint8_t *d_k8, *d_v8;
+    float *d_qr[NT], *d_oa[NT], *d_ob[NT], *d_scr;
+    int* d_pos[NT];
+    CUDA_CHECK(cudaMalloc(&d_kb, kb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_k8, k8.size()));
+    CUDA_CHECK(cudaMalloc(&d_v8, v8.size()));
+    CUDA_CHECK(cudaMemcpy(d_k8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kb, kb.data(), kb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vb, vb.data(), vb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    for (int t = 0; t < NT; t++) {
+        CUDA_CHECK(cudaMalloc(&d_qr[t], (size_t)QROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_oa[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_ob[t], (size_t)OROW * 4));
+        CUDA_CHECK(cudaMalloc(&d_pos[t], 4));
+    }
+    CUDA_CHECK(cudaMalloc(&d_scr, (size_t)NT * NH * q27k::FD_MAXNS * q27k::FD_ST * 4));
+    const float scale = 1.0f / sqrtf((float)HD);
+    std::vector<float> A(OROW), Bv(OROW);
+    char label[96];
+    for (int ntok : {5, 12}) {
+        for (int seq : {47, SEQMAX}) {
+            q27k::CP3 q{};
+            q27k::P3 qw{}, va{}, vb2{};
+            q27k::IP3 P{};
+            for (int t = 0; t < ntok; t++) {
+                // rotated Q, fresh each config (wht3 is in-place)
+                CUDA_CHECK(cudaMemcpy(d_qr[t], qh.data() + (size_t)t * QROW,
+                                      (size_t)QROW * 4, cudaMemcpyHostToDevice));
+                int p = std::max(0, seq - 1 - (ntok - 1 - t));
+                CUDA_CHECK(cudaMemcpy(d_pos[t], &p, 4, cudaMemcpyHostToDevice));
+                q.p[t] = d_qr[t];
+                qw.p[t] = d_qr[t];
+                va.p[t] = d_oa[t];
+                vb2.p[t] = d_ob[t];
+                P.p[t] = d_pos[t];
+            }
+            q27k::wht3(qw, NH, HD, 2 * HD, false, 0, ntok);
+            // A: fd2-t3 reference (post-attention inverse-WHT skipped on both
+            // legs -- comparing pre-rotation outputs is equivalent and avoids
+            // touching the buffers twice)
+            q27k::attn_decode3_fd2(q, 2 * HD, d_kb, d_vb, va, d_scr, P, SEQMAX, NH, NKV,
+                                   HD, scale, 0, ntok, KV_T3);
+            // control: no Q27_FD -> dispatch must fall through to fd2 BITWISE
+            unsetenv("Q27_FD");
+            q27k::attn_decode3(q, 2 * HD, d_kb, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, KV_T3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double ctrl = 0;
+            for (int t = 0; t < ntok; t++) {
+                CUDA_CHECK(cudaMemcpy(A.data(), d_oa[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(Bv.data(), d_ob[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                for (int i = 0; i < OROW; i++) {
+                    double d = std::fabs((double)A[i] - Bv[i]);
+                    ctrl = std::max(ctrl, std::isfinite(d) ? d : 1e30);
+                }
+            }
+            snprintf(label, sizeof label, "fdmma-t3 control fallthrough ntok=%d seq=%d",
+                     ntok, seq);
+            check(label, ctrl, 1e-30);
+            // B: Q27_FD=mma -> the turbo3 fdmma leg
+            setenv("Q27_FD", "mma", 1);
+            q27k::attn_decode3(q, 2 * HD, d_kb, d_vb, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, KV_T3);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsetenv("Q27_FD");
+            double md = 0, worst = 0;
+            for (int t = 0; t < ntok; t++) {
+                CUDA_CHECK(cudaMemcpy(A.data(), d_oa[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(Bv.data(), d_ob[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                double ss = 0;
+                for (int i = 0; i < OROW; i++) ss += (double)A[i] * A[i];
+                double rms = std::sqrt(ss / OROW) + 1e-12;
+                for (int i = 0; i < OROW; i++) {
+                    double d = std::fabs((double)A[i] - Bv[i]);
+                    md = std::max(md, std::isfinite(d) ? d : 1e30);
+                    worst = std::max(worst, std::isfinite(d) ? d / rms : 1e30);
+                }
+            }
+            snprintf(label, sizeof label, "fdmma-t3 engaged (!=fd2) ntok=%d seq=%d", ntok,
+                     seq);
+            check(label, md > 1e-9 ? 0.0 : 1.0, 0.5);
+            // fp8 CONTROL: fdmma-vs-fd2 rel with scalar e4m3 KV and raw Q --
+            // the e4m3 Q/P pipeline's own noise floor. fdmma ships
+            // tolerance-class (argmax/acceptance-preserving), NOT small
+            // output-rel; the t3 leg is gated RELATIVE to this floor.
+            for (int t = 0; t < ntok; t++)
+                CUDA_CHECK(cudaMemcpy(d_qr[t], qh.data() + (size_t)t * QROW,
+                                      (size_t)QROW * 4, cudaMemcpyHostToDevice));
+            q27k::attn_decode3_fd2(q, 2 * HD, d_k8, d_v8, va, d_scr, P, SEQMAX, NH, NKV,
+                                   HD, scale, 0, ntok, KV_FP8);
+            setenv("Q27_FD", "mma", 1);
+            q27k::attn_decode3(q, 2 * HD, d_k8, d_v8, vb2, d_scr, P, SEQMAX, NH, NKV, HD,
+                               scale, 0, ntok, KV_FP8);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unsetenv("Q27_FD");
+            double fp8rel = 0;
+            for (int t = 0; t < ntok; t++) {
+                CUDA_CHECK(cudaMemcpy(A.data(), d_oa[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(Bv.data(), d_ob[t], (size_t)OROW * 4,
+                                      cudaMemcpyDeviceToHost));
+                double ss = 0;
+                for (int i = 0; i < OROW; i++) ss += (double)A[i] * A[i];
+                double rms = std::sqrt(ss / OROW) + 1e-12;
+                for (int i = 0; i < OROW; i++) {
+                    double d = std::fabs((double)A[i] - Bv[i]) / rms;
+                    fp8rel = std::max(fp8rel, std::isfinite(d) ? d : 1e30);
+                }
+            }
+            snprintf(label, sizeof label, "fdmma fp8 control rel ntok=%d seq=%d", ntok,
+                     seq);
+            check(label, fp8rel, 1.0); // informational floor (never gates)
+            snprintf(label, sizeof label, "fdmma-t3 rel vs fp8 floor ntok=%d seq=%d",
+                     ntok, seq);
+            check(label, worst / std::max(fp8rel, 1e-6), 2.5);
+        }
+    }
+    CUDA_CHECK(cudaFree(d_kb));
+    CUDA_CHECK(cudaFree(d_vb));
+    CUDA_CHECK(cudaFree(d_k8));
+    CUDA_CHECK(cudaFree(d_v8));
+    for (int t = 0; t < NT; t++) {
+        CUDA_CHECK(cudaFree(d_qr[t]));
+        CUDA_CHECK(cudaFree(d_oa[t]));
+        CUDA_CHECK(cudaFree(d_ob[t]));
+        CUDA_CHECK(cudaFree(d_pos[t]));
+    }
+    CUDA_CHECK(cudaFree(d_scr));
+}
+
 // phase 2 (prefill): kv_store_T_t3 parity vs the CPU quantizer at a nonzero
 // base row; k_plain leg bitwise fp16 K. Same tie budget rationale as the
 // decode store test.
@@ -2293,6 +2464,7 @@ int main(int argc, char** argv) {
     test_attn_fd2_turbo3();
     test_kv_turbo3_store_T();
     test_attn_prefill_turbo3();
+    test_attn_fdmma_turbo3();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);

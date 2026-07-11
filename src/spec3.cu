@@ -674,9 +674,9 @@ void attn_decode3_fd2(CP3 q, int q_stride, const void* kc, const void* vc, P3 ou
 void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, float* scratch,
                   IP3 pos, int max_ctx, int n_q_heads, int n_kv_heads, int head_dim, float scale,
                   cudaStream_t st, int ntok, int kvk) {
-    // turbo3 has exactly one read path (fd2); Q27_FD=v1/mma fall through here
-    // silently -- neither kernel family has a block-cache leg.
-    if (kvk >= KV_T3) {
+    // turbo3v (diagnostic) has exactly one read path (fd2). turbo3 gets the
+    // fdmma verify leg below (phase 3); Q27_FD=v1 still falls to fd2.
+    if (kvk == KV_T3V) {
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
@@ -693,7 +693,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // below); everything else falls through to fd2, so W=2..3 rounds and
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
-    if (fd && strcmp(fd, "mma") == 0 && fp8 && ntok >= 4 && ntok <= 12) {
+    if (fd && strcmp(fd, "mma") == 0 && (fp8 || kvk == KV_T3) && ntok >= 4 && ntok <= 12) {
         static int arch = -1;
         if (arch < 0) {
             int dev, mj, mn;
@@ -740,7 +740,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             }();
             if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
                                     n_q_heads / n_kv_heads, head_dim, scale, fdmma_ns, ntok, st,
-                                    fdmma_stages)) {
+                                    fdmma_stages, /*t3=*/kvk == KV_T3)) {
                 dim3 g2(n_q_heads, ntok);
                 k_attn_fd_combine<<<g2, 256, 0, st>>>(scratch, out, n_q_heads, head_dim,
                                                       fdmma_ns, pos);
@@ -749,7 +749,8 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             }
         }
     }
-    if (!fd || strcmp(fd, "v1") != 0) {
+    if (!fd || strcmp(fd, "v1") != 0 || kvk == KV_T3) {
+        // turbo3 never runs the v1 kernel (no block leg there)
         attn_decode3_fd2(q, q_stride, kc, vc, out, scratch, pos, max_ctx, n_q_heads,
                          n_kv_heads, head_dim, scale, st, ntok, kvk);
         return;
