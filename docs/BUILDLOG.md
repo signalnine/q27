@@ -4139,3 +4139,45 @@ GATES:
 NEXT: turbo3 serving trial (live CC session on the eval box) now that the
 kernel gap is closed; prefill staging perf if profiles warrant; ctx-ceiling
 sweep (turbo3 should push far past 131K -- 13.4 KB/token).
+
+## 2026-07-11 -- thunderdome T8 A/B (fp8 vs turbo3 serving) + mode-6/7 inference tie-break fix
+
+Live CC-harness trial (thunderdome claude-code-q27-haight, T8 x3 per leg,
+same binary 68fd707+parser-fix, same 10-day-old CC image as the 07-09 runs).
+
+ROUND 1 found a SERVING BUG, not an engine delta: the fp8 leg one-shot-quit
+all 3 trials (score 0.00, 81 tok, turns=1) -- the first tool call came out
+in the name-dropped mode-6/7 drift shape and the rescue REFUSED it: the
+modern CC registry carries property-twins (Bash and Monitor both have
+{command, description}), orphaned Bash args scored a 4-4 tie, and
+infer_tool_name refuses ties. Cross-BUILD tie-reroll (the fd2-fp8 SASS
+drift; MTP drafts ride fd2) moved T8's opening call into that shape today.
+FIX (api_common.h, TDD'd in test_tokenizer ok12/ok13): on a score tie,
+eliminate candidates whose REQUIRED params are not covered by the args
+(such a call could never validate); a UNIQUE survivor wins; ties among
+required-satisfied candidates still refuse. The exact trial bytes are the
+test. Meanwhile the turbo3 leg (round 1, old parser) rolled a GOOD basin
+and scored 0.852.
+
+ROUND 2 (patched parser, both legs fresh):
+  fp8/mma    0.54 / 0.54 / 0.54  (173/152/130s)  hidden .219  4.00M tok
+  turbo3/mma 0.85 / 0.85 / 0.85  (145/132/148s)  hidden .969  2.79M tok
+  Live decode telemetry ([req], per-leg): fp8 median 230.9 t/s (219 reqs),
+  turbo3 median 205.0 t/s (171 reqs) = -11% median; aggregate confounded
+  by traffic mix (bad-basin fp8 sessions flail: 74.8K vs 42.0K decode tok).
+SCORE READ: T8 is the documented BIMODAL eval (auth-chain gate artifact;
+fp8's 0.54/hidden-.219 IS the known low mode from the 07-10 full-stack
+trials, turbo3's 0.852/.969 the high mode). Six turbo3 trials today (2
+rounds x 3) all landed the good basin; that is basin-lottery evidence, not
+an engine-quality claim -- but it IS the strongest live validation yet
+that turbo3 serving is production-shaped: full 100-turn CC sessions,
+wall-clock equal-or-better per trial, -11% median decode, zero protocol
+failures.
+VERDICT: the performance picture is UNCHANGED in kind -- turbo3 costs ~11%
+median decode on live traffic (vs -4.4% at matched 27K replay) and nothing
+else; scores are basin lottery. Serving default remains fp8; turbo3 is
+fully cleared for long-context serving. The parser tie-break fix is the
+real catch of the trial (it protects EVERY leg on the modern CC registry).
+Gates: test_tokenizer (incl. new ok12/ok13) + test_toolconstrain PASS;
+parser is host-side only (canonical CLI legs unaffected); live E2E = the
+round-2 legs themselves (100-turn sessions through the patched path).

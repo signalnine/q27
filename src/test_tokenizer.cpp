@@ -385,8 +385,42 @@ int main(int argc, char** argv) {
         auto v11 = q27::parse_bare_tool_calls(
             "{\"function\": \"rm_rf\", \"arguments\": {\"path\": \"/\"}}", &pre, &tools8);
         bool ok11 = v11.empty();
+        // mode-6/7 inference TIE-BREAK (2026-07-11, thunderdome T8 one-shot-quit
+        // root cause): the modern CC registry carries BOTH Bash{command,
+        // description,...} and Monitor{command,description,timeout_ms,
+        // persistent,...} -- orphaned args {description,command} score a 4-4
+        // tie and the rescue refused, leaking the call as prose. On a score
+        // tie, candidates whose REQUIRED set is not covered by the args are
+        // eliminated (such a call could never validate anyway); a unique
+        // survivor wins, anything else still refuses.
+        nlohmann::json tools12 = nlohmann::json::parse(R"([
+            {"function":{"name":"Bash","parameters":{
+                "properties":{"command":{},"description":{},"timeout":{},"run_in_background":{}},
+                "required":["command"]}}},
+            {"function":{"name":"Monitor","parameters":{
+                "properties":{"command":{},"description":{},"timeout_ms":{},"persistent":{},"ws":{}},
+                "required":["description","timeout_ms","persistent"]}}}])");
+        auto v12 = q27::parse_bare_tool_calls(
+            "I'll start by examining the existing project structure, schema, and tests "
+            "to understand what needs to be built.\n\n{\"name\":\n{\"function\":"
+            "{\"description\":\"List project structure\",\"command\":\"find /workspace "
+            "-type f | head -200\"}}", &pre, &tools12);
+        bool ok12 = v12.size() == 1 && v12[0].name == "Bash" &&
+                    v12[0].arguments.value("command", "").find("find /workspace") == 0 &&
+                    !v12[0].arguments.contains("function");
+        // genuine ambiguity (both candidates' required sets satisfied) must
+        // STILL refuse: {description} alone covers Bash-req? no (command
+        // missing) -- use two tools whose required sets are both covered
+        nlohmann::json tools13 = nlohmann::json::parse(R"([
+            {"function":{"name":"A1","parameters":{
+                "properties":{"x":{},"y":{}},"required":["x"]}}},
+            {"function":{"name":"A2","parameters":{
+                "properties":{"x":{},"y":{}},"required":["y"]}}}])");
+        auto v13 = q27::parse_bare_tool_calls(
+            "{\"name\":\n{\"x\":\"1\",\"y\":\"2\"}}", &pre, &tools13);
+        bool ok13 = v13.empty();
         bool ok = ok1 && !c2.ok && !c3.ok && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 &&
-                  ok10 && ok11;
+                  ok10 && ok11 && ok12 && ok13;
         printf("bare tool-call fallback: %s\n", ok ? "PASS" : "FAIL");
         if (!ok) return 1;
     }

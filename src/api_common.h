@@ -434,7 +434,16 @@ inline std::string infer_tool_name(const json& tools, const json& args) {
     std::set<std::string> ak;
     for (auto it = args.begin(); it != args.end(); ++it) ak.insert(it.key());
     if (ak.empty()) return "";
-    std::string best; int best_score = 0; bool tie = false;
+    // Tie-break (2026-07-11, thunderdome T8 one-shot-quit root cause): the
+    // modern CC registry has property-set near-twins (Bash and Monitor both
+    // carry {command, description}), so orphaned Bash args scored a 4-4 tie
+    // and the rescue refused. A tied candidate whose REQUIRED params are not
+    // all present in ARGS could never validate as a call -- eliminate those;
+    // a UNIQUE survivor wins. Both-satisfied ties still refuse (a wrong tool
+    // remains worse than un-rescued).
+    struct Cand { std::string name; bool req_ok; };
+    std::vector<Cand> best;
+    int best_score = 0;
     for (const auto& t : tools) {
         if (!t.contains("function")) continue;
         const json& fn = t["function"];
@@ -452,12 +461,27 @@ inline std::string infer_tool_name(const json& tools, const json& args) {
         int overlap = 0, foreign = 0;
         for (const auto& k : ak) (props.count(k) ? overlap : foreign)++;
         int score = 2 * overlap - foreign;
-        if (overlap > 0) {
-            if (score > best_score) { best_score = score; best = name; tie = false; }
-            else if (score == best_score) tie = true;
+        if (overlap > 0 && score > 0) { // score-0 candidates never won before either
+            bool rok = true;
+            for (const auto& r : req)
+                if (!ak.count(r)) { rok = false; break; }
+            if (score > best_score) {
+                best_score = score;
+                best.clear();
+                best.push_back({name, rok});
+            } else if (score == best_score) {
+                best.push_back({name, rok});
+            }
         }
     }
-    return tie ? "" : best;
+    if (best.size() == 1) return best[0].name;
+    std::string pick;
+    for (const auto& c : best)
+        if (c.req_ok) {
+            if (!pick.empty()) return ""; // >1 required-satisfied: genuine ambiguity
+            pick = c.name;
+        }
+    return pick;
 }
 
 // Drift mode 7 (2026-07-08, base Qwen3.6-27B-MTP on the CC schema, first turn,
