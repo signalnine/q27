@@ -8,202 +8,111 @@ scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
 `CANON_MD5=` env overrides; Qwopus3.6-27B-v2-MTP canonical `4c4120c7...`).
 Historical numbers in this README were measured on Qwopus unless noted.
 
-**Baseline reference numbers** (2026-07-09 campaign, master 197d6b6,
-production config `Q27_KV=fp8 Q27_PMIN=0.5 Q27_MAXD=auto Q27_DEXIT=1
---fast-head`, server-replay medians; full tables in BUILDLOG):
+**Reference numbers** (2026-07-10, master, vanilla model, 5090; full
+tables in BUILDLOG):
 
-- Decode @~26K: 160-185 t/s by flavor at auto (echo 184.5 / codegen 182.8 /
-  docs 173.0 / testgen 160.2); cctx (real-CC) 162.1, fixed d6 165.7.
-- Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (2206 t/s).
-- Sampling tax @8K: -6.1% at T=0.7/top-p 0.95, acceptance preserved.
-- Shortbench suite 161.1; canonical `a2982c51` EXACT.
-- Fine-tune headroom: Qwopus on the same binary/payload runs +35% on cctx
-  (219.0 at auto) -- pure spec-acceptance (5.82 vs 3.56 tok/round).
+- Short-bench suite **172.2 t/s** (fp16 stock CLI, 5-prompt mean; canonical
+  `a2982c51` EXACT). History: 161.8 (07-09) -> 149.5 (width-12 param-copy
+  regression, caught by this suite) -> 172.2 (`__grid_constant__` fix --
+  ABOVE the old baseline; the per-thread param copy predated width-12).
+- Decode @26K (server replay, constructed cctx payload, fp8 basin):
+  classic config 143.0 / **full default stack 176.3 t/s** (+23%).
+- Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
+  server 400.6 t/s** -- the engine record.
+- Live Claude-Code traffic (vanilla triplet, T2/T5/T8): 213-227 t/s
+  aggregate per task, per-request median 209-264, **peak 362 t/s**;
+  suffix drafter AL 8.4-9.6 on 24-31% of decode.
+- Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (~2200 t/s).
+- Cross-engine (same model, GPU, harness, day -- 2026-07-10 A/B):
+  **q27 +40% decode vs llama.cpp's best config** (221 vs 157 t/s aggregate;
+  draft-mtp10/p-min0.5/fa on Q5_K_M), 1.8-3.5x end-to-end task wall at
+  matched scores. llama's one winning cell: ngram speculation on a pure
+  token loop (889 t/s -- degenerate case; q27's suffix cap of 12 does not
+  bind on real traffic).
+- Fine-tune headroom: Qwopus +35% on acceptance alone (07-09 same-binary
+  cctx replay, 219.0 vs 162.1 at auto). Its live triplet (pre-
+  `__grid_constant__`): 197-222 t/s aggregate, peak 320.
 
-## State of the engine (2026-07-08)
+## State of the engine (2026-07-10)
 
-- **Adaptive draft-depth ladder 4..6 SHIPPED (2026-07-08, maxd6):** the spec
-  round can now draft/verify to depth 6 (7-lane verify, perm mod-7, +157 MB GDN
-  state), controlled by a 3-bar controller (`src/depthctl.h`, CPU-tested;
-  engine-lifetime carry by default, `Q27_MAXD_RESET=1` for per-request
-  isolation): promote 4->5 at sustained ceiling-saturation >= 0.50, promote 5->6 at
-  >= 0.60, demote on conditional top-lane yield < 0.35 (the measured win/loss
-  crossover) or on level-6 margin-run firing < 0.45. Ships ONLY as
-  `Q27_MAXD=auto` (fixed `Q27_MAXD=6` exists for testing); binary defaults
-  untouched. Measured on a real-CC-transcript replay @25.8K (the traffic that
-  fires deep): d4 202.6 / d5 216.1 / d6 222.0 t/s, 7-token rounds on 64% of
-  rounds, **auto 220.7 vs d5 211.9 = +4.2% same-harness** (server replay,
-  2026-07-09 review rerun; the original +4.7% mixed a warm-server auto number
-  with a CLI d5 leg). Emitted text byte-identical at every ceiling
-  (canonical 4c4120c7 EXACT at d4/5/6/auto). Envelope payloads that don't
-  saturate never promote past 5 (within noise of the 4..5 ladder). This
-  reverses the 07-07 maxd6 NO-GO on refreshed economics -- docs/maxd6-decision.md
-  carries the full audit trail (NO-GO -> GO-IF rerun -> build gates).
-- **Acceptance tuning (2026-07-08, accept-gate Phases 0-1):** re-measured the
-  depth economics post-verify-gemv and found the d5 win/loss crossover at
-  **conditional lane-5 yield ~0.35** -- half the maxd6-era estimate; fixed-d5 is
-  now >= d4 on every 26K payload flavor and loses only at 61K low-yield
-  (-1.7%). Controller fixes that fell out: yield EMA is now CONDITIONAL on the
-  lane firing (the old unconditional EMA sat above the demote bar on traffic
-  where depth-5 measurably lost), promote seed clamped, `maxd_lo` 0.10 -> 0.35.
-  **Production rec is now `Q27_PMIN=0.5 Q27_MAXD=auto`** (+2.7% geomean over
-  the d4-gated rec across the payload envelope, and it beats both fixed
-  ceilings). New telemetry: per-lane fired/accepted counters (`glf=`/`gla=` in
-  `[req]`) -- the conditional yields the gch/gnh marginals cannot reconstruct.
-- **Verify-GEMV latency fix (2026-07-08): +5.9% decode @61K.** ncu attribution
-  showed the batched verify GEMV LATENCY-bound at 39-47% of DRAM peak
-  (long_scoreboard 90% of the inter-issue gap) -- the per-column activation
-  loads, not the weight stream. Widening them (4x uint2 -> 2x uint4) is
-  bitwise by construction: 163.2 -> 172.9 t/s @61K on the current fixtures.
-  Tensor-core verify (canonical-breaking) NOT justified -- dp4a issue was never
-  the limiter. docs/perf-attribution-verify-gemv.md.
-- **fp8 QK^T MMA prefill DEFAULT-ON (2026-07-07/08): +11.8% @128K.** New
-  `mma.sync.m16n8k32.e4m3` prefill-attention kernel consumes fp8 KV directly
-  (Q staged as e4m3, bank-conflict padding load-bearing at +6.9pp). Cold 128K
-  prefill **68.3 -> 59.6s** (~2200 t/s). Quality battery: logit cosine
-  0.9999827 + argmax-match at position 131072, needle **6/6 to ~301K**
-  (beyond the 262K native limit). fp16-KV path and canonical untouched;
-  `Q27_PF_FP8MMA=0` opts out, <sm_89 auto-falls-back.
-- **Strict-parser A/B resolved (2026-07-08):** the tolerant tool-call parser is
-  LOAD-BEARING -- see "Open quality gates" below for the full verdict (T8:
-  tolerant 0.837 / strict 0.000 / strict+constrain 0.549) and the honest
-  system-fairness framing.
-- **Agentic serving unblocked (2026-07-06):** the SERVING-layer tool-call parser
-  -- not the quant, not sampling -- was the ceiling on agentic scores. Three
-  drift-mode fixes took Claude Code from one-shot-quit basins (score 0, the model
-  emits a malformed tool call, gets no tool_use, and ends the turn) to full 65-92
-  turn trajectories: **CC 0.00 -> 0.55, CRUSH greedy 0.095 -> 0.48** on the
-  analytics-dashboard task. Fixes (docs/BUILDLOG.md 2026-07-06): write-content
-  (`"content": "CODE</content>` -- unescaped multi-line bodies), mode-6
-  name-dropped calls (`{"name":\n{args}}` with the name string absent; the tool is
-  inferred from the arg-key signature), and a dangling `{"name":` prefix before a
-  batch of valid calls. Greedy canonical 4c4120c7 untouched throughout.
-- **Sampling shipped end-to-end and cleared to default (2026-07-06):** Phase 2
-  (spec rejection sampling) brings `temperature>0` up to spec speed on the depth-4
-  round; the exit-gate A/B **PASSED** -- sampled T=0.7 >= greedy on both harnesses,
-  no regression, no new drift mode -- so sampling is cleared to default at
-  T<=0.7 / top_p 0.95 (server `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P`; explicit request
-  temperature still wins). Greedy stays bitwise. docs/sampling-exit-gate.md.
-- **P14 perf-levers bundle landed (2026-07-07, merged to master same day):**
-  five decode changes, reported as same-prompt A/B t/s deltas only
-  (n=1 t/s is near-deterministic; no cross-prompt or score claims).
-  (1) **Fused draft argmax+margin** (`k_argmax_top2`) folds each draft's argmax
-  and its P12 gate margin into one full-vocab pass, killing the 4-5 dead
-  `k_margin` scans that were baked into the ungated round (-0.545 ms/round).
-  (2) **P12 confidence gate ported to the production SAMPLED spec path** (was
-  greedy-only). (3) **Draft early-exit** (`Q27_DEXIT`, default-ON when
-  `Q27_PMIN` is set) stops DRAFTING at the first sub-theta margin -- llama's
-  p_min draft-stop parity, which the P12 verify-only gate never had -- with a
-  `min(W,md_used)` width-floor top-up that keeps emitted bytes AND round counts
-  bitwise-identical to the monolithic draft. (4) **fd2 lane-innermost grid
-  order** co-schedules the verify lanes onto the same KV chunk for partial
-  cross-lane L2 reuse (**+2.7% @61K ungated, MARGINAL-KEPT** -- in the
-  [+1.5%,+3%) band, above the revert floor but below an unqualified keep; the
-  residual R~4.25 headroom is the deferred lane-pair-fusion target). Greedy
-  stays bitwise throughout (canonical 4c4120c7 unchanged). **Headline
-  same-config @61K docs greedy: ungated 109.9 -> 119.3 t/s across the bundle
-  (Task 2 fusion + Task 5 L2); production gated config (`Q27_PMIN=0.5` +
-  `Q27_DEXIT`) 124-125 t/s.** Sampled @61K gated+dexit **+3.6% over ungated**.
-  Key finding (Task 3): verify-narrowing ALONE is acceptance-NEGATIVE under
-  sampling -- a low-margin draft the sampler might still accept gets skipped, so
-  tok/round drops and the cheaper round only breaks even (+0.0% @61K) -- so it is
-  draft-side early-exit (Task 4), not the verify gate, that makes the sampled
-  gate pay. Production recommendation: gate ON both paths with `Q27_PMIN=0.5` as
-  the cross-path default (greedy also tolerates theta=1.0 for +4.9%, but sampled
-  theta=1.0 nets -2.1% vs ungated @61K, so 0.5 is the safe default). Attribution:
-  docs/perf-attribution-p14.md. The depth-6 (`gate_maxd`) question was
-  answered in three acts -- 07-07 NO-GO, 07-08 GO-IF rerun on refreshed
-  economics, 07-08 build (the 4..6 ladder above); docs/maxd6-decision.md keeps
-  all three verdicts.
-- Decode at depth (the metric that matters for agentic work): **172.9 t/s
-  ungated @61K on the current (2026-07-08) fixtures** after verify-gemv;
-  **202-223 t/s @26K on real-CC-transcript replay** (d4-gated to auto-ladder).
-  Fixture caveat: the docs corpus was regenerated 2026-07-08 and its
-  acceptance is higher than the P14-era corpus, so 172.9 is NOT comparable to
-  the P14-era 119-125 -- the ms/round attribution is the cross-era anchor
-  (reproduced +-0.6%). History: 78.0 pre-fd2 -> 126.2 fd2 -> 119-125 P14-gated
-  (old corpus) -> 163.2 -> 172.9 verify-gemv (new corpus). attn-fd2 fixed the
-  third SM-starvation disease (attention was 99% of depth cost at 5% DRAM BW,
-  now ~45%); verify-gemv fixed the fourth (GEMV latency-bound on activation
-  loads, not weight bandwidth)
-- Decode short-ctx: **179.7 t/s** short-bench suite mean (5 fixed prompts,
-  `tools/shortbench_suite.sh`, 2026-07-08; per-prompt spread 167-202 on
-  trajectory alone) / **209.2** stock 2K soak (4.32 t/round, pre-verify-gemv).
-  The old single-prompt short-bench number is retired as a benchmark -- it
-  re-rolled 177.5 -> 160.2 on one argmax tie while per-round cost moved +1.3%;
-  it survives only as the bitwise gate (see Decode methodology)
-- Prefill: cold 28.5K TTFT **~15.0s** after P1-P6 (was 63.8s at P1 start);
-  cold 128K **59.6s (~2200 t/s)** after the prefill-attn pair (cp.async
-  prefetch +5.4% and fp8 QK^T MMA default-on +11.8%, both 2026-07-07/08)
-- Context: fp8 KV ceiling **~355K**, correctness validated to **361K** (risk 5)
-- Quality: Thunderdome **0.786 vs 0.786** dead even against Q5_K_M (30
-  trials/leg, 2026-07-03); same-day spot A/B 2026-07-05 (n=1/task):
-  collab q27 0.847 vs llama 0.843, analytics q27 0.825 vs llama 0.478.
-  Do NOT read the analytics delta as an engine win: analytics is bimodal on
-  BOTH engines (this week's greedy draws -- q27 {0.49, 0.60, then 0.79-0.85
-  x6}, llama {0.478-0.483 x3, 0.83 x2}; the 30-trial A/B scored the task a
-  variance wash, delta -0.073 AGAINST q27). One draw per leg cannot
-  separate the engines; llama sampled its low basin that day, q27 didn't
-- Agentic wall time vs llama.cpp (same-day A/B 2026-07-05): collab q27 230s
-  vs llama 120s -- q27 **1.92x slower** at equal score (0.847 vs 0.843);
-  analytics q27 180s vs llama 190s, but the llama leg sat in its low-score
-  takes it). Decode RATE at depth -- DEPTH-MATCHED cross-engine, multi-prompt
-  confirm 2026-07-07 (4 flavors @~75.4K matched tokens, single-stream greedy,
-  post-P12/P14 q27 gated Q27_PMIN=0.5 vs tuned llama draft10/pmin0.5): **PARITY
-  on mixed traffic** (P1-P3 geomean q27 120.6 vs llama 119.6) -- q27 wins
-  transcript +10.7% (123.3 vs 111.4), ties repro (153.0 vs 154.4), loses code
-  ~7% (93.1 vs 99.5). llama's edge is the NEAR-VERBATIM tail: pure-echo payload
-  229.9 vs 158.0 (+45%) -- its depth-10 drafts beat q27's then-depth-4/5
-  ceiling when acceptance saturates. The 07-08 ladder reaches depth 6 there
-  (7-token rounds on 64% of rounds on CC-flavor traffic), narrowing that tail;
-  no fresh cross-engine echo A/B has been run since, so the +45% stands as the
-  last measured number. The 07-06 n=1 "-31%" (q27 145.6 ungated vs
-  190.3) was prompt-specific (repro-flavored slice) AND pre-P12 -- retired.
-  The collab wall gap is OUTPUT VOLUME, not rate (q27's basin wrote 22K tokens vs
-  llama's ~11K) -- a prompt/sampling lever, not an engine one. The llama
-  leg was NOT handicapped: mainline b9857 with hybrid context checkpoints
-  active -- its A/B server log shows LCP prefix reuse with f_keep ~0.99 at
-  62-65K ctx (per-turn prompt evals of only ~0.2-1.3K tokens) and draft-mtp
-  mean chain 4.8-7.0
-- Serving: multi-slot (`--slots N`) with R1b round-granularity GPU
-  time-slicing (FIFO gate + engine yield hooks; queue-wait class dead,
-  outputs byte-identical solo vs interleaved); server defaults fp8 KV
-  (opt out `--kv-fp16`). `--constrain-tools`: the engage-lag hole is FIXED
-  (P15, 2026-07-07): the round is truncated at the `<tool_call>` marker and
-  re-finished from resident per-lane state, so every in-grammar byte
-  (including the whole tool name) is decided under the mask -- verified by
-  round-phase invariance, zero disengages, sanitizer-clean, canonical
-  bitwise (tools/constrain_gate.sh). Serving-state gates shipped with it:
-  clear-at-claim, sticky pool-full disengage, split-brain id rebind, `tg=`
-  telemetry. Still not DEFAULT-on: in-grammar acceptance is capped 1/round
-  (~22 t/s inside call bodies; cost soak pending) and the strict-parser
-  rerun (zero rescues both legs -- the engine-true tie proof) is now
-  UNBLOCKED but not yet run. Constraint is wired on the Anthropic
-  `/v1/messages` path only
-- Claude Code as harness (same-day A/B 2026-07-05, native Anthropic BOTH
-  engines, no proxy either leg -- build log): T8 q27 **167s @ 0.82** vs
-  llama 222s @ 0.50, the day's only matched-basin pair; first real-client
-  P9 checkpoint restore; 2.47M tokens served from prefix cache in that one
-  trial. T2 drew a deterministic one-shot-quit basin -- since ROOT-CAUSED to
-  mode-6 tool-call drift (the model emits `{"name":\n{args}}`, the parser can't
-  recover it, CC gets text-only and ends the turn) and FIXED 2026-07-06, so that
-  basin no longer costs the turn. Load-bearing fix: cch
-  billing-header normalization (2026-07-05) -- without it Claude Code's
-  mutating prompt head forces a full re-prefill every turn
-- P10-A status: A0 PASSED, A1 SHIPPED (R1 + R1b, 2026-07-04). Decode-at-depth
-  attributed and fixed (fd2, 2026-07-05). Claude-Code robustness shipped
-  (`/v1/messages/count_tokens` + context-limit error shape, 2026-07-05).
-  Sampling Phases 1+2 shipped (plain-path top-p + Gumbel-max, then spec rejection
-  sampling at spec speed; greedy bitwise) and the exit-gate A/B PASSED
-  (docs/sampling-exit-gate.md). Tool-call parser drift fixes unblocked agentic CC
-  (2026-07-06). A2 fusion / light utility slots only if telemetry shows
-  engine-claim waits dominating
+One day, five shipped stages -- each gated (canonical EXACT / byte-identity
+/ sanitizer / test suites) and pushed; details + negatives in BUILDLOG:
+
+- **Width-12 verify architecture.** The lane fabric widened 8 -> 12 (p[16]
+  struct family, 12 GDN role sets, perm mod 12, 12-perm graph zoo,
+  prep/finish pointer-struct signatures). Policy-decoupled: the MTP ladder
+  stays 4..7; widths 9..12 belong to the **suffix drafter** (`Q27_SUFFIX_W`,
+  default 12), which fills draft lanes from recurring committed-stream
+  suffixes at zero model cost. Live T8: **AL 10.61 on 61.6% of decode**
+  (same fire rate as width-8, +63% tokens per fire -- the cap-release
+  mechanism the plan predicted), good-basin score 0.84. Byte-identical to
+  the pre-widen binary under fd2 by construction.
+- **fdmma verify attention, tuned 1.75x in a day.** The fp8-MMA shared-KV
+  verify kernel went 354.7 -> 282.4 (STAGES=1: single-buffered K/V at
+  **2 CTAs/SM** -- ncu showed the 1-CTA kernel 89% no-eligible) -> **202.6us
+  at 61K W=12 (5.6x over fd2)** via the split-count retune (ns =
+  SMs*2/kv_heads, computed per GPU -- 128 splits left a half-empty wave).
+  Three negatives attributed and recorded: prefetch reorder (wash),
+  warp-pair PV and warp-specialized producer (both bitwise-correct, both
+  lose -- for this kernel family CTA count dominates intra-CTA
+  orchestration; reopening bar filed).
+- **`__grid_constant__` on every struct-param kernel.** The vanilla
+  short-bench suite caught an 8% engine-wide regression the depth gates
+  missed: by-value lane structs indexed by blockIdx are copied to
+  per-thread LOCAL memory (128B since P10-A0; width-12 doubled it).
+  The fix is addressing-only (bitwise) and lands the suite at 172.2 --
+  above the pre-width-12 baseline. Standing lesson: the short-ctx suite
+  is the param/launch-overhead canary; run it after any plumbing change.
+- **Zero-config Claude-Code serving.** A bare `q27-server model.q27
+  model.tok` now IS the full measured stack (see Serving) with VRAM-sized
+  auto `--ctx`; the CLI keeps reference defaults so the bitwise canonical
+  world is untouched. The standing eval unit is a two-argument command.
+- **Deep-MTP question closed (width-12 P3).** On the freshly measured
+  wide-round curve, MTP ceilings 9/10 price NEGATIVE even on the hottest
+  chains (acceptance saturates at 4.79 tok/rnd vs 2.7-3.2ms marginal
+  lanes); ceiling 8 prices +2.7% MTP-wall on hot chains but the live cap
+  mix (16% full-fire at 7, sat7 ~25%) plus suffix shadowing shrink it
+  under 1% engine -- NO-BUILD, reopen conditions filed. The wide-lane
+  marginal is **GEMV-N-bound**, not GDN-bound: the deferred-snapshot GDN
+  chunk stays shelved; the honest lever for cheaper wide rounds is the
+  mma16 batched-GEMM verify pivot (on file, not commissioned).
+
+**Cross-engine (2026-07-10, the cleanest read yet):** both engines on
+vanilla qwen, same 5090, same Claude Code harness, back to back -- q27
+zero-config vs llama.cpp Q5_K_M at its best config (draft-mtp10,
+p-min 0.5, fa): scores converge to the model (T2 0.84 == 0.84; T5
+0.78/0.81; T8 llama drew the documented engine-independent bad basin),
+**decode q27 +40%** (221 vs 157 t/s aggregate; peaks 362 vs 259), wall
+1.8-3.5x. Arc for honesty: tuned llama was +31% at depth on 07-06, parity
+on 07-07, q27 +40% today; llama's ngram spec still owns the degenerate
+pure-loop echo (889 t/s vs 318 -- unbounded draft length vs q27's 12-lane
+cap, which real traffic never reaches).
+
+**Carried state (pre-2026-07-10, still load-bearing):**
+
+- Adaptive draft ladder 4..7 (`Q27_MAXD=auto7`, now server default): 3-bar
+  controller (`src/depthctl.h`), emitted text byte-identical at every
+  ceiling. docs/maxd6-decision.md has the NO-GO -> GO-IF -> build trail.
+- Confidence-gated depth + draft early-exit (`Q27_PMIN=0.5` +
+  `Q27_DEXIT`, now server defaults): P12/P14; greedy width-invariant, sampled
+  gate pays only with draft-side early-exit.
+- fp8 KV end-to-end (now server default; needle 6/6 to 361K, fp8 QK^T MMA
+  prefill +11.8% @128K, fp8-PV +2.4%); fp16 CLI canonical untouched.
+- Sampling at spec speed (Phases 1-2, exit-gate PASSED, cleared to default
+  T<=0.7/top-p 0.95; greedy stays bitwise).
+- Agentic serving: the tolerant tool-call parser is load-bearing (drift
+  modes 1-8 fixed; CC 0.00 -> 0.55 was a PARSER ceiling, not quant);
+  `--constrain-tools` P15 engage-lag fixed, still opt-in (in-call cost).
+- Multi-slot serving (`--slots N`) with R1b round-granularity GPU
+  time-slicing; P9 same-session checkpoint ring; P8 stable-prefix snapshot
+  (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`.
+- Long-context: validated to 361K needle 6/6 (fp8); ~355K fp8 KV ceiling.
 
 ## Why this model is a good target
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2, opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~355K (was ~370K before P3's 5th GDN buffer set) -- the advertised 262K native fits** (allocates and runs; correctness validated to 361K, see risk 5)
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2; server default since 07-03, arch-gated sm_89+ with the `Q27_PROFILE=ref` escape 07-10; CLI opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~285K est. post-width-12 (~355K before the role sets grew 5 -> 12; +627MB) -- the advertised 262K native still fits** (allocates and runs; correctness validated to 361K, see risk 5)
 - The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
 - Measured baseline to beat: llama.cpp mainline (b9857, `--spec-type
   draft-mtp`, Q5_K_M, greedy) at 106-127 t/s single-stream on this box;
@@ -217,7 +126,8 @@ production config `Q27_KV=fp8 Q27_PMIN=0.5 Q27_MAXD=auto Q27_DEXIT=1
   (6->10 buys ~0-1); draft=6/p_min0 (our old A/B config) 102.4 t/s vs
   draft=10/p_min0.5 117.9. So the honest strongest-llama decode baseline is
   **~117 t/s @2K**, and our earlier A/B UNDER-STATED llama by ~15%. Depth-matched
-  measurement still owed before any headline cross-engine wall/rate claim.
+  confirm DONE 07-07 (parity); superseded by the 2026-07-10 same-model A/B
+  (q27 +40% decode) -- see Reference numbers.
 
 ## Architecture facts (ground truth from GGUF metadata)
 
@@ -277,21 +187,28 @@ These numbers are NOT interchangeable -- each answers a different question:
 
 - **Short-bench suite** (SOTA-comparable): 5 fixed genre-diverse short
   prompts x 128 tokens, `--spec`, STOCK clocks -- `tools/shortbench_suite.sh`.
-  **verify-gemv era (2026-07-08): 179.7 t/s mean** (fd2 era 169.4; per-prompt
-  spread ~167-202, t/round 3.20-3.88). The per-prompt spread is
-  trajectory/acceptance variance, which is exactly why no single short prompt
-  may carry a cross-engine number.
+  **Current (2026-07-10, vanilla baseline): 172.2 t/s mean** (per-prompt
+  143.9-179.9; vanilla series 161.8 on 07-09 -> 172.2 post
+  `__grid_constant__`). Qwopus-era historical mean: 179.7 (07-08). The
+  per-prompt spread is trajectory/acceptance variance, which is exactly why
+  no single short prompt may carry a cross-engine number. It is also the
+  param/launch-overhead CANARY: it caught the width-12 param-copy regression
+  the depth gates missed (07-10).
 - **Canonical prompt** (bitwise gate, NOT a benchmark): 128 tokens from the
-  5-token canonical prompt, md5 4c4120c72056aba2bc2d2561471eafce -- held
-  bitwise through fd2, P12-P15, fp8q prefill, verify-gemv, and the maxd6
-  7-lane widening (and at every gated ceiling 4/5/6/auto). ~168-170 t/s /
-  3.25 t/round on trajectory; `Q27_FD=v1` reproduces the pre-fd2 text
-  bit-for-bit. Tie-lottery sensitivity is why it gates bitwise identity and
-  nothing else.
+  5-token canonical prompt -- vanilla baseline md5 `a2982c51...` (the
+  standard; ~140 t/s on 07-10 trajectory), Qwopus `4c4120c7...` for
+  fine-tune gating (~168-170 t/s fd2-era). Held bitwise through fd2,
+  P12-P15, fp8q prefill, verify-gemv, the maxd6/7 widenings, the FULL
+  width-12 widening (8 -> 12 lanes, perm mod 12), fdmma STAGES=1, and
+  `__grid_constant__`; `Q27_FD=v1` reproduces the pre-fd2 text bit-for-bit.
+  Tie-lottery sensitivity is why it gates bitwise identity and nothing
+  else. It gates the CLI's reference defaults; the server's CC defaults are
+  deliberately tolerance-class (fp8+mma) -- `Q27_PROFILE=ref` restores
+  reference behavior there.
 - **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
   STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
   short-ctx split tax). Headline for agentic reply-length outputs.
-- **Depth numbers**: **172.9 t/s ungated @61K** (verify-gemv, 2026-07-08
+- **Depth numbers** (Qwopus 07-08-era history; CURRENT depth predictors are the 07-10 Reference numbers: cctx 26K 143.0/176.3 vanilla, live CC 213-227 t/s aggregate): **172.9 t/s ungated @61K** (verify-gemv, 2026-07-08
   fixtures -- NOT comparable to the P14-era 119-126 on the old corpus; the
   ms/round attribution bridges eras); **202-223 t/s @26K real-CC-transcript
   replay** (d4-gated -> auto-ladder-6); **156-164 t/s effective** across real
@@ -306,7 +223,7 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
 ## Design decisions
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF (container spec: docs/FORMAT.md).
-- **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships opt-in via `Q27_KV=fp8` (P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32.
+- **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships as the SERVER default (since 07-03; arch-gated + profile-escaped 07-10; CLI opt-in via `Q27_KV=fp8`, P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- the CLI default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline tools are Python: tools/repack.py (runs once; docs/FORMAT.md) and tools/gguf_to_hf.py (certified GGUF -> HF inversion, 866/866 tensors byte-exact, for cross-engine reference runs).
 - **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
@@ -401,8 +318,9 @@ decode.** `Q27_PMIN=theta` caps the verify width on the drafter's top1-top2
 margin (skipping the deep-KV verify when the draft head is unconfident), and
 `Q27_DEXIT` (P14, default-ON whenever `Q27_PMIN` is set) additionally stops
 DRAFTING at the first sub-theta margin -- the llama p_min draft-stop that the
-verify-only gate lacked. **Recommended production config (2026-07-08):
-`Q27_PMIN=0.5 Q27_MAXD=auto`** -- the adaptive 4..6 depth ladder
+verify-only gate lacked. **These are the server DEFAULTS since 2026-07-10** (`Q27_PMIN=0.5
+Q27_MAXD=auto7`; `Q27_PROFILE=ref` opts back out) -- the adaptive 4..7
+depth ladder
 (src/depthctl.h): promote when the current ceiling saturates (sat >= 0.50 for
 4->5, >= 0.60 for 5->6), demote when the top lane's CONDITIONAL yield drops
 below the measured breakeven (0.35) or, at level 6, when margin runs reach
@@ -418,8 +336,9 @@ under gating AND under any ceiling (only round count/segmentation + verify
 width change -- canonical 4c4120c7 EXACT at d4/5/6/auto); sampled output stays
 seeded-reproducible. Note: under `auto` the round SEGMENTATION varies with the
 controller's EMA state (e.g. across identical replays on one server), so round
-counts are not replay-deterministic mid-convergence -- tokens always are. Gate
-OFF by default (`Q27_PMIN` unset) -> zero risk to traffic that does not opt in.
+counts are not replay-deterministic mid-convergence -- tokens always are. The gate
+is ON by default on the server (`Q27_PMIN=0.5` since 07-10); the CLI and
+`Q27_PROFILE=ref` leave it unset, so reference/canonical traffic is untouched.
 
 ## Progress log (tg t/s, greedy, token-identical output verified each step)
 
@@ -526,7 +445,17 @@ P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Recently shipped (2026-07-05 -> 08):** `/v1/messages/count_tokens` + the
+**Recently shipped (2026-07-10):** width-12 verify + suffix width 12 (live
+AL 10.6); fdmma STAGES=1 2-CTA + computed split count (5.6x fd2 at 61K
+W12); `__grid_constant__` param fix (suite 172.2, above the old baseline);
+zero-config CC serving defaults + auto `--ctx` + `Q27_PROFILE=ref`; P3
+verdicts (MTP 9/10 NO-GO, 8 NO-BUILD, GDN chunk shelved -- wide marginal is
+GEMV-N-bound; mma16 GEMM-verify pivot is the filed lever); vanilla + llama
+cross-engine A/Bs. Open engine ideas, none commissioned: Saguaro-style
+3090 off-path drafting; mma16 GEMM verify; W=16 revisit if live suffix AL
+ever jams at 11.
+
+**Previously shipped (2026-07-05 -> 08):** `/v1/messages/count_tokens` + the
 Anthropic-shaped context-limit error; sampling Phases 1-2 + the exit-gate A/B
 (passed); the tool-call parser drift fixes that unblocked agentic Claude Code;
 P12 confidence-gated depth (`Q27_PMIN`); the P14 perf-levers bundle (merged);
@@ -590,7 +519,7 @@ theta the offline margin bins predicted. The prior fixed-depth (P3), adaptive-de
 and burst-depth negatives were all UNGATED or accept-count-gated and did not cover
 this. **P12b depth-5** (`Q27_MAXD=5`, opt-in) works but is traffic-dependent
 (+2.6% agentic vs -8% docs -- Path C always drafts to gate_maxd, so the 5th MTP
-pass is pure cost at low acceptance), so depth-4 is the default. Adaptive maxd
+pass is pure cost at low acceptance), so depth-4 was the default at P12 time [the server default is `Q27_MAXD=auto7` (ladder 4..7) since 07-10]. Adaptive maxd
 (P13, `Q27_MAXD=auto`) floats the ceiling 4..5 per stream from realized
 acceptance. On branch `p12-confidence-gated-depth` (Phase-0/0b margin
 measurement + implementation; see BUILDLOG).
@@ -610,7 +539,7 @@ docs/perf-attribution-p14.md.
 
 **Open decode/prefill levers (post-maxd6):**
 - **prefill-attn Phase 3 (occupancy; requires Gabe's explicit go on the
-  smem-relayout).** The prefill-attention kernel is OCCUPANCY-bound (12.5%,
+  smem-relayout).** [RETIRED 07-09: Phase 3a doubled occupancy for -1% TTFT -- the kernel is BARRIER-serialized, not occupancy-bound; the filed follow-up is the async producer/consumer + mbarrier rewrite (Eligible-Warps target).] The prefill-attention kernel was believed OCCUPANCY-bound (12.5%,
   dual register+smem limiter, DRAM 2%/tensor 33%); cp.async and fp8-MMA
   captured the latency-hiding wins available WITHIN 6 warps. A 2-CTA/SM play
   needs both a register cut (the o[32][4] accumulator = 128 regs) and smem
