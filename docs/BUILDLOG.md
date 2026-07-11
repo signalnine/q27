@@ -3686,3 +3686,17 @@ trajectories); decode telemetry is the claim, wall is context.
 Publish-gate ledger: parity bar passed at +47% on the protocol-grade
 measurement. Remaining before any writeup: nothing on the measurement
 side. qwopus standing env restored after the run.
+
+## 2026-07-10 -- statistical register correction on the n=3 robustness read
+
+The 8/9-vs-5/9 trial-robustness split and the T8 2/3-vs-1/3 basin split
+CANNOT carry weight at n=9/leg (Fisher's exact p ~= 0.29 on the
+robustness table; the T8 split is one draw). Both demoted from
+"signal" to descriptive observations in the README; the claims that
+stand statistically are the score-median convergence and the +47%
+within-leg decode gap (430 requests of telemetry). Also promoted into
+the README: the protocol's 07-05 filing date (acceptance criteria
+predate the result -- the credibility asset), replication direction
+(+40% n=1 -> +47% n=3), and quality parity scoped as a SYSTEM-level
+claim with the strict-parser reality stated plainly (strict = 0.000 on
+T8-class for any engine; the tolerant parser is load-bearing).

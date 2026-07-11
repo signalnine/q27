@@ -24,18 +24,27 @@ tables in BUILDLOG):
   requests): **231.3 t/s aggregate**, per-request median 225 / p75 277 /
   **peak 378 t/s**; suffix drafter AL 9.4 on 37% of decode.
 - Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (~2200 t/s).
-- Cross-engine (same model, GPU, harness, day -- 2026-07-10, the standing
-  n>=3 protocol: 3 trials x {T2,T5,T8} per engine, both legs strongest
-  config, no-think greedy CC harness): **q27 +47% decode vs llama.cpp's
-  best config** (231.3 vs 157.4 t/s aggregate over 430/197 requests;
-  medians 225 vs 155, peaks 378 vs 274; llama = draft-mtp10/p-min0.5/fa
-  on Q5_K_M). Score medians converge (T2 0.83 == 0.83, T5 0.78 vs 0.79);
-  T8 stays bimodal on BOTH engines (q27 2/3 good draws, llama 1/3).
-  Trial robustness over the 9 draws: q27 8/9 in-band vs llama 5/9 (one
-  0.00 and a 0.45 on llama's side) -- a serving-layer signal, held at
-  n=9. Wall medians favor q27 3-4x on T2/T5 but wall is
-  trajectory-confounded (llama generated ~2.3x tokens on its own
-  trajectories), so within-leg decode telemetry is the rate currency. Decomposition: q27 reads ~15.8GB
+- Cross-engine (same model, GPU, harness, day -- 2026-07-10, executing
+  the n>=3 protocol AS FILED 2026-07-05, five days before it could be
+  passed: 3 trials x {T2,T5,T8} per engine, both legs strongest config,
+  no-think greedy CC harness): **q27 +47% decode vs llama.cpp's best
+  config** (231.3 vs 157.4 t/s aggregate over 430/197 requests; medians
+  225 vs 155, peaks 378 vs 274; llama = draft-mtp10/p-min0.5/fa on
+  Q5_K_M; the n=1 pilot read +40% -- the number STRENGTHENED under
+  replication). The statistically solid claims: median convergence
+  (T2 0.83 == 0.83, T5 0.78 vs 0.79 -- quality is the model's) and the
+  within-leg decode gap (430 requests of telemetry). Score parity is a
+  SYSTEM-level claim: engine + serving-layer parser, and the tolerant
+  tool-call parser is load-bearing on this harness for any engine
+  (strict parsing scores 0.000 on T8-class tasks). Reported
+  descriptively, NOT as findings (n=9/leg cannot separate them --
+  Fisher's exact p~=0.29): raw draws q27 8/9 in-band vs llama 5/9
+  (llama's misses: one hard 0.00 at 443s, a 0.45, two bad T8 basins);
+  T8 bimodal on BOTH engines, q27 2/3 vs llama 1/3 good -- one draw
+  apart on a task documented as basin-lottery for every engine. Wall
+  medians favor q27 3-4x on T2/T5 but wall is trajectory-confounded
+  (llama generated ~2.3x tokens on its own trajectories), so within-leg
+  decode telemetry is the rate currency. Decomposition: q27 reads ~15.8GB
   weights/step at 5.25bpw vs Q5_K_M's ~18.2GB -- ~15% of the gap is
   bit-width on a bandwidth-bound decode, ~+22% is mechanism (suffix +
   ladder + fdmma + prefix cache); the Thunderdome quality tie (0.786 ==
