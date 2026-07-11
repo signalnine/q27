@@ -3881,3 +3881,38 @@ OPS: canonical a2982c51 re-verified clean (closes W_MAX commit f551561,
 whose in-session check returned the co-located-CLI-OOM empty-md5).
 Lesson re-logged: pkill -x q27-server also kills the standing eval unit
 -- name the PID or CUDA_VISIBLE_DEVICES-scope it.
+
+## 2026-07-11 -- turbo3 KV port phase 1: format+WHT+quant/dequant VALIDATED (microtest ALL PASS)
+
+Porting TurboQuant 3-bit KV (Gabe's llama-cpp-turboquant fork @c3e6dbb13)
+into q27. Phase-1 = de-risk the format before any engine wiring, done
+microtest-first against the CPU reference (ggml-turbo-quant.c).
+
+turbo3 = QuaRot-style: per-128-group L2-normalize -> forward Walsh-
+Hadamard (baked, seed-42 s1/s2 diagonals + butterfly) -> 8 Lloyd-Max
+centroids {+-0.190207,0.118786,0.066822,0.021663} scaled by a corrected
+per-block norm (grp_norm/recon_norm). block_turbo3 = 50B (fp16 norm +
+qs[32] 2-bit + signs[16] 1-bit) covering 128 dims. head_dim=256 = TWO
+groups, TURBO_D=128, no padding.
+
+SHIPPED: src/turbo3.cuh (shared device format: struct, centroids,
+TURBO_S1/S2[128] verbatim, WHT inv_sqrt_128, nearest-centroid, dequant
+helper); tools/turbo3_test.cu (faithful device port validated vs CPU
+oracle). RESULTS (5090): device quant == CPU (1/4096 midpoint tie),
+norm/dequant EXACT, round-trip q->deq->inverse-WHT cosine 0.983 (= the
+3-bit quality floor), and THE READ CONTRACT: WHT(q).dequant(K) vs true
+q.K score cosine 0.983 over 512 pairs -- proving the Q-rotate +
+rotated-K-storage math (the silent-wrong-output risk) is correct.
+Debug lesson: the device __constant__ arrays loaded fine; the initial
+"4096 mismatches" was a hand-typed oracle-array transcription bug in the
+test, not a port bug (device-only round-trip 0.985 isolated it).
+
+Build (Makefile target pending): nvcc -O2 -std=c++17 -arch=sm_120
+tools/turbo3_test.cu -o build/turbo3_test.
+NEXT (phase 1 cont., own session): block-addressed KV storage (8
+blocks/row = 400B, 2.56x vs fp8), k_kv_store3 turbo3 cooperative write,
+fd2 turbo3 read (k_attn_fd2_turbo3 + fd2_ld8_turbo3), forward-WHT on Q
+after rope + inverse-WHT on attnout post-combine, all behind
+Q27_KV=turbo3 with fp8/fp16 BITWISE. fdmma (dequant-to-e4m3 smem)
+deferred. Then the fresh quality gate (no head_dim=256 oracle -- PPL +
+needle on the q27 model). Full port spec: wf_f94f54d8-2ab.
