@@ -3659,3 +3659,30 @@ q27 at 75K, retired to PARITY on 07-07; today, post width-12 + fdmma
 tuning + defaults, the same-model comparison is q27 +40% decode and
 multiples on wall. The llama echo-ngram degenerate case (889 t/s,
 earlier entry) remains their one winning cell.
+
+## 2026-07-10 -- n>=3 CROSS-ENGINE PROTOCOL RUN: q27 +47% decode, score medians converge, 8/9 vs 5/9 trial robustness
+
+The standing final-A/B protocol (07-05: n>=3 per task, both legs
+strongest config, same day) executed: 3 x {T2,T5,T8} per engine, vanilla
+qwen both sides, q27 zero-config defaults vs llama Q5_K_M
+draft-mtp10/p-min0.5/fa, no-think greedy CC harness, back to back.
+
+SCORES: T2 q27 {.84,.81,.83} vs llama {.45,.84,.83} -- medians 0.83 ==
+0.83; T5 q27 {.78,.78,.78} (three identical draws) vs llama
+{.79,0.00,.82} -- medians 0.78 vs 0.79; T8 q27 {.83,.85,.56} vs llama
+{.57,.53,.83} -- the documented bimodality on BOTH engines, q27 2/3
+good draws vs llama 1/3. Trial robustness across the 9 draws: q27 8/9
+in-band; llama 5/9 (one hard 0.00 at 443s -- harness-terminal -- plus a
+0.45 and two bad T8 basins). Serving-layer signal, held at n=9.
+
+DECODE (within-leg, the rate currency): q27 231.3 t/s aggregate (430
+reqs / 137.5K tok; median 225, p75 277, PEAK 378 = new live record;
+suffix AL 9.4 on 37%) vs llama 157.4 (197 reqs / 313.5K tok; median
+155, p75 187, peak 274) = **q27 +47%** -- stronger than the n=1's +40%.
+WALL: q27 medians 86/97/145s vs llama 286/443/146s -- 3-4x on T2/T5 but
+trajectory-confounded (llama ~2.3x token volume on its own
+trajectories); decode telemetry is the claim, wall is context.
+
+Publish-gate ledger: parity bar passed at +47% on the protocol-grade
+measurement. Remaining before any writeup: nothing on the measurement
+side. qwopus standing env restored after the run.

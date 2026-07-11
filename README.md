@@ -20,18 +20,22 @@ tables in BUILDLOG):
 - Echo (repetitive traffic, wide suffix): 2K CLI 317.9; **26K zero-config
   server 400.6 t/s** -- the degenerate-echo CEILING, quoted as a bound,
   never a headline.
-- Live Claude-Code traffic (vanilla triplet, T2/T5/T8): 213-227 t/s
-  aggregate per task, per-request median 209-264, **peak 362 t/s**;
-  suffix drafter AL 8.4-9.6 on 24-31% of decode.
+- Live Claude-Code traffic (vanilla, n=3 x {T2,T5,T8} = 9 trials, 430
+  requests): **231.3 t/s aggregate**, per-request median 225 / p75 277 /
+  **peak 378 t/s**; suffix drafter AL 9.4 on 37% of decode.
 - Prefill (fp8 batched TTFT): 8K 2.35s | 32K 10.4s | 128K 59.4s (~2200 t/s).
-- Cross-engine (same model, GPU, harness, day -- 2026-07-10 A/B, no-think
-  greedy CC harness, n=1 per task pending the standing n>=3 protocol):
-  **q27 +40% decode vs llama.cpp's best config** (221 vs 157 t/s aggregate;
-  draft-mtp10/p-min0.5/fa on Q5_K_M), 1.8-3.5x end-to-end task wall at
-  matched scores. Caveats carried from the log: wall is
-  trajectory-confounded (llama generated ~1.8x tokens on its own
-  trajectories; T8's llama wall excluded -- bad basin), so within-leg
-  decode telemetry is the rate currency. Decomposition: q27 reads ~15.8GB
+- Cross-engine (same model, GPU, harness, day -- 2026-07-10, the standing
+  n>=3 protocol: 3 trials x {T2,T5,T8} per engine, both legs strongest
+  config, no-think greedy CC harness): **q27 +47% decode vs llama.cpp's
+  best config** (231.3 vs 157.4 t/s aggregate over 430/197 requests;
+  medians 225 vs 155, peaks 378 vs 274; llama = draft-mtp10/p-min0.5/fa
+  on Q5_K_M). Score medians converge (T2 0.83 == 0.83, T5 0.78 vs 0.79);
+  T8 stays bimodal on BOTH engines (q27 2/3 good draws, llama 1/3).
+  Trial robustness over the 9 draws: q27 8/9 in-band vs llama 5/9 (one
+  0.00 and a 0.45 on llama's side) -- a serving-layer signal, held at
+  n=9. Wall medians favor q27 3-4x on T2/T5 but wall is
+  trajectory-confounded (llama generated ~2.3x tokens on its own
+  trajectories), so within-leg decode telemetry is the rate currency. Decomposition: q27 reads ~15.8GB
   weights/step at 5.25bpw vs Q5_K_M's ~18.2GB -- ~15% of the gap is
   bit-width on a bandwidth-bound decode, ~+22% is mechanism (suffix +
   ladder + fdmma + prefix cache); the Thunderdome quality tie (0.786 ==
