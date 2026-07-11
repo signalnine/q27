@@ -1402,10 +1402,17 @@ int main(int argc, char** argv) {
                 // as text, no <tool_call> wrapper -- it already streamed as an
                 // output_text item (cosmetic), but codex needs it as a
                 // function_call to execute. Emit the recovered calls as items
-                // after the text (T5 task-queue failed exactly here).
-                if (tools.is_array() && !tools.empty()) {
+                // after the text (T5 task-queue failed exactly here). UNLIKE
+                // the Anthropic path, recovery runs even with empty `tools`:
+                // codex registers its shell tool as a hosted type this handler
+                // skips (so `tools` is empty) yet the model still emits bare
+                // calls for it -- the parser only recovers well-shaped
+                // name+arguments JSON, which codex validates against its own
+                // tool set, so a spurious recovery is harmless.
+                {
                     std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
+                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre,
+                                                          tools.empty() ? nullptr : &tools);
                     if (!bcs.empty())
                         fprintf(stderr, "[tool-fallback] %zu bare call(s) recovered (resp)\n",
                                 bcs.size());

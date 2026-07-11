@@ -3745,3 +3745,37 @@ finished emitting. Same class as the T8 auth-gate bimodality; CC handles
 T5 fine on the identical model, so it's codex-instruction-style-specific
 model behavior, not q27. Three harnesses now proven on q27 (Claude Code
 native Anthropic, CRUSH OpenAI chat, codex OpenAI Responses).
+
+## 2026-07-11 -- vanilla qwen x codex: T2 parity with CC, T5 is a model x harness basin (3 shapes, un-recoverable)
+
+Ran the codex triplet on VANILLA qwen (the published-numbers model).
+Result: T2 0.85 (== CC-on-vanilla 0.84-0.85), T8 auth-gate basin
+(0.51/0.23 draws -- bimodal on every engine), T5 0.00.
+
+T5 is a MODEL x CODEX-HARNESS basin, confirmed by three distinct
+un-recoverable malformations across three runs -- Qwopus: one 14,662-char
+bare exec_command heredoc, truncated mid-string; vanilla run 1: dropped
+the opening quote on the "arguments" key; vanilla run 2: emitted
+`{"name": "exec_command",` and abandoned the call mid-object. The common
+cause is the model, not the wire: under codex's tool-instruction style
+this model family mis-formats or abandons tool calls on T5, differently
+each trajectory; Claude Code drives the SAME models through T5 at
+0.78-0.81. q27 faithfully relays what the model emits.
+
+Two REAL parser fixes landed along the way (both correct, unit-tested,
+not basin-overfit -- they recover terminated bare calls in production):
+(1) Responses bare-call recovery no longer guards on non-empty `tools`
+-- codex registers its shell tool as a hosted type this handler skips,
+so `tools` is empty yet the model still emits bare calls for it; the
+parser only recovers well-shaped name+arguments JSON and codex validates
+names itself, so a spurious recovery is harmless. (2) drift mode 9:
+repair a dropped opening quote on the "arguments" key
+({"name":"X",\narguments":{...}} -> valid) -- "arguments" is the schema
+key so the repair is unambiguous inside these segments; unit-verified on
+the exact vanilla-run-1 bytes (recovers to a valid exec_command call)
+with no false-fire on prose containing `arguments"`.
+
+VERDICT: codex is a working third harness on q27 across both models
+(T2 parity with CC). T5's tool-formatting basin is a codex x
+model-family interaction to note, not a q27 bug to fix. q27-eval
+restored to the qwopus standing env.

@@ -606,7 +606,20 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         return out;
     }
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
-    const std::string text = escape_content_tags(text_in);
+    // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
+    // OPENING quote of the "arguments" key ({"name":"X",\narguments":{...}}).
+    // "arguments" is the tool-call schema key, so quoting a bare `arguments":`
+    // is unambiguous inside these segments. Applied before segmentation so
+    // both the whole-object and truncated-tail parse paths see valid JSON.
+    auto fix_arg_quote = [](std::string s) {
+        size_t p = 0;
+        while ((p = s.find("arguments\"", p)) != std::string::npos) {
+            if (p == 0 || s[p - 1] != '"') { s.insert(p, "\""); p += 11; }
+            else p += 10;
+        }
+        return s;
+    };
+    const std::string text = fix_arg_quote(escape_content_tags(text_in));
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
     const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
     size_t first = std::string::npos;
