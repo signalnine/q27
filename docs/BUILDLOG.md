@@ -3817,3 +3817,41 @@ AL 9.4 on 38% of decode. Throughput held across all categories.
 
 Blog quality claim now has breadth behind it: median 0.83 across 21
 tasks / 10 categories, zero crashes, at 233 t/s aggregate.
+
+## 2026-07-11 -- Q27_W_MAX build knob: narrow builds for smaller cards (3090 restored to ~49K)
+
+FINDING first: width-12 broke 3090 (24GB) serving. The default build
+OOMs at graph instantiation on the 3090 REGARDLESS of --ctx (fails at
+16K same as 49K) -- the 12-perm graph zoo + 12 GDN role sets + weights
+overflow 24GB before KV is even allocated. Width-8 era ran 32K at
+23.1GB; width-12 added ~1.5-2GB (4 role sets + 50% more captured graphs)
+and pushed it over. Also found: --ctx auto's fixed anchor (22.6GB) was
+calibrated on the 5090 fp8/mma path and (a) didn't scale with the graph
+zoo, (b) forced a 16384 floor that itself OOMed rather than failing
+clean.
+
+FIX: `-DQ27_W_MAX=N` (default 12, floor 8, cap 12). W_MAX controls the
+memory-scaling axis -- GDN role count, perm modulus, graph-zoo
+dimension, max verify width -- so a narrow build reclaims one role set
+(~157MB) + one perm's graphs (~130MB) per width dropped. Crucially
+separated from W_PLUMB=12, the FIXED lane-buffer plumbing (per-lane
+buffers i..l, p[16] structs, the 14-int finish outcome) that must stay
+12-wide regardless -- the narrow build's conflation of these was 5
+"too many initializer" compile errors, now clean. auto-ctx now
+W_MAX-scales the anchor and clamps to what fits (warns instead of
+forcing an OOM floor).
+
+GATES: default W_MAX=12 canonical a2982c51 EXACT (guards are alloc-only,
+zero behavior change); W_MAX=8 build canonical EXACT AND its
+gated-fp8-auto7 leg BYTE-IDENTICAL to the W_MAX=12 build (760801e0) --
+proving the narrow build is a pure memory reduction, no behavior change
+at the widths it supports (widths <=8 use the same role prefix by
+construction). 3090 measured with the W_MAX=8 + Q27_KV=fp8 build:
+serves 32K at 23.2GB, 49K at 23.8GB (generates correctly) -- BETTER
+than the old 32K because fp8 KV halves the per-token cost.
+
+Build narrow (until a Makefile knob lands):
+  nvcc <NVCCFLAGS> -DQ27_W_MAX=8 <sources> -o build/q27-server-w8
+3090 serving: build W_MAX=8, run with Q27_KV=fp8 (sm_86 CC profile
+arch-gates fp8 off, but fp8 KV storage works on sm_86 -- only the fdmma
+MMA kernel needs sm_89; force it), explicit --ctx up to ~49152.

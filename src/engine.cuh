@@ -39,8 +39,26 @@ static constexpr int MAX_GEN_TRACK = 65536;
 // width-12 (plan 2026-07-10): max verify width = lane count = GDN role count
 // = perm modulus. The MTP draft ladder stays policy-capped at 4..7
 // (D_MAX_MTP); widths 9..12 are reserved for the suffix drafter (P1).
-static constexpr int W_MAX = 12;
+// Q27_W_MAX build knob (2026-07-11): narrow builds for smaller cards.
+// Each width costs one GDN role set (~157MB/engine) AND one perm's worth
+// of the graph zoo (~1.5x captures from 8->12), so W_MAX=8 reclaims
+// ~1.5-2GB -- the difference between fitting and OOMing a 24GB 3090.
+// Floor 8 keeps the full maxd7 (4..7) ladder; cap 12 = the lane plumbing.
+// Struct arrays stay p[16]; the unused high slots are never dereferenced.
+#ifndef Q27_W_MAX
+#define Q27_W_MAX 12
+#endif
+static constexpr int W_MAX = Q27_W_MAX;
 static constexpr int D_MAX_MTP = 7;
+static_assert(W_MAX >= 8 && W_MAX <= 12, "Q27_W_MAX in [8,12] (>=8 for maxd7 ladder, <=12 lane plumbing)");
+// LANE PLUMBING is FIXED at 12, independent of W_MAX. The per-lane verify
+// buffers (i..l), the p[16] kernel structs, and the finish-kernel outcome
+// layout ({n, t1, dr1..dr11, pending} = 14 ints) are always 12-wide; W_MAX
+// only caps how many lanes go LIVE (verify width) + the role/perm/graph
+// count that scales memory. Arrays that LIST all lane pointers or read the
+// fixed outcome use W_PLUMB; arrays sized by live width use W_MAX.
+static constexpr int W_PLUMB = 12;
+static constexpr int OUTCOME_INTS = W_PLUMB + 2; // n, t1, dr1..dr11, pending
 
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
@@ -656,7 +674,7 @@ struct Engine {
         CUDA_CHECK(cudaMemset(d_pos_i, 0, 4)); CUDA_CHECK(cudaMemset(d_pos_j, 0, 4));
         CUDA_CHECK(cudaMemset(d_pos_k, 0, 4)); CUDA_CHECK(cudaMemset(d_pos_l, 0, 4));
         A((void**)&d_P, 4);
-        A((void**)&d_outcome, (W_MAX + 2) * 4); // width-12: {n, t1, dr1..dr11, pending}
+        A((void**)&d_outcome, OUTCOME_INTS * 4); // fixed 14: {n, t1, dr1..dr11, pending}
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
@@ -721,19 +739,34 @@ struct Engine {
                 A((void**)&ring_spare6[il], 3 * GDN_CH * 4);
                 A((void**)&S_spare7[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd7
                 A((void**)&ring_spare7[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare8[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // width-12
-                A((void**)&ring_spare8[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare9[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare9[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare10[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare10[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare11[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare11[il], 3 * GDN_CH * 4);
-                // 13 S-buffers (main + 11 spares + snap) + 13 rings per GDN
-                // layer -- keep in sync when adding sets; server slot
-                // admission sizes its floor from this (review 2026-07-09: the
-                // old hardcoded "5 sets ~3GB" predated maxd6/7)
-                gdn_state_bytes += 13ull * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
+                // roles 8..11 exist only when W_MAX admits them (Q27_W_MAX
+                // knob). Skipped sets stay nullptr and are never addressed
+                // (SBuf/RBuf index (role+perm)%W_MAX < W_MAX). This is the
+                // narrow-build memory win: each skipped role = ~157MB/engine.
+                S_spare8[il] = S_spare9[il] = S_spare10[il] = S_spare11[il] = nullptr;
+                ring_spare8[il] = ring_spare9[il] = ring_spare10[il] = ring_spare11[il] = nullptr;
+                if (W_MAX > 8) {
+                    A((void**)&S_spare8[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                    A((void**)&ring_spare8[il], 3 * GDN_CH * 4);
+                }
+                if (W_MAX > 9) {
+                    A((void**)&S_spare9[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                    A((void**)&ring_spare9[il], 3 * GDN_CH * 4);
+                }
+                if (W_MAX > 10) {
+                    A((void**)&S_spare10[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                    A((void**)&ring_spare10[il], 3 * GDN_CH * 4);
+                }
+                if (W_MAX > 11) {
+                    A((void**)&S_spare11[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                    A((void**)&ring_spare11[il], 3 * GDN_CH * 4);
+                }
+                // (W_MAX + 1) S-buffers (main + W_MAX-1 spares + snap) + rings
+                // per GDN layer -- server slot admission sizes its floor from
+                // this (review 2026-07-09: the old hardcoded "5 sets" predated
+                // maxd6/7; the (W_MAX+1) form tracks the Q27_W_MAX knob).
+                gdn_state_bytes +=
+                    (size_t)(W_MAX + 1) * ((size_t)GDN_HEADS * GDN_DIM * GDN_DIM + 3 * GDN_CH) * 4;
                 attn_cache_idx.push_back(-1);
             }
         }
@@ -952,9 +985,9 @@ struct Engine {
     void mm5(const DevTensor& w, float* out_a, float* out_b, float* out_c, float* out_d,
              float* out_e, float* out_f, float* out_g, float* out_h, float* out_i, float* out_j,
              float* out_k, float* out_l) {
-        q27k::XQuant qs[W_MAX] = {xq2[0], xq2[1], xqC, xqD, xqE, xqF, xqG, xqH, xqI, xqJ, xqK,
+        q27k::XQuant qs[W_PLUMB] = {xq2[0], xq2[1], xqC, xqD, xqE, xqF, xqG, xqH, xqI, xqJ, xqK,
                                   xqL};
-        float* const ys[W_MAX] = {out_a, out_b, out_c, out_d, out_e, out_f, out_g, out_h, out_i,
+        float* const ys[W_PLUMB] = {out_a, out_b, out_c, out_d, out_e, out_f, out_g, out_h, out_i,
                                   out_j, out_k, out_l};
         if (w.dtype == DType::Q4_G64)
             q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
@@ -1380,14 +1413,14 @@ struct Engine {
                     CUDA_CHECK(cudaMemset(ring_spare6[il], 0, 3 * GDN_CH * 4));
                     CUDA_CHECK(cudaMemset(S_spare7[il], 0, sb));           // maxd7
                     CUDA_CHECK(cudaMemset(ring_spare7[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));           // width-12
-                    CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4));
+                    if (W_MAX > 8) { CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));  // width-12
+                        CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4)); }
+                    if (W_MAX > 9) { CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
+                        CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4)); }
+                    if (W_MAX > 10) { CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
+                        CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4)); }
+                    if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
+                        CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
                 }
             CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
             CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
@@ -1586,7 +1619,7 @@ struct Engine {
             if (phase_stats) ph_t0 = std::chrono::steady_clock::now();
             q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
                              stm);
-            int* ds[W_MAX - 1] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
+            int* ds[W_PLUMB - 1] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
                                   d_draft7, d_draft8, d_draft9, d_draft10, d_draft11};
             for (int k = 0; k < sw - 1; k++)
                 CUDA_CHECK(cudaMemcpyAsync(ds[k], &h_sfx_prop[k], 4, cudaMemcpyHostToDevice,
@@ -1665,8 +1698,8 @@ struct Engine {
             CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
         }
         // width-12 outcome: [0]=n, [1..12]=up to 12 emitted tokens, [13]=new pending.
-        int oc[W_MAX + 2];
-        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, (W_MAX + 2) * 4, cudaMemcpyDeviceToHost, stm));
+        int oc[OUTCOME_INTS];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         if (ph_timed) {
             double v = std::chrono::duration<double, std::milli>(
@@ -1716,12 +1749,12 @@ struct Engine {
             }
         }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
-        last_pending = oc[W_MAX + 1];
+        last_pending = oc[OUTCOME_INTS - 1];
         sfx_valid = true; // pending now known on host; suffix may fire next round
         if (sfx_dbg) {
             fprintf(stderr, "[sfxdbg-oc] n=%d em=", n);
             for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
-            fprintf(stderr, " pend=%d sfx_round=%d\n", oc[W_MAX + 1], sfx_round ? 1 : 0);
+            fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1], sfx_round ? 1 : 0);
         }
         perm = (perm + (n - 1)) % W_MAX;
         return n;
@@ -1883,7 +1916,7 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
     }
     // P11: stage all 5 lane mask ids at once (split path). cap stays 0.
-    int h_mask_ids5[W_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    int h_mask_ids5[W_PLUMB] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     void set_tool_masks5(const int ids[5]) {
         for (int i = 0; i < 5; i++) h_mask_ids5[i] = ids[i];
         h_cap0 = 0;
@@ -1896,7 +1929,7 @@ struct Engine {
         h_mask_id0 = -1;
         h_cap0 = 0;
         tool_split_active = false;
-        for (int i = 0; i < W_MAX; i++) h_mask_ids5[i] = -1;
+        for (int i = 0; i < W_PLUMB; i++) h_mask_ids5[i] = -1;
         CUDA_CHECK(cudaMemcpyAsync(d_mask_ids, h_mask_ids5, W_MAX * 4, cudaMemcpyHostToDevice,
                                    stm));
         CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
@@ -1915,7 +1948,7 @@ struct Engine {
     int refinish_round(int m, int n, int P_target) {
         perm = (perm + (m - n) + W_MAX) % W_MAX;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P_target, 4, cudaMemcpyHostToDevice, stm));
-        const float* lanes[W_MAX] = {x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h,
+        const float* lanes[W_PLUMB] = {x1, x1_b, x1_c, x1_d, x1_e, x1_f, x1_g, x1_h,
                                      x1_i, x1_j, x1_k, x1_l};
         CUDA_CHECK(cudaMemcpyAsync(h_next, lanes[m - 1], (size_t)N_EMBD * 4,
                                    cudaMemcpyDeviceToDevice, stm));
@@ -2207,10 +2240,6 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(S_spare5[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare6[il], 0, sb));
                 CUDA_CHECK(cudaMemset(S_spare7[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
@@ -2219,10 +2248,15 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(ring_spare5[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare6[il], 0, 3 * GDN_CH * 4));
                 CUDA_CHECK(cudaMemset(ring_spare7[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4));
+                // roles 8..11 only when Q27_W_MAX admits them (nullptr else)
+                if (W_MAX > 8) { CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4)); }
+                if (W_MAX > 9) { CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4)); }
+                if (W_MAX > 10) { CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4)); }
+                if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
+                    CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));
         CUDA_CHECK(cudaMemset(mtp_v, 0, (size_t)max_ctx * N_KV * HEAD_DIM * kv_esz()));

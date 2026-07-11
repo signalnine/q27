@@ -179,11 +179,16 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1);
 
-    // --ctx auto (single-slot): size the KV budget to free VRAM. Anchor:
-    // 131072 fp8 single-slot measured 27.0GB total => fixed (weights +
-    // roles + graphs + buffers) ~= 22.6GB; per-token = 34KB fp8 / 68KB
-    // fp16 (attn + MTP KV). Cap 131072, floor 16384, 4K granularity,
-    // ~1GB slack. Multi-slot keeps the old explicit-ctx contract.
+    // --ctx auto (single-slot): size the KV budget to free VRAM. The fixed
+    // cost (weights + GDN role sets + graph zoo + buffers) SCALES WITH
+    // Q27_W_MAX -- each width adds one role set (~157MB) and ~one perm's
+    // worth of captured graphs (~130MB), so a narrow build frees budget.
+    // Anchor: 131072 fp8 W_MAX=12 measured ~27.0GB total => base ~19.0GB +
+    // (W_MAX+1)*0.157 roles + W_MAX*0.13 graphs = ~22.6GB at W_MAX=12.
+    // per-token = 34KB fp8 / 68KB fp16 (attn + MTP KV). NOTE the anchor was
+    // calibrated on the 5090 fp8/mma path; the sm_86 fp16/fd2 fallback runs
+    // heavier, so on a 24GB card the fit can still miss -- hence no forced
+    // floor: clamp to what actually fits and warn rather than OOM.
     if (ctx < 0) {
         if (n_slots > 1) {
             ctx = 8192; // legacy default; multi-slot should pass --ctx
@@ -193,14 +198,24 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
             const bool fp8 = getenv("Q27_KV") && !strcmp(getenv("Q27_KV"), "fp8");
-            const double fixed = 22.6e9, slack = 1.0e9, per_tok = fp8 ? 34e3 : 68e3;
+            const double fixed = 19.0e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
+            const double slack = 1.0e9, per_tok = fp8 ? 34e3 : 68e3;
             long budget = (long)((double)free_b - fixed - slack);
             long c = budget > 0 ? (long)(budget / per_tok) : 0;
             if (c > 131072) c = 131072;
-            if (c < 16384) c = 16384;
             ctx = (int)(c / 4096 * 4096);
-            fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV)\n", ctx, free_b / 1e9,
-                    fp8 ? "fp8" : "fp16");
+            if (ctx < 4096) {
+                fprintf(stderr,
+                        "--ctx auto: only %d fits (free %.1fGB, %s KV, W_MAX=%d) -- likely to "
+                        "OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
+                        ctx, free_b / 1e9, fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
+            } else {
+                fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV, W_MAX=%d)\n", ctx,
+                        free_b / 1e9, fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                if (ctx < 16384)
+                    fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
+            }
         }
     }
 
