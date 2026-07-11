@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "cuda_common.h" // KvKind
 #include "kernels.cuh"
 
 namespace q27k {
@@ -41,6 +42,18 @@ void conv_prefill_T(float* ring, const float* qkvT, const float* w, float* outT,
                     int T, cudaStream_t st);
 void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
                 int rowlen, int T, cudaStream_t st, bool fp8 = false);
+// turbo3 prefill store: cooperative per-128-group quantize of T tokens'
+// rope'd K + raw V into block caches at rows base_pos..base_pos+T-1
+// (same pipeline as the decode store -- shared turbo3_quant_group).
+// k_plain: K side stays plain fp16 rows (turbo3v).
+void kv_store_T_t3(const float* kT, const float* vT, void* kc, void* vc, int base_pos,
+                   int n_kv_heads, int head_dim, int T, cudaStream_t st, bool k_plain = false);
+// Per-128-group WHT rotate over a flat [T][row_stride] buffer (prefill Q
+// forward after rope; attention output inverse before the sigmoid gate).
+// head_stride = floats between heads within a row (2*head_dim for qgT,
+// head_dim for attnT).
+void wht_T(float* x, int n_heads, int head_dim, int head_stride, int row_stride, int T,
+           bool inv, cudaStream_t st);
 // Flash-attention prefill for a sub-batch of SB tokens starting at (base_pos+t0);
 // online softmax. Caches fp16, or fp8 E4M3 when fp8 (P2). At deep base_pos the
 // MMA path splits positions across gridDim.z blocks (P4, SM starvation fix)
@@ -48,10 +61,13 @@ void kv_store_T(const float* kT, const float* vT, void* kc, void* vc, int base_p
 // n_q_heads * SB_rounded_to_16 * PF_SPLIT_MAX * 258 floats. part == nullptr
 // disables splitting (exact pre-split path).
 constexpr int PF_SPLIT_MAX = 8;
+// kvk (KvKind): widened from `bool fp8` (0/1 keep the old meaning). KV_T3
+// runs the f16-MMA path with turbo3 tile dequant (lite via Q27_ATTN_PF=lite);
+// KV_T3V (fp16 K + turbo3 V, diagnostic) always uses the lite path.
 void attn_prefill_T(const float* qT, int q_stride, int q_row, const void* kc, const void* vc,
                     float* outT, int out_row, float* part, int base_pos, int t0, int SB,
                     int n_q_heads, int n_kv_heads, int head_dim, float scale, cudaStream_t st,
-                    bool fp8 = false);
+                    int kvk = KV_F16);
 // Sequential gated delta rule over T tokens, S resident in shared memory.
 // P6: the 128 S-columns per head are independent, so the launcher slices them
 // across delta_scan_nsplit() blocks per head (48 blocks alone starve 170 SMs).

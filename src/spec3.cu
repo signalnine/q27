@@ -191,40 +191,7 @@ __global__ void k_kv_store_t3(__grid_constant__ const CP3 kp, __grid_constant__ 
     q27turbo::block_turbo3* dst = (q27turbo::block_turbo3*)(is_v ? vc : kc) +
                                   (size_t)p * n_kv_heads * 2 + h * 2 + g;
     __shared__ float xs[128], red[128];
-    float x = src[j];
-    xs[j] = x;
-    red[j] = x * x;
-    __syncthreads();
-#pragma unroll
-    for (int s = 64; s > 0; s >>= 1) {
-        if (j < s) red[j] += red[j + s];
-        __syncthreads();
-    }
-    float gn = sqrtf(red[0]);
-    float inv = gn > 1e-10f ? 1.f / gn : 0.f;
-    xs[j] = xs[j] * inv * q27turbo::TURBO_S1[j];
-    q27turbo::turbo3_butterfly128(xs, j);
-    float w = xs[j] * (q27turbo::TURBO_INV_SQRT_128 * q27turbo::TURBO_S2[j]);
-    int idx = q27turbo::turbo3_nearest(w);
-    red[j] = q27turbo::TURBO_CENTROIDS_3BIT[idx] * q27turbo::TURBO_CENTROIDS_3BIT[idx];
-    __syncthreads();
-#pragma unroll
-    for (int s = 64; s > 0; s >>= 1) {
-        if (j < s) red[j] += red[j + s];
-        __syncthreads();
-    }
-    float rn = sqrtf(red[0]);
-    float corr = rn > 1e-10f ? gn / rn : gn;
-    // warp-cooperative pack: 4 lanes share a qs byte (shfl), ballot -> signs
-    int low2 = idx & 3;
-    unsigned bal = __ballot_sync(0xffffffffu, idx & 4);
-    int l1 = __shfl_down_sync(0xffffffffu, low2, 1);
-    int l2 = __shfl_down_sync(0xffffffffu, low2, 2);
-    int l3 = __shfl_down_sync(0xffffffffu, low2, 3);
-    if ((j & 3) == 0)
-        dst->qs[j >> 2] = (uint8_t)(low2 | (l1 << 2) | (l2 << 4) | (l3 << 6));
-    if ((j & 7) == 0) dst->signs[j >> 3] = (uint8_t)((bal >> (j & 31)) & 0xFF);
-    if (j == 0) dst->norm = __float2half(corr);
+    q27turbo::turbo3_quant_group(src[j], dst, j, xs, red);
 }
 
 void kv_store_t3(CP3 k, CP3 v, void* kc, void* vc, IP3 pos, int n_kv_heads, int head_dim,

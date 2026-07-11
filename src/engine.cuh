@@ -476,11 +476,9 @@ struct Engine {
                                                    : KV_F16;
         if (kv_fp8) fprintf(stderr, "KV cache: fp8 E4M3 (opt-in, 34 KB/token)\n");
         else if (kv_kind == KV_T3)
-            fprintf(stderr, "KV cache: turbo3 3-bit K+V (opt-in, ~13.4 KB/token; "
-                            "phase-1 DECODE-ONLY -- no batched prefill)\n");
+            fprintf(stderr, "KV cache: turbo3 3-bit K+V (opt-in, ~13.4 KB/token)\n");
         else if (kv_kind == KV_T3V)
-            fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in; phase-1 DECODE-ONLY "
-                            "-- no batched prefill)\n");
+            fprintf(stderr, "KV cache: turbo3 V + fp16 K (opt-in, diagnostic)\n");
         const std::string& mj = model.meta_json;
         size_t p = mj.find("\"attn_layers\": [");
         if (p == std::string::npos) { fprintf(stderr, "no attn_layers in meta\n"); exit(1); }
@@ -2084,10 +2082,22 @@ struct Engine {
         q27k::rope_neox_T(qgT, N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, QROW, base, T, FREQ_BASE,
                           stm);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base, T, FREQ_BASE, stm);
-        q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
+        // turbo3 (phase 2): same rotation contract as decode -- forward-WHT
+        // on Q post-rope (K's rotation folds into the store), inverse-WHT on
+        // the pooled output BEFORE the sigmoid gate. turbo3v: K plain fp16,
+        // Q unrotated.
+        if (kv_kind == KV_T3)
+            q27k::wht_T(qgT, N_HEAD, HEAD_DIM, 2 * HEAD_DIM, QROW, T, false, stm);
+        if (kv_kind >= KV_T3)
+            q27k::kv_store_T_t3(kT, vT, kc, vc, base, N_KV, HEAD_DIM, T, stm,
+                                /*k_plain=*/kv_kind == KV_T3V);
+        else
+            q27k::kv_store_T(kT, vT, kc, vc, base, KVROW, T, stm, kv_fp8);
         q27k::attn_prefill_T(qgT, 2 * HEAD_DIM, QROW, kc, vc, attnT, N_HEAD * HEAD_DIM, pf_part,
                              base, 0, T, N_HEAD, N_KV, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM),
-                             stm, kv_fp8);
+                             stm, kv_kind);
+        if (kv_kind >= KV_T3)
+            q27k::wht_T(attnT, N_HEAD, HEAD_DIM, HEAD_DIM, N_HEAD * HEAD_DIM, T, true, stm);
         q27k::sigmoid_gate_mul_T(attnT, qgT, N_HEAD, HEAD_DIM, T, stm);
         qxT(attnT, N_HEAD * HEAD_DIM, T);
         mmT(T2(il, "attn_output.weight"), attnT, yT, T);
@@ -2106,14 +2116,6 @@ struct Engine {
     // Leaves hT = final residual for each token. Updates conv rings, GDN state,
     // attention KV caches in place.
     void prefill_chunk(const int* d_toks, int base, int T) {
-        if (kv_kind >= KV_T3) {
-            // phase 1: kv_store_T / attn_prefill_T have no turbo3 leg -- a
-            // batched prefill would write scalar rows into block caches.
-            // Serial paths (--nll-serial, --tokens -n) cover the quality gate.
-            fprintf(stderr, "Q27_KV=turbo3*: batched prefill not ported (phase 1); "
-                            "use serial paths (--nll-serial, --tokens -n)\n");
-            exit(1);
-        }
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
                               N_EMBD, T, hT, stm);
@@ -2159,7 +2161,11 @@ struct Engine {
         mmT(T2(il, "attn_v.weight"), x1T, vT, T);
         q27k::rope_neox_T(kT, N_KV, HEAD_DIM, N_ROT, HEAD_DIM, KVROW, base + 1, T, FREQ_BASE,
                           stm);
-        q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
+        if (kv_kind >= KV_T3)
+            q27k::kv_store_T_t3(kT, vT, mtp_k, mtp_v, base + 1, N_KV, HEAD_DIM, T, stm,
+                                /*k_plain=*/kv_kind == KV_T3V);
+        else
+            q27k::kv_store_T(kT, vT, mtp_k, mtp_v, base + 1, KVROW, T, stm, kv_fp8);
     }
 
     // ---- P9: same-session GDN checkpoint ring (host pinned RAM) ----

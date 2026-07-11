@@ -4002,3 +4002,58 @@ fp16) -- run the accept-rate A/B on real traffic before any default flip.
 NEXT: prefill port (kv_store_T turbo3 + attn_prefill read leg) -> unlocks
 serving + needle; fdmma turbo3 (dequant-to-e4m3 smem) deferred; InnerQ
 skipped (auto-off at head_dim>128).
+
+## 2026-07-11 -- turbo3 KV phase 2: PREFILL ported -- serving + needle UNLOCKED, fp8/fp16 bitwise-EXACT again
+
+Batched prefill gets turbo3 legs; the phase-1 decode-only guards are gone.
+Q27_KV=turbo3 now runs the full stack: prefill (f16-MMA or lite) + decode +
+verify + MTP warm, server included.
+
+SHIPPED (TDD'd; stubs -> 6 failing checks -> green):
+- prefill.cu k_kv_store_T_t3: prefill store over T tokens (grid (8, K|V, T)),
+  quant pipeline EXTRACTED to turbo3.cuh turbo3_quant_group and the decode
+  store (spec3.cu) refactored onto it -- the two writers cannot drift.
+- prefill.cu k_wht_T<INV>: flat [T][row] per-128-group WHT (Q forward
+  post-rope / attnout inverse pre-gate), shares turbo3_butterfly128.
+- k_attn_prefill_T / k_attn_prefill_mma widened to <CT, KT3, VT3>: ONLY the
+  smem staging changes (turbo3_deq_elem per-element for lite;
+  turbo3_stage8_h2 2-qs-bytes+1-sign-byte+norm -> 4x half2 for the mma
+  tiles); every MMA past the tiles is format-agnostic. cp.async prefetch
+  stays fp8-only (CPA guard); fp8q/pv8 kernels untouched. turbo3 = mma
+  default (lite via Q27_ATTN_PF=lite); turbo3v = <half,false,true>.
+- attn_prefill_T bool fp8 -> int kvk; engine attn_block_T + mtp_warm_T
+  wired; prefill_chunk/server guards REMOVED; server auto-ctx per_tok
+  (13.6e3 turbo3 / 41.6e3 turbo3v) + slot admission now derives bytes/row
+  from Engine::kv_bytes; auto-ctx log KV label fixed.
+
+GATES:
+- test_kernels +6 checks ALL PASS (suite green on 3090): store_T 100%
+  bit-match vs CPU quantizer at base offset + k_plain bitwise fp16;
+  prefill-vs-double-host-ref lite t3/t3v 1.6e-6/1.9e-6 (exact-staging
+  class), mma t3 4.8e-3 (fp16 staging of rotated Q + dequant values; the
+  scalar mma-vs-lite gate class is 5e-3).
+- Canonical bitwise: 6 legs (pre-change binary vs new, fp16/fp8/v1,
+  vanilla, 5090) byte-IDENTICAL; fp16 == a2982c51 stored canonical.
+- Batched NLL (prefill path, same 16x2048 protocol as the phase-1 serial
+  triage): fp16 7.3214 (vs serial 7.3172, +0.06% = the known g64-regroup
+  design delta -- control leg); turbo3v 7.3390; turbo3 7.3978 (+1.04% vs
+  batched fp16). K/V cost attribution SHIFTS vs serial (batched: V +0.24%
+  K +0.80%; serial: V +0.70% K +0.17%) -- the mma leg stages WHT-rotated Q
+  to fp16, and that noise lands only on the rotated-Q (turbo3-K) leg;
+  TOTALS agree (~+0.9-1.0%) and stay well inside the 5% gate.
+- --pf 512 M6 smoke under turbo3: batched-vs-serial continuations
+  IDENTICAL (32/32) -- same blocks from both writers, greedy absorbed the
+  attention-order noise; batched 2827 t/s vs serial 74.4 (38x) at 512.
+- NEEDLE 6/6 at ~122K prompt tokens (turbo3 server, auto-ctx 131072,
+  needles at 10..95% depth, exact retrieval every time) -- the port-spec
+  quality gate is now fully closed: PPL + needle both pass on 3-bit K+V.
+- Sanitizer (kernel-filtered + MemoryMax-capped per the standing ops
+  rule): memcheck 0 errors (turbo3 --pf 384 full run), racecheck 0
+  hazards (filtered to kv_store_T_t3|wht_T|attn_prefill_*). No OOMs this
+  time -- the kernel-filter + MemoryMax + own-unit recipe holds.
+
+NEXT: perf pass on the turbo3 prefill staging (dequant loads are scalar
+byte reads; cp.async-style block prefetch if profiles say it matters at
+128K), fdmma turbo3 verify leg (dequant-to-e4m3 smem) still deferred,
+accept-rate A/B on real CC traffic before any serving-default discussion
+(decode smoke saw 3.05 vs 3.42 tok/rnd).

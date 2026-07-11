@@ -168,14 +168,6 @@ int main(int argc, char** argv) {
         setenv("Q27_SUFFIX_W", "12", 0);
         setenv("Q27_PHASE_STATS", "1", 0);
     }
-    if (getenv("Q27_KV") && !strncmp(getenv("Q27_KV"), "turbo3", 6)) {
-        // phase 1 is decode-only: every request prefills its prompt, and the
-        // batched prefill has no turbo3 leg yet (Engine::prefill_chunk aborts)
-        fprintf(stderr, "Q27_KV=%s: turbo3 is phase-1 decode-only (no batched prefill); "
-                        "serving unsupported -- use the q27 CLI serial paths\n",
-                getenv("Q27_KV"));
-        return 1;
-    }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
             "think=%d\n",
@@ -205,9 +197,15 @@ int main(int argc, char** argv) {
         } else {
             size_t free_b = 0, total_b = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-            const bool fp8 = getenv("Q27_KV") && !strcmp(getenv("Q27_KV"), "fp8");
+            const char* kvv = getenv("Q27_KV");
+            const bool fp8 = kvv && !strcmp(kvv, "fp8");
+            const bool t3 = kvv && !strcmp(kvv, "turbo3");
+            const bool t3v = kvv && !strcmp(kvv, "turbo3v");
             const double fixed = 19.0e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
-            const double slack = 1.0e9, per_tok = fp8 ? 34e3 : 68e3;
+            // per-token KV bytes across the 17 attn+MTP cache pairs: turbo3
+            // 2*400 B, turbo3v 2048+400 B, fp8 2*1024, fp16 2*2048
+            const double slack = 1.0e9,
+                         per_tok = t3 ? 13.6e3 : t3v ? 41.6e3 : fp8 ? 34e3 : 68e3;
             long budget = (long)((double)free_b - fixed - slack);
             long c = budget > 0 ? (long)(budget / per_tok) : 0;
             if (c > 131072) c = 131072;
@@ -216,11 +214,11 @@ int main(int argc, char** argv) {
                 fprintf(stderr,
                         "--ctx auto: only %d fits (free %.1fGB, %s KV, W_MAX=%d) -- likely to "
                         "OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
-                        ctx, free_b / 1e9, fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
                 if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
             } else {
                 fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV, W_MAX=%d)\n", ctx,
-                        free_b / 1e9, fp8 ? "fp8" : "fp16", Q27_W_MAX);
+                        free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
                 if (ctx < 16384)
                     fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
             }
@@ -268,9 +266,11 @@ int main(int argc, char** argv) {
             // rather than abort on cudaMalloc
             size_t freeb = 0, totalb = 0;
             cudaMemGetInfo(&freeb, &totalb);
-            // KV bytes/token from the engine's own sizing (34 KB at 1-byte
-            // elements, 68 KB fp16) -- slots[0] is always constructed first
-            size_t kvb = (size_t)sctx * 34 * 1024 * slots[0].eng->kv_esz();
+            // KV bytes/token from the engine's own sizing (kv_bytes covers
+            // fp16/fp8/turbo3 rows) -- slots[0] is always constructed first
+            size_t row_b = (slots[0].eng->kv_bytes(false) + slots[0].eng->kv_bytes(true)) /
+                           slots[0].eng->max_ctx;
+            size_t kvb = (size_t)sctx * row_b * (slots[0].eng->kcache.size() + 1);
             size_t need = slots[0].eng->gdn_state_bytes + (700ull << 20) + kvb + (kvb >> 3) +
                           (512ull << 20);
             if (freeb < need) {

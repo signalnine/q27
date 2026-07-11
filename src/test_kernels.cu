@@ -1408,6 +1408,189 @@ static void test_attn_fd2_turbo3() {
     CUDA_CHECK(cudaFree(d_scr));
 }
 
+// phase 2 (prefill): kv_store_T_t3 parity vs the CPU quantizer at a nonzero
+// base row; k_plain leg bitwise fp16 K. Same tie budget rationale as the
+// decode store test.
+static void test_kv_turbo3_store_T() {
+    const int NKV = 4, HD = 256, ROW = NKV * HD, T = 40, BASE = 7, CAP = 64;
+    const int BPR = NKV * (HD / 128);
+    std::vector<float> kf = rand_vec((size_t)T * ROW, 75), vf = rand_vec((size_t)T * ROW, 76);
+    float *d_kT, *d_vT;
+    CUDA_CHECK(cudaMalloc(&d_kT, (size_t)T * ROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_vT, (size_t)T * ROW * 4));
+    CUDA_CHECK(cudaMemcpy(d_kT, kf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vT, vf.data(), (size_t)T * ROW * 4, cudaMemcpyHostToDevice));
+    block_turbo3 *d_kc, *d_vc;
+    CUDA_CHECK(cudaMalloc(&d_kc, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_vc, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMemset(d_kc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMemset(d_vc, 0, (size_t)CAP * BPR * sizeof(block_turbo3)));
+    q27k::kv_store_T_t3(d_kT, d_vT, d_kc, d_vc, BASE, NKV, HD, T, 0, false);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<block_turbo3> kc(CAP * BPR), vc(CAP * BPR);
+    CUDA_CHECK(cudaMemcpy(kc.data(), d_kc, kc.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(vc.data(), d_vc, vc.size() * sizeof(block_turbo3),
+                          cudaMemcpyDeviceToHost));
+    long elem_mism = 0, total = 0, blk_n = 0, blk_match = 0;
+    auto blk_cmp = [&](const block_turbo3& dev, const float* src) {
+        block_turbo3 ref;
+        t3_quant(src, &ref);
+        blk_n++;
+        if (!memcmp(ref.qs, dev.qs, 32) && !memcmp(ref.signs, dev.signs, 16)) {
+            blk_match++;
+        } else {
+            for (int j = 0; j < 128; j++) {
+                uint8_t rl = (ref.qs[j / 4] >> ((j % 4) * 2)) & 3;
+                uint8_t dl = (dev.qs[j / 4] >> ((j % 4) * 2)) & 3;
+                uint8_t rh = (ref.signs[j / 8] >> (j % 8)) & 1;
+                uint8_t dh = (dev.signs[j / 8] >> (j % 8)) & 1;
+                if (rl != dl || rh != dh) elem_mism++;
+            }
+        }
+        total += 128;
+    };
+    for (int t = 0; t < T; t++)
+        for (int b = 0; b < BPR; b++) {
+            blk_cmp(kc[(size_t)(BASE + t) * BPR + b], kf.data() + (size_t)t * ROW + (size_t)b * 128);
+            blk_cmp(vc[(size_t)(BASE + t) * BPR + b], vf.data() + (size_t)t * ROW + (size_t)b * 128);
+        }
+    check("turbo3 store_T idx vs CPU ref (<=0.2% ties)", (double)elem_mism / total, 2e-3);
+    check("turbo3 store_T blocks bit-matching (>=95%)", 1.0 - (double)blk_match / blk_n, 0.05);
+    __half* d_kh;
+    CUDA_CHECK(cudaMalloc(&d_kh, (size_t)CAP * ROW * 2));
+    CUDA_CHECK(cudaMemset(d_kh, 0, (size_t)CAP * ROW * 2));
+    q27k::kv_store_T_t3(d_kT, d_vT, d_kh, d_vc, BASE, NKV, HD, T, 0, true);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<__half> kh((size_t)CAP * ROW);
+    CUDA_CHECK(cudaMemcpy(kh.data(), d_kh, kh.size() * 2, cudaMemcpyDeviceToHost));
+    long kbad = 0;
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < ROW; i++) {
+            __half w = __float2half_rn(kf[(size_t)t * ROW + i]);
+            if (memcmp(&kh[(size_t)(BASE + t) * ROW + i], &w, 2)) kbad++;
+        }
+    check("turbo3v store_T k_plain fp16 rows (bitwise)", (double)kbad, 1);
+    CUDA_CHECK(cudaFree(d_kT)); CUDA_CHECK(cudaFree(d_vT));
+    CUDA_CHECK(cudaFree(d_kc)); CUDA_CHECK(cudaFree(d_vc)); CUDA_CHECK(cudaFree(d_kh));
+}
+
+// phase 2 (prefill): e2e turbo3 prefill attention. lite leg stages exact
+// fp32 dequant values => tight bound vs the double host reference; mma leg
+// stages Q and dequant values as fp16 => 1e-2 class (mma-vs-lite gate for
+// scalar KV is 5e-3; the extra dequant fp16 rounding stacks on top). T3V
+// (fp16 K + turbo3 V) always routes to lite. Token t attends [0, BASE+t].
+static void test_attn_prefill_turbo3() {
+    const int NKV = 4, GQA = 6, HD = 256, NH = NKV * GQA;
+    const int BASE = 100, T = 48, CAP = BASE + T;
+    const int BPR = NKV * (HD / 128), ROW = NKV * HD;
+    const int QROW = NH * 2 * HD, OROW = NH * HD;
+    std::vector<float> kf = rand_vec((size_t)CAP * ROW, 95), vf = rand_vec((size_t)CAP * ROW, 96);
+    std::vector<float> qh = rand_vec((size_t)T * QROW, 97);
+    std::vector<block_turbo3> kb((size_t)CAP * BPR), vb((size_t)CAP * BPR);
+    std::vector<__half> khalf(kf.size());
+    for (size_t b = 0; b < kb.size(); b++) {
+        t3_quant(kf.data() + b * 128, &kb[b]);
+        t3_quant(vf.data() + b * 128, &vb[b]);
+    }
+    for (size_t i = 0; i < kf.size(); i++) khalf[i] = __float2half_rn(kf[i]);
+    block_turbo3 *d_kb, *d_vb;
+    __half* d_kh;
+    float *d_q, *d_qr, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_kb, kb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_vb, vb.size() * sizeof(block_turbo3)));
+    CUDA_CHECK(cudaMalloc(&d_kh, khalf.size() * 2));
+    CUDA_CHECK(cudaMalloc(&d_q, (size_t)T * QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_qr, (size_t)T * QROW * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, (size_t)T * OROW * 4));
+    CUDA_CHECK(cudaMemcpy(d_kb, kb.data(), kb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vb, vb.data(), vb.size() * sizeof(block_turbo3),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kh, khalf.data(), khalf.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_q, qh.data(), (size_t)T * QROW * 4, cudaMemcpyHostToDevice));
+    const float scale = 1.0f / sqrtf((float)HD);
+    std::vector<float> ref(OROW), got((size_t)T * OROW);
+    auto href = [&](int t, bool k_t3, std::vector<float>& out) {
+        out.assign(OROW, 0.f);
+        float qw[256], dq[256];
+        const int bound = BASE + t + 1;
+        for (int hh = 0; hh < NH; hh++) {
+            int kvh = hh / GQA;
+            const float* qv = qh.data() + (size_t)t * QROW + (size_t)hh * 2 * HD;
+            for (int i = 0; i < HD; i++) qw[i] = qv[i];
+            if (k_t3) {
+                t3_fwht(qw);
+                t3_fwht(qw + 128);
+            }
+            std::vector<double> sc(bound);
+            double mx = -1e300;
+            for (int p = 0; p < bound; p++) {
+                double d = 0;
+                if (k_t3) {
+                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2], dq);
+                    t3_dequant(&kb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                    for (int i = 0; i < HD; i++) d += (double)qw[i] * dq[i];
+                } else {
+                    for (int i = 0; i < HD; i++)
+                        d += (double)qw[i] *
+                             (double)__half2float(khalf[((size_t)p * NKV + kvh) * HD + i]);
+                }
+                sc[p] = d / sqrt((double)HD);
+                mx = std::max(mx, sc[p]);
+            }
+            double lsum = 0;
+            for (int p = 0; p < bound; p++) {
+                sc[p] = exp(sc[p] - mx);
+                lsum += sc[p];
+            }
+            std::vector<double> acc(HD, 0.0);
+            for (int p = 0; p < bound; p++) {
+                double w = sc[p] / lsum;
+                t3_dequant(&vb[((size_t)p * NKV + kvh) * 2], dq);
+                t3_dequant(&vb[((size_t)p * NKV + kvh) * 2 + 1], dq + 128);
+                for (int i = 0; i < HD; i++) acc[i] += w * dq[i];
+            }
+            float accf[256];
+            for (int i = 0; i < HD; i++) accf[i] = (float)acc[i];
+            t3_fwht_inv(accf);
+            t3_fwht_inv(accf + 128);
+            for (int i = 0; i < HD; i++) out[(size_t)hh * HD + i] = accf[i];
+        }
+    };
+    struct Leg { const char* name; int kvk; bool lite; double tol; };
+    for (Leg L : { Leg{"mma  t3 ", KV_T3, false, 1e-2}, Leg{"lite t3 ", KV_T3, true, 2e-4},
+                   Leg{"lite t3v", KV_T3V, true, 2e-4} }) {
+        if (L.lite) setenv("Q27_ATTN_PF", "lite", 1);
+        CUDA_CHECK(cudaMemcpy(d_qr, d_q, (size_t)T * QROW * 4, cudaMemcpyDeviceToDevice));
+        if (L.kvk == KV_T3) q27k::wht_T(d_qr, NH, HD, 2 * HD, QROW, T, false, 0);
+        const void* kc = L.kvk == KV_T3 ? (const void*)d_kb : (const void*)d_kh;
+        q27k::attn_prefill_T(d_qr, 2 * HD, QROW, kc, d_vb, d_out, OROW, nullptr, BASE, 0, T,
+                             NH, NKV, HD, scale, 0, L.kvk);
+        q27k::wht_T(d_out, NH, HD, HD, OROW, T, true, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (L.lite) unsetenv("Q27_ATTN_PF");
+        CUDA_CHECK(cudaMemcpy(got.data(), d_out, (size_t)T * OROW * 4,
+                              cudaMemcpyDeviceToHost));
+        double worst = 0;
+        for (int t : {0, 7, T - 1}) {
+            href(t, L.kvk == KV_T3, ref);
+            double ss = 0;
+            for (int i = 0; i < OROW; i++) ss += (double)ref[i] * ref[i];
+            double rms = std::sqrt(ss / OROW) + 1e-12;
+            for (int i = 0; i < OROW; i++) {
+                double d = std::fabs((double)got[(size_t)t * OROW + i] - ref[i]) / rms;
+                worst = std::max(worst, std::isfinite(d) ? d : 1e30);
+            }
+        }
+        char label[96];
+        snprintf(label, sizeof label, "prefill %s vs host-ref (base=%d T=%d)", L.name, BASE, T);
+        check(label, worst, L.tol);
+    }
+    CUDA_CHECK(cudaFree(d_kb)); CUDA_CHECK(cudaFree(d_vb)); CUDA_CHECK(cudaFree(d_kh));
+    CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_qr)); CUDA_CHECK(cudaFree(d_out));
+}
+
 // P4: split-position MMA prefill vs the exact single-split path at a deep
 // base_pos (splits change fp summation grouping -> tolerance like MMA-vs-lite),
 // plus the fp8 == fp16(dequantized-cache) bitwise identity under forced splits
@@ -2108,6 +2291,8 @@ int main(int argc, char** argv) {
     test_kv_turbo3_store();
     test_wht3();
     test_attn_fd2_turbo3();
+    test_kv_turbo3_store_T();
+    test_attn_prefill_turbo3();
     test_rmsnorm(m);
     test_silu_mul();
     test_embed(dm, m);
