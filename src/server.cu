@@ -189,8 +189,10 @@ int main(int argc, char** argv) {
     // cost (weights + GDN role sets + graph zoo + buffers) SCALES WITH
     // Q27_W_MAX -- each width adds one role set (~157MB) and ~one perm's
     // worth of captured graphs (~130MB), so a narrow build frees budget.
-    // Anchor: 131072 fp8 W_MAX=12 measured ~27.0GB total => base ~19.0GB +
-    // (W_MAX+1)*0.157 roles + W_MAX*0.13 graphs = ~22.6GB at W_MAX=12.
+    // Anchor: 131072 fp8 W_MAX=12 measured ~27.0GB total on the 17.73GB
+    // v1.4 artifact => non-weight base ~1.27GB + weights (stat'd from the
+    // model file, so heavier tiers like q6-v1 at 20.49GB size correctly) +
+    // (W_MAX+1)*0.157 roles + W_MAX*0.13 graphs.
     // per-token = 34KB fp8 / 68KB fp16 (attn + MTP KV). NOTE the anchor was
     // calibrated on the 5090 fp8/mma path; the sm_86 fp16/fd2 fallback runs
     // heavier, so on a 24GB card the fit can still miss -- hence no forced
@@ -207,7 +209,9 @@ int main(int argc, char** argv) {
             const bool fp8 = kvv && !strcmp(kvv, "fp8");
             const bool t3 = kvv && !strcmp(kvv, "turbo3");
             const bool t3v = kvv && !strcmp(kvv, "turbo3v");
-            const double fixed = 19.0e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
+            struct stat wst {};
+            const double wbytes = stat(model.c_str(), &wst) == 0 ? (double)wst.st_size : 17.73e9;
+            const double fixed = wbytes + 1.27e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
             // per-token KV bytes across the 17 attn+MTP cache pairs: turbo3
             // 2*400 B, turbo3v 2048+400 B, fp8 2*1024, fp16 2*2048
             const double slack = 1.0e9,

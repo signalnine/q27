@@ -99,6 +99,8 @@ def main():
     ap.add_argument("--report", type=int, default=15)
     ap.add_argument("--q8", default=None,
                     help="extra tensor-name regex forced to Q8_G128 (v1.4 policy experiments)")
+    ap.add_argument("--tag", default=None,
+                    help="quant_policy meta override (e.g. q6-v1 for the 6-bit tier)")
     args = ap.parse_args()
     global Q8_EXTRA
     if args.q8:
@@ -107,7 +109,8 @@ def main():
     t0 = time.time()
     r = GGUFReader(args.input)
 
-    meta = {"q27_version": VERSION, "quant_policy": "v1.4" if args.q8 else "v1.3",
+    meta = {"q27_version": VERSION,
+            "quant_policy": args.tag or ("v1.4" if args.q8 else "v1.3"),
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     if args.q8:
         meta["q8_extra"] = args.q8

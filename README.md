@@ -77,6 +77,13 @@ tables in BUILDLOG):
   (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
   with vanilla (median 0.836 vs 0.830, 13/21 tasks tied). The old +35%
   figure was the echo-heavy cctx replay BEST-CASE, not a traffic number.
+- q6 weight tier (07-12, `qwen36-27b-mtp-q6.q27`, 20.5 GB = 6.0
+  bits/param): v1.4 + ffn_down promoted to Q8. Matched-protocol PPL
+  8.0409 -> **7.9460** vs the Q5_K_M bar 7.9179 -- the gap to Q5_K_M
+  shrinks from +1.55% to **+0.35%**. Price: suite decode 171.5 -> 152.1
+  t/s (-11%), 26K replay 176.6 -> 169.2 (-4%). fp8 auto-ctx 196608 on a
+  5090. Does NOT fit 24GB cards (fixed cost alone is 24.2 GB) -- the
+  default 5.25 bpw artifact remains the 3090 answer.
 - 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
   at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
   85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
@@ -105,6 +112,8 @@ between boot and OOM.
 huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
   --local-dir models/qwen36-27b-mtp
 # fine-tune variant: signalnine/Qwopus3.6-27B-v2-MTP-q27
+# quality tier (5090-class only): add --include qwen36-27b-mtp-q6.q27
+#   6.0 bits/param, +0.35% PPL vs Q5_K_M, ~10% slower short-ctx decode
 # verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5)
 
 # 2. build (CLI + server + test suites)

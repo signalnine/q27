@@ -4515,3 +4515,48 @@ is 2.4x that. En-route bug caught by smell: a script edit dropped the
 prismascout-27b key, vllm-serve printed help and exited, and the
 "rdtand" bench re-hit the still-running unsloth container -- flagged by
 byte-identical 64.2s, fixed, re-run clean.
+
+## 2026-07-12 -- q6 tier SHIPPED: 6.0 bits/param, +0.35% vs Q5_K_M, -4-11% decode
+
+Ask: a bigger quant for quality-first users. Design was already priced
+by the P0.5 study: q6 = v1.4 + ffn_down ALL promoted to Q8 (the one
+measured lever with uniform sensitivity; GDN in-projections stay Q4 on
+purpose -- promoting them measured WORSE). Plan
+docs/plans/2026-07-12-q6-tier.md; repack.py grew --tag (quant_policy
+meta override, q6-v1).
+
+    tools/repack.py BF16.gguf out.q27 --q8 '(ssm_out|attn_output|ffn_down)\.' --tag q6-v1
+
+Artifact: qwen36-27b-mtp-q6.q27, 20.49 GB = 6.00 bits/param (884s
+repack; ffn_down vacated the worst-RMSE list, remaining Q4 worst ~0.115
+attn_q/qkv/ffn_gate). Canonical (new artifact, own gate):
+666ffd70747e10e6a9a2087cb18ce8d2.
+
+MEASURED, all same-day matched-protocol on the 5090:
+- PPL (--nll full corpus, 148335 preds, fp16 KV): v1.4 8.0409 -> q6
+  7.9460; llama-perplexity Q5_K_M bar 7.9179 (145 chunks, c2048, same
+  corpus). Gap to Q5_K_M: +1.55% -> +0.35% = 77% of the gap closed for
+  +2.76 GB. WAY better than the P0.5 qwopus-scale projection (29%) --
+  the vanilla/wikitext scale is kinder to ffn_down promotion.
+- Speed price: short-bench suite 171.5 -> 152.1 t/s (-11.3%, tok/rnd
+  flat: no acceptance dividend this time, unlike the v1.4 residual-
+  writer promotion); 26K cctx server replay 176.6 -> 169.2 (-4.3%) --
+  the price shrinks at depth.
+- Serving envelope: fp8 auto-ctx 196608 on the 5090 (was OOM before the
+  fix below), turbo3 full 262144 cap expected (per_tok math; not
+  boot-tested). 3090 W8 turbo3: measured OOM -- fixed cost alone
+  (20.49 + 1.27 + roles/graphs = 24.2 GB) exceeds the card. q6 is
+  5090-class; 24 GB cards stay on the 5.25 bpw artifact.
+
+EN-ROUTE FIX (server.cu): auto-ctx's fixed-cost anchor hardcoded
+19.0e9, which silently WAS "17.73 GB v1.4 weights + 1.27 GB base". q6's
++2.76 GB made auto-ctx oversize KV and OOM at boot. Now: fixed =
+stat(model file) + 1.27e9 + role/graph terms. Gate: v1.4 fp8 boot still
+picks 262144 (anchor bitwise-reproduced); q6 picks 196608 and serves.
+Ops note repeated the hard way: journalctl -u shows PRIOR invocations
+-- greping a rebooted unit's log without --since/invocation filter
+reads the previous crash as the current state.
+
+Shipped to HF: signalnine/Qwen3.6-27B-MTP-q27/qwen36-27b-mtp-q6.q27 +
+CHECKSUMS.md5 + model-card section. Non-goals logged in the plan:
+Q6 kernel dtype, ffn_gate/up (8-bit-class), AWQ-style scales, qwopus-q6.
