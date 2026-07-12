@@ -4293,3 +4293,17 @@ With T8's pair (0.83/0.46 @ 253/256s): six concurrent-session runs on the
 basins on T2/T11. Lighter tasks (T2/T11) barely feel the second tenant;
 T8's heavy decode shows the ~1.8x interleave cost. q27-eval restored to
 default fp8 single-slot.
+
+## 2026-07-11 -- docs/multislot-throughput.md: why 2-slot is capacity, not vLLM-style aggregate
+
+Written against the day's measurements: R1b = round-granularity
+time-slicing (p90 200.8 shows zero scheduler tax; the ~2x per-request
+split on dual sustained decode is pure weight-bandwidth physics). q27
+spends its weight-read amortization on speculative WIDTH within one user
+(tok/rnd 5.8 = its "batch"), vLLM spends it across users. Cross-user
+batching remains rejected per P10-A pricing (12^2 perm product kills the
+baked-pointer graph zoo; per-lane sequence plumbing; 2-user VRAM cap that
+turbo3 does NOT lift -- GDN role sets, not KV, are the per-slot cost).
+Multi-slot's actual product: 2x full-context tenants + zero-queue
+admission + near-zero cost on bursty CC traffic (T2/T11 pairs at
+solo-class score AND wall).
