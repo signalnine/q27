@@ -1,6 +1,6 @@
 # Quasar
 
-A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090. One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
+A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (also supports 3090). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
 ## Why this is interesting
 
