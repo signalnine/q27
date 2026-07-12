@@ -16,10 +16,8 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
   needle 6/6 at a 361K-token prompt, 655K context allocatable on a
   5090, two full 131K tenants at once, and a 24GB card promoted from a
   32K box to a 131K box. Ported from
-  [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
-  (credit where due -- the quant design is theirs); that fork refuses
-  3-bit K on this model class and caps 33% lower; we measured instead
-  (K costs +0.17%).
+  [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant);
+  that fork refuses 3-bit K on this model class and caps 33% lower; I measured K costs +0.17%.
 - **Native Anthropic Messages endpoint at Claude-Code grade**: thinking
   blocks, tool_use with input_json_delta streaming, exact
   `count_tokens`, anthropic-shaped context-limit errors, billing-header
