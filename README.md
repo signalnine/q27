@@ -39,9 +39,11 @@ tables in BUILDLOG):
   Arc: tuned llama +31% on 07-06, parity 07-07, q27 +47% on 07-10.
   llama's one winning cell: ngram spec on a pure token loop (889 t/s;
   q27's 12-lane cap never binds on real traffic).
-- Fine-tune headroom: Qwopus +35% on acceptance alone (07-09 same-binary
-  cctx replay, 219.0 vs 162.1 at auto). Its live triplet (pre-
-  `__grid_constant__`): 197-222 t/s aggregate, peak 320.
+- Fine-tune headroom, REVISED by the matched 21-task sweep (07-11):
+  Qwopus is a SPEED fine-tune worth **+5.7% decode on real traffic**
+  (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
+  with vanilla (median 0.836 vs 0.830, 13/21 tasks tied). The old +35%
+  figure was the echo-heavy cctx replay BEST-CASE, not a traffic number.
 
 ## Quickstart
 
