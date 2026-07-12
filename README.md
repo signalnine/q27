@@ -77,6 +77,15 @@ tables in BUILDLOG):
   (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
   with vanilla (median 0.836 vs 0.830, 13/21 tasks tied). The old +35%
   figure was the echo-heavy cctx replay BEST-CASE, not a traffic number.
+- q6k weight tier (07-12, `qwen36-27b-mtp-q6k.q27`, 23.25 GB = 6.8
+  bits/param): q6 + ffn_gate to Q8. Matched-protocol PPL **7.9127** --
+  below unsloth Q5_K_M (7.9179) and Q6_K (7.9811), and inside
+  single-run noise of their 26 GB UD-Q6_K_XL flagship (7.9584) at
+  2.75 GB smaller. ffn_up is deliberately NOT promoted -- measured
+  WORSE (+1.6% over q6; its Q4 noise cancels inside the SwiGLU
+  product, the second such structure after the GDN in-projections).
+  Decode 143.1 suite / 150.6 @26K; auto-ctx fp8 114688, turbo3 262144.
+  5090-class only.
 - q6 weight tier (07-12, `qwen36-27b-mtp-q6.q27`, 20.5 GB = 6.0
   bits/param): v1.4 + ffn_down promoted to Q8. Matched-protocol PPL
   8.0409 -> **7.9460** vs the Q5_K_M bar 7.9179 -- the gap to Q5_K_M
@@ -112,8 +121,10 @@ between boot and OOM.
 huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
   --local-dir models/qwen36-27b-mtp
 # fine-tune variant: signalnine/Qwopus3.6-27B-v2-MTP-q27
-# quality tier (5090-class only): add --include qwen36-27b-mtp-q6.q27
-#   6.0 bits/param, +0.35% PPL vs Q5_K_M, ~10% slower short-ctx decode
+# quality tiers (5090-class only):
+#   qwen36-27b-mtp-q6.q27  -- 6.0 bpp, +0.35% PPL vs Q5_K_M, ~10% slower
+#   qwen36-27b-mtp-q6k.q27 -- 6.8 bpp, beats/matches every measured GGUF
+#                             of this model, ~17% slower short-ctx
 # verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5)
 
 # 2. build (CLI + server + test suites)

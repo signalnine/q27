@@ -4560,3 +4560,43 @@ reads the previous crash as the current state.
 Shipped to HF: signalnine/Qwen3.6-27B-MTP-q27/qwen36-27b-mtp-q6.q27 +
 CHECKSUMS.md5 + model-card section. Non-goals logged in the plan:
 Q6 kernel dtype, ffn_gate/up (8-bit-class), AWQ-style scales, qwopus-q6.
+
+## 2026-07-12 -- q6k tier: down+gate Q8 BEATS every measured GGUF of this model, incl. unsloth's 26GB flagship
+
+Ask: target Q6_K-class quality. Method: measure the REAL bars (naive
+local Q6_K is a trap: 8.1089, worse than Q5_K_M -- no imatrix; unsloth's
+GGUFs are imatrix'd dynamic quants), then a mini sensitivity pass on the
+two FFN levers P0.5 never isolated. All PPL matched-protocol (wikitext-2
+test, c2048; q27 legs paired on the same 148335 predictions):
+
+    GGUF bars (llama-perplexity):        q27 nll ladder:
+    unsloth Q5_K_M   19.5GB  7.9179      v1.4 5.25bpw    8.0409
+    unsloth Q6_K     22.9GB  7.9811      c3 gate-only    8.0088
+    unsloth UD-Q6_K_XL 26GB  7.9584      q6 down-only    7.9460
+    naive Q6_K (no imx) 22GB 8.1089      c1 down+gate    7.9127  <- q6k
+                                         c2 down+up      8.0695
+
+FINDINGS: (1) ffn_gate compounds with ffn_down (-0.42% beyond q6) but
+is the WEAKER solo lever (c3 loses to q6 at equal size). (2) ffn_up
+promotion HURTS (+1.6% over q6) -- second confirmed error-cancellation
+structure after P0.5's GDN in-proj: cleaning up's Q4 noise inside the
+SwiGLU product breaks a correlation. Do NOT promote ffn_up. (3) unsloth
+non-monotonicity: their Q5_K_M beats both their 6-bit variants on this
+corpus. (4) c1-vs-UD-Q6_K_XL delta (-0.57%) is inside llama's single-run
+SE (+-0.77%) -- claim is "matches the 26GB flagship at 23.25GB", not
+"beats"; the q27-internal ladder is paired and solid.
+
+q6k artifact: qwen36-27b-mtp-q6k.q27, 23.25GB = 6.81 bits/param,
+--q8 '(ssm_out|attn_output|ffn_down|ffn_gate)\.' --tag q6k-v1
+(re-repacked from c1 for the clean tag; repack determinism gated on
+canonical equality). Canonical 2122018dce5929a74c72aa140e713098.
+Speed/envelope (5090, same-day): suite 143.1 (-17% vs default, -6% vs
+q6), 26K replay 150.6, auto-ctx fp8 114688 / turbo3 262144 (both
+boot-verified). 24GB cards: even more DOA than q6.
+
+Tier map now: 5.25bpw default (fastest, 3090-capable) / q6 6.0bpw
+(+0.35% off Q5_K_M, -4% depth decode) / q6k 6.8bpw (GGUF-flagship
+quality, -15% depth decode). Next uncommissioned lever: attn_q
+promotion (+~0.34GB, unmeasured); AWQ-style scales remain the real
+path past uniform promotion. Losers c2/c3 + naive Q6_K deleted;
+unsloth 6-bit GGUFs kept as reference bars.
