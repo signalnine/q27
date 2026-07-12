@@ -4475,3 +4475,43 @@ vs 1720 t/s (prefix-cache mechanics dominate raw rate), and the 3090
 dome wins were decode-side. A sm_86 GEMM-tile retune is the lever if
 raw 3090 prefill ever matters; not commissioned. README 3090 bullet
 updated with the honest split. vox restored.
+
+## 2026-07-12 -- unsloth dynamic-NVFP4 probe: new vLLM-best 155.6 (their fixed MTP, NOT their kernels); q27 same-day 370 on the same payload
+
+unsloth released Qwen3.6-27B-NVFP4 (announced 07-10, "~2.5x faster than
+other NVFP4 quants"): compressed-tensors mixed export, fp8 attention +
+NVFP4 MLPs, MTP layer kept BF16 with config flag unsloth_fixed_mtp. It
+LOADS on the same vLLM nightly image as the 07-09 shootout
+(v0.23.1rc1.dev748) -- but it is heavier (23.4GB): 131K max-len no
+longer fits at util 0.85 (wants 4.88GiB KV, 2.34 free), so the new
+vllm-serve keys (unsloth-nvfp4-27b[-mtp], 5090-local-llm repo) run 32K.
+
+Same-day five-way, 25.8K cctx payload, decode = wall(256)-wall(1),
+temp 0, batch 1, 3 reps, one image:
+
+    rdtand  no-MTP   73.2 t/s   (reproduces 07-09's 73.5 -- rig valid)
+    unsloth no-MTP   64.2       (-12% RAW vs rdtand)
+    rdtand  MTP k=3 119.0       (07-09's 155.5 = different day/basin)
+    unsloth MTP k=3 155.6       NEW vLLM BEST, +31% same-day
+    q27 zero-config 370.5       (Qwopus; w1 0.05s prefix-cached vs
+                                 vLLM 2.5-3.4s re-prefill every call)
+
+Decomposition: unsloth's quant kernels are SLOWER here -- the mixed
+export streams more bytes and bandwidth-bound decode goes as bytes.
+All of the win is the fixed MTP export: MTP multiplier 2.42x
+(155.6/64.2) vs rdtand's 1.62x (119.0/73.3). Their "~2.5x" claim is
+almost certainly that multiplier, not a kernel speedup; as a
+quant-vs-quant kernel claim it does NOT hold on this box.
+
+Caveats, stated: q27 leg is the Qwopus speed fine-tune at 5.25 bpw
+(worth ~6% vs vanilla per the 07-11 sweep) vs base-model vLLM legs;
+cctx replay numbers are basin-valid same-day only (the 370 vs 07-08's
+222.6 is engine progress + basin + replay-warm suffix traffic, do not
+ratio across days). The standing vLLM structural notes are unchanged:
+0% prefix-cache reuse on hybrid-GDN, every request re-prefills.
+Cross-engine pitch update: vLLM's best batch-1 decode on this model is
+now 155.6 by unsloth's fixed-MTP checkpoint; q27 same-day same-payload
+is 2.4x that. En-route bug caught by smell: a script edit dropped the
+prismascout-27b key, vllm-serve printed help and exited, and the
+"rdtand" bench re-hit the still-running unsloth container -- flagged by
+byte-identical 64.2s, fixed, re-run clean.
