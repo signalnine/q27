@@ -226,37 +226,37 @@ summaries): docs/SPEC.md.
 
 ## Performance model
 
-5090 GDDR7 ~1.79 TB/s. Single-stream decode is weight-read-bound.
+Single-stream decode is weight-read-bound. The model: t/s = BW x eff /
+bytes-per-step x accepted-tokens-per-round. Every number below is
+measured.
 
-| Stage | Per-step read | Ceiling | With MTP (~1.9x measured) |
-|---|---|---|---|
-| llama.cpp Q5_K_M (62% BW eff) | 18.2 GB | 61.6 t/s measured | 106-127 t/s measured |
-| q27 Q5-class, 85-90% eff | ~18 GB | ~88 t/s | ~165 |
-| q27 custom 4-bit at 85-90% eff | ~14.8 GB | ~103-109 t/s | ~200-225 |
-| q27 4-bit **measured** (2026-07-02, +4000 OC) | ~15.5 GB/step | **91.0 t/s plain** (~75% eff) | **188.9** (depth-3 spec, 2.07x) [superseded -- see Decode methodology] |
+| Card | DRAM | GEMV eff | Plain ceiling | Live agentic (measured) |
+|---|---|---|---|---|
+| 5090 (GDDR7) | 1.79 TB/s | 85-90% assumed, consistent with live rates | ~103-109 t/s @15.8 GB/step | **231-246 t/s** aggregate (vanilla/Qwopus, CC harness, 07-10/11) |
+| 3090 (sm_86) | 936 GB/s | **81-90% ncu-MEASURED** (big FFN GEMVs ~90% DRAM SOL) | ~52 t/s | **102.2 t/s** median (turbo3+h16, 07-12) |
 
-The original "~120 t/s ceiling" row implied ~99% BW efficiency and is retired.
-Plain decode sits ~15% under the honest 85-90% ceiling; that tail is GDN
-recurrence + ~140 small-kernel launches/token, and three attempts on it
-(E4 launch geometry, E5 fusions, cp.async) all came back negative.
+The efficiency assumption stopped being an assumption on 07-12: ncu on
+the 3090 clocks the GEMV family at 81-90% of DRAM speed-of-light, and
+the GEMV weight stream is 68% of the round. Plain decode's residual
+~15% tail is GDN recurrence + ~140 launches/token; three attempts on it
+(E4/E5/cp.async) came back negative, and the 3090 profile re-confirmed
+there is nothing else material left in the kernels.
 
 ### Why self-speculation is the whole game at batch 1
 
 Arithmetic-intensity framing (the same napkin datacenters use for the
-opposite conclusion): a 5090 offers on the order of hundreds of int8 ops per
-byte of DRAM bandwidth, and batch-1 decode with a KV/state cache uses ~2 ops
-per byte -- >99% of the compute sits idle while weights stream. Datacenter
-serving closes that gap by batching hundreds of USERS per weight read, which
-is why API tokens are cheap and why a single-user GPU looks "wasted" in
-cost-per-token terms. MTP self-speculation is the batch-1 counter-move: the
-batch-5 verify amortizes one weight read across 5 candidate positions --
-batching with yourself instead of with other users. That is exactly how
-218.6 t/s clears the ~91 t/s plain-decode bandwidth ceiling (2.4x, at 4.36
-accepted tokens/round): the idle ops-per-byte gets converted into
-single-stream latency instead of multi-tenant throughput. Corollary: every
-future decode win here is either (a) fewer bytes per step (quant policy,
-fp8 KV) or (b) more accepted positions per weight read (deeper/gated
-speculation) -- there is no third lever at batch 1.
+opposite conclusion): the GPU offers hundreds of int8 ops per byte of
+DRAM bandwidth, and batch-1 decode uses ~2 -- >99% of compute idles
+while weights stream. Datacenters close that gap by batching USERS per
+weight read; q27 batches WITH ITSELF: the width-12 verify amortizes one
+weight read across the MTP ladder's drafts plus the suffix drafter's
+free lanes. Live traffic runs 5.3-5.8 accepted tokens per round (echo
+stretches hit 9-10.6), which is how 231 t/s clears a ~105 t/s plain
+ceiling on the 5090 and 102 clears ~52 on the 3090. Corollary, twice
+proven now: every decode win is (a) fewer bytes per step (quant policy,
+fp8 KV, turbo3 KV) or (b) more accepted positions per weight read
+(ladder, suffix width) -- there is no third lever at batch 1, and
+docs/multislot-throughput.md is what happens when you ask for one.
 
 ### Decode methodology (canonical, 2026-07-02)
 
