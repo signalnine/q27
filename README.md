@@ -105,6 +105,19 @@ tables in BUILDLOG):
   T8 scores do NOT separate across tiers (basin lottery at n=3; all 9
   trials completed) -- the quality tiers buy PPL margin, not task
   scores. The serving default stays 5.25 bpw.
+- Weight tier x KV format -> max context on a 32GB 5090 (auto-ctx
+  picks; * = boot-verified 07-12, ~ = formula from the same anchor):
+
+  | KV format | default 5.25 bpw | q6 | q6k |
+  |---|---|---|---|
+  | fp8 (34 KB/tok) | 262144 (cap; 294912 fits) | 196608* | 114688* |
+  | turbo3 (13.4 KB/tok) | 262144 (cap; 655360 fits) | 262144 (~495K fits) | 262144* (~292K fits) |
+  | fp16 (68 KB/tok) | 131072 (cap) | ~98K | ~57K |
+
+  turbo3 absorbs the tiers completely -- even q6k keeps the full native
+  262144 window. fp8 is where the tiers bite (~29K tokens of window per
+  GB of weights); q6k+fp8 at 114K can pinch a deep agentic session, so
+  pair the quality tiers with `Q27_KV=turbo3`.
 - 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
   at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
   85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
