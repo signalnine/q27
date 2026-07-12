@@ -32,7 +32,8 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
   aggregate on a 5090).
 - **Receipts for everything**: bitwise canonical gates, negative
   results logged at the same rate as wins, and every number in this
-  README traceable to a BUILDLOG entry.
+  README traceable to a dated BUILDLOG entry. (The BUILDLOG is the
+  ledger, not git history -- commits sometimes batch a day's entries.)
 
 **Baseline model (2026-07-09): vanilla Qwen3.6-27B-MTP** (`qwen36-27b-mtp`,
 canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate

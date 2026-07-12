@@ -8,7 +8,7 @@
 //        thinking blocks, tool_use/tool_result, input_json_delta streaming)
 //   POST /v1/responses                                (OpenAI Responses, Codex CLI)
 //
-// usage: q27-server model.q27 model.tok [--port 8080] [--host 0.0.0.0]
+// usage: q27-server model.q27 model.tok [--port 8080] [--host 127.0.0.1]
 //                   [--ctx 8192] [--fast-head] [--slots N] [--slot1-ctx M]
 #include <atomic>
 #include <condition_variable>
@@ -113,7 +113,14 @@ int main(int argc, char** argv) {
                 argv[0]);
         return 1;
     }
-    std::string model = argv[1], tokpath = argv[2], host = "0.0.0.0";
+    // loopback by default: this server has NO auth -- exposing it beyond
+    // the local host is an explicit operator decision (--host 0.0.0.0).
+    std::string model = argv[1], tokpath = argv[2], host = "127.0.0.1";
+    // served model id = model file stem (e.g. qwen36-27b-mtp-q6k), not a
+    // hardcoded name that goes stale the moment a second model exists
+    std::string served_name = model.substr(model.find_last_of('/') + 1);
+    if (served_name.size() > 4 && served_name.substr(served_name.size() - 4) == ".q27")
+        served_name.resize(served_name.size() - 4);
     int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
     int n_slots = 1, slot1_ctx = 32768;
     int fast_flag = -1;        // tri-state: explicit flag wins over profile
@@ -595,7 +602,7 @@ int main(int argc, char** argv) {
 
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json j = {{"object", "list"},
-                  {"data", json::array({{{"id", "q27-qwopus-27b"}, {"object", "model"},
+                  {"data", json::array({{{"id", served_name}, {"object", "model"},
                                          {"owned_by", "q27"}}})}};
         res.set_content(j.dump(), "application/json");
     });
@@ -692,7 +699,7 @@ int main(int argc, char** argv) {
                 choice = {{"index", 0}, {"finish_reason", n >= n_max ? "length" : "stop"},
                           {"text", text}};
             json out = {{"id", "q27-0"}, {"object", obj}, {"created", created},
-                        {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})},
+                        {"model", served_name}, {"choices", json::array({choice})},
                         {"usage", {{"prompt_tokens", (int)prompt.size()},
                                    {"completion_tokens", n},
                                    {"total_tokens", (int)prompt.size() + n}}}};
@@ -725,7 +732,7 @@ int main(int argc, char** argv) {
                         ? json{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}
                         : json{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
                     return json{{"id", "q27-0"}, {"object", objd}, {"created", created},
-                                {"model", "q27-qwopus-27b"}, {"choices", json::array({choice})}};
+                                {"model", served_name}, {"choices", json::array({choice})}};
                 };
                 eng.generate(prompt, nm, EOS, [&](int id) {
                     // empty pieces (control tokens, gate holdbacks) still probe
@@ -905,7 +912,7 @@ int main(int argc, char** argv) {
                                        {"name", c.name}, {"input", c.arguments}});
             const char* sr = any_call ? "tool_use" : (n >= n_max ? "max_tokens" : "end_turn");
             json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                        {"model", "q27-qwopus-27b"}, {"content", content},
+                        {"model", served_name}, {"content", content},
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", n}}}};
@@ -942,7 +949,7 @@ int main(int argc, char** argv) {
                     return sink.write(s.data(), s.size());
                 };
                 json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                            {"model", "q27-qwopus-27b"}, {"content", json::array()},
+                            {"model", served_name}, {"content", json::array()},
                             {"stop_reason", nullptr}, {"stop_sequence", nullptr},
                             {"usage", {{"input_tokens", (int)prompt.size()}, {"output_tokens", 0}}}};
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});
@@ -1291,7 +1298,7 @@ int main(int argc, char** argv) {
             flush_think();
             flush_text();
             json out = {{"id", resp_id}, {"object", "response"}, {"status", "completed"},
-                        {"model", "q27-qwopus-27b"}, {"output", items},
+                        {"model", served_name}, {"output", items},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", produced},
                                    {"total_tokens", (int)prompt.size() + produced}}}};
