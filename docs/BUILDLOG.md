@@ -4453,3 +4453,25 @@ hybrid-GDN support is incomplete at the quantized-checkpoint loader
 level as of 0.5.15 / 2026-07-12. No decode number is possible; the
 cross-engine pitch cites llama.cpp and vLLM (measured) and this finding
 for sglang. Probe cost: ~35 min, two launch attempts, no code written.
+
+## 2026-07-12 -- 3090 prefill A/B vs llama.cpp: llama +27% raw (first Ampere prefill read)
+
+Gap in the record: the 07-09 cross-engine day benched prefill on the
+5090 only (parity: llama pp8192 3562 vs q27 fp8 ~3480). Same read on
+the 3090 (vox paused, GPU1 exclusive, vanilla model both sides):
+
+- llama mainline 13e67386, Q5_K_M, -fa 1: pp512 1419 +- 13,
+  pp8192 1355 +- 5 t/s.
+- q27 (--pf, Q27_PF_NOSERIAL=1): fp8 512/8192 = 1040/1065 t/s;
+  turbo3 = 1041/1089 t/s (KV format is noise here, as expected --
+  prefill is GEMM-bound).
+
+llama +27-30% raw on sm_86 vs parity on sm_120. Not a fallback
+artifact: 1065 is right where the 5090's 3480 lands scaled by int8
+tensor throughput; llama's Ampere mmq path is simply better tuned than
+our P1/P5 GEMM tiling on this arch (tuned on the 5090). Serving picture
+unchanged: effective prefill on real CC traffic favors q27 2309-2569
+vs 1720 t/s (prefix-cache mechanics dominate raw rate), and the 3090
+dome wins were decode-side. A sm_86 GEMM-tile retune is the lever if
+raw 3090 prefill ever matters; not commissioned. README 3090 bullet
+updated with the honest split. vox restored.

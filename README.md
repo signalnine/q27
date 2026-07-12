@@ -78,7 +78,10 @@ tables in BUILDLOG):
 - 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
   at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
   85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
-  ctx** on the strongest vanilla config.
+  ctx** on the strongest vanilla config. Raw prefill on the 3090 goes
+  the other way: llama pp8192 1355 t/s vs q27 1065-1089 (-21%; parity
+  on the 5090) -- serving-effective prefill still favors q27 via its
+  prefix cache (2309-2569 vs 1720 t/s on real CC traffic).
 
 ## Quickstart
 
