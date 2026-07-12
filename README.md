@@ -44,6 +44,10 @@ tables in BUILDLOG):
   (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
   with vanilla (median 0.836 vs 0.830, 13/21 tasks tied). The old +35%
   figure was the echo-heavy cctx replay BEST-CASE, not a traffic number.
+- 3090 (24GB, turbo3 + h16, 07-12): **102.2 t/s median** live CC decode
+  at **131K ctx**, 3/3 T8 sessions -- vs vanilla mainline llama.cpp's
+  85.6 t/s at 82K (2/3, one context-wall crash): **+19% decode, +60%
+  ctx** on the strongest vanilla config.
 
 ## Quickstart
 
@@ -109,53 +113,27 @@ errors so Claude Code compacts correctly.
 
 ## State of the engine (2026-07-10)
 
-One day, five shipped stages -- each gated (canonical EXACT / byte-identity
-/ sanitizer / test suites) and pushed; details + negatives in BUILDLOG:
+Five stages shipped in one day, each gated; the full entries (and their
+negatives) are the 2026-07-10 BUILDLOG block. Headlines:
 
-- **Width-12 verify architecture.** The lane fabric widened 8 -> 12 (p[16]
-  struct family, 12 GDN role sets, perm mod 12, 12-perm graph zoo,
-  prep/finish pointer-struct signatures). Policy-decoupled: the MTP ladder
-  stays 4..7; widths 9..12 belong to the **suffix drafter** (`Q27_SUFFIX_W`,
-  default 12), which fills draft lanes from recurring committed-stream
-  suffixes at zero model cost. Live T8: **AL 10.61 on 61.6% of decode**
-  (same fire rate as width-8, +63% tokens per fire -- the cap-release
-  mechanism the plan predicted), good-basin score 0.84. Byte-identical to
-  the pre-widen binary under fd2 by construction. Framing: stream-lookup
-  self-speculation is an old family (llama's ngram spec is a sibling, and
-  beats us on the degenerate pure loop); what is ours is the COMPOSITION
-  -- per-round arbitration between the trained MTP ladder and the free
-  suffix drafter, both verified through one shared-KV width-12 MMA
-  kernel, with the suffix taking the echo cream so the ladder is not
-  starved (auto rounds still promote to their ceiling on live traffic).
-- **fdmma verify attention, tuned 1.75x in a day.** The fp8-MMA shared-KV
-  verify kernel went 354.7 -> 282.4 (STAGES=1: single-buffered K/V at
-  **2 CTAs/SM** -- ncu showed the 1-CTA kernel 89% no-eligible) -> **202.6us
-  at 61K W=12 (5.6x over fd2)** via the split-count retune (ns =
-  SMs*2/kv_heads, computed per GPU -- 128 splits left a half-empty wave).
-  Three negatives attributed and recorded: prefetch reorder (wash),
-  warp-pair PV and warp-specialized producer (both bitwise-correct, both
-  lose -- for this kernel family CTA count dominates intra-CTA
-  orchestration; reopening bar filed).
-- **`__grid_constant__` on every struct-param kernel.** The vanilla
-  short-bench suite caught an 8% engine-wide regression the depth gates
-  missed: by-value lane structs indexed by blockIdx are copied to
-  per-thread LOCAL memory (128B since P10-A0; width-12 doubled it).
-  The fix is addressing-only (bitwise) and lands the suite at 172.2 --
-  above the pre-width-12 baseline. Standing lesson: the short-ctx suite
-  is the param/launch-overhead canary; run it after any plumbing change.
-- **Zero-config Claude-Code serving.** A bare `q27-server model.q27
-  model.tok` now IS the full measured stack (see Serving) with VRAM-sized
-  auto `--ctx`; the CLI keeps reference defaults so the bitwise canonical
-  world is untouched. The standing eval unit is a two-argument command.
-- **Deep-MTP question closed (width-12 P3).** On the freshly measured
-  wide-round curve, MTP ceilings 9/10 price NEGATIVE even on the hottest
-  chains (acceptance saturates at 4.79 tok/rnd vs 2.7-3.2ms marginal
-  lanes); ceiling 8 prices +2.7% MTP-wall on hot chains but the live cap
-  mix (16% full-fire at 7, sat7 ~25%) plus suffix shadowing shrink it
-  under 1% engine -- NO-BUILD, reopen conditions filed. The wide-lane
-  marginal is **GEMV-N-bound**, not GDN-bound: the deferred-snapshot GDN
-  chunk stays shelved; the honest lever for cheaper wide rounds is the
-  mma16 batched-GEMM verify pivot (on file, not commissioned).
+- **Width-12 verify**: lanes 8 -> 12; widths 9..12 belong to the suffix
+  drafter (live T8 AL 10.61 on 61.6% of decode -- the predicted cap
+  release). Byte-identical at old widths by construction.
+- **fdmma tuned 5.6x over fd2** at 61K W12 (2-CTA STAGES=1 + computed
+  split count); three orchestration negatives filed with a do-not-retry
+  bar (CTA count dominates intra-CTA choreography here).
+- **`__grid_constant__`** on struct-param kernels: the short-bench suite
+  caught an 8% engine-wide param-copy tax the depth gates missed; suite
+  172.2, above the pre-regression baseline. The suite is the standing
+  launch-overhead canary.
+- **Zero-config serving**: bare `q27-server model tok` = the full
+  measured stack; CLI keeps reference defaults (bitwise world untouched).
+- **Deep-MTP closed by pricing**: ceilings 9/10 negative, 8 NO-BUILD;
+  the wide-lane marginal is GEMV-N-bound (mma16 GEMM-verify is the filed
+  pivot, not commissioned).
+
+(2026-07-11/12 shipped the turbo3 KV arc and the h16 Ampere verify --
+see the features list above and BUILDLOG.)
 
 **Carried state (pre-2026-07-10, still load-bearing):**
 
@@ -184,6 +162,10 @@ One day, five shipped stages -- each gated (canonical EXACT / byte-identity
   fp8-MMA verify leg; PPL +0.87% flat to 297K, acceptance TIES fp8 on
   basin-matched replay, needle 6/6 at a 361K prompt, allocates to 655K
   (2.5x native); promotes a 24GB 3090 from a 32K box to a 131K box.
+- fdmma-h16 (2026-07-12): fp16-MMA verify on sm_80+, all KV formats,
+  W<=8 -- Ampere's mma leg (3090 +32% replay decode; profile shows the
+  round then sits at 81-90% of the DRAM roofline) and fp16-KV's first
+  mma leg on every arch.
 
 ## Why this model is a good target
 
@@ -296,12 +278,10 @@ These numbers are NOT interchangeable -- each answers a different question:
 - **2K soak** (long-generation number): 2000-token generation, **209.2 t/s
   STOCK fd2-era** (4.32 t/round; pre-fd2 213.2/4.36, the ~2% is the
   short-ctx split tax). Headline for agentic reply-length outputs.
-- **Depth numbers** (Qwopus 07-08-era history; CURRENT depth predictors are the 07-10 Reference numbers: cctx 26K 143.0/176.3 vanilla, live CC 213-227 t/s aggregate): **172.9 t/s ungated @61K** (verify-gemv, 2026-07-08
-  fixtures -- NOT comparable to the P14-era 119-126 on the old corpus; the
-  ms/round attribution bridges eras); **202-223 t/s @26K real-CC-transcript
-  replay** (d4-gated -> auto-ladder-6); **156-164 t/s effective** across real
-  CRUSH trials to 74K (fd2-era). These, not the 2K numbers, predict agentic
-  wall time.
+- **Depth numbers**: the current predictors are the Reference-numbers
+  block (cctx 26K 143.0/176.3, live CC 213-246 aggregate); the 07-08-era
+  61K/74K series lives in BUILDLOG with its cross-era bridges. Depth
+  numbers, not 2K numbers, predict agentic wall time.
 
 OC policy: headline + SOTA comparisons are reported STOCK (community numbers
 aren't OC'd; sidesteps the non-ECC tail-risk conversation). +3000 stays a
@@ -364,7 +344,8 @@ serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV itself needs sm_89+, older parts default fp16 KV),
 `Q27_PMIN=0.5`, `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head,
 no-think, phase stats; `--ctx` auto-sizes the KV budget to free VRAM
-(cap 131072, single-slot). Every knob keeps its env/flag override
+(capped at the 262144 native window for fp8/turbo3, 131072 fp16;
+single-slot). Every knob keeps its env/flag override
 (user env always wins), `Q27_PROFILE=ref` restores the conservative
 reference behavior (fp16, ungated, no suffix, fd2), and the **CLI binary
 keeps reference defaults** so the bitwise canonical gates are untouched.
@@ -522,7 +503,11 @@ P8 stable-prefix snapshot to hold on real re-rendering traffic]
 
 ## Roadmap
 
-**Recently shipped (2026-07-10):** width-12 verify + suffix width 12 (live
+**Recently shipped (2026-07-11/12):** the turbo3 KV arc (port -> prefill
+-> fdmma leg -> ctx sweeps -> 2-slot -> 3090 promotion) and fdmma-h16;
+BUILDLOG has the dozen entries.
+
+**Shipped 2026-07-10:** width-12 verify + suffix width 12 (live
 AL 10.6); fdmma STAGES=1 2-CTA + computed split count (5.6x fd2 at 61K
 W12); `__grid_constant__` param fix (suite 172.2, above the old baseline);
 zero-config CC serving defaults + auto `--ctx` + `Q27_PROFILE=ref`; P3
@@ -580,18 +565,9 @@ docs/perf-attribution-p14.md.
   needs both a register cut (the o[32][4] accumulator = 128 regs) and smem
   halving -- a from-the-layout rewrite. Attention is still ~half of 128K
   prefill.
-- **d7/d8 ladder extension, telemetry-gated.** cctx sat6 = 0.64 still
-  saturates at depth 6; live `glf=`/`gla=` now report lane-6 fired/accepted on
-  real serving traffic. Extend by the same recipe (S_spare7, hi7/flo7) IF
-  sustained sat6 >= ~0.6 shows up live; the pointer-array lane refactor
-  (maxd6-decision.md) becomes worth it at d7+. The P4-echo tail (llama
-  depth-10 +45%) is the prize.
-- **Task 6 fd2 lane-pair fusion (requires Gabe's explicit go).** Task 5
-  captured only ~10% of the R~4.25 cross-lane KV headroom; the residual
-  ~6 ms/round verify-attention is the lane-pair-fusion target -- helps every
-  round of every traffic class, ~0 VRAM, and it lowers the ladder's per-lane
-  breakeven (deeper levels get cheaper). The expensive kernel rewrite (fd3
-  design doc + occupancy gate); DEFERRED pending explicit approval.
+- **Task 6 fd2 lane-pair fusion -- MEASURED NEGATIVE (07-07).** Bitwise
+  but -4%: fd2 decode attention is LATENCY-bound, not BW-bound. Retry bar:
+  <=~128 registers. (Superseded in practice by fdmma/h16 anyway.)
 - **docs-class promote churn (~1%).** Boundary traffic (bursty sat5 ~0.46-0.5)
   keeps a ~1% auto-vs-fixed gap from promote exploration, bounded by flo6.
   Known shave: a demote-count promote-escalator. Not built (YAGNI at 1%,
