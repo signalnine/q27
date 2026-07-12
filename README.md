@@ -150,7 +150,9 @@ huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
 #                             of this model, ~17% slower short-ctx
 # verify: (cd models/qwen36-27b-mtp && md5sum -c CHECKSUMS.md5)
 
-# 2. build (CLI + server + test suites)
+# 2. build (CLI + server + test suites) -- or skip the toolchain and
+#    grab prebuilt linux x86_64 binaries (CUDA runtime statically
+#    linked) from https://github.com/signalnine/q27/releases
 git clone https://github.com/signalnine/q27 && cd q27
 make
 
