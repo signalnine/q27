@@ -2,6 +2,37 @@
 
 A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090. One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
+## Why this is interesting
+
+- **Fastest known way to run this model.** +47% decode over tuned
+  llama.cpp on a 5090 (same model, GPU, harness, day; protocol filed
+  before it could pass). On a 24GB 3090: +19% decode at +60% context
+  over mainline llama.cpp -- whose best config crashed an agentic
+  session on its own 82K context wall. vLLM measured 4.7x slower wall
+  on real Claude-Code traffic (its prefix cache gets 0% reuse on this
+  hybrid-GDN architecture).
+- **turbo3 3-bit KV cache**, symmetric K+V: 13.4 KB/token, ~1% PPL,
+  needle 6/6 at a 361K-token prompt, 655K context allocatable on a
+  5090, two full 131K tenants at once, and a 24GB card promoted from a
+  32K box to a 131K box. The fork this quant came from refuses 3-bit K
+  on this model class and caps 33% lower; we measured instead
+  (K costs +0.17%).
+- **Native Anthropic Messages endpoint at Claude-Code grade**: thinking
+  blocks, tool_use with input_json_delta streaming, exact
+  `count_tokens`, anthropic-shaped context-limit errors, billing-header
+  normalization so the prefix cache survives real CC turns, and a
+  tolerant tool-call parser (nine cataloged drift modes) that is
+  load-bearing for ANY engine on this harness. One env var points
+  Claude Code at it; OpenAI and Codex (Responses) shapes ride the same
+  binary.
+- **Self-speculation as the whole design**: trained-in MTP ladder +
+  free suffix drafter through one shared-KV MMA verify -- 5.3-5.8
+  accepted tokens per weight read on live traffic (231-246 t/s
+  aggregate on a 5090).
+- **Receipts for everything**: bitwise canonical gates, negative
+  results logged at the same rate as wins, and every number in this
+  README traceable to a BUILDLOG entry.
+
 **Baseline model (2026-07-09): vanilla Qwen3.6-27B-MTP** (`qwen36-27b-mtp`,
 canonical md5 `a2982c51...`) -- the benchmark standard: bench rigs and gate
 scripts default to it. Fine-tunes stay fully supported (`MODEL=`/`TOK=`/
