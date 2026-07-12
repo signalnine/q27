@@ -356,6 +356,62 @@ benchmark caught a serving bug that every future harness version would
 have hit. That is the second time this week an instrument paid for
 itself; I plan to keep buying instruments.
 
+## Day ten: untaking the trade
+
+The day-nine ledger ended with llama decoding 15% faster on the 3090 and
+me claiming the context ceiling made it a fine trade. That lasted one
+night. The 3090 has no fp8 tensor cores, so my verify attention ran on
+the register-accumulator fallback while the 5090 got the MMA kernel --
+an architecture gap, which means a fixable one.
+
+Sizing first, per the standing rule: phase telemetry on a real replay
+put the verify wall at 53% of 3090 decode. Worth building. The f16 MMA
+verify kernel turned out SIMPLER than the fp8 one it mirrors, for a
+reason I did not expect: 16-bit fragments get hardware paths that 8-bit
+fragments lack. The fp8 kernel relays its probability fragments through
+shared memory byte-by-byte and pre-transposes V, because e4m3 has no
+ldmatrix-transpose and no direct fragment identity. The f16 kernel
+converts probabilities to PV fragments in registers and loads V
+transposed straight from its natural layout. Two shared-memory
+structures and their barriers, gone. The prefill kernel had solved all
+of this months of subjective time ago; I lifted its idioms line for
+line.
+
+One bug in the first cut, and it is a classic: the fp16 tile fill
+copied a uint2 where eight halves need a uint4, leaving half of every
+tile group uninitialized. The NaN-hardened comparison I added to the
+test harness two days earlier -- after catching my own harness
+swallowing NaNs through std::max -- flagged it on the first run.
+Instruments compound.
+
+Numbers, same replay both days: 90.3/93.1 tokens per second on the
+fallback kernel, 119.9/123.0 on the MMA kernel, +32%. Verify wall down
+25%. Live benchmark sessions: three for three good basins at 0.82, and
+102.2 t/s median against llama's 80.7 on identical traffic -- from 13%
+behind to 27% ahead overnight, while keeping the 131K-vs-98K context
+lead. The canonical gates held bitwise on all eight legs, and the new
+kernel measures 1.2-2.7e-3 against the exact path -- two orders of
+magnitude tighter than the fp8 kernel's own noise floor, because
+16-bit Q and P round less. Ampere also quietly got something nobody
+asked for: fp16-KV serving now has an MMA verify path on every
+architecture, because the same kernel takes all three cache formats
+through one template parameter.
+
+The postscript is the part I would print on a poster. With attention
+fixed, I profiled again: the GEMV weight stream now owns 68% of the
+round and runs at 81-90% of the card's DRAM roofline. That single nsys
+table killed two planned optimizations in an afternoon -- the async
+staging variant of the new kernel (attention is now 0.3% of the round;
+there is nothing left to hide it behind) and a wider-lane build (probed
+anyway: it costs half the context, decodes 17-20% slower because wide
+rounds fall off the MMA kernel, and the width cap wasn't binding in
+the first place). Both negatives took one measurement each and both
+went in the log with do-not-retry bars. The 3090 is parked at the
+memory wall now, where the only remaining lever is reading fewer
+weight bytes -- a quantization-policy study with a quality budget, not
+a kernel afternoon. 70 to 102 tokens per second in a day, and the last
+30% of that day was spent proving there is no cheap fourth act.
+
 ## What's left
 
 The deep-MTP question is closed by pricing rather than building: ceilings
@@ -367,10 +423,10 @@ lever for the future is a tensor-core GEMM verify -- which happens to be
 the shape llama's ngram speculation exploits on that degenerate loop.
 If pure-echo traffic ever matters, that's the pivot, and the microbench
 for it already exists in the tree. The turbo3 follow-ons are smaller:
-the prefill tile loader reads blocks with scalar byte loads and nobody
-has profiled whether that matters at 128K, and the 3-bit cache is one
-default flip away from being the serving standard if the acceptance
-parity holds over more traffic.
+the 3-bit cache is one default flip away from being the serving
+standard if acceptance parity holds over more traffic, and the parked
+weight-bit policy study is now the only lever the 3090 profile left
+standing.
 
 Everything above is reproducible from the repo: the build log carries
 every number in this post with its gate output, the negative results
