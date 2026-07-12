@@ -101,17 +101,10 @@ struct Engine {
     float *h_b, *x1_b, *y_b, *qg_b, *kbuf_b, *vbuf_b, *attnout_b;
     float *qkv_b, *convout_b, *z_b, *alpha_b, *betar_b, *g_b, *beta_b, *o_b, *og_b;
     float *ffn_g_b, *ffn_u_b, *logits2, *y2big;
-    float *S_spare[N_LAYER], *ring_spare[N_LAYER];
-    float *S_spare2[N_LAYER], *ring_spare2[N_LAYER];
-    float *S_spare3[N_LAYER], *ring_spare3[N_LAYER];
-    float *S_spare4[N_LAYER], *ring_spare4[N_LAYER];
-    float *S_spare5[N_LAYER], *ring_spare5[N_LAYER]; // P12b: 6th role (maxd=5)
-    float *S_spare6[N_LAYER], *ring_spare6[N_LAYER]; // maxd6: 7th role (maxd=6)
-    float *S_spare7[N_LAYER], *ring_spare7[N_LAYER]; // maxd7: 8th role (maxd=7)
-    float *S_spare8[N_LAYER], *ring_spare8[N_LAYER];   // width-12: roles 9..12
-    float *S_spare9[N_LAYER], *ring_spare9[N_LAYER];   //   (verify lanes i..l;
-    float *S_spare10[N_LAYER], *ring_spare10[N_LAYER]; //   suffix-only widths
-    float *S_spare11[N_LAYER], *ring_spare11[N_LAYER]; //   until MTP 8+ prices)
+    // GDN role state, spare sets 1..11 (role 0 = S/conv_ring). Roles 8..11
+    // (indices 7..10) exist only when Q27_W_MAX admits them -- nullptr else.
+    // Was 11 pairs of named members + ternary chains (audit 2026-07-12).
+    float *S_sp[W_PLUMB - 1][N_LAYER], *ring_sp[W_PLUMB - 1][N_LAYER];
     float *h_c, *x1_c, *y_c, *qg_c, *kbuf_c, *vbuf_c, *attnout_c;
     float *qkv_c, *convout_c, *z_c, *alpha_c, *betar_c, *g_c, *beta_c, *o_c, *og_c;
     float *ffn_g_c, *ffn_u_c;
@@ -397,33 +390,11 @@ struct Engine {
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
         int ph = (role + perm) % W_MAX;
-        return ph == 0 ? S[il]
-               : ph == 1 ? S_spare[il]
-               : ph == 2 ? S_spare2[il]
-               : ph == 3 ? S_spare3[il]
-               : ph == 4 ? S_spare4[il]
-               : ph == 5 ? S_spare5[il]
-               : ph == 6 ? S_spare6[il]
-               : ph == 7 ? S_spare7[il]
-               : ph == 8 ? S_spare8[il]
-               : ph == 9 ? S_spare9[il]
-               : ph == 10 ? S_spare10[il]
-                          : S_spare11[il];
+        return ph == 0 ? S[il] : S_sp[ph - 1][il];
     }
     float* RBuf(int il, int role) {
         int ph = (role + perm) % W_MAX;
-        return ph == 0 ? conv_ring[il]
-               : ph == 1 ? ring_spare[il]
-               : ph == 2 ? ring_spare2[il]
-               : ph == 3 ? ring_spare3[il]
-               : ph == 4 ? ring_spare4[il]
-               : ph == 5 ? ring_spare5[il]
-               : ph == 6 ? ring_spare6[il]
-               : ph == 7 ? ring_spare7[il]
-               : ph == 8 ? ring_spare8[il]
-               : ph == 9 ? ring_spare9[il]
-               : ph == 10 ? ring_spare10[il]
-                          : ring_spare11[il];
+        return ph == 0 ? conv_ring[il] : ring_sp[ph - 1][il];
     }
     q27k::XQuant xq;
     // layer state
@@ -741,48 +712,21 @@ struct Engine {
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
                 A((void**)&S[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
                 CUDA_CHECK(cudaMemset(S[il], 0, (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4));
-                A((void**)&S_spare[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare2[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare2[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare3[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare3[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare4[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                A((void**)&ring_spare4[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare5[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // P12b
-                A((void**)&ring_spare5[il], 3 * GDN_CH * 4);
-                // spare sets 6..11 are allocated at EVERY gate_maxd (review
+                // spare sets 1..7 are allocated at EVERY gate_maxd (review
                 // 2026-07-09, accepted tradeoff ~157MB each): the perm
                 // rotation is uniformly mod-12 ((role+perm)%12), so all 12
-                // sets enter rotation even at shallow ceilings. A
-                // width-dependent modulus would save the VRAM but complicate
-                // the refinish_round rewind (the P15-hardened state
-                // machinery).
-                A((void**)&S_spare6[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd6
-                A((void**)&ring_spare6[il], 3 * GDN_CH * 4);
-                A((void**)&S_spare7[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4); // maxd7
-                A((void**)&ring_spare7[il], 3 * GDN_CH * 4);
-                // roles 8..11 exist only when W_MAX admits them (Q27_W_MAX
-                // knob). Skipped sets stay nullptr and are never addressed
+                // sets enter rotation even at shallow ceilings. Roles 8..11
+                // (indices 7..10) exist only when W_MAX admits them (Q27_W_MAX
+                // knob); skipped sets stay nullptr and are never addressed
                 // (SBuf/RBuf index (role+perm)%W_MAX < W_MAX). This is the
                 // narrow-build memory win: each skipped role = ~157MB/engine.
-                S_spare8[il] = S_spare9[il] = S_spare10[il] = S_spare11[il] = nullptr;
-                ring_spare8[il] = ring_spare9[il] = ring_spare10[il] = ring_spare11[il] = nullptr;
-                if (W_MAX > 8) {
-                    A((void**)&S_spare8[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                    A((void**)&ring_spare8[il], 3 * GDN_CH * 4);
-                }
-                if (W_MAX > 9) {
-                    A((void**)&S_spare9[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                    A((void**)&ring_spare9[il], 3 * GDN_CH * 4);
-                }
-                if (W_MAX > 10) {
-                    A((void**)&S_spare10[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                    A((void**)&ring_spare10[il], 3 * GDN_CH * 4);
-                }
-                if (W_MAX > 11) {
-                    A((void**)&S_spare11[il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
-                    A((void**)&ring_spare11[il], 3 * GDN_CH * 4);
+                for (int r = 0; r < W_PLUMB - 1; r++) {
+                    if (r >= 7 && W_MAX <= r + 1) {
+                        S_sp[r][il] = ring_sp[r][il] = nullptr;
+                        continue;
+                    }
+                    A((void**)&S_sp[r][il], (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4);
+                    A((void**)&ring_sp[r][il], 3 * GDN_CH * 4);
                 }
                 // (W_MAX + 1) S-buffers (main + W_MAX-1 spares + snap) + rings
                 // per GDN layer -- server slot admission sizes its floor from
@@ -1460,29 +1404,12 @@ struct Engine {
                 if (!attn_layer[il]) {
                     size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
                     CUDA_CHECK(cudaMemset(S[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
                     CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare5[il], 0, sb));           // P12b
-                    CUDA_CHECK(cudaMemset(ring_spare5[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare6[il], 0, sb));           // maxd6
-                    CUDA_CHECK(cudaMemset(ring_spare6[il], 0, 3 * GDN_CH * 4));
-                    CUDA_CHECK(cudaMemset(S_spare7[il], 0, sb));           // maxd7
-                    CUDA_CHECK(cudaMemset(ring_spare7[il], 0, 3 * GDN_CH * 4));
-                    if (W_MAX > 8) { CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));  // width-12
-                        CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4)); }
-                    if (W_MAX > 9) { CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
-                        CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4)); }
-                    if (W_MAX > 10) { CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
-                        CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4)); }
-                    if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
-                        CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
+                    for (int r = 0; r < W_PLUMB - 1; r++)
+                        if (S_sp[r][il]) {
+                            CUDA_CHECK(cudaMemset(S_sp[r][il], 0, sb));
+                            CUDA_CHECK(cudaMemset(ring_sp[r][il], 0, 3 * GDN_CH * 4));
+                        }
                 }
             CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
             CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
@@ -2311,30 +2238,12 @@ struct Engine {
             if (!attn_layer[il]) {
                 size_t sb = (size_t)GDN_HEADS * GDN_DIM * GDN_DIM * 4;
                 CUDA_CHECK(cudaMemset(S[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare2[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare3[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare4[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare5[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare6[il], 0, sb));
-                CUDA_CHECK(cudaMemset(S_spare7[il], 0, sb));
                 CUDA_CHECK(cudaMemset(conv_ring[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare2[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare3[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare4[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare5[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare6[il], 0, 3 * GDN_CH * 4));
-                CUDA_CHECK(cudaMemset(ring_spare7[il], 0, 3 * GDN_CH * 4));
-                // roles 8..11 only when Q27_W_MAX admits them (nullptr else)
-                if (W_MAX > 8) { CUDA_CHECK(cudaMemset(S_spare8[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare8[il], 0, 3 * GDN_CH * 4)); }
-                if (W_MAX > 9) { CUDA_CHECK(cudaMemset(S_spare9[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare9[il], 0, 3 * GDN_CH * 4)); }
-                if (W_MAX > 10) { CUDA_CHECK(cudaMemset(S_spare10[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare10[il], 0, 3 * GDN_CH * 4)); }
-                if (W_MAX > 11) { CUDA_CHECK(cudaMemset(S_spare11[il], 0, sb));
-                    CUDA_CHECK(cudaMemset(ring_spare11[il], 0, 3 * GDN_CH * 4)); }
+                for (int r = 0; r < W_PLUMB - 1; r++)
+                    if (S_sp[r][il]) {
+                        CUDA_CHECK(cudaMemset(S_sp[r][il], 0, sb));
+                        CUDA_CHECK(cudaMemset(ring_sp[r][il], 0, 3 * GDN_CH * 4));
+                    }
             }
         CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
         CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
