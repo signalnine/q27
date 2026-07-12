@@ -4393,3 +4393,20 @@ borderline on 24GB) and the parked lower-bit weight policy (the only
 path to materially fewer bytes; needs its own quality-gated study).
 Standing rule reaffirmed: profile before building -- this killed a
 planned kernel change for the cost of one nsys run.
+
+## 2026-07-12 -- W10 probe on the 3090: NEGATIVE (costs ctx AND speed, buys nothing)
+
+Q27_W_MAX=10 build, turbo3, 3090 (vox paused): OOM at 131K, fits at 65K
+(24.08GB -- the two extra role sets + graphs eat half the context
+headroom). cctx2 warm replays: 98.6/99.2 tps vs the W8+h16 reference's
+119.9/123.0 = 17-20% SLOWER, identical round counts and tok/rnd (~5.6),
+suffix fire unchanged. Two compounding reasons: (a) rounds wider than 8
+route to fd2_t3 (h16 caps at W8 by smem), so width 9-10 trades the mma
+attention win away exactly when it engages; (b) the width cap does not
+bind on this traffic anyway -- gla lanes 6-7 tail to near zero, so lanes
+9-10 would idle. The 5090's AL-10.6 story needs BOTH width 12 AND the
+e4m3 kernel's W12 smem budget; Ampere has neither. VERDICT: W8 stays the
+3090 recommendation, binary deleted, do-not-retry unless an h16 W>8
+variant exists (needs the 2-CTA smem math to change, i.e. it does not).
+3090 optimization is now formally parked at the weight roofline: the
+remaining lever is the weight-bit policy study.
