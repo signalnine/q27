@@ -4317,3 +4317,14 @@ Ladder (CLI --spec boot + decode): 262144 / 278528 / 294912 OK; 299102 and
 record alongside turbo3's 655360 (2.2x) and fp16's ~180K. Also corrects
 the ctx-sweep entry's untested "297054 did not fit" aside -- probed now,
 it indeed does not (barely: the boundary sits in [294912, 299102)).
+
+## 2026-07-11 -- auto-ctx cap raised to the native window for compact KV (Gabe sign-off)
+
+server.cu: auto-ctx cap is now format-aware -- 262144 (the advertised
+native window) for fp8/turbo3/turbo3v, 131072 kept for fp16. Rationale:
+the old cap was a TTFT + estimate-margin guard from the fp8-era formula
+distrust, not a VRAM fact (fp8 measured to 294912 today, turbo3 to
+655360). Verified: bare boots auto-size 262144 and reach slot-ready on
+both fp8 and turbo3; explicit --ctx still overrides both ways. q27-eval
+now serves 262144 fp8 zero-config. Cold-prefill TTFT at full window is
+the accepted tradeoff (~4-5 min worst case at 262K).

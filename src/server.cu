@@ -105,7 +105,8 @@ int main(int argc, char** argv) {
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=12 + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
-                "  (cap 131072, single-slot). Escapes: Q27_PROFILE=ref (conservative\n"
+                "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
+                "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
                 "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
                 "  defaults (bitwise canonical).\n",
@@ -208,7 +209,13 @@ int main(int argc, char** argv) {
                          per_tok = t3 ? 13.6e3 : t3v ? 41.6e3 : fp8 ? 34e3 : 68e3;
             long budget = (long)((double)free_b - fixed - slack);
             long c = budget > 0 ? (long)(budget / per_tok) : 0;
-            if (c > 131072) c = 131072;
+            // cap: native window (262144) for the compact KV formats
+            // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
+            // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
+            // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
+            // historical 131072 (it barely clears it anyway).
+            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
+            if (c > cap) c = cap;
             ctx = (int)(c / 4096 * 4096);
             if (ctx < 4096) {
                 fprintf(stderr,
