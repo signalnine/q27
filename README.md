@@ -7,8 +7,7 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 - **Fastest known way to run this model.** +47% decode over tuned
   llama.cpp on a 5090 (same model, GPU, harness, day; protocol filed
   before it could pass). On a 24GB 3090: +19% decode at +60% context
-  over mainline llama.cpp -- whose best config crashed an agentic
-  session on its own 82K context wall. vLLM measured 4.7x slower wall
+  over mainline llama.cpp. vLLM measured 4.7x slower wall
   on real Claude-Code traffic (its prefix cache gets 0% reuse on this
   hybrid-GDN architecture). sglang 0.5.15 cannot load the model at all
   (quantized-checkpoint loader gaps on the GDN layers; BUILDLOG
