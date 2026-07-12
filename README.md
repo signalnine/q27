@@ -47,10 +47,18 @@ tables in BUILDLOG):
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU with 24GB+ VRAM (built for the RTX 5090 /
-sm_120; runs on sm_86+ with automatic fallbacks -- the fp8-KV + MMA fast
-paths need sm_89+, and 24GB cards serve at reduced context), CUDA
-toolkit 12.x at `/usr/local/cuda`, and gcc.
+Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.x at
+`/usr/local/cuda`, and gcc. `make` builds ONE dual-arch binary
+(sm_86 + sm_120: 3090 and 5090 class); arch dispatch is at runtime --
+fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80) runs the
+fp16-MMA verify (h16) and fp16/turbo3 KV.
+
+24GB cards (3090-class): build `make build/q27-server-w8` as well --
+`Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
+default width-12 build OOMs at graph setup on 24GB. Serve it with
+`Q27_KV=turbo3` for 131K context (fp16 KV caps ~32K there). The card
+must be otherwise idle: ~2.7GB of other resident VRAM is the difference
+between boot and OOM.
 
 ```bash
 # 1. model + tokenizer from Hugging Face (~17GB; Apache-2.0)
@@ -353,7 +361,7 @@ make build/q27-server
 
 **Defaults (2026-07-10) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
-fp8 KV + `Q27_FD=mma` (sm_89+; older parts fall back fp16 + fd2),
+fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV itself needs sm_89+, older parts default fp16 KV),
 `Q27_PMIN=0.5`, `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head,
 no-think, phase stats; `--ctx` auto-sizes the KV budget to free VRAM
 (cap 131072, single-slot). Every knob keeps its env/flag override
