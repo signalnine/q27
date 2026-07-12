@@ -188,18 +188,26 @@ cap, which real traffic never reaches).
 - Sampling at spec speed (Phases 1-2, exit-gate PASSED, cleared to default
   T<=0.7/top-p 0.95; greedy stays bitwise).
 - Agentic serving: the tolerant tool-call parser is load-bearing (drift
-  modes 1-8 fixed; CC 0.00 -> 0.55 was a PARSER ceiling, not quant);
+  modes 1-9 fixed + required-subset inference tie-break 2026-07-11 (modern
+  CC registries carry property-twins); CC 0.00 -> 0.55 was a PARSER
+  ceiling, not quant);
   `--constrain-tools` P15 engage-lag fixed, still opt-in (in-call cost).
 - Multi-slot serving (`--slots N`) with R1b round-granularity GPU
   time-slicing; P9 same-session checkpoint ring; P8 stable-prefix snapshot
-  (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`.
+  (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`. turbo3
+  fits TWO full 131K slots on the 5090 (capacity, not vLLM-style aggregate
+  -- docs/multislot-throughput.md).
 - Long-context: validated to 361K needle 6/6 (fp8); ~355K fp8 KV ceiling.
+- turbo3 3-bit KV (2026-07-11, `Q27_KV=turbo3`): full stack incl. the
+  fp8-MMA verify leg; PPL +0.87% flat to 297K, acceptance TIES fp8 on
+  basin-matched replay, needle 6/6 at a 361K prompt, allocates to 655K
+  (2.5x native); promotes a 24GB 3090 from a 32K box to a 131K box.
 
 ## Why this model is a good target
 
 - Dense-ish 27B that fits entirely in 32 GB VRAM at 4-bit -- no expert offload, no DRAM scatter, none of the DSV4 pain
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
-- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2; server default since 07-03, arch-gated sm_89+ with the `Q27_PROFILE=ref` escape 07-10; CLI opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~285K est. post-width-12 (~355K before the role sets grew 5 -> 12; +627MB) -- the advertised 262K native still fits** (allocates and runs; correctness validated to 361K, see risk 5)
+- Hybrid Gated-DeltaNet architecture means near-O(1) memory per token for 48 of 65 layers. KV lives only in the 17 full-attention layers (16 + MTP, all **global**, no windowing): 68 KB/token at fp16 = ~4.3 GB @64K, ~8.5 GB @128K, ~17.8 GB @256K. A dense-attention 65-layer build would be ~68 GB @256K. At fp16 KV the practical allocation ceiling is ~180K; **fp8 E4M3 KV (P2; server default since 07-03, arch-gated sm_89+ with the `Q27_PROFILE=ref` escape 07-10; CLI opt-in via `Q27_KV=fp8`) halves that to 34 KB/token and raises the ceiling to ~285K est. post-width-12 (~355K before the role sets grew 5 -> 12; +627MB) -- the advertised 262K native still fits** (allocates and runs; correctness validated to 361K, see risk 5). **turbo3 3-bit KV (2026-07-11) cuts that to ~13.4 KB/token: allocates and decodes at 655K on the 5090 (VRAM-bound ~660K; the 131K auto-ctx cap is policy), position-bucket NLL flat through 297K, needle 6/6 at a 361K prompt -- and two FULL 131K slots fit at once.**
 - The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
 - Measured baseline to beat: llama.cpp mainline (b9857, `--spec-type
   draft-mtp`, Q5_K_M, greedy) at 106-127 t/s single-stream on this box;
@@ -321,7 +329,7 @@ tool (`--verify-weights`, `/health?verify=1`) exists for OC sessions.
 ## Design decisions
 
 - **Weights**: custom 4-bit symmetric groupwise (group 64, fp16 scales), packed for coalesced 128B warp loads, dequant fused into GEMV. Embeddings, lm_head, MTP layer, norms at 8-bit/f32. Repacked offline from the BF16 GGUF (container spec: docs/FORMAT.md).
-- **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships as the SERVER default (since 07-03; arch-gated + profile-escaped 07-10; CLI opt-in via `Q27_KV=fp8`, P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- the CLI default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32. **turbo3 3-bit KV (phase 1, 2026-07-11; CLI opt-in `Q27_KV=turbo3`, or `turbo3v` for fp16-K + turbo3-V) stores K/V as WHT-rotated 50-byte blocks per 128 dims (TurboQuant port, src/turbo3.cuh): ~13.4 KB/token, 2.56x under fp8. Decode, verify, and batched prefill all have turbo3 legs (prefill dequants blocks in the f16-MMA smem staging; lite path is the oracle). Quality (wikitext PPL, qwopus): fp16 7.317 / fp8 7.327 / turbo3 7.381 (+0.87%; K adds only +0.17% -- the GQA=6 K-crater the fork saw did not reproduce).**
+- **KV cache**: fp16 for the 17 attention layers by default (f32 originally). FP8 E4M3 ships as the SERVER default (since 07-03; arch-gated + profile-escaped 07-10; CLI opt-in via `Q27_KV=fp8`, P2): scale-free saturating conversion (measured K amax <= 21.8, V amax <= 118.6 vs the 448 E4M3 max -- per-row scales buy nothing for a float format with that much headroom), same element-indexed layout, all store/load sites templated on the element type. Halves KV bytes (34 KB/token) and cuts long-ctx decode bandwidth (+11% decode @28.5K). NOT lossless -- the CLI default stays fp16 so decode canonicals hold bitwise; measured cost is noise-level (corpus PPL -0.05%, logit KL 3.4e-5). DeltaNet recurrent state is tiny and stays f32. **turbo3 3-bit KV (phase 1, 2026-07-11; CLI opt-in `Q27_KV=turbo3`, or `turbo3v` for fp16-K + turbo3-V) stores K/V as WHT-rotated 50-byte blocks per 128 dims (TurboQuant port, src/turbo3.cuh): ~13.4 KB/token, 2.56x under fp8. Decode, verify, and batched prefill all have turbo3 legs (prefill dequants blocks in the f16-MMA smem staging; lite path is the oracle). Quality (wikitext PPL, qwopus): fp16 7.317 / fp8 7.327 / turbo3 7.381 (+0.87%; K adds only +0.17% -- the GQA=6 K-crater the fork saw did not reproduce; flat by position through 297K, tracking fp8 +0.65-1.2% every bucket). The fdmma verify leg (dequant-to-e4m3 tiles) puts turbo3 on the mma serving path: acceptance TIES fp8 exactly on basin-matched replay (5.818 tok/rnd), wall -4.4% @27K and +9.6% @61K; live CC traffic -11% median decode. Ceiling: allocates/decodes to 655K, needle 6/6 at a 361K prompt, 2x131K multi-slot. The symmetric 3-bit K is the differentiator -- the source fork refuses 3-bit K at GQA>=6 and caps 33% lower on a 3090 (98K vs 131K).**
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline tools are Python: tools/repack.py (runs once; docs/FORMAT.md) and tools/gguf_to_hf.py (certified GGUF -> HF inversion, 866/866 tensors byte-exact, for cross-engine reference runs).
 - **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
@@ -404,11 +412,13 @@ bitwise-unchanged (docs/sampling-design.md, Phases 1-2). The exit-gate A/B passe
 (docs/sampling-exit-gate.md), so the server can default sampling on for clients
 that send no temperature via `Q27_FORCE_TEMP`/`Q27_FORCE_TOP_P` (an explicit
 request temperature still wins; a forced request gets a distinct logged seed).
-The tolerant tool-call parser recovers six observed drift modes -- dropped
+The tolerant tool-call parser recovers nine observed drift modes -- dropped
 `<tool_call>` wrapper, truncated JSON, `<content>`-tagged and
 quote-open/`</content>` bodies, `{"tool_call":` openers, in-string control chars,
 and name-dropped `{"name":\n{args}}` calls (tool inferred from the arg-key
-signature) -- logging each recovery for the drift catalog. `--fast-head` trades
+signature; on a score tie, candidates whose required params the args don't
+cover are eliminated -- modern CC registries carry property-twins like
+Bash/Monitor) -- logging each recovery for the drift catalog. `--fast-head` trades
 output exactness for ~7% more t/s.
 
 **Confidence-gated depth (P12 + P14) applies to BOTH greedy and sampled
