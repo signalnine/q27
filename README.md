@@ -78,9 +78,14 @@ tables in BUILDLOG):
   tokens per fire and still LOSES 15% throughput, because the wide round
   costs more than proportionally. What the cap was hiding is that the
   batched verify GEMV was spilling registers under a 3-CTA occupancy pin;
-  retiering widths >=10 to a 2-CTA pin is worth **+18% t/s on the shipped
-  width** (367 -> 434 on that payload) with no widening at all. Per-token
-  cost now bottoms at W12. Closing the rest of the gap needs a verify GEMM
+  retiering widths >=10 to a 2-CTA pin cuts the cost of a 12-lane suffix
+  round by **16%** (29.5 -> 24.8 ms) with no widening at all, and per-token
+  cost now bottoms at W12. SCOPE THAT HONESTLY: the engine-level gain is
+  proportional to how much the traffic repeats itself, because the retier
+  only touches suffix rounds. Byte-identical paired replays: novel codegen
+  +0% (suffix never fires), docs-style +2%, real agentic CC tasks ~+5-6%
+  (T8/T2, 27-37% suffix wall share), pure file re-emission **+17%**. The
+  headline is the repetition regime, not the engine average. Closing the rest of the gap needs a verify GEMM
   that is flat in width, not more lanes (BUILDLOG 2026-07-13). Against
   llama's *deployed* config (draft-mtp) q27 still wins both regimes;
   the ngram win is to a mode llama does not run in production and that

@@ -4997,3 +4997,61 @@ changed today is the size of the prize -- the GEMV it has to beat is now
 0.055 ms at N=12, not 0.070 -- and the fact that a GEMM verify would be flat
 in W is exactly what would make widths past 12 pay at all. W16 reopens ONLY
 behind that pivot.
+
+## 2026-07-13 (cont.) -- the retier through the REAL harness: mechanism confirmed, headline rescoped (+19% was the echo number, agentic is ~+5%)
+
+Ran the gemv pin A/B through thunderdome + Claude Code (recreated the
+claude-code-q27-haight adapter -- the old one was an uncommitted convention
+and is gone; it now lives in the thunderdome tree, base URL retargeted at
+:8081, otherwise the stock CC adapter verbatim). Leg = the binary behind
+:8081; T8 + T2; same day, same model.
+
+FIRST, THE GATE THE 07-13 REVIEW SAID WAS MISSING. Nothing exercised the
+retiered widths for TOKEN identity -- the canonical prompt never runs a suffix
+round. Closed it: old-pin vs new-pin on a suffix-heavy payload, greedy ->
+BYTE-IDENTICAL output (same md5, same 254 suffix tokens over 22 rounds), only
+the wall moved (642 -> 534 ms). The retier is a PURE speed change; quality
+cannot move. That is the strongest form of the claim and it is now gated.
+
+MECHANISM CONFIRMED ON LIVE AGENTIC TRAFFIC. Over 3,389 (old) and 2,024 (new)
+real suffix rounds driven by Claude Code:
+  suffix ms/round  29.53 -> 24.78  = -16.1%
+matching the isolated bench (-17%). Per-round cost is trajectory-independent,
+so this number is unconfounded.
+
+BUT THE RAW AGGREGATE A/B IS UNINFORMATIVE: 252.5 -> 251.9 t/s (-0.3%). The
+legs FORKED (the documented cross-run CC confound -- tool outputs carry
+wall-clock bytes): old drew a 48.1%-suffix trajectory, new a 38.5% one. At
+n=1/leg the trajectory lottery swamps a ~5% effect. Trajectory-matched
+counterfactual (each leg priced under the other pin, using its OWN round counts
+-- no cross-leg pairing): +6.3% and +5.2%.
+
+RESOLVED IT PROPERLY with fixed-BYTES paired replays (byte-identity means both
+binaries walk the same trajectory -- no fork, no lottery). All four verified
+IDENTICAL output:
+  payload    suffix tok/decode   old ms/sfx-rnd -> new    delta t/s
+  codegen          0.4%            28.8 -> 24.2            -0.1%
+  testgen          0.0%             (never fires)          -0.3%
+  docs            21.9%            29.0 -> 24.3            +2.0%
+  echo            99.2%            29.1 -> 24.4           +17.4%
+
+THE LAW: the suffix round gets 16% cheaper EVERYWHERE it fires (28.8/29.0/29.1
+-> 24.2/24.3/24.4 -- dead uniform). The ENGINE-level gain is that 16% times the
+suffix WALL share. Novel generation never fires the suffix drafter, so it gets
+exactly nothing. Real CC agentic work sits at 27-37% suffix wall share (T8/T2
+re-emit files constantly) -> ~+5-6%.
+
+HEADLINE RESCOPED. The "+19%" is the ECHO/repetition number, NOT an engine
+average. README corrected. This does not change the W16 verdict (per-token still
+bottoms at W12) and it does not change the mma16-GEMM conclusion -- if anything
+it sharpens it: a verify GEMM flat in W is what would make the WIDE path cheap
+enough to matter on traffic that is not already repetitive.
+
+Scores (descriptive only, n=1, and the pin CANNOT move them -- byte-identity):
+new 0.52/0.55 (T8/T2), old 0.29/0.57. Both legs sit below the historical 0.82-0.85
+band on this RECREATED adapter, on both legs -- read nothing into it except that
+the recreated adapter is not bit-for-bit the lost original. Not chased.
+
+Tools: tools/thunderdome_pin_ab.sh, tools/pin_ab_report.py ([req] gotcha: dec/
+tps/sfxm/sfxn are PER-REQUEST but sfx=<fired>,<tok> is ENGINE-CUMULATIVE --
+summing it across requests overcounts; take the last line, or diff consecutive).
