@@ -4677,3 +4677,12 @@ basin, same speed). Net -446 lines of copy-paste (360+86); the lane
 state is now ~20 array members and 6 loops. En-route gotcha: LANES12
 next to a declarator name token-pastes (q27k::IP3 P{{...}} ->
 PLANES12) -- spaced.
+
+## 2026-07-12 (addendum) -- lane collapse: perf VERIFIED unchanged
+
+Post-collapse vs same-day pre-collapse, same model/GPU/binary-era:
+suite 171.6 vs 171.5 t/s (5-prompt mean, the cross-build-robust
+comparator); 26K server replay 176.6/177.3 vs 176.6/177.5; boot-to-
+ready 4.0s (weights page-cache-warm; capture cost unchanged -- the new
+loops execute at graph-CAPTURE time only, decode replays captured
+graphs, so there was no mechanism for a decode delta and none measured).
