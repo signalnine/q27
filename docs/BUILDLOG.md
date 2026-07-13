@@ -4686,3 +4686,38 @@ comparator); 26K server replay 176.6/177.3 vs 176.6/177.5; boot-to-
 ready 4.0s (weights page-cache-warm; capture cost unchanged -- the new
 loops execute at graph-CAPTURE time only, decode replays captured
 graphs, so there was no mechanism for a decode delta and none measured).
+
+## 2026-07-12 -- alias exposure LEDGER (checked claim, per review) + gate promotion
+
+"No published number rode the bug" is now a CHECKED claim, not an
+assumed one. Method: journald [gen] lines since 07-10 (552 survive),
+grepped for ckpt>=0 (a mid-history divergence restore -- the alias
+precondition).
+
+CLEAN -- zero divergence-restores observed:
+- Every replay/CLI bench (fresh server, identical prompts): all t/s
+  headlines, PPL ladders, ctx ceilings, prefill benches, accept A/Bs.
+- 2026-07-10 cross-engine triplet (the +47% protocol A/B): 0 hits.
+- ALL of 2026-07-12: the h16 3090 dome (+27%, 102.2 t/s), the tier
+  dome, both probe days' benches. 0 hits.
+
+EXPOSED -- 552 traversals of the alias CONDITION, all on 2026-07-11:
+six 5090 server instances (66-133 each: the turbo3 T8 trials, 2-slot
+pairs, T2/T11 breadth) and 6 on the 3090 w8 leg. Mechanism confirmed in
+the logs: CC sidechain/compaction traffic interleaves a ~32K main
+conversation with ~19-20K branches on one engine; each branch's
+re-prefill left the other's longer-coverage entries stale (pattern:
+prompt=32335 restore@12288 alternating with prompt=19397 hit@16384).
+Caveat, stated honestly: a traversal is not a confirmed foreign-row
+read (prefix-covered restores are valid) and the corrupt fraction is
+not reconstructible post-hoc. Decode RATES are content-independent and
+stand; 07-11 live-session SCORES and walls carry unquantifiable
+exposure. Consequence: README's 3090 bullet (07-12 data) is unaffected;
+docs/multislot-throughput.md's session results are annotated; rerun the
+2-slot pair + one turbo3 T8x3 leg under >= e16c394 before citing any
+07-11 session score publicly.
+
+Gate promotion: the divergence-then-replay shape is now
+tools/ckpt_gate.sh (self-contained: generates prompts, boots the
+server, A/B/A, asserts replay hit <= divergence base). Run it on every
+cache-path change. First run on the fixed binary: PASS (1024 <= 1024).
