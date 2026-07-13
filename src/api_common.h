@@ -191,6 +191,15 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     size_t start = 0;
     std::string sys;
     if (!msgs.empty() && msgs[0].role == "system") { sys = strip_ctrl(msgs[0].content); start = 1; }
+    // Over-refusal fix (2026-07-13, external review): under the no-think
+    // serving default a bare request WITH NO SYSTEM PROMPT gives the model
+    // zero context AND zero reasoning budget, so it falls to a defensive
+    // refusal prior on borderline-legitimate requests (measured: a
+    // signed-authorization pentest command). A minimal neutral default --
+    // only when the client supplied none -- fully recovers compliance at
+    // zero reasoning cost (real Claude Code always sends a system prompt, so
+    // this never fires there). Q27_BARE=1 restores the no-default behavior.
+    if (sys.empty() && !getenv("Q27_BARE")) sys = "You are a helpful assistant.";
     if (tools.is_array() && !tools.empty()) {
         p += "<|im_start|>system\n" + tools_preamble(tools);
         if (!sys.empty()) p += "\n\n" + sys;

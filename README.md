@@ -464,9 +464,13 @@ carries the ~224 t/s headline. The cost is a reasoning model handed
 zero reasoning budget, which over-refuses a narrow class of
 borderline-but-legitimate requests (measured: a signed-authorization
 pentest command it declines under no-think, it supplies under `--think`
-after reasoning through the authorization; BUILDLOG 2026-07-13). If your
-workload includes security/compliance-sensitive requests that should be
-answered, run `--think` and trade the speed for the reasoning pass.
+after reasoning through the authorization; BUILDLOG 2026-07-13). Mitigated as of 2026-07-13: a bare
+request with NO system prompt was the trigger (empty think budget +
+zero context -> defensive refusal); the server now injects a minimal
+default system prompt when the client sends none, which recovers
+compliance at zero reasoning cost and never fires for real Claude Code
+(it always sends a system prompt). `Q27_BARE=1` opts out. For heavier
+compliance-sensitive workloads `--think` remains the stronger lever.
 
 Three API shapes on one server:
 - **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)
