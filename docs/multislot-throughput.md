@@ -68,11 +68,10 @@ Capacity and admission, not aggregate: two FULL-context tenants (131K+131K
 vs fp8's 131K+~23K), zero queue latency for the second user, fair splits
 under contention, near-zero cost on bursty real traffic. The six concurrent
 sessions of 2026-07-11 (T8/T2/T11 pairs) completed 6/6 with T2/T11 at
-solo-class scores AND walls. [2026-07-12 annotation: these sessions ran
-before the P9 alias fix (e16c394) and their traffic traversed the alias
-condition (BUILDLOG ledger, same date) -- treat the session SCORES as
-provisional until rerun under the fixed binary; the capacity and
-admission claims (allocation, routing, splits) are unaffected.]
+solo-class scores AND walls. [2026-07-13 update: rerun under the
+fixed binary (>= e16c394) reproduced solo-class T2/T11 scores and walls
+and the T8 basin profile -- the provisional flag is lifted; see the
+BUILDLOG rerun entry.]
 
 If aggregate throughput ever becomes the goal on this box: that's vLLM's
 game (with its own measured costs here -- 0% prefix-cache reuse on

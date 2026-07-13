@@ -4721,3 +4721,44 @@ Gate promotion: the divergence-then-replay shape is now
 tools/ckpt_gate.sh (self-contained: generates prompts, boots the
 server, A/B/A, asserts replay hit <= divergence base). Run it on every
 cache-path change. First run on the fixed binary: PASS (1024 <= 1024).
+
+## 2026-07-13 -- exposed 07-11 session results RERUN under the fixed binary: scores validated
+
+Per review: "no published number rode the bug" required rerunning the
+two exposed result sets under >= e16c394. Both rerun same-config
+(qwopus, turbo3, ports/adapters identical to 07-11).
+
+2-slot pairs (5090, 2x131K):
+    pair  fixed binary            07-11 (exposed)
+    T2    0.84/0.84 @ 136/148s    0.84-class @ 152/162s
+    T11   0.85/0.85 @ 59/87s      @ 69/70s
+    T8    0.55/0.84 @ 236/297s    ~0.82 both @ 253/256s
+T2/T11 reproduce solo-class scores AND walls; T8 drew the documented
+bimodal basin split. Throughput: per-request decode median 145.3 /
+p90 268.1 all-pairs (T8 window 155.1 / 302.0), busy-agg 115.9 t/s.
+The p90 above solo median re-confirms no scheduler tax. Divergence-
+restores under 256 requests of concurrent traffic: ONE (valid by
+construction post-fix). multislot-throughput.md annotation resolved:
+capacity, admission, split, and score claims all stand.
+
+3090 turbo3 T8x3 (w8, 131K): scores 0.81 / 0.84 / 0.82 -- the 07-11
+0.82x3 score class reproduced exactly on the fixed binary. Decode
+median 92.8 t/s (qwopus; h16-era band), busy-agg 120.4, zero
+divergence-restores. Caveat, stated: all three trials hit the 2700s
+harness ceiling still working (scored at cutoff; ~27 min GPU-busy of
+each 45-min wall was tool execution) -- trajectories are cross-build
+incomparable per the standing doctrine, so the WALLS validate nothing
+either way; the SCORES were the exposed claim and they hold.
+
+VERDICT: the alias exposure did not flatter any published score. The
+07-11 numbers stand with the annotation lifted (scores) and the usual
+trajectory caveat (walls).
+
+En-route negative, filed for triage: the FIRST 3090 rerun leg
+mistakenly ran the VANILLA model and hit a deterministic parser-drift
+retry loop (2/3 trials: [drift] modes=12 recovery re-requested
+identically every ~5 min to harness timeout; prompt=34344,
+prefix_hit=34343 each time). Vanilla + w8 + turbo3 + this harness
+build reaches a drift shape the recovery satisfies but CC rejects.
+NOT triaged tonight; the loop payload shape is in journald
+(2026-07-12 20:52-21:26). Candidate fixture once reproduced small.
