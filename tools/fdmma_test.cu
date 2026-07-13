@@ -34,6 +34,7 @@
     } while (0)
 
 static constexpr int N_KV = 4, GQA = 6, HD = 256, NQH = N_KV * GQA;
+static constexpr int WMAXT = 16; // W16: the kernel ceiling (6*16 = 96 rows)
 static constexpr int NS = 128, ST = 258;
 static int fails = 0;
 #define CHECK(cond, ...)                                                       \
@@ -96,15 +97,15 @@ int main() {
     CUDA_CHECK(cudaMemcpy(vc, hv.data(), kvn, cudaMemcpyHostToDevice));
 
     const int QSTRIDE = 2 * HD; // engine q_stride
-    std::vector<float> hq(12 * (size_t)NQH * QSTRIDE); // width-12 P2: 12 lanes
+    std::vector<float> hq(WMAXT * (size_t)NQH * QSTRIDE); // W16: WMAXT lanes
     for (auto& v : hq) {
         s = s * 1664525u + 1013904223u;
         v = ((s >> 8) & 0xFFFF) / 65536.0f - 0.5f;
     }
-    float* d_q[12];
-    int* d_pos[12];
-    float* d_out[12];
-    for (int t = 0; t < 12; t++) {
+    float* d_q[WMAXT];
+    int* d_pos[WMAXT];
+    float* d_out[WMAXT];
+    for (int t = 0; t < WMAXT; t++) {
         CUDA_CHECK(cudaMalloc(&d_q[t], (size_t)NQH * QSTRIDE * 4));
         CUDA_CHECK(cudaMemcpy(d_q[t], hq.data() + t * (size_t)NQH * QSTRIDE,
                               (size_t)NQH * QSTRIDE * 4, cudaMemcpyHostToDevice));
@@ -112,7 +113,7 @@ int main() {
         CUDA_CHECK(cudaMalloc(&d_out[t], (size_t)NQH * HD * 4));
     }
     float* part;
-    const size_t partn = (size_t)12 * NQH * NS * ST; // width-12 P2: 12 lanes
+    const size_t partn = (size_t)WMAXT * NQH * NS * ST; // W16: WMAXT lanes
     CUDA_CHECK(cudaMalloc(&part, partn * 4));
 
     const float scale = 1.0f / sqrtf((float)HD);
@@ -120,9 +121,10 @@ int main() {
 
     // seq bases: straddle k*NS so per-lane chunk_t DISAGREE within a block
     // (design risk #1) plus a short-seq case with many empty splits.
-    for (int nsv : {128, 85}) // split-count retune 2026-07-10: gate both ns values
+    // W16: ns 42 is the engine default at W>=14 (one CTA/SM -> half the wave).
+    for (int nsv : {128, 85, 42})
     for (int stages : {2, 1}) // tuning 2026-07-10: gate BOTH staging variants
-    for (int W : {4, 5, 6, 8, 9, 11, 12}) { // width-12 P2: the Q27_SUFFIX_W range
+    for (int W : {4, 5, 6, 8, 9, 11, 12, 13, 14, 15, 16}) { // W16: the full Q27_SUFFIX_W range
         for (int base : {NS * 7 - 2 /*894: straddles 896=7*128*/, 800, 130}) {
             // lane t position = base - 1 + t  (seq_t = base + t)
             fdmma::FCP3 qp{};

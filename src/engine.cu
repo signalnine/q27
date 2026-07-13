@@ -1144,10 +1144,10 @@ int main(int argc, char** argv) {
             e.sfx.reset(toks);
             e.sfx_valid = false;
         }
-        int total_emitted = 0, rounds = 0, hist[W_MAX] = {0}; // width-12: up to 12-tok rounds
+        int total_emitted = 0, rounds = 0, hist[W_MAX] = {0}; // a round emits up to W_MAX tokens
         while ((int)out.size() < n_gen) {
             if (P + e.ctx_round_reserve() > ctx) { fprintf(stderr, "ctx-guard: stopping at P=%d\n", P); break; }
-            int em[W_MAX]; // width-12: a round emits up to 12 tokens
+            int em[W_MAX]; // a round emits up to W_MAX tokens
             int n = sampling ? (plain_sample ? e.sample_round(em) : e.spec_sample_round(em))
                              : e.spec_round(em);
             for (int k = 0; k < n; k++) out.push_back(em[k]);
@@ -1158,11 +1158,13 @@ int main(int argc, char** argv) {
             hist[n - 1]++;
             P += n;
         }
-        fprintf(stderr,
-                "round outcomes: 1-tok %d, 2-tok %d, 3-tok %d, 4-tok %d, 5-tok %d, 6-tok %d, "
-                "7-tok %d, 8-tok %d, 9-tok %d, 10-tok %d, 11-tok %d, 12-tok %d\n",
-                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8],
-                hist[9], hist[10], hist[11]);
+        // W16: this used to print a fixed 12 slots out of a hist[W_MAX] array --
+        // a stack OOB read on any build with W_MAX < 12, and silent truncation
+        // on any build above it. Print exactly the slots that exist.
+        fprintf(stderr, "round outcomes:");
+        for (int k = 0; k < W_MAX; k++)
+            fprintf(stderr, "%s %d-tok %d", k ? "," : "", k + 1, hist[k]);
+        fprintf(stderr, "\n");
         if (e.maxd_auto)
             fprintf(stderr,
                     "adaptive maxd: %ld rounds @depth-4, %ld @depth-5, %ld @depth-6, "

@@ -15,6 +15,27 @@
         }                                                                              \
     } while (0)
 
+// LANE PLUMBING WIDTH -- the FIXED number of lane slots the round kernels
+// address. Q27_W_MAX (engine.cuh) only caps how many go LIVE and sizes the
+// per-width memory (GDN role sets, captured-graph zoo); W_PLUMB sizes the
+// structs, the outcome layout, and every "list every lane" array. It is 16
+// because the lane-pointer structs (P3/CP3/IP3/XQ3/WIP3) carry p[16] and the
+// fdmma verify kernel asserts 6*W <= 96 rows -- 16 is the hard ceiling of the
+// current kernel family, so there is no reason to plumb anything narrower.
+//
+// It lives HERE, not in engine.cuh, because spec3.cu (k_prep_round /
+// k_finish_round -- the kernels that walk every lane slot) does not include
+// engine.cuh. Before W16 those kernels carried hardcoded 11/12 literals that
+// no compiler could tie back to the plumbing width; a widening had to find
+// them by grep. Now they derive from this constant.
+#ifndef Q27_W_PLUMB
+#define Q27_W_PLUMB 16
+#endif
+static constexpr int W_PLUMB = Q27_W_PLUMB;
+static_assert(W_PLUMB <= 16, "lane-pointer structs are p[16]; k_attn_fdmma asserts 6*W <= 96");
+// Round outcome layout: {n, t1, dr1..dr(W_PLUMB-1), pending}.
+static constexpr int OUTCOME_INTS = W_PLUMB + 2;
+
 // KV-cache format kind (Q27_KV): scalar fp16 (default) / fp8 E4M3 ("fp8") /
 // turbo3 3-bit blocks ("turbo3", src/turbo3.cuh) / turbo3 V with plain fp16 K
 // ("turbo3v" -- the GQA=6 escape hatch if turbo3-K craters, port spec risk

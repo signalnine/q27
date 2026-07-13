@@ -693,7 +693,7 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
     // below); everything else falls through to fd2, so W=2..3 rounds and
     // the plain path are untouched. Numerics are tolerance-class (fp8 Q/P)
     // -- OPT-IN until the acceptance A/B replay gate clears a default flip.
-    if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= 12) {
+    if (fd && strcmp(fd, "mma") == 0 && kvk != KV_T3V && ntok >= 4 && ntok <= W_PLUMB) {
         static int arch = -1;
         if (arch < 0) {
             int dev, mj, mn;
@@ -714,10 +714,32 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             // 2-stage kernel (shared fdmma_tile_compute) and +5..26% at
             // every measured (ctx, W); Q27_FDMMA_STAGES=2 restores the old
             // staging for A/B. Read once; graphs bake it at capture.
-            static const int fdmma_stages = [] {
+            //
+            // W16 CORRECTION: stages=1 is only better BECAUSE two CTAs fit.
+            // That stops being true at W>=14. s_q holds fdmma_qrows(W) = 16-
+            // rounded 6W rows: 80 rows through W=13, but 96 from W=14 (6*14=84),
+            // which pushes smem(W,1) from 48.0KB to 52.1KB. Two CTAs then need
+            // 104.2KB > the 100KB sharedMemPerMultiprocessor on sm_120/sm_86, so
+            // occupancy drops to ONE CTA -- and a single-CTA kernel is strictly
+            // better double-buffered. So: keep stages=1 while 2 CTAs actually
+            // co-reside, else fall back to the 2-stage kernel. Both variants are
+            // bitwise-equal (shared fdmma_tile_compute), so this is a pure
+            // scheduling choice; Q27_FDMMA_STAGES pins it either way for A/B.
+            static const int stages_pin = [] {
                 const char* e = getenv("Q27_FDMMA_STAGES");
-                return e && atoi(e) == 2 ? 2 : 1;
+                return e ? atoi(e) : 0; // 0 = auto
             }();
+            static const int smem_per_sm = [] {
+                int dev3, v;
+                CUDA_CHECK(cudaGetDevice(&dev3));
+                CUDA_CHECK(cudaDeviceGetAttribute(
+                    &v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev3));
+                return v;
+            }();
+            const bool two_cta =
+                (size_t)2 * fdmma::fdmma_smem_bytes(ntok, 1) <= (size_t)smem_per_sm;
+            const int fdmma_stages =
+                (stages_pin == 1 || stages_pin == 2) ? stages_pin : (two_cta ? 1 : 2);
             // split-count retune (tuning 2026-07-10): fdmma's grid is
             // (ns, kv_heads) with 2 CTAs/SM resident -- ns = SMs*2/kv_heads
             // fills EXACTLY one wave (85 on the 5090; 128 left a half-empty
@@ -727,17 +749,30 @@ void attn_decode3(CP3 q, int q_stride, const void* kc, const void* vc, P3 out, f
             // boundaries move -> combine fp order) -- rebuild-class
             // tie-lottery, the regime the mma basin matrix cleared;
             // Q27_FDMMA_NS pins it for A/B.
-            static const int fdmma_ns = [n_kv_heads] {
-                if (const char* e = getenv("Q27_FDMMA_NS")) {
-                    int v = atoi(e);
-                    if (v >= 1 && v <= FD_MAXNS) return v;
-                }
-                int dev2, smc;
-                CUDA_CHECK(cudaGetDevice(&dev2));
-                CUDA_CHECK(cudaDeviceGetAttribute(&smc, cudaDevAttrMultiProcessorCount, dev2));
-                int v = (smc * 2) / n_kv_heads;
-                return v < 16 ? 16 : v > FD_MAXNS ? FD_MAXNS : v;
+            // W16: the "2" was the resident-CTA count, baked in when every live
+            // width ran 2 CTAs/SM. It is now `two_cta` -- at W>=14 one CTA is
+            // resident, so one wave is smc (not 2*smc) CTAs and ns must halve
+            // or the grid overflows into a half-empty second wave (the exact
+            // failure the 128->85 retune fixed). W<=13 still computes 85 on the
+            // 5090, bit-for-bit the shipped value.
+            // The device query and the env read stay in one-shot statics (this
+            // runs per attention layer per round -- a getenv on that path would
+            // be a real cost). Only the width-dependent arithmetic is per-call.
+            static const int ns_pin = [] {
+                const char* e = getenv("Q27_FDMMA_NS");
+                if (!e) return 0;
+                int v = atoi(e);
+                return (v >= 1 && v <= FD_MAXNS) ? v : 0; // 0 = auto
             }();
+            static const int smc = [] {
+                int dev2, v;
+                CUDA_CHECK(cudaGetDevice(&dev2));
+                CUDA_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev2));
+                return v;
+            }();
+            int fdmma_ns = (smc * (two_cta ? 2 : 1)) / n_kv_heads;
+            fdmma_ns = fdmma_ns < 16 ? 16 : fdmma_ns > FD_MAXNS ? FD_MAXNS : fdmma_ns;
+            if (ns_pin) fdmma_ns = ns_pin;
             if (fdmma::launch_fdmma(mq, q_stride, kc, vc, scratch, mp, n_kv_heads,
                                     n_q_heads / n_kv_heads, head_dim, scale, fdmma_ns, ntok, st,
                                     fdmma_stages, /*t3=*/kvk == KV_T3)) {
@@ -845,7 +880,7 @@ void prep_round(const int* d_P, const int* d_token, WIP3 pos_v, WIP3 pos_m, int 
 // width-12: lanes ride IP3/CP3 structs (the flat list capped at 8). The
 // acceptance walk is the same leading-run chain as the old a1..a7 bools:
 // draft k accepts iff k <= max_draft, all earlier drafts accepted, and
-// lane k's argmax equals draft k. All 11 draft / 12 verdict slots are
+// lane k's argmax equals draft k. All W_PLUMB-1 draft / W_PLUMB verdict slots are
 // dereferenced unconditionally (engine allocates every lane; the old
 // kernel read all 7/8 the same way) -- only slots < max_draft / n matter.
 __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
@@ -854,18 +889,22 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
                                __grid_constant__ const CP3 x1s, float* __restrict__ h_next,
                                int* __restrict__ outcome, int n_embd,
                                const int* __restrict__ cap, int max_draft) {
-    int dr[11], v[12];
+    // W16: these were 11/12 literals. They are the lane plumbing, so they now
+    // derive from W_PLUMB (cuda_common.h) -- a width change is one constant,
+    // not a grep. NDRAFT = W_PLUMB-1 drafts feeding W_PLUMB verify columns.
+    constexpr int NDRAFT = W_PLUMB - 1;
+    int dr[NDRAFT], v[W_PLUMB];
 #pragma unroll
-    for (int k = 0; k < 11; k++) dr[k] = *drafts.p[k];
+    for (int k = 0; k < NDRAFT; k++) dr[k] = *drafts.p[k];
 #pragma unroll
-    for (int t = 0; t < 12; t++) v[t] = *verdicts.p[t];
+    for (int t = 0; t < W_PLUMB; t++) v[t] = *verdicts.p[t];
     // P12/P12b: max_draft gates depth to the verified columns (narrow-verify
     // graph). P7 (*cap): in-grammar rounds accept only the pending token;
     // drafts are unconstrained and must not commit past the constrained lane.
     int n = 1;
     if (!*cap) {
 #pragma unroll
-        for (int k = 1; k <= 11; k++)
+        for (int k = 1; k <= NDRAFT; k++)
             if (k <= max_draft && n == k && v[k - 1] == dr[k - 1]) n = k + 1;
     }
     const float* src = x1s.p[n - 1];
@@ -876,11 +915,12 @@ __global__ void k_finish_round(int* __restrict__ dP, int* __restrict__ dtok,
         *dtok = nt;
         *dP += n;
         outcome[0] = n;
-        // width-12 outcome layout: [0]=n, [1]=t1(prep), [2..12]=dr1..dr11 (up
-        // to 12 emitted tokens live in [1..n]), [13]=new pending.
+        // outcome layout (OUTCOME_INTS = W_PLUMB+2): [0]=n, [1]=t1(prep),
+        // [2 .. W_PLUMB]=dr1..dr(W_PLUMB-1) (the emitted tokens live in
+        // [1..n]), [W_PLUMB+1]=new pending.
 #pragma unroll
-        for (int k = 0; k < 11; k++) outcome[2 + k] = dr[k];
-        outcome[13] = nt; // new pending token (P7: host grammar needs it pre-round)
+        for (int k = 0; k < NDRAFT; k++) outcome[2 + k] = dr[k];
+        outcome[OUTCOME_INTS - 1] = nt; // new pending (P7: host grammar needs it pre-round)
     }
 }
 void finish_round(int* d_P, int* d_token, IP3 drafts, IP3 verdicts, CP3 x1s, float* h_next,

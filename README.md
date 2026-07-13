@@ -71,9 +71,17 @@ tables in BUILDLOG):
   Arc: tuned llama +31% on 07-06, parity 07-07, q27 +47% on 07-10.
   llama's ngram spec wins the repetition regime: on file re-emission
   its unbounded prompt-lookup drafts beat q27's fused MTP+suffix (an
-  external fork-maintainer A/B measured 653 vs 377 t/s), because q27's
-  suffix draft truncates at the 12-lane verify cap -- which DOES bind
-  here (81% of suffix fires pin at 12; BUILDLOG 2026-07-13). Against
+  external fork-maintainer A/B measured 653 vs 377 t/s). q27's suffix
+  draft does truncate at the 12-lane verify cap, and that cap DOES bind
+  (95% of fires pin at 12) -- but **widening it is not the fix, and we
+  measured that the hard way**: a W16 build accepts the predicted +33%
+  tokens per fire and still LOSES 15% throughput, because the wide round
+  costs more than proportionally. What the cap was hiding is that the
+  batched verify GEMV was spilling registers under a 3-CTA occupancy pin;
+  retiering widths >=10 to a 2-CTA pin is worth **+18% t/s on the shipped
+  width** (367 -> 434 on that payload) with no widening at all. Per-token
+  cost now bottoms at W12. Closing the rest of the gap needs a verify GEMM
+  that is flat in width, not more lanes (BUILDLOG 2026-07-13). Against
   llama's *deployed* config (draft-mtp) q27 still wins both regimes;
   the ngram win is to a mode llama does not run in production and that
   is mutually exclusive with draft-mtp and poor on novel prose.

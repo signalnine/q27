@@ -3,6 +3,24 @@
 #include "cuda_common.h"
 #include "kernels.cuh"
 
+// W16 retier (measured, tools/width_bench.cu on the 5090): the batched verify
+// GEMV's 3-CTA/256-thread pin gives ~80 registers, and past N=9 the per-lane
+// accumulators no longer fit -- ptxas spills, and the spill grows with N.
+// Dropping those widths to a 2-CTA pin (128 regs) buys the accumulators back:
+//
+//   q4 ffn 17408x5120, ms/call     N=10    N=11    N=12    N=13    N=16
+//     3-CTA (old, spilling)       0.0536  0.0638  0.0702  0.0800  0.180
+//     2-CTA (this)                0.0476  0.0509  0.0554  0.0638  0.113
+//
+// N=9 is the crossover and stays 3-CTA (0.0411 vs 0.0448 for 2-CTA). The
+// threshold therefore sits at 10 -- which leaves EVERY ladder width untouched:
+// gated rounds only ever verify 2..gate_maxd+1 (<= 8), so the widths this moves
+// are exactly the suffix rounds' (sfx_width() == W_MAX). Register allocation
+// only; values are bit-identical (canonical-gated).
+#ifndef Q27_GEMV_2CTA_MIN
+#define Q27_GEMV_2CTA_MIN 10
+#endif
+
 namespace q27k {
 
 // ---------------- dequant ----------------
@@ -246,7 +264,7 @@ struct Q8Lanes {
 // 64 regs); N=10 keeps its natural 3. Register allocation only -- values are
 // bit-identical (canonical-gated).
 template <int N>
-__global__ void __launch_bounds__(256, N <= 8 ? 4 : 3)
+__global__ void __launch_bounds__(256, N <= 8 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
     k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                 __grid_constant__ const Q4Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -302,7 +320,7 @@ __global__ void __launch_bounds__(256, N <= 8 ? 4 : 3)
 // mid-size and latency-sensitive like the Q4 mats. Pin 3 CTAs through N=8
 // (85-reg budget, small spill beats the 2-CTA cliff); N<=5 keeps 4.
 template <int N>
-__global__ void __launch_bounds__(256, N <= 5 ? 4 : 3)
+__global__ void __launch_bounds__(256, N <= 5 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
     k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
                 __grid_constant__ const Q8Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -366,6 +384,10 @@ void gemv_q4_n(const uint8_t* W, const __half* S, const XQuant* q, int nb, float
         case 10: k_gemv_q4_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 11: k_gemv_q4_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
         case 12: k_gemv_q4_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 9..12
+        case 13: k_gemv_q4_n<13><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // W16:
+        case 14: k_gemv_q4_n<14><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 15: k_gemv_q4_n<15><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
+        case 16: k_gemv_q4_n<16><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 13..16
         default: fprintf(stderr, "gemv_q4_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -392,6 +414,10 @@ void gemv_q8_n(const int8_t* W, const __half* S, const XQuant* q, int nb, float*
         case 10: k_gemv_q8_n<10><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
         case 11: k_gemv_q8_n<11><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
         case 12: k_gemv_q8_n<12><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 9..12
+        case 13: k_gemv_q8_n<13><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // W16:
+        case 14: k_gemv_q8_n<14><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break;
+        case 15: k_gemv_q8_n<15><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // suffix
+        case 16: k_gemv_q8_n<16><<<blocks, 256, 0, st>>>(W, S, L, rows, cols); break; // widths 13..16
         default: fprintf(stderr, "gemv_q8_n: bad nbatch %d\n", nb); exit(1);
     }
     CUDA_CHECK(cudaGetLastError());

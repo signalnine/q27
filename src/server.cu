@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C]\n"
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
-                "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=12 + Q27_FD=mma (sm_89+)\n"
+                "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
                 "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
                 "  Q27_PROFILE=ref (conservative\n"
@@ -178,7 +178,11 @@ int main(int argc, char** argv) {
         setenv("Q27_PMIN", "0.5", 0);
         setenv("Q27_MAXD", "auto7", 0);
         setenv("Q27_SUFFIX", "1", 0);
-        setenv("Q27_SUFFIX_W", "12", 0);
+        // W16: was the literal "12". The suffix wants the widest verify the
+        // build actually has -- the engine clamps sfx_w to W_MAX anyway, so the
+        // literal silently meant "W_MAX" on the w8 build and "12" everywhere
+        // else. Naming W_MAX makes a wider build use its width by default.
+        setenv("Q27_SUFFIX_W", std::to_string(W_MAX).c_str(), 0);
         setenv("Q27_PHASE_STATS", "1", 0);
     }
     fprintf(stderr,

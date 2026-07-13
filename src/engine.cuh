@@ -51,20 +51,21 @@ static constexpr int MAX_GEN_TRACK = 65536;
 #endif
 static constexpr int W_MAX = Q27_W_MAX;
 static constexpr int D_MAX_MTP = 7;
-static_assert(W_MAX >= 8 && W_MAX <= 12, "Q27_W_MAX in [8,12] (>=8 for maxd7 ladder, <=12 lane plumbing)");
-// LANE PLUMBING is FIXED at 12, independent of W_MAX. The per-lane verify
-// buffers (i..l), the p[16] kernel structs, and the finish-kernel outcome
-// layout ({n, t1, dr1..dr11, pending} = 14 ints) are always 12-wide; W_MAX
-// only caps how many lanes go LIVE (verify width) + the role/perm/graph
-// count that scales memory. Arrays that LIST all lane pointers or read the
-// fixed outcome use W_PLUMB; arrays sized by live width use W_MAX.
-static constexpr int W_PLUMB = 12;
-// 12-wide lane-pointer aggregate from one array member (audit refactor):
+static_assert(W_MAX >= 8 && W_MAX <= W_PLUMB,
+              "Q27_W_MAX in [8, W_PLUMB] (>=8 for the maxd7 ladder, <= the lane plumbing)");
+// LANE PLUMBING is FIXED at W_PLUMB (16, cuda_common.h), independent of W_MAX.
+// The per-lane verify buffers, the p[16] kernel structs, and the finish-kernel
+// outcome layout ({n, t1, dr1..dr15, pending} = 18 ints) are always W_PLUMB
+// wide; W_MAX only caps how many lanes go LIVE (verify width) + the role/perm/
+// graph count that scales memory. Arrays that LIST all lane pointers or read
+// the fixed outcome use W_PLUMB; arrays sized by live width use W_MAX.
+// W_PLUMB-wide lane-pointer aggregate from one array member (audit refactor):
 // expands to the exact brace list the q27k::*3 kernel wrappers take.
-#define LANES12(F) \
-    {{F##_L[0], F##_L[1], F##_L[2], F##_L[3], F##_L[4], F##_L[5], F##_L[6], \
-      F##_L[7], F##_L[8], F##_L[9], F##_L[10], F##_L[11]}}
-static constexpr int OUTCOME_INTS = W_PLUMB + 2; // n, t1, dr1..dr11, pending
+static_assert(W_PLUMB == 16, "LANESW lists 16 slots -- keep it in step with W_PLUMB");
+#define LANESW(F)                                                              \
+    {{F##_L[0], F##_L[1], F##_L[2], F##_L[3], F##_L[4], F##_L[5], F##_L[6],    \
+      F##_L[7], F##_L[8], F##_L[9], F##_L[10], F##_L[11], F##_L[12],           \
+      F##_L[13], F##_L[14], F##_L[15]}}
 
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
@@ -133,14 +134,16 @@ struct Engine {
     // depth-7 lane (h): 8th verify column + pass-7 draft chain (maxd7 ladder)
     float *h_next7;
     int *d_pos_m7, *d_draft7;
-    // width-12 lanes (i..l): verify columns 9..12. VERIFY-ONLY -- no h_nextN
-    // (the finish h_next select reads x1_*; the MTP chain never extends past
-    // depth 7) and no d_pos_mN. Draft slots d_draft8..11 exist so the suffix
-    // drafter (P1) can stage proposals 8..11; the MTP chain never writes them.
-    int *d_draft8;
-    int *d_draft9;
-    int *d_draft10;
-    int *d_draft11;
+    // wide lanes (verify columns 9..W_PLUMB). VERIFY-ONLY -- no h_nextN (the
+    // finish h_next select reads x1_*; the MTP chain never extends past depth
+    // 7) and no d_pos_mN. These draft slots exist so the suffix drafter can
+    // stage proposals 8..W_PLUMB-1; the MTP chain never writes them.
+    // W16: the named d_draft8..11 members became this array -- k_finish_round
+    // dereferences EVERY slot < W_PLUMB-1 unconditionally, so the widening has
+    // to fill all of them, and a by-name brace list is exactly the landmine
+    // the 8->12 widening tripped over. d_draft_L[k] is draft k+1 (d_draft_L[0]
+    // == d_draft); the MTP chain still writes d_draft..d_draft7 by name.
+    std::array<int*, W_PLUMB - 1> d_draft_L;
     int *d_P, *d_outcome;
     q27k::XQuant xq2[2];
     // P7 constrained tool decoding: resident mask pool + per-slot ids +
@@ -355,7 +358,7 @@ struct Engine {
     q27::SuffixDraft sfx;
     bool sfx_valid = false;      // last_pending valid (>=1 round this request)
     long sfx_fired = 0, sfx_tok = 0; // engine-cumulative, like glf/gla
-    int h_sfx_prop[W_MAX];       // host staging for the H2D draft copies (11 proposals max)
+    int h_sfx_prop[W_MAX];       // host staging for the H2D draft copies (W_MAX-1 max)
     bool sfx_dbg = false;        // Q27_SUFFIX_DBG: per-round propose trace
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     float* SBuf(int il, int role) {
@@ -578,75 +581,51 @@ struct Engine {
         xq_L[7] = q27k::xquant_alloc(N_FFN);
         A((void**)&d_pos_L[7], 4); A((void**)&d_pos_m7, 4); A((void**)&d_draft7, 4);
         A((void**)&d_v_L[7], 4);
-        // width-12 lanes (i..l): verify columns 9..12, no h_next/pos_m (the
-        // MTP chain stays <= depth 7; these lanes are suffix-fed in P1).
-        // d_draft8..11 + d_v* are memset once: k_finish_round dereferences
-        // every slot unconditionally, and until P1 captures widths > 8
-        // nothing else writes the new draft slots.
-        A((void**)&h_L[8], N_EMBD * 4); A((void**)&x1_L[8], N_EMBD * 4); A((void**)&y_L[8], N_EMBD * 4);
-        A((void**)&qg_L[8], 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_L[8], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[8], N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_L[8], N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_L[8], GDN_CH * 4); A((void**)&convout_L[8], GDN_CH * 4);
-        A((void**)&z_L[8], GDN_V * 4);
-        A((void**)&alpha_L[8], GDN_HEADS * 4); A((void**)&betar_L[8], GDN_HEADS * 4);
-        A((void**)&g_L[8], GDN_HEADS * 4); A((void**)&beta_L[8], GDN_HEADS * 4);
-        A((void**)&o_L[8], GDN_V * 4); A((void**)&og_L[8], GDN_V * 4);
-        A((void**)&ffn_g_L[8], N_FFN * 4); A((void**)&ffn_u_L[8], N_FFN * 4);
-        xq_L[8] = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_L[8], 4); A((void**)&d_draft8, 4); A((void**)&d_v_L[8], 4);
-        A((void**)&h_L[9], N_EMBD * 4); A((void**)&x1_L[9], N_EMBD * 4); A((void**)&y_L[9], N_EMBD * 4);
-        A((void**)&qg_L[9], 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_L[9], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[9], N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_L[9], N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_L[9], GDN_CH * 4); A((void**)&convout_L[9], GDN_CH * 4);
-        A((void**)&z_L[9], GDN_V * 4);
-        A((void**)&alpha_L[9], GDN_HEADS * 4); A((void**)&betar_L[9], GDN_HEADS * 4);
-        A((void**)&g_L[9], GDN_HEADS * 4); A((void**)&beta_L[9], GDN_HEADS * 4);
-        A((void**)&o_L[9], GDN_V * 4); A((void**)&og_L[9], GDN_V * 4);
-        A((void**)&ffn_g_L[9], N_FFN * 4); A((void**)&ffn_u_L[9], N_FFN * 4);
-        xq_L[9] = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_L[9], 4); A((void**)&d_draft9, 4); A((void**)&d_v_L[9], 4);
-        A((void**)&h_L[10], N_EMBD * 4); A((void**)&x1_L[10], N_EMBD * 4); A((void**)&y_L[10], N_EMBD * 4);
-        A((void**)&qg_L[10], 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_L[10], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[10], N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_L[10], N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_L[10], GDN_CH * 4); A((void**)&convout_L[10], GDN_CH * 4);
-        A((void**)&z_L[10], GDN_V * 4);
-        A((void**)&alpha_L[10], GDN_HEADS * 4); A((void**)&betar_L[10], GDN_HEADS * 4);
-        A((void**)&g_L[10], GDN_HEADS * 4); A((void**)&beta_L[10], GDN_HEADS * 4);
-        A((void**)&o_L[10], GDN_V * 4); A((void**)&og_L[10], GDN_V * 4);
-        A((void**)&ffn_g_L[10], N_FFN * 4); A((void**)&ffn_u_L[10], N_FFN * 4);
-        xq_L[10] = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_L[10], 4); A((void**)&d_draft10, 4); A((void**)&d_v_L[10], 4);
-        A((void**)&h_L[11], N_EMBD * 4); A((void**)&x1_L[11], N_EMBD * 4); A((void**)&y_L[11], N_EMBD * 4);
-        A((void**)&qg_L[11], 2 * N_HEAD * HEAD_DIM * 4);
-        A((void**)&kbuf_L[11], N_KV * HEAD_DIM * 4); A((void**)&vbuf_L[11], N_KV * HEAD_DIM * 4);
-        A((void**)&attnout_L[11], N_HEAD * HEAD_DIM * 4);
-        A((void**)&qkv_L[11], GDN_CH * 4); A((void**)&convout_L[11], GDN_CH * 4);
-        A((void**)&z_L[11], GDN_V * 4);
-        A((void**)&alpha_L[11], GDN_HEADS * 4); A((void**)&betar_L[11], GDN_HEADS * 4);
-        A((void**)&g_L[11], GDN_HEADS * 4); A((void**)&beta_L[11], GDN_HEADS * 4);
-        A((void**)&o_L[11], GDN_V * 4); A((void**)&og_L[11], GDN_V * 4);
-        A((void**)&ffn_g_L[11], N_FFN * 4); A((void**)&ffn_u_L[11], N_FFN * 4);
+        // WIDE lanes 8..W_PLUMB-1: verify columns 9..W_PLUMB, no h_next/pos_m
+        // (the MTP chain stays <= depth 7; these lanes are suffix-fed).
+        // Allocated for every build regardless of W_MAX -- "plumbing is fixed"
+        // means k_finish_round may dereference any slot < W_PLUMB, so a narrow
+        // build still needs the pointers to be real and zeroed. The per-lane
+        // alloc is uniform up here, so W16 loops it instead of unrolling four
+        // more copy-pasted blocks (the 8->12 widening's by-hand list is exactly
+        // where the k_quantize_x3 lane-aliasing bug hid).
+        for (int L = 8; L < W_PLUMB; L++) {
+            A((void**)&h_L[L], N_EMBD * 4); A((void**)&x1_L[L], N_EMBD * 4);
+            A((void**)&y_L[L], N_EMBD * 4);
+            A((void**)&qg_L[L], 2 * N_HEAD * HEAD_DIM * 4);
+            A((void**)&kbuf_L[L], N_KV * HEAD_DIM * 4);
+            A((void**)&vbuf_L[L], N_KV * HEAD_DIM * 4);
+            A((void**)&attnout_L[L], N_HEAD * HEAD_DIM * 4);
+            A((void**)&qkv_L[L], GDN_CH * 4); A((void**)&convout_L[L], GDN_CH * 4);
+            A((void**)&z_L[L], GDN_V * 4);
+            A((void**)&alpha_L[L], GDN_HEADS * 4); A((void**)&betar_L[L], GDN_HEADS * 4);
+            A((void**)&g_L[L], GDN_HEADS * 4); A((void**)&beta_L[L], GDN_HEADS * 4);
+            A((void**)&o_L[L], GDN_V * 4); A((void**)&og_L[L], GDN_V * 4);
+            A((void**)&ffn_g_L[L], N_FFN * 4); A((void**)&ffn_u_L[L], N_FFN * 4);
+            xq_L[L] = q27k::xquant_alloc(N_FFN);
+            A((void**)&d_pos_L[L], 4); A((void**)&d_v_L[L], 4);
+            A((void**)&d_draft_L[L - 1], 4); // lane L verifies draft L
+            // nothing writes a wide slot until a suffix round stages proposals
+            // into it, but finish reads every slot every round -> zero them.
+            CUDA_CHECK(cudaMemset(d_draft_L[L - 1], 0, 4));
+            CUDA_CHECK(cudaMemset(d_v_L[L], 0, 4));
+            CUDA_CHECK(cudaMemset(d_pos_L[L], 0, 4));
+        }
         // lane index 0 aliases the primary lane's buffers (audit refactor):
-        // every 12-wide call site indexes one array instead of 12 names.
+        // every W_PLUMB-wide call site indexes one array instead of N names.
         h_L[0] = h; x1_L[0] = x1; y_L[0] = y; qg_L[0] = qg; kbuf_L[0] = kbuf;
         vbuf_L[0] = vbuf; attnout_L[0] = attnout; qkv_L[0] = qkv;
         convout_L[0] = convout; z_L[0] = z; alpha_L[0] = alpha;
         betar_L[0] = betar; g_L[0] = g; beta_L[0] = beta; o_L[0] = o;
         og_L[0] = og; ffn_g_L[0] = ffn_g; ffn_u_L[0] = ffn_u;
         xq_L[0] = xq2[0]; xq_L[1] = xq2[1];
-        xq_L[11] = q27k::xquant_alloc(N_FFN);
-        A((void**)&d_pos_L[11], 4); A((void**)&d_draft11, 4); A((void**)&d_v_L[11], 4);
-        CUDA_CHECK(cudaMemset(d_draft8, 0, 4)); CUDA_CHECK(cudaMemset(d_draft9, 0, 4));
-        CUDA_CHECK(cudaMemset(d_draft10, 0, 4)); CUDA_CHECK(cudaMemset(d_draft11, 0, 4));
-        CUDA_CHECK(cudaMemset(d_v_L[8], 0, 4)); CUDA_CHECK(cudaMemset(d_v_L[9], 0, 4));
-        CUDA_CHECK(cudaMemset(d_v_L[10], 0, 4)); CUDA_CHECK(cudaMemset(d_v_L[11], 0, 4));
-        CUDA_CHECK(cudaMemset(d_pos_L[8], 0, 4)); CUDA_CHECK(cudaMemset(d_pos_L[9], 0, 4));
-        CUDA_CHECK(cudaMemset(d_pos_L[10], 0, 4)); CUDA_CHECK(cudaMemset(d_pos_L[11], 0, 4));
+        // draft slots 1..7 are the MTP chain's, still written by name; alias
+        // them into the array so every "list every draft" site is one loop.
+        d_draft_L[0] = d_draft; d_draft_L[1] = d_draft2; d_draft_L[2] = d_draft3;
+        d_draft_L[3] = d_draft4; d_draft_L[4] = d_draft5; d_draft_L[5] = d_draft6;
+        d_draft_L[6] = d_draft7;
         A((void**)&d_P, 4);
-        A((void**)&d_outcome, OUTCOME_INTS * 4); // fixed 14: {n, t1, dr1..dr11, pending}
+        A((void**)&d_outcome, OUTCOME_INTS * 4); // {n, t1, dr1..dr(W_PLUMB-1), pending}
         CUDA_CHECK(cudaMemset(mtp_k, 0, kv_bytes(false)));
         CUDA_CHECK(cudaMemset(mtp_v, 0, kv_bytes(true)));
         CUDA_CHECK(cudaMemset(d_pos, 0, 4));
@@ -943,26 +922,27 @@ struct Engine {
     // dmax = # MTP drafts the draft graph produces (4 default; 5 for the gated
     // depth-5 draft graph). Capture-time only, like vw.
     int dmax = 4;
+    // W16: the flat 12-pointer overloads are gone. They existed so a call site
+    // could name its lanes, but at W_PLUMB=16 mm5's flat form would take 17
+    // params -- the exact signature wall that pushed prep/finish onto by-value
+    // structs. Every caller already had its lanes in a W_PLUMB array (or can
+    // build one, as the vocab head does), so the array form is the only form.
     void qx5(const std::array<float*, W_PLUMB>& x, int cols) {
-        qx5(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], cols);
+        q27k::XQ3 q{};
+        q27k::CP3 xs{};
+        for (int i = 0; i < W_PLUMB; i++) {
+            q.q[i] = xq_L[i]; // xq_L[0]/[1] alias xq2[0]/[1]
+            xs.p[i] = x[i];
+        }
+        q27k::quantize3(xs, cols, q, stm, vw);
     }
-    void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys) {
-        mm5(w, ys[0], ys[1], ys[2], ys[3], ys[4], ys[5], ys[6], ys[7], ys[8], ys[9], ys[10],
-            ys[11]);
-    }
-    void qx5(const float* xa, const float* xb, const float* xc, const float* xd, const float* xe,
-             const float* xf, const float* xg, const float* xh, const float* xi, const float* xj,
-             const float* xk, const float* xl, int cols) {
-        q27k::XQ3 q{{xq2[0], xq2[1], xq_L[2], xq_L[3], xq_L[4], xq_L[5], xq_L[6], xq_L[7], xq_L[8], xq_L[9], xq_L[10], xq_L[11]}};
-        q27k::quantize3({{xa, xb, xc, xd, xe, xf, xg, xh, xi, xj, xk, xl}}, cols, q, stm, vw);
-    }
-    void mm5(const DevTensor& w, float* out_a, float* out_b, float* out_c, float* out_d,
-             float* out_e, float* out_f, float* out_g, float* out_h, float* out_i, float* out_j,
-             float* out_k, float* out_l) {
-        q27k::XQuant qs[W_PLUMB] = {xq2[0], xq2[1], xq_L[2], xq_L[3], xq_L[4], xq_L[5], xq_L[6], xq_L[7], xq_L[8], xq_L[9], xq_L[10],
-                                  xq_L[11]};
-        float* const ys[W_PLUMB] = {out_a, out_b, out_c, out_d, out_e, out_f, out_g, out_h, out_i,
-                                  out_j, out_k, out_l};
+    void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
+        q27k::XQuant qs[W_PLUMB];
+        float* ys[W_PLUMB];
+        for (int i = 0; i < W_PLUMB; i++) {
+            qs[i] = xq_L[i];
+            ys[i] = ys_a[i];
+        }
         if (w.dtype == DType::Q4_G64)
             q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
                             w.cols, stm);
@@ -977,19 +957,19 @@ struct Engine {
         mm5(T(il, "attn_qkv.weight"), qkv_L);
         mm5(T(il, "attn_gate.weight"), z_L);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         LANES12(x1),
-                         LANES12(alpha), GDN_HEADS,
+                         LANESW(x1),
+                         LANESW(alpha), GDN_HEADS,
                          N_EMBD, stm, vw);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         LANES12(x1),
-                         LANES12(betar), GDN_HEADS,
+                         LANESW(x1),
+                         LANESW(betar), GDN_HEADS,
                          N_EMBD, stm, vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates3(LANES12(alpha),
-                         LANES12(betar), sa, sdt,
-                         LANES12(g),
-                         LANES12(beta), GDN_HEADS, stm, vw);
+        q27k::gdn_gates3(LANESW(alpha),
+                         LANESW(betar), sa, sdt,
+                         LANESW(g),
+                         LANESW(beta), GDN_HEADS, stm, vw);
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
@@ -999,15 +979,15 @@ struct Engine {
         for (int L = 1; L < vw; L++)
             q27k::conv_step(RBuf(il, L - 1), RBuf(il, L), qkv_L[L], cw, convout_L[L], GDN_CH, stm);
         // q||k are contiguous (offsets 0 and 2048): 32 heads in one merged call
-        q27k::l2norm3(LANES12(convout), 32,
+        q27k::l2norm3(LANESW(convout), 32,
                       GDN_DIM, eps, stm, vw);
         q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm); // lane 0
         for (int L = 1; L < vw; L++)
             q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], stm);
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm3(LANES12(o), nw,
-                          LANES12(z),
-                          LANES12(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
+        q27k::gated_norm3(LANESW(o), nw,
+                          LANESW(z),
+                          LANESW(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
         qx5(og_L, GDN_V);
         mm5(T(il, "ssm_out.weight"), y_L);
     }
@@ -1024,37 +1004,37 @@ struct Engine {
         for (int L = 0; L < vw; L++)
             q27k::rmsnorm_heads(kbuf_L[L], kn, kbuf_L[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
         mm5(T(il, "attn_v.weight"), vbuf_L);
-        q27k::IP3 P LANES12(d_pos);
-        q27k::rope3(LANES12(qg),
+        q27k::IP3 P LANESW(d_pos);
+        q27k::rope3(LANESW(qg),
                     N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
                     FREQ_BASE, stm, vw);
-        q27k::rope3(LANES12(kbuf), N_KV, HEAD_DIM, N_ROT,
+        q27k::rope3(LANESW(kbuf), N_KV, HEAD_DIM, N_ROT,
                     HEAD_DIM, P, FREQ_BASE, stm, vw);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
         // branch on kv_kind only (init-fixed, graph-capture-safe)
         if (kv_kind == KV_T3)
-            q27k::wht3(LANES12(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
+            q27k::wht3(LANESW(qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM, false, stm, vw);
         // store vw lanes (disjoint slots); each token's attention only reads
         // cache[0 .. its own pos], so later tokens' entries are invisible to earlier ones
         if (kv_kind >= KV_T3)
-            q27k::kv_store_t3(LANES12(kbuf),
-                              LANES12(vbuf), kcache[ci], vcache[ci],
+            q27k::kv_store_t3(LANESW(kbuf),
+                              LANESW(vbuf), kcache[ci], vcache[ci],
                               P, N_KV, HEAD_DIM, stm, vw, /*k_plain=*/kv_kind == KV_T3V);
         else
-            q27k::kv_store3(LANES12(kbuf),
-                            LANES12(vbuf), kcache[ci], vcache[ci],
+            q27k::kv_store3(LANESW(kbuf),
+                            LANESW(vbuf), kcache[ci], vcache[ci],
                             P, N_KV * HEAD_DIM, stm, vw, kv_fp8);
-        q27k::attn_decode3(LANES12(qg), 2 * HEAD_DIM, kcache[ci],
+        q27k::attn_decode3(LANESW(qg), 2 * HEAD_DIM, kcache[ci],
                            vcache[ci],
-                           LANES12(attnout),
+                           LANESW(attnout),
                            scratch, P, max_ctx, N_HEAD, N_KV, HEAD_DIM, kq, stm, vw, kv_kind);
         // inverse-WHT on all vw pooled outputs BEFORE the sigmoid gate
         if (kv_kind >= KV_T3)
-            q27k::wht3(LANES12(attnout),
+            q27k::wht3(LANESW(attnout),
                        N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
-        q27k::sigmoid_gate3(LANES12(attnout),
-                            LANES12(qg), N_HEAD, HEAD_DIM, stm, vw);
+        q27k::sigmoid_gate3(LANESW(attnout),
+                            LANESW(qg), N_HEAD, HEAD_DIM, stm, vw);
         qx5(attnout_L, N_HEAD * HEAD_DIM);
         mm5(T(il, "attn_output.weight"), y_L);
     }
@@ -1063,8 +1043,8 @@ struct Engine {
         qx5(x1_L, N_EMBD);
         mm5(T(il, "ffn_gate.weight"), ffn_g_L);
         mm5(T(il, "ffn_up.weight"), ffn_u_L);
-        q27k::silu_mul3(LANES12(ffn_g),
-                        LANES12(ffn_u), N_FFN, stm, vw);
+        q27k::silu_mul3(LANESW(ffn_g),
+                        LANESW(ffn_u), N_FFN, stm, vw);
         qx5(ffn_g_L, N_FFN);
         mm5(T(il, "ffn_down.weight"), y_L);
     }
@@ -1089,11 +1069,11 @@ struct Engine {
     // leads step k+1 -- same stream order), so every existing graph capture is
     // unchanged; the gated rounds additionally capture each step alone
     // (draft_step_graph) to stop drafting at the first sub-theta margin.
-    // width-12: the 12 verify positions + 7 MTP positions ride WIP3 structs
-    // (prep_round hit the 17-param wall). Positions 9..12 are written every
+    // the W_PLUMB verify positions + 7 MTP positions ride WIP3 structs
+    // (prep_round hit the 17-param wall). The wide positions are written every
     // round but only read by graphs captured at vw > 8 (suffix widths, P1).
     q27k::WIP3 lane_pos() {
-        return LANES12(d_pos);
+        return LANESW(d_pos);
     }
     q27k::WIP3 mtp_pos() {
         return {{d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7}};
@@ -1123,17 +1103,24 @@ struct Engine {
     // batch-5 forward of {pending, d1..d4} -> logits2[5*VOCAB]. Shared verbatim
     // by the greedy verify tail and the Phase-2 sampled tail (so the two never
     // drift; the sampled path samples the identical logits the greedy path argmaxes).
+    // Lane t of the verify batch reads token: t=0 the pending token, t>=1 the
+    // t'th draft. One loop over W_PLUMB so a widening never has to grow a
+    // hand-written brace list again.
+    q27k::IP3 verify_tokens() const {
+        q27k::IP3 t{};
+        t.p[0] = d_token;
+        for (int k = 0; k + 1 < W_PLUMB; k++) t.p[k + 1] = d_draft_L[k];
+        return t;
+    }
     void spec_verify_forward() {
         const DevTensor& emb = dm.get("token_embd.weight");
-        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales,
-                     {{d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
-                       d_draft7, d_draft8, d_draft9, d_draft10, d_draft11}},
-                     N_EMBD, LANES12(h), stm,
+        q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, verify_tokens(),
+                     N_EMBD, LANESW(h), stm,
                      vw);
-        q27k::CP3 Hc LANES12(h),
-            Yc LANES12(y);
-        q27k::P3 Hm LANES12(h),
-            X1m LANES12(x1);
+        q27k::CP3 Hc LANESW(h),
+            Yc LANESW(y);
+        q27k::P3 Hm LANESW(h),
+            X1m LANESW(x1);
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
             q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, vw);
@@ -1150,61 +1137,34 @@ struct Engine {
         qx5(x1_L, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
-        mm5(dm.get(vhead), logits2, logits2 + VOCAB, logits2 + 2 * (size_t)VOCAB,
-            logits2 + 3 * (size_t)VOCAB, logits2 + 4 * (size_t)VOCAB, logits2 + 5 * (size_t)VOCAB,
-            logits2 + 6 * (size_t)VOCAB, logits2 + 7 * (size_t)VOCAB,
-            logits2 + 8 * (size_t)VOCAB, logits2 + 9 * (size_t)VOCAB,
-            logits2 + 10 * (size_t)VOCAB, logits2 + 11 * (size_t)VOCAB);
+        // lane t's logits live at logits2 + t*VOCAB (the alloc is W_MAX*VOCAB;
+        // only lanes < vw are computed, and only those are ever read).
+        std::array<float*, W_PLUMB> lg{};
+        for (int t = 0; t < W_PLUMB; t++)
+            lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
+        mm5(dm.get(vhead), lg);
     }
 
     // P11: verify half -- batch-5 forward, masked argmax per lane, finish_round.
     void spec_verify_launches() {
         spec_verify_forward();
-        // P7: slot 0 (the post-pending lane) is the constrained one; slots
-        // 1-4 keep id -1 (v1 caps acceptance in-grammar instead of chasing
-        // draft-dependent states the host cannot know pre-launch)
-        q27k::argmax_masked(logits2, VOCAB, d_mask_pool, mask_words, d_mask_ids, 0, d_v_L[0],
-                            d_amax, stm);
-        if (vw > 1)
-            q27k::argmax_masked(logits2 + VOCAB, VOCAB, d_mask_pool, mask_words, d_mask_ids, 1,
-                                d_v_L[1], d_amax, stm);
-        if (vw > 2)
-            q27k::argmax_masked(logits2 + 2 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 2, d_v_L[2], d_amax, stm);
-        if (vw > 3)
-            q27k::argmax_masked(logits2 + 3 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 3, d_v_L[3], d_amax, stm);
-        if (vw > 4)
-            q27k::argmax_masked(logits2 + 4 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 4, d_v_L[4], d_amax, stm);
-        if (vw > 5)
-            q27k::argmax_masked(logits2 + 5 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 5, d_v_L[5], d_amax, stm);
-        if (vw > 6)
-            q27k::argmax_masked(logits2 + 6 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 6, d_v_L[6], d_amax, stm);
-        if (vw > 7)
-            q27k::argmax_masked(logits2 + 7 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 7, d_v_L[7], d_amax, stm);
-        if (vw > 8)
-            q27k::argmax_masked(logits2 + 8 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 8, d_v_L[8], d_amax, stm);
-        if (vw > 9)
-            q27k::argmax_masked(logits2 + 9 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 9, d_v_L[9], d_amax, stm);
-        if (vw > 10)
-            q27k::argmax_masked(logits2 + 10 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 10, d_v_L[10], d_amax, stm);
-        if (vw > 11)
-            q27k::argmax_masked(logits2 + 11 * (size_t)VOCAB, VOCAB, d_mask_pool, mask_words,
-                                d_mask_ids, 11, d_v_L[11], d_amax, stm);
+        // P7: slot 0 (the post-pending lane) is the constrained one; the rest
+        // keep id -1 (v1 caps acceptance in-grammar instead of chasing
+        // draft-dependent states the host cannot know pre-launch).
+        // W16: was an unrolled `if (vw > k)` chain per lane. The loop emits the
+        // identical launch sequence in the identical order for any vw, so the
+        // captured graphs -- and the tokens they produce -- are unchanged at
+        // every width the chain covered.
+        for (int t = 0; t < vw; t++)
+            q27k::argmax_masked(logits2 + (size_t)t * VOCAB, VOCAB, d_mask_pool, mask_words,
+                                d_mask_ids, t, d_v_L[t], d_amax, stm);
         // P12: a width-vw verify computed columns 0..vw-1; cap acceptance at vw-1
         // drafts so finish never commits an uncomputed lane. vw=5 => max_draft=4.
-        q27k::finish_round(d_P, d_token,
-                           {{d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
-                             d_draft7, d_draft8, d_draft9, d_draft10, d_draft11}},
-                           LANES12(d_v),
-                           LANES12(x1),
+        q27k::IP3 drafts{};
+        for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
+        q27k::finish_round(d_P, d_token, drafts,
+                           LANESW(d_v),
+                           LANESW(x1),
                            h_next, d_outcome, N_EMBD, d_accept_cap, vw - 1, stm);
     }
 
@@ -1288,21 +1248,17 @@ struct Engine {
             if (sfx_w < gate_maxd + 1) sfx_w = 0;      // narrower than gated = legacy
             if (sfx_w > W_MAX) sfx_w = W_MAX;
         }
-        int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6, z7 = 7;
-        int z8 = 8, z9 = 9, z10 = 10, z11 = 11; // width-12 lanes i..l
+        // W16: lane seeds were a by-name z0..z11 list that stopped at 12 -- the
+        // same hand-written-lane-list shape that left refinish_round's slots
+        // nullptr. Warm-up positions only (prep_round rewrites every lane each
+        // round), but it must cover W_PLUMB or a wider build seeds garbage.
+        int zs[W_PLUMB];
+        for (int i = 0; i < W_PLUMB; i++) zs[i] = i;
+        int z0 = 0, z1 = 1, z2 = 2, z3 = 3, z4 = 4, z5 = 5, z6 = 6;
         auto seed_positions = [&]() {
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[0], &z0, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[1], &z1, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[2], &z2, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[3], &z3, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[4], &z4, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[5], &z5, 4, cudaMemcpyHostToDevice, stm)); // P12b
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[6], &z6, 4, cudaMemcpyHostToDevice, stm)); // maxd6
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[7], &z7, 4, cudaMemcpyHostToDevice, stm)); // maxd7
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[8], &z8, 4, cudaMemcpyHostToDevice, stm)); // width-12
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[9], &z9, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[10], &z10, 4, cudaMemcpyHostToDevice, stm));
-            CUDA_CHECK(cudaMemcpyAsync(d_pos_L[11], &z11, 4, cudaMemcpyHostToDevice, stm));
+            for (int i = 0; i < W_PLUMB; i++)
+                CUDA_CHECK(
+                    cudaMemcpyAsync(d_pos_L[i], &zs[i], 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m, &z0, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m2, &z1, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_pos_m3, &z2, 4, cudaMemcpyHostToDevice, stm));
@@ -1470,9 +1426,10 @@ struct Engine {
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
                     sfx_L, sfx_width());
         fprintf(stderr,
-                "spec graphs captured (12 perms, depth-4; +split D/V; +per-width verify "
+                "spec graphs captured (%d perms, depth-4; +split D/V; +per-width verify "
                 "2..%d%s; +P14 sampled per-width verify 2..5 + per-step draft 0..%d); "
                 "Q27_PMIN=%.3f (%s), gate_maxd=%d%s, dexit=%d\n",
+                W_MAX, // was the literal "12" -- the capture loop is over W_MAX
                 gate_maxd + 1, maxd_auto ? "; +P13 depth-4 draft" : "", gate_maxd - 1,
                 pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd,
                 maxd_auto ? (gate_maxd >= 6 ? (gate_maxd == 7 ? " (auto: ladder 4..7)"
@@ -1522,11 +1479,9 @@ struct Engine {
             if (phase_stats) ph_t0 = std::chrono::steady_clock::now();
             q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
                              stm);
-            int* ds[W_PLUMB - 1] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6,
-                                  d_draft7, d_draft8, d_draft9, d_draft10, d_draft11};
             for (int k = 0; k < sw - 1; k++)
-                CUDA_CHECK(cudaMemcpyAsync(ds[k], &h_sfx_prop[k], 4, cudaMemcpyHostToDevice,
-                                           stm));
+                CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], &h_sfx_prop[k], 4,
+                                           cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaGraphLaunch(verify_graph_w[sw][perm], stm));
         } else if (pmin_theta > 0.f && h_mask_id0 < 0) {
             // P12/P12b confidence-gated depth (unconstrained decode only): draft to
@@ -1600,7 +1555,7 @@ struct Engine {
         } else {
             CUDA_CHECK(cudaGraphLaunch(spec_graph[perm], stm));
         }
-        // width-12 outcome: [0]=n, [1..12]=up to 12 emitted tokens, [13]=new pending.
+        // outcome: [0]=n, [1..W_PLUMB]=the emitted tokens, [OUTCOME_INTS-1]=new pending.
         int oc[OUTCOME_INTS];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -1819,7 +1774,12 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(d_accept_cap, &h_cap0, 4, cudaMemcpyHostToDevice, stm));
     }
     // P11: stage all 5 lane mask ids at once (split path). cap stays 0.
-    int h_mask_ids5[W_PLUMB] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    // W16: was a 12-entry {-1,...} brace list -- slots 12..15 would value-init
+    // to 0, which is a VALID mask-pool id, not "unconstrained". Harmless today
+    // (only 5 ints are ever copied to the device, and clear_tool_constraint
+    // rewrites all W_PLUMB), but it is the wrong default to leave lying around.
+    int h_mask_ids5[W_PLUMB] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                                -1, -1, -1, -1, -1, -1, -1, -1};
     void set_tool_masks5(const int ids[5]) {
         for (int i = 0; i < 5; i++) h_mask_ids5[i] = ids[i];
         h_cap0 = 0;
@@ -1851,9 +1811,12 @@ struct Engine {
     int refinish_round(int m, int n, int P_target) {
         perm = (perm + (m - n) + W_MAX) % W_MAX;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P_target, 4, cudaMemcpyHostToDevice, stm));
-        const float* lanes[W_PLUMB] = {x1, x1_L[1], x1_L[2], x1_L[3], x1_L[4], x1_L[5], x1_L[6], x1_L[7],
-                                     x1_L[8], x1_L[9], x1_L[10], x1_L[11]};
-        CUDA_CHECK(cudaMemcpyAsync(h_next, lanes[m - 1], (size_t)N_EMBD * 4,
+        // W16: this was a hand-written 12-entry brace list into a W_PLUMB array
+        // -- at W_PLUMB=16 it left lanes[12..15] = nullptr, and a wide suffix
+        // round that commits n >= 13 with a tool marker completing there would
+        // memcpy from nullptr and take the server down. x1_L[0] aliases x1, so
+        // the whole list is just x1_L.
+        CUDA_CHECK(cudaMemcpyAsync(h_next, x1_L[m - 1], (size_t)N_EMBD * 4,
                                    cudaMemcpyDeviceToDevice, stm));
         q27k::argmax_masked(logits2 + (size_t)(m - 1) * VOCAB, VOCAB, d_mask_pool, mask_words,
                             d_mask_ids, 0, d_token, d_amax, stm);

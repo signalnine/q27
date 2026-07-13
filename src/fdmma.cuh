@@ -452,13 +452,21 @@ inline bool launch_fdmma(FCP3 qp, int q_stride, const void* kc, const void* vc, 
         FDMMA_CASE(7);
         FDMMA_CASE(8);
         // width-12 P2: the suffix drafter's wide verify (Q27_SUFFIX_W).
-        // 13..16 compile (kernel is 16-ready) but stay uninstantiated until
-        // something launches them; caller MUST honor the false return.
         FDMMA_CASE(9);
         FDMMA_CASE(10);
         FDMMA_CASE(11);
         FDMMA_CASE(12);
-        default: return false; // W<4 (and 13..16) stay on fd2
+        // W16: 13..16 instantiated. 16 is the kernel's hard ceiling (the
+        // static_assert: 6*16 = 96 rows = the 192-thread launch's 6 warps).
+        // NOTE 14..16 cross the s_q 80->96 row step, so they run ONE CTA/SM
+        // (see the stages selection in attn_decode3) -- they are correct, but
+        // they are not free; the width curve, not this switch, decides if they
+        // pay.
+        FDMMA_CASE(13);
+        FDMMA_CASE(14);
+        FDMMA_CASE(15);
+        FDMMA_CASE(16);
+        default: return false; // W<4 stays on fd2; caller MUST honor the false
     }
 #undef FDMMA_CASE
 }

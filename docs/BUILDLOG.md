@@ -4863,3 +4863,137 @@ Validation A/B (no-think default, no client system):
   the reviewer's exact condition).
 Canonical a2982c51 EXACT (CLI uses --tokens, never the chat template).
 README serving-section note updated to reference the fix.
+
+## 2026-07-13 -- W16 BUILT AND MEASURED: cap raise is a NO-GO; the real bottleneck was a GEMV register spill (+18% on the SHIPPED width)
+
+Built the W16 plan (docs/plans/2026-07-13-w16-suffix.md), gated it, and
+measured it. The plan's premise -- "81% of suffix fires pin at the 12-lane
+cap, so raise the cap" -- is half right, and the half that is wrong is the
+half that mattered.
+
+### The cap binds. Raising it makes things WORSE.
+
+Suffix-leg width curve (the width-12 P3 instrument: server Q27_MAXD=4 +
+Q27_SUFFIX_W=W, open-cut echo payload @28K, qwopus, 5090):
+
+  W_MAX=16 build:  W=12   24.28 ms/rnd   2.103 ms/tok   434.5 t/s  <- OPTIMUM
+                   W=13   27.21          2.194          427.1
+                   W=14   30.47          2.177          424.0
+                   W=16   39.97          2.518          368.5  <- -15% t/s
+
+The cap-binding claim reproduces exactly, at BOTH widths (Q27_SUFFIX_DBG):
+  W=12: 21/22 fires = 95% pinned at n=12
+  W=16: 15/16 fires = 94% pinned at n=16
+So W16 delivers precisely the +33% accepted-tokens-per-fire the plan
+predicted -- and throughput falls anyway, because the wide round costs MORE
+than proportionally. Tokens per fire was never the throughput variable.
+
+Not a tuning artifact. At W=16, the stages/ns choice this session added
+(below) is the best of the four combinations, and W16 still loses:
+  auto (stages=2, ns=42)  39.52 ms/rnd  372.4 t/s  <- best
+  stages=1, ns=85         40.96         360.3      (what the old code picked)
+  stages=1, ns=42         39.94         368.6
+  stages=2, ns=85         39.99         368.2
+
+VERDICT: W16 = measured NO-GO. W12 is the per-token optimum of this kernel
+family. Q27_W_MAX stays 12; no q27-server-w16 target is recommended. The
+answer to the fork maintainer's 653-vs-377 is NOT verify width.
+
+### What the width curve was actually hiding: a register-spill cliff
+
+The 07-10 width-12 P3 entry recorded "per-token at full accept flattens: W8
+2.93 / W10 2.88 / W12 2.94 ms/tok" and attributed the accelerating marginal
+lane (1.6 -> 2.7 -> 3.2 ms) to "GEMV-N". That was the right suspect and the
+wrong diagnosis: it is not that a wide GEMV is inherently expensive, it is
+that ours was SPILLING.
+
+k_gemv_q4_n / k_gemv_q8_n carried `__launch_bounds__(256, N <= 8 ? 4 : 3)`.
+The 3-CTA pin gives ~80 registers, and past N=9 the per-lane accumulators
+stop fitting. ptxas -v on sm_120, q4:
+
+  N=12: 40B stack /  76B spill stores      N=14: 104B / 140B
+  N=13: 40B      /  68B                    N=15: 144B / 212B
+                                           N=16: 232B / 296B
+
+Retiering widths >= 10 to a 2-CTA/128-reg pin (Q27_GEMV_2CTA_MIN=10, swept:
+N=9 is the crossover and stays 3-CTA) buys the accumulators back. Measured
+q4 ffn 17408x5120, ms/call:
+
+            N=10    N=11    N=12    N=13    N=16
+  3-CTA    0.0536  0.0638  0.0702  0.0800  0.180
+  2-CTA    0.0476  0.0509  0.0554  0.0638  0.113
+
+ENGINE A/B, same binary, same day, same payload -- only the pin differs:
+
+  W    old ms/rnd   new    | old ms/tok  new   | old t/s  new t/s
+  5      15.99     16.02   |   3.211    3.217  |  305.2   304.7   (control)
+  8      19.54     19.65   |   2.462    2.476  |  387.5   385.4   (control)
+  10     24.12     21.42   |   2.472    2.194  |  388.9   433.5
+  12     29.16     24.33   |   2.526    2.107  |  367.4   433.4
+
+W5/W8 are unchanged by construction (their pins do not move) and land within
+noise -- the control that says the delta is the pin and nothing else. At the
+SHIPPED suffix width the round drops 29.16 -> 24.33 ms: **+18% t/s (367 ->
+434) on the production path, no plumbing required.**
+
+And note what it does to the SHAPE: under the old pin, per-token cost was
+flat-to-RISING past W8 (2.462 -> 2.472 -> 2.526) -- widening was worthless,
+exactly as P3 concluded. Under the new pin it falls monotonically. The
+"widening does not pay" finding was an artifact of the spill, not a property
+of the design. (It still does not pay past 12 -- see the W16 curve -- but for
+a different reason: the fdmma occupancy cliff below.)
+
+The retier touches ONLY suffix rounds: gated ladder rounds verify widths
+2..gate_maxd+1 (<= 8), which keep their existing pins. Canonical a2982c51
+EXACT on both builds.
+
+### fdmma loses its 2-CTA occupancy at W>=14 (why 14..16 are expensive)
+
+k_attn_fdmma's shipped STAGES=1 variant is the default because TWO CTAs
+co-reside per SM. s_q holds fdmma_qrows(W) = 16-rounded 6W rows: 80 rows
+through W=13, but 96 from W=14 (6*14=84). smem(W,1) goes 48.0KB -> 52.1KB,
+so 2 CTAs need 104.2KB against a 100KB sharedMemPerMultiprocessor -- and
+occupancy silently drops to ONE CTA, which is strictly worse single-buffered.
+The split count ns had the same 2-CTA assumption baked in (SMs*2/kv_heads).
+
+Fixed both: stages=1 iff 2*fdmma_smem_bytes(W,1) <= smem/SM, else stages=2;
+ns = SMs*(2 or 1)/kv_heads to match. No-op at W<=13 (2 CTAs still fit -> ns
+computes 85 on the 5090, bit-for-bit the shipped value); worth +3.4% at W16.
+This is why W=13 is the last cheap width and 14..16 are not.
+
+### Shipped anyway: the plumbing, because the refactor is a keeper
+
+W_PLUMB moved to cuda_common.h (spec3.cu could not see it, which is why
+k_finish_round carried hardcoded 11/12 literals that no compiler could tie
+back to the width) and went 12 -> 16, the hard ceiling of the kernel family
+(k_attn_fdmma asserts 6*W <= 96 rows). Q27_W_MAX stays 12. Every "list every
+lane" site is now loop-built off W_PLUMB rather than a hand-written brace
+list -- that class of site is where the 8->12 widening hid the k_quantize_x3
+lane-aliasing bug, and where a 4-lens audit workflow found this session's
+worst bug: refinish_round's 12-entry `lanes[W_PLUMB]` list left slots 12..15
+nullptr, so a W_MAX=16 server taking a tool-marker completion on a >=13-token
+suffix round would memcpy from nullptr and die. Also fixed: the CLI round-
+outcome print indexed 12 fixed slots out of a hist[W_MAX] array (a stack OOB
+read on the w8 build, silent truncation above it), and the graph banner
+hardcoded "12 perms".
+
+Costs measured, not assumed: shortbench suite 171.7 t/s vs the 172.2 vanilla
+standard (noise) -- the plumbing canary says W_PLUMB=16 taxes the ladder path
+nothing.
+
+GATES: canonical a2982c51 EXACT (default W12 build AND W_MAX=16 build);
+fdmma_test PASS at widths 4..16 x stages{1,2} x ns{128,85,42} (modeled cos
+1.0000000, rel 3-5e-6); test_kernels ALL PASS; compute-sanitizer memcheck 0
+errors on a W_MAX=16 run in which a 16-token suffix round actually committed;
+shortbench 171.7.
+
+### Where the 653 actually lives
+
+Not in the cap. The wide-round marginal is still superlinear even retiered
+(q4 gemv 0.055 ms/call at N=12 -> 0.113 at N=16), and fdmma's occupancy
+cliff sits at 14. The honest lever remains the one P3 named: the mma16 NT=16
+GEMM pivot (tools/mma16_bench.cu, 76% SOL, 0.043-0.045 ms FLAT W2..16). What
+changed today is the size of the prize -- the GEMV it has to beat is now
+0.055 ms at N=12, not 0.070 -- and the fact that a GEMM verify would be flat
+in W is exactly what would make widths past 12 pay at all. W16 reopens ONLY
+behind that pivot.
