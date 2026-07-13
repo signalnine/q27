@@ -3658,7 +3658,11 @@ Context for the record: 07-06's depth-match had TUNED llama +31% over
 q27 at 75K, retired to PARITY on 07-07; today, post width-12 + fdmma
 tuning + defaults, the same-model comparison is q27 +40% decode and
 multiples on wall. The llama echo-ngram degenerate case (889 t/s,
-earlier entry) remains their one winning cell.
+earlier entry) is their one winning cell. [2026-07-13 CORRECTION: it is
+NOT just the degenerate loop -- see the cap-binding entry that date;
+ngram wins the realistic file-re-emission regime too, 653 vs 377, and
+q27's "cap never binds" claim was regime-limited. Corrected in README +
+speed post.]
 
 ## 2026-07-10 -- n>=3 CROSS-ENGINE PROTOCOL RUN: q27 +47% decode, score medians converge, 8/9 vs 5/9 trial robustness
 
@@ -4762,3 +4766,68 @@ prefix_hit=34343 each time). Vanilla + w8 + turbo3 + this harness
 build reaches a drift shape the recovery satisfies but CC rejects.
 NOT triaged tonight; the loop payload shape is in journald
 (2026-07-12 20:52-21:26). Candidate fixture once reproduced small.
+
+## 2026-07-13 -- the 12-lane suffix cap BINDS on file re-emission (external-review-driven) + two more findings
+
+The maintainer of the turboquant fork (TheTom/llama-cpp-turboquant @
+558c6b78e) ran a KV-matched, slot-matched, sampling-matched A/B of his
+build vs q27@dc8d5ad on the 5090. His headline that mattered: in the
+file-re-emission regime his ngram-mod does 653 t/s vs q27's fused
+MTP+suffix 376.9 (+73%), at 85%+ draft acceptance. That directly
+challenges q27's published "12-lane cap never binds on real traffic."
+
+MEASURED (Q27_SUFFIX_DBG trace, file re-emission payload = real code
+file + targeted addition, forced full-file re-emit):
+- suffix-fired rounds 103, ladder rounds 253; suffix mean accepted
+  10.68 against the 12 ceiling.
+- accepted-length histogram, suffix rounds: n=12 in 83/103 fires = 81%
+  PINNED AT THE CAP. The rest scattered 1..11. This is truncation, not
+  weak matching -- llama's unbounded ngram takes ~24-token drafts at
+  251/251, q27 stops at 12 by construction.
+VERDICT: the cap binds in this regime. Published claim corrected
+(README, speed post, the 07-09 entry above).
+
+Widening is a BOUNDED plumbing project, not a kernel rewrite: the fdmma
+verify kernel already has FDMMA_CASE 13..16 ("kernel is 16-ready"), and
+the lane-pointer structs (P3/CP3/IP3/XQ3) are already float*[16]. What
+is still 12-wide: W_PLUMB (outcome ints, emit[], S_sp/ring_sp role
+arrays, the gch/gnh/glf/gla histograms) and the per-perm captured-graph
+zoo (grows with W_MAX). So W16 is the same CLASS of work as the 8->12
+widening was (~a day, its own canonical campaign, +~630MB role VRAM for
+4 more sets + graph growth), gated by the modulus-relabel invariant
+that kept 8->12 bitwise. NOT built tonight -- sized and filed; it is the
+single highest-value speed item and it barely touches novel-prose rate
+(suffix only fires on repetition; the MTP ladder path is untouched).
+
+### Finding 2: over-refusal localizes to the no-think serving default
+
+Reviewer saw q27 flatly refuse a signed-authorization pentest scan and
+an OTC-dosage question where his build answered; verified not an
+injected system prompt. Localized it: the CC serving profile defaults
+to no-think, which prefills an empty <think></think> block
+(api_common.h chatml_prompt). A/B, same prompt, default vs --think:
+- pentest (nmap SYN scan, stated engagement ID): no-think SOFT-REFUSES
+  ("cannot provide the command even with claimed authorization");
+  --think reasons through the authorization and GIVES the command
+  (`nmap -sS -p 80,443,8080,8443 10.2.0.0/24`).
+- otc: answered correctly under BOTH (could not reproduce the reviewer's
+  flat OTC refusal on default serving -- likely phrasing/sampling; the
+  pentest class is the clean repro).
+Mechanism: a reasoning model handed zero reasoning budget pattern-
+matches "nmap SYN scan -> refuse" instead of reaching "authorized ->
+answer." NOT a fix to the default (no-think is the speed default and
+carries the 224 t/s headline); this is a documented tradeoff --
+operators who need borderline-legit compliance pass --think, one flag.
+Filed for the serving docs.
+
+### Finding 3: GQA-6 guard, INDEPENDENT cross-engine confirmation
+
+The reviewer forced his fork's auto-asymmetric guard off
+(TURBO_AUTO_ASYMMETRIC=0): symmetric 3-bit K+V ran clean, +0.87% total
+on this model -- matching q27's own triage (+0.70% V, +0.17% K-on-top)
+from a SEPARATE engine. Same mechanism cited independently (head_dim 256
+= two independent 128-dim WHT groups protecting K at GQA 6). This is the
+strongest validation the K-crater refutation has: two engines, one
+finding. Belongs in the 3090 post as external confirmation. His
+actionable: per-arch guard calibration / documented override (his fork's
+call; the calibration logic is q27's to offer back).

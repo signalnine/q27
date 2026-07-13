@@ -69,8 +69,14 @@ tables in BUILDLOG):
   decode telemetry is the rate currency. Decomposition: ~15 points of
   the 47 are bit-width (15.8 vs 18.2 GB/step), the rest is mechanism.
   Arc: tuned llama +31% on 07-06, parity 07-07, q27 +47% on 07-10.
-  llama's one winning cell: ngram spec on a pure token loop (889 t/s;
-  q27's 12-lane cap never binds on real traffic).
+  llama's ngram spec wins the repetition regime: on file re-emission
+  its unbounded prompt-lookup drafts beat q27's fused MTP+suffix (an
+  external fork-maintainer A/B measured 653 vs 377 t/s), because q27's
+  suffix draft truncates at the 12-lane verify cap -- which DOES bind
+  here (81% of suffix fires pin at 12; BUILDLOG 2026-07-13). Against
+  llama's *deployed* config (draft-mtp) q27 still wins both regimes;
+  the ngram win is to a mode llama does not run in production and that
+  is mutually exclusive with draft-mtp and poor on novel prose.
 - Fine-tune headroom, REVISED by the matched 21-task sweep (07-11):
   Qwopus is a SPEED fine-tune worth **+5.7% decode on real traffic**
   (246.5 vs 233.1 t/s aggregate, 5.65 vs 5.31 tok/rnd) at quality TIE
@@ -451,6 +457,16 @@ single-slot). Every knob keeps its env/flag override
 reference behavior (fp16, ungated, no suffix, fd2), and the **CLI binary
 keeps reference defaults** so the bitwise canonical gates are untouched.
 Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
+
+Behavior note (`--think`): the default serving profile is no-think for
+speed -- it prefills an empty `<think></think>` block, which is what
+carries the ~224 t/s headline. The cost is a reasoning model handed
+zero reasoning budget, which over-refuses a narrow class of
+borderline-but-legitimate requests (measured: a signed-authorization
+pentest command it declines under no-think, it supplies under `--think`
+after reasoning through the authorization; BUILDLOG 2026-07-13). If your
+workload includes security/compliance-sensitive requests that should be
+answered, run `--think` and trade the speed for the reasoning pass.
 
 Three API shapes on one server:
 - **OpenAI**: `/v1/chat/completions`, `/v1/completions` (text)
