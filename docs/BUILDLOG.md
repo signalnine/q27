@@ -5055,3 +5055,58 @@ the recreated adapter is not bit-for-bit the lost original. Not chased.
 Tools: tools/thunderdome_pin_ab.sh, tools/pin_ab_report.py ([req] gotcha: dec/
 tps/sfxm/sfxn are PER-REQUEST but sfx=<fired>,<tok> is ENGINE-CUMULATIVE --
 summing it across requests overcounts; take the last line, or diff consecutive).
+
+## 2026-07-13 (cont.) -- spill audit across ALL kernels: the LADDER gemv was never occupancy-swept either (+1.7% on the main decode path)
+
+The 2-CTA retier came from noticing one kernel spilled. Nobody had ever asked
+the same question of the other 183. Asked it (`nvcc -Xptxas -v` over kernels.cu
+/ spec3.cu / blocks.cu / prefill.cu): 30 of 184 kernels spill. Ranked by spill
+stores, the interesting ones are all in the same family -- and four of them are
+the widths the LADDER verifies:
+
+  k_gemv_q4_n<4>  48B spill @ 64 regs (4-CTA)
+  k_gemv_q4_n<5>  36B         "
+  k_gemv_q4_n<8>  24B         "
+
+The 4-CTA/64-reg tier dates from the depth-4 era and was never swept. It is
+beaten by 3 CTAs / 80 regs at EVERY ladder width:
+
+  q4 ffn 17408x5120, ms/call    N=5     N=6     N=7     N=8
+    4-CTA (old)                0.0361  0.0338  0.0368  0.0438
+    3-CTA (new)                0.0332  0.0329  0.0341  0.0391
+                                -8.0%   -2.7%   -7.3%  -10.7%
+
+This one is worth more than the suffix retier in BREADTH: gated rounds verify
+widths 2..gate_maxd+1, so it hits EVERY round, not just the repetitive ones.
+
+  canonical         139.8 -> 142.2 t/s  (+1.7%, md5 a2982c51 EXACT)
+  shortbench suite  171.9 -> 174.9 t/s  (+1.7%)
+  @26K, fixed-bytes paired (all IDENTICAL output):
+    codegen +0.8%   testgen +0.6%   docs +0.7%   echo -0.0%
+
+The gain SHRINKS with context (+1.7% @2K -> +0.7% @26K) because attention, not
+the weight GEMV, owns a deep round -- exactly the mirror of the suffix retier,
+which is worthless on novel prose and worth +17% on echo. Together the two pins
+cover the two regimes: the ladder pin pays on every round and most at short
+context; the suffix pin pays only on repetition. Neither moves a single token
+(both are register allocation; canonical EXACT).
+
+N<=3 stays 4-CTA (narrow gated graphs, untouched). Knobs: Q27_GEMV_3CTA_MIN_Q4
+(4) and Q27_GEMV_2CTA_MIN (10).
+
+STILL ON THE TABLE (not built): k_gemv_q8_n<6..9> spill 80-112B at the 3-CTA
+pin, but the q8 head only runs WITHOUT --fast-head, so it is off the serving
+path -- fix if the reference profile ever matters. k_attn_fdmma<6/7/8> spill
+8-24B at 168 regs; that kernel is occupancy/latency-bound, not register-bound
+(three separate 2026-07-10 experiments said so), so the bar to retry is low
+value.
+
+THE REAL REMAINING LEVER, now priced: the mma16 NT=16 GEMM verify pivot. With
+the GEMV retiered, the crossover is visible -- gemv is 0.033-0.039 ms/call at
+ladder widths but 0.055 @N=12 and 0.113 @N=16, while the MMA GEMM measured
+0.043-0.045 ms FLAT W2..16 (76% SOL, tools/mma16_bench.cu). So the GEMM LOSES
+below ~N=10 and wins 2.5x at N=16. The architecture that falls out is a HYBRID:
+GEMV for the ladder (2..8), MMA GEMM for the suffix widths (>=10). That flattens
+the wide-round marginal -- which is the one thing that would make the W16 cap
+raise pay, and it is exactly the conclusion the 07-10 P3 entry reached from the
+other direction. This is the next build, not another pin.

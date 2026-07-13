@@ -20,6 +20,26 @@
 #ifndef Q27_GEMV_2CTA_MIN
 #define Q27_GEMV_2CTA_MIN 10
 #endif
+// LADDER RETIER (measured 2026-07-13, same sweep): the 4-CTA/64-reg tier was
+// never occupancy-swept -- it dates from the depth-4 era and spills at the
+// widths the ladder actually verifies (ptxas: N=4 48B, N=5 36B, N=8 24B spill
+// stores). 3 CTAs / 80 regs is faster at EVERY ladder width:
+//
+//   q4 ffn 17408x5120, ms/call    N=5     N=6     N=7     N=8
+//     4-CTA (old)                0.0361  0.0338  0.0368  0.0438
+//     3-CTA (this)               0.0332  0.0329  0.0341  0.0391
+//
+// N<=3 stays 4-CTA (the narrow gated graphs; untouched). Unlike the 2-CTA
+// retier above -- which only helps suffix rounds -- this one hits EVERY gated
+// round: canonical 139.8 -> 142.2 t/s and shortbench suite 171.9 -> 174.9
+// (+1.7%), both bitwise EXACT. Smaller at depth (+0.7% @26K) where attention,
+// not the weight GEMV, owns the round.
+#ifndef Q27_GEMV_3CTA_MIN_Q4
+#define Q27_GEMV_3CTA_MIN_Q4 4
+#endif
+#ifndef Q27_GEMV_3CTA_MIN_Q8
+#define Q27_GEMV_3CTA_MIN_Q8 6
+#endif
 
 namespace q27k {
 
@@ -264,7 +284,7 @@ struct Q8Lanes {
 // 64 regs); N=10 keeps its natural 3. Register allocation only -- values are
 // bit-identical (canonical-gated).
 template <int N>
-__global__ void __launch_bounds__(256, N <= 8 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
+__global__ void __launch_bounds__(256, N < Q27_GEMV_3CTA_MIN_Q4 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
     k_gemv_q4_n(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                 __grid_constant__ const Q4Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -320,7 +340,7 @@ __global__ void __launch_bounds__(256, N <= 8 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 
 // mid-size and latency-sensitive like the Q4 mats. Pin 3 CTAs through N=8
 // (85-reg budget, small spill beats the 2-CTA cliff); N<=5 keeps 4.
 template <int N>
-__global__ void __launch_bounds__(256, N <= 5 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
+__global__ void __launch_bounds__(256, N < Q27_GEMV_3CTA_MIN_Q8 ? 4 : N < Q27_GEMV_2CTA_MIN ? 3 : 2)
     k_gemv_q8_n(const int8_t* __restrict__ W, const __half* __restrict__ S,
                 __grid_constant__ const Q8Lanes L, int64_t rows, int64_t cols) {
     int64_t row = (int64_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
