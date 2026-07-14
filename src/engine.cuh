@@ -369,23 +369,46 @@ struct Engine {
     // MTP ladder stays 4..gate_maxd regardless.
     int sfx_w = 0;
     int sfx_width() const { return sfx_w > gate_maxd + 1 ? sfx_w : gate_maxd + 1; }
-    // Context-adaptive suffix verify width (2026-07-13, external-review sweep).
-    // W16 suffix beats W12 by ~16% on short-ctx echo/file-re-emission, decaying to
-    // +2.7% @26K and -0.8% @60K: fdmma attention grows ~linearly in W and eats the
-    // extra-token gain as ctx grows. So verify at the WIDE width sfx_w below
-    // sfx_ctx_thresh tokens, and at a NARROW width sfx_w_lo at/above it. Both are
-    // captured as their own per-perm verify graphs; the fire path picks one by
-    // sequence length. Greedy verify is width-invariant (leading-run accept), so
-    // switching width per-round is byte-identical to any fixed width -- same class
-    // as the Q27_PMIN gate. sfx_width() stays the ARMED (max) width used for
-    // buffer/reserve sizing (verify_w_max) and the banner; only the fire path uses
-    // sfx_width_at. sfx_w_lo <= gate_maxd+1 or >= sfx_w = feature OFF (single fixed
-    // suffix width = legacy P1).
-    int sfx_w_lo = 0;            // Q27_SUFFIX_W_LO: narrow (long-ctx) suffix width
-    long sfx_ctx_thresh = 16384; // Q27_SUFFIX_CTX: seqlen at/above which lo fires
+    // Realized-SATURATION suffix width gate (2026-07-14; replaces the 07-13
+    // context-length gate, which was the wrong proxy). The wide (sfx_w) verify
+    // only pays when the suffix MATCH SATURATES the narrow cap -- the model is
+    // confidently copying a long verbatim run, so accepted n hits sfx_w_lo. That
+    // regime is exactly where the fdmma wide verify does NOT tie-fork the greedy
+    // output (confident logits, no ties), so gating on saturation captures the
+    // clean +16% AND stays in the no-fork basin. Non-saturating traffic (the
+    // model diverges after a few tokens -- the common single-file re-emit /
+    // agentic-edit case, accept ~7-9) keeps the narrow width: no wide-verify
+    // overhead, no fork. WHY NOT CTX: measured 07-14, a single-file re-emit at
+    // 11K forks the output and swings +31% (qwen) / -18% (qwopus) by which fork
+    // is more echo-able -- a content lottery, not a width win; context length
+    // does not distinguish saturating from diverging. Both widths are captured as
+    // per-perm verify graphs; sfx_width() stays the ARMED (max) width for
+    // buffer/reserve sizing (verify_w_max) and the banner. sfx_w_lo <= gate_maxd+1
+    // or >= sfx_w = feature OFF (single fixed suffix width = legacy P1).
+    int sfx_w_lo = 0;            // Q27_SUFFIX_W_LO: narrow suffix width (default 12)
     bool sfx_adaptive() const { return sfx_w_lo > gate_maxd + 1 && sfx_w_lo < sfx_w; }
-    int sfx_width_at(size_t seqlen) const {
-        return sfx_adaptive() && (long)seqlen >= sfx_ctx_thresh ? sfx_w_lo : sfx_width();
+    // Saturation controller (depthctl-style EMA + hysteresis). Start NARROW
+    // (conservative). A/B endpoints: Q27_SUFFIX_SAT_HI=99 = never wide (== W12);
+    // Q27_SUFFIX_SAT_HI=-1 + Q27_SUFFIX_SAT_LO=-1 = always wide after round 1.
+    bool sfx_wide = false;          // current width decision
+    float sfx_sat_ema = 0.f;        // EMA of (suffix round saturated the narrow cap)
+    float sfx_sat_ema_a = 1.f / 16.f; // Q27_SUFFIX_SAT_EMA (~11-round half-life)
+    float sfx_sat_hi = 0.50f;       // Q27_SUFFIX_SAT_HI: promote narrow -> wide
+    float sfx_sat_lo = 0.30f;       // Q27_SUFFIX_SAT_LO: demote wide -> narrow
+    int sfx_cur_width() const {
+        return sfx_adaptive() ? (sfx_wide ? sfx_w : sfx_w_lo) : sfx_width();
+    }
+    // Fold one suffix round's realized accept into the width decision. Saturation
+    // = n reached the narrow cap (the width was the binding constraint, so wider
+    // would capture more). Same test drives both transitions: high EMA -> wide,
+    // low -> narrow. Greedy: this only changes round grouping/verify width, and
+    // (unlike the ctx gate) only goes wide in the confident-copy no-fork regime.
+    void sfx_sat_update(int n) {
+        if (!sfx_adaptive()) return;
+        float sat = (n >= sfx_w_lo) ? 1.f : 0.f;
+        sfx_sat_ema += sfx_sat_ema_a * (sat - sfx_sat_ema);
+        if (!sfx_wide && sfx_sat_ema >= sfx_sat_hi) sfx_wide = true;
+        else if (sfx_wide && sfx_sat_ema < sfx_sat_lo) sfx_wide = false;
     }
     q27::SuffixDraft sfx;
     bool sfx_valid = false;      // last_pending valid (>=1 round this request)
@@ -1329,17 +1352,18 @@ struct Engine {
             if (sfx_w < gate_maxd + 1) sfx_w = 0;      // narrower than gated = legacy
             if (sfx_w > W_MAX) sfx_w = W_MAX;
         }
-        // Context-adaptive suffix width (see sfx_width_at). Default the narrow leg
-        // to 12 whenever the wide leg exceeds it -- the sweep crossover is the
+        // Saturation-gated suffix width (see sfx_sat_update). Default the narrow
+        // leg to 12 whenever the wide leg exceeds it -- the sweep crossover is the
         // 12-vs-16 pair, and a build/env with sfx_w <= 12 leaves lo == wide (off).
-        // Q27_SUFFIX_W_LO overrides the narrow width; Q27_SUFFIX_CTX the threshold
-        // (Q27_SUFFIX_CTX=0 forces always-narrow, a huge value forces always-wide
-        // -- the two A/B endpoints the byte-identity gate needs).
+        // Q27_SUFFIX_W_LO overrides the narrow width; Q27_SUFFIX_SAT_{HI,LO,EMA}
+        // tune the controller (see the field comments for the A/B endpoints).
         if (sfx_w > 12) sfx_w_lo = 12;
         if (const char* lo = getenv("Q27_SUFFIX_W_LO")) sfx_w_lo = atoi(lo);
         if (sfx_w_lo > sfx_w) sfx_w_lo = sfx_w;         // never wider than the wide leg
         if (sfx_w_lo < gate_maxd + 1) sfx_w_lo = 0;     // below the wide-graph floor = off
-        if (const char* ct = getenv("Q27_SUFFIX_CTX")) sfx_ctx_thresh = atol(ct);
+        if (const char* e = getenv("Q27_SUFFIX_SAT_HI")) sfx_sat_hi = (float)atof(e);
+        if (const char* e = getenv("Q27_SUFFIX_SAT_LO")) sfx_sat_lo = (float)atof(e);
+        if (const char* e = getenv("Q27_SUFFIX_SAT_EMA")) sfx_sat_ema_a = (float)atof(e);
         // W16: lane seeds were a by-name z0..z11 list that stopped at 12 -- the
         // same hand-written-lane-list shape that left refinish_round's slots
         // nullptr. Warm-up positions only (prep_round rewrites every lane each
@@ -1457,12 +1481,12 @@ struct Engine {
                 CUDA_CHECK(cudaGraphInstantiate(&verify_graph_w[W][p], gw, nullptr, nullptr, 0));
                 CUDA_CHECK(cudaGraphDestroy(gw));
             }
-            // width-12 P1 + adaptive (2026-07-13): the suffix drafter's wide
-            // verify. Suffix rounds always launch full width, so each DISTINCT
-            // suffix width is captured at exactly that width (not every width
-            // 9..sfx_w) -- 12 extra graphs per width. Context-adaptive adds the
-            // narrow leg sfx_w_lo as a second per-perm graph; the fire path picks
-            // between them by sequence length (sfx_width_at).
+            // width-12 P1 + adaptive: the suffix drafter's wide verify. Suffix
+            // rounds always launch full width, so each DISTINCT suffix width is
+            // captured at exactly that width (not every width 9..sfx_w) -- 12
+            // extra graphs per width. Saturation-gated adaptive adds the narrow
+            // leg sfx_w_lo as a second per-perm graph; the fire path picks between
+            // them by realized saturation (sfx_cur_width / sfx_sat_update).
             const int sfx_ws[2] = {sfx_w, sfx_adaptive() ? sfx_w_lo : 0};
             for (int wi = 0; wi < 2; wi++) {
                 const int W = sfx_ws[wi];
@@ -1522,9 +1546,9 @@ struct Engine {
         // (suffix envs parsed above, pre-capture -- width-12 P1)
         if (suffix_on && sfx_adaptive())
             fprintf(stderr,
-                    "suffix drafter ON: L>=%d, width %d<%ldtok / %d>= (adaptive, greedy gated "
-                    "rounds only)\n",
-                    sfx_L, sfx_width(), sfx_ctx_thresh, sfx_w_lo);
+                    "suffix drafter ON: L>=%d, width %d(narrow)->%d(wide) sat-gated hi=%.2f "
+                    "lo=%.2f (greedy gated rounds only)\n",
+                    sfx_L, sfx_w_lo, sfx_w, sfx_sat_hi, sfx_sat_lo);
         else if (suffix_on)
             fprintf(stderr, "suffix drafter ON: L>=%d, width %d (greedy gated rounds only)\n",
                     sfx_L, sfx_width());
@@ -1568,7 +1592,7 @@ struct Engine {
             on_drafts(dr); // stages d_mask_ids[0..4], sets d_accept_cap=0 (async on stm)
             CUDA_CHECK(cudaGraphLaunch(verify_graph[perm], stm));
         } else if (suffix_on && sfx_valid && pmin_theta > 0.f && h_mask_id0 < 0 &&
-                   sfx.propose_with(last_pending, sfx_width_at(sfx.size()) - 1, h_sfx_prop) >=
+                   sfx.propose_with(last_pending, sfx_cur_width() - 1, h_sfx_prop) >=
                        sfx_L) {
             // Suffix round: the committed stream's suffix recurs -- fill the
             // draft lanes from the earlier continuation and skip the MTP
@@ -1579,10 +1603,11 @@ struct Engine {
             // quality. h_next for the next round comes from the verify's
             // resident role buffers, unaffected by how drafts were made.
             sfx_round = true;
-            // adaptive: wide (sfx_w) below sfx_ctx_thresh, narrow (sfx_w_lo)
-            // above. sfx.size() is stable between the propose above and here (no
-            // append until the round commits), so both see the same width.
-            const int sw = sfx_width_at(sfx.size());
+            // saturation-gated width: wide (sfx_w) once suffix rounds are
+            // saturating the narrow cap, else narrow (sfx_w_lo). sfx_wide is
+            // stable within a round (updated post-commit in sfx_sat_update), so
+            // the propose above and this launch see the same width.
+            const int sw = sfx_cur_width();
             if (phase_stats) ph_t0 = std::chrono::steady_clock::now();
             q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
                              stm);
@@ -1687,6 +1712,7 @@ struct Engine {
         if (sfx_round) {
             sfx_fired++;
             sfx_tok += n;
+            sfx_sat_update(n); // fold realized accept into the width decision
         }
         if (gate_cap >= 0) {
             gate_cap_hist[gate_cap]++; gate_n_hist[n]++;

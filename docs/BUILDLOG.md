@@ -5577,3 +5577,111 @@ W12 default build unaffected (feature inert by construction; rebuilt, canonical
 holds). NOTE: q27-server-w16 still has no Makefile target (built by hand
 -DQ27_W_MAX=16, as on 07-13); adding one is a sensitive-file edit, filed not done.
 Gate script + payloads in scratchpad/ (adaptive_sfx_gate.sh, echo_ctx*.json).
+
+## 2026-07-14 -- adaptive suffix width validated on REAL agentic CC traffic (thunderdome A/B + CC-session capture-replay): correct + safe, but INERT on agentic serving -- the +16% is a short-ctx-only win
+
+Tested the adaptive branch against real Claude Code traffic two ways. Quality is
+byte-identical across widths by construction (greedy verify is width-invariant), so
+both are decode-rate / engagement reads, not quality reads.
+
+(1) LIVE THUNDERDOME A/B (3 legs x 4 bench-* tasks via claude-code-q27-haight on
+qwopus, scratchpad/td_adaptive_ab.sh). All tasks hit the 500s cap (these agentic
+trajectories run long), so the aggregate t/s is 3-way confounded (trajectory fork +
+different truncation points + wildly different decode volumes: W12 235k tok/66 req vs
+adapt 65k/134) -- NOT trustworthy for the fine margin. Two signals survive: prompts
+are long (p50 35-43k, only ~5-10% of requests <16k) and suffix matches are short
+(even fixed-W16 gets 12.1 tok/fire; W12 8.7). So on agentic CC, adaptive picks W12
+for ~90% of requests and width past 12 is barely used.
+
+(2) CC-SESSION CAPTURE-REPLAY (the clean methodology -- identical bytes per leg, no
+fork). Built a transparent tee-proxy (scratchpad/capture_proxy.py, :8081->:8082,
+tees each /v1/messages body) and captured a real 39-turn bench-structural-merge
+session. v1 replay (scratchpad/ccreplay_ab.sh) was CONFOUNDED: the captured session
+grew to 171-174k tokens > the 131k server ctx, and raw-POSTing those oversized
+prompts (bypassing CC's count_tokens 400 guard) crashed+restarted the server 5x
+(306/86/39 [req] from 39 POSTs; md5 mismatch from the overflow turns, NOT width --
+early in-ctx turns already matched). v2 (scratchpad/ccreplay_v2.sh) pre-filters via
+the server's own count_tokens, keeping the 34/39 turns < 118k, then replays clean:
+
+  BYTE-IDENTITY: W12 == adapt == W16fix, md5 a1a02e7d... on all 34 real in-ctx turns.
+    Width-invariance PROVEN on real CC content (not just the synthetic gate payloads);
+    also clears the cross-BUILD worry -- W12-binary and W16-binary greedy output match
+    exactly, no rebuild tie-lottery here.
+  DECODE (identical inputs = pure width): W12 medTps 266.9 / adapt 263.9 / W16fix 271.2;
+    W12 and adapt have IDENTICAL decTok (72064) and agg t/s within 0.6% (273.0 vs 271.3)
+    -- adaptive IS W12 on this traffic, by design (every turn >16k -> narrow). W16fix ran
+    wide (11.6 tok/fire vs 7.7) at ~equal medTps -> always-16 is ~neutral on 16-118k
+    turns, matching the sweep's decay (+2.7% @26k, -0.8% @60k). (W16fix agg t/s 252 is a
+    partial journald [req] harvest on the fast 3rd leg -- decTok 10193 vs the true 72064
+    the identical 937-byte responses imply; medTps is the robust cross-leg number.)
+
+VERDICT: the adaptive cap is CORRECT (byte-identical on real CC content) and SAFE
+(never worse than W12; ~630MB W_MAX=16 role VRAM the only cost), but effectively
+INERT on agentic CC serving -- real Claude Code context exceeds the 16k threshold by
+turn 2 (1/39 captured turns was <16k), so it runs W12 for ~97% of agentic turns and
+the synthetic-echo +16% does NOT transfer. The +16% is a genuine but SHORT-CONTEXT
+win: standalone completion requests, single-file rewrites, first-turn interactions,
+non-agentic /v1/completions echo -- not multi-turn agentic coding, which accumulates
+context immediately. Feature stands (correct, free, helps where short-ctx echo
+happens); the headline should be scoped to short-context traffic, not agentic serving.
+FOLLOW-UP noted, not done: raw >ctx /v1/messages POSTs crash-restart the server
+(replay bypassed the count_tokens 400 guard) -- a robustness gap worth a graceful
+413/400, separate from this feature. Artifacts in scratchpad/ (td_adaptive_ab.sh,
+capture_proxy.py, capture_cc.sh, ccreplay_ab.sh, ccreplay_v2.sh, ccreplay/req_*.json).
+
+## 2026-07-14 -- CORRECTION + FIX: wide suffix verify TIE-FORKS on uncertain inputs; the width gate is now SATURATION-based, not context-based
+
+Trying the fork maintainer's exact regime (forced single-file verbatim re-emit,
+~11K tok) overturned two things I had claimed for the adaptive cap. Both corrected
+here; the gate is reworked.
+
+CORRECTION 1 -- "byte-identical" was TOO STRONG. The wide fdmma verify is only
+tolerance-class across widths, not bitwise: at a TIED logit the m16n8k32 attention
+tie-breaks differently by lane count (the documented "wide-vs-narrow grouping is
+tolerance-class under mma -- union-window tile phase depends on the lane set").
+Proven on the file-emit payload, SAME W16 binary: narrow(12) md5 eb28599a /
+wide(16) md5 fb86aeed -- different greedy output. It held on the 07-13 gate
+payloads (echo, CC turns) only because those have CONFIDENT logits (no ties). So
+adaptive is byte-identical when no ties are hit, tolerance-class otherwise -- not
+"byte-identical by construction."
+
+CORRECTION 2 -- the +16% needs SATURATING matches, and context length is the WRONG
+proxy. On single-file re-emit BOTH models diverge after ~7-9 tokens (they do NOT
+sustain the 24-tok verbatim echo the fork maintainer's model did -- his 653 needs
+a stronger copy-force or his specific model+quant), so the match never saturates
+the 12-cap and the wide width is pure overhead PLUS a fork. And because it forks,
+the perf sign is a CONTENT LOTTERY -- which fork happens to be more echo-able:
+
+  same file-emit payload, wide vs narrow:  qwopus -18% (280->229)  qwen +31%
+  (181->237)  qwen forceWIDE run3 +8% -- three different forks, three signs.
+
+Opposite signs on identical input = the delta is fork-driven, not width-driven. The
+clean +16% from the 07-13 sweep was on REPEATED-BLOCK echo, which saturates AND has
+confident logits (byte-identical, no fork). Unifying principle: SATURATION ==
+CONFIDENCE == NO FORK. The clean win lives only in the confident-saturating basin.
+
+FIX -- realized-SATURATION gate (src/engine.cuh, replaces the ctx gate). A
+depthctl-style EMA of "suffix round saturated the narrow cap" (accepted n >=
+sfx_w_lo) with hysteresis: promote narrow->wide at Q27_SUFFIX_SAT_HI (0.50),
+demote at Q27_SUFFIX_SAT_LO (0.30), ema_a 1/16. Goes wide ONLY when matches are
+saturating -- which is exactly the confident-copy regime with no ties, so it
+captures the clean win AND stays in the no-fork basin; non-saturating traffic keeps
+the narrow width (no overhead, no fork). sfx_wide starts narrow (conservative).
+A/B endpoints: SAT_HI=99 = never wide (==W12); SAT_HI=-1 SAT_LO=-1 = always wide.
+
+GATES (vanilla qwen, W16 binary):
+  - canonical a2982c51 EXACT (CLI, feature inert).
+  - DIVERGENT file-emit: satGATE == forceNARROW, tps 180.5, md5 358b7a6b (== W12) --
+    the gate NEVER promotes, so no fork, no lottery, tracks W12. (forceWIDE forks to
+    7ae52d04.) The -18%/+31% swing is GONE.
+  - SATURATING echo_ctx4k: satGATE promotes to wide -> 735.1 t/s vs forceNARROW
+    617.0 (+19%), md5 7cbd939a IDENTICAL to narrow -- clean win, ZERO output change
+    (saturating => confident => no fork).
+
+NET: the saturation gate is strictly better than the 07-13 ctx gate -- it keeps the
++19% on confident echo (byte-identical) and eliminates the fork/lottery on the
+divergent short-ctx re-emit the ctx gate was gambling on. On agentic CC (long ctx,
+~9-12 tok/fire, non-saturating) it stays narrow = W12, same safe inert behavior as
+before but now for the RIGHT reason (non-saturation, not just ctx). Env knobs:
+Q27_SUFFIX_W_LO, Q27_SUFFIX_SAT_HI/LO/EMA. Payloads: scratchpad/fileemit_verbatim.json,
+echo_ctx4k.json.
