@@ -31,6 +31,23 @@ __global__ void k_arch_probe(int* out) {
 #endif
 }
 
+// Compile-time A/B for the prefill GEMM B-operand (activation) load. Default
+// LDMB=1: ldmatrix.x2 loads the n8k32 activation fragment once per subtile in
+// place of 4 scalar smem loads. Spike 2026-07-13 (tools/gemm_ldm_spike.cu):
+// +4.1% GEMM, BITWISE (0/17.8M floats differ) -- ldmatrix moves the same bytes
+// into the same registers. B-side ONLY: the A/weight ldmatrix loses (amortized
+// 8x, its instruction overhead > the load it saves) and AB cancels.
+// -DQ27_GEMM_LDMB=0 restores the scalar reference (the in-binary A/B leg).
+#ifndef Q27_GEMM_LDMB
+#define Q27_GEMM_LDMB 1
+#endif
+static __device__ __forceinline__ void ldm_x2(uint32_t& r0, uint32_t& r1, const void* p) {
+    uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
 template <int TB, int CS>
 __global__ void k_gemm_q4_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                             const uint2* __restrict__ eo, const float* __restrict__ xs,
@@ -380,9 +397,16 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
 #pragma unroll
                 for (int s = 0; s < TS; s++) {
                     const int tb = wn * (NT / 2) + s * 8; // token subtile base
+                    uint32_t b0, b1;
+#if Q27_GEMM_LDMB
+                    // ldmatrix.x2 B-load, single 32-K sub-block (kb:kb+32).
+                    const int8_t* xr = s_x + (tb + (lane & 7)) * LDX + kb + ((lane & 15) >> 3) * 16;
+                    ldm_x2(b0, b1, xr);
+#else
                     const int8_t* xcol = s_x + (tb + gid) * LDX + kb;
-                    uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
-                    uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+                    b0 = *(const uint32_t*)(xcol + tg * 4);
+                    b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+#endif
                     int d0, d1, d2, d3;
                     mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
                     const float xs0 = s_xs[(tb + tg * 2) * 4 + cc];
@@ -415,11 +439,21 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
 #pragma unroll
                 for (int s = 0; s < TS; s++) {
                     const int tb = wn * (NT / 2) + s * 8; // token subtile base
+                    uint32_t b0, b1, b2, b3;
+#if Q27_GEMM_LDMB
+                    // ldmatrix.x2 B-load: lane -> token (lane%8), K-half
+                    // (lane%16)/8; one x2 per 32-K sub-block (b0,b1=K[kb:kb+32],
+                    // b2,b3=K[kb+32:kb+64]). Bitwise vs the scalar loads below.
+                    const int8_t* xr = s_x + (tb + (lane & 7)) * LDX + kb + ((lane & 15) >> 3) * 16;
+                    ldm_x2(b0, b1, xr);
+                    ldm_x2(b2, b3, xr + 32);
+#else
                     const int8_t* xcol = s_x + (tb + gid) * LDX + kb;
-                    uint32_t b0 = *(const uint32_t*)(xcol + tg * 4);
-                    uint32_t b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
-                    uint32_t b2 = *(const uint32_t*)(xcol + tg * 4 + 32);
-                    uint32_t b3 = *(const uint32_t*)(xcol + tg * 4 + 48);
+                    b0 = *(const uint32_t*)(xcol + tg * 4);
+                    b1 = *(const uint32_t*)(xcol + tg * 4 + 16);
+                    b2 = *(const uint32_t*)(xcol + tg * 4 + 32);
+                    b3 = *(const uint32_t*)(xcol + tg * 4 + 48);
+#endif
                     int d0, d1, d2, d3;
                     mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
                     mma_s8_acc(d0, d1, d2, d3, a4, a5, a6, a7, b2, b3);

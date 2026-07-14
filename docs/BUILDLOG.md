@@ -5716,3 +5716,39 @@ Same lesson as the width work, now PROVEN by md5: the suffix params -- width AND
 threshold -- have clean effects ONLY in the saturating/confident regime. The
 saturation width gate (shipped 07-14) is the one clean suffix lever; the fire
 threshold is not. Sweep: scratchpad/suffix_L_sweep2.sh (model-parameterized + md5).
+## 2026-07-14 -- P1 SHIPPED: ldmatrix-B integrated into the prefill GEMM, bitwise, +1.5% batched prefill (below the +2.6% projection)
+
+External review P1: integrate the ldmatrix-B spike (tools/gemm_ldm_spike.cu,
+07-13: +4.1% GEMM, bitwise, 0/17.8M floats differ; B-side only -- A loses, AB
+cancels) into the production prefill GEMM (src/prefill.cu k_gemm_mma_T, scalar
+B-loads). Done: added a plain `ldm_x2` helper (non-trans m8n8.x2.shared.b16) and
+swapped the scalar activation-fragment loads for `ldmatrix.x2` in BOTH branches --
+XG64 (two x2 per gg, b0..b3) and XG32 (one x2 per cc, b0,b1) -- behind
+`#if Q27_GEMM_LDMB` (default 1; -DQ27_GEMM_LDMB=0 = scalar reference, the in-binary
+A/B leg). ldmatrix address = the spike's exact formula (lane->token lane%8, K-half
+(lane%16)/8), which reuses production's own MR/NT/KS/LDX layout, so it's a direct
+swap.
+
+GATES (vanilla qwen, --pf batched prefill = the k_gemm_mma_T path):
+  - BITWISE: dump-logits(LDMB=1) == dump-logits(LDMB=0), byte-for-byte (993280-B
+    logit vector), on BOTH branches -- default XG64 AND Q27_PF_XG=32. ldmatrix moves
+    the same bytes into the same registers; confirmed in the production kernel on
+    real weights, not just the synthetic spike.
+  - canonical a2982c51 EXACT (decode path unaffected -- it uses the GEMV, not this
+    kernel).
+  - Q8 (Q4IN=false) NOT run (no Q8 weights on hand) but covered BY CONSTRUCTION:
+    the B/activation load I changed is Q4IN-independent (Q4IN only touches the
+    weight/A side + scale unpack), identical code in each branch.
+
+PERF (--pf 4096, batched TTFT t/s, 3 runs median, <0.3% spread):
+  LDMB ON  3507.3 t/s   LDMB OFF 3455.4 t/s   = +1.50% end-to-end batched prefill.
+
+HONEST DELTA: +1.5% measured, BELOW the reviewer's +2.6% projection. The +4.1% was
+the ffn_gate GEMM in ISOLATION at T=1024; end-to-end batched prefill at T=4096 runs
+all layers' GEMMs plus attention/GDN/other kernels, so the isolated GEMM win does
+not translate 1:1 (either the GEMM is <64% of prefill at this shape or the in-context
+per-GEMM benefit is smaller). Still a FREE, bitwise, universal-on-prefill win with
+zero VRAM/quality cost -- default on. Session discipline again: measure the real
+end-to-end number, don't ship the isolated-kernel projection. NOTE: the CLI carries
+it; server binaries (q27-server[-w16]) need a rebuild to pick up the prefill.cu
+change. Reference binary build/q27-ldmoff kept for A/B.
