@@ -57,6 +57,21 @@ build/gdn_chunk_bench: tools/gdn_chunk_bench.cu | build
 build/attn_fdw_bench: tools/attn_fdw_bench.cu | build
 	$(NVCC) $(NVCCFLAGS) tools/attn_fdw_bench.cu -o $@
 
+VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
+            src/device_model.cu src/loader.cpp
+
+# P1 gates for the flat-in-W verify weight path (docs/plans/2026-07-13-gemm-verify.md):
+#   vgemm_test -- gate 3 (numerics vs the gemv on all lanes/widths + determinism)
+#                 and gate 4 (regs/spill/CTA-per-SM; FAILS LOUD -- zero slack).
+#   vgemm_race -- gate 6's racecheck leg. racecheck instruments every shared-memory
+#                 access and cannot finish on a real 47MB weight, so this drives the
+#                 identical reduce path on a synthetic shape with z > 1.
+build/vgemm_test: tools/vgemm_test.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/vgemm_test.cu $(VGEMM_SRC) -o $@
+
+build/vgemm_race: tools/vgemm_race.cu src/vgemm.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/vgemm_race.cu $(VGEMM_SRC) -o $@
+
 build/fdmma_test: tools/fdmma_test.cu src/fdmma.cuh | build
 	$(NVCC) $(NVCCFLAGS) tools/fdmma_test.cu -o $@
 
