@@ -5685,3 +5685,34 @@ divergent short-ctx re-emit the ctx gate was gambling on. On agentic CC (long ct
 before but now for the RIGHT reason (non-saturation, not just ctx). Env knobs:
 Q27_SUFFIX_W_LO, Q27_SUFFIX_SAT_HI/LO/EMA. Payloads: scratchpad/fileemit_verbatim.json,
 echo_ctx4k.json.
+
+## 2026-07-14 -- P5 suffix-L sweep = NO RETUNE. md5 fork-detection proves the "wins" are the tie-fork lottery; L stays 12
+
+External review P5: "Q27_SUFFIX_L=12 predates the flat wide GEMM (~20% cheaper
+suffix rounds); a lower fire threshold may expose more useful fires." No-code sweep
+L={6,8,10,12,16} on the W12 build, vanilla qwen (canonical model per the standing
+rule), server tps (capped dec = unbiased rate), median of 3, three payloads. KEY
+ADDITION vs the first pass: an output md5 per (L,payload) to detect the fdmma
+tie-fork -- if the greedy output changes with L, the tps delta is a content lottery,
+not a fire-threshold effect.
+
+  echo_ctx4k (saturating):  STABLE md5 7cbd939a at ALL L, fired=84 tok/fire=12.0
+    every L -> +0.9..0.0%. L is IRRELEVANT when matches >> L (identical fire
+    pattern, byte-identical output).
+  fileemit_verbatim (divergent): 5 DIFFERENT md5s (e8d6c550/b5d617c4/11168e3d/
+    358b7a6b/ff643504) -> the -2.2..+3.2% swings are the fork lottery.
+  accept_payload_cctx (mixed):  5 DIFFERENT md5s -> +2.2..-3.7% also lottery.
+
+The md5 test refuted a wrong read from the first (qwopus) pass: there cctx looked
+MONOTONIC (+3.9% @L6, clean L6>L8>L10>L12>L16) and I tentatively called it real;
+the vanilla-qwen re-run shows cctx forks across every L, so the qwopus monotonicity
+was coincidental fork alignment. (Switching to vanilla qwen + adding md5 detection
+caught it -- exactly why the standing rule is benchmark-on-qwen.)
+
+VERDICT: no L retune, Q27_SUFFIX_L stays 12. The reviewer's static-L hypothesis does
+not survive the fork test: where L could matter (non-saturating) it just rolls the
+tie-fork dice for a random +-3%; where it's clean (saturating echo) it's irrelevant.
+Same lesson as the width work, now PROVEN by md5: the suffix params -- width AND fire
+threshold -- have clean effects ONLY in the saturating/confident regime. The
+saturation width gate (shipped 07-14) is the one clean suffix lever; the fire
+threshold is not. Sweep: scratchpad/suffix_L_sweep2.sh (model-parameterized + md5).
