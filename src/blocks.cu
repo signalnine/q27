@@ -196,11 +196,21 @@ __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__
     const float* Si = Ssrc + (size_t)h * SK * SK;
     float* So = Sdst + (size_t)h * SK * SK;
 
+    // Hold this thread's 32 decayed state values (column j, rows i0..i0+31) in
+    // registers across the two passes. The shipped kernel wrote them to So in
+    // pass 1 and read them back in pass 2 -- 12 MB of traffic where the recurrence
+    // floor is 6 MB (read Si, write So once). Keeping them resident hits that floor
+    // (measured: 0.0061 -> 0.0041 ms/call = SOL, tools/delta_bench.cu) and is
+    // BITWISE identical (fp32 in a register == fp32 round-tripped through global;
+    // the arithmetic is unchanged, so the GDN state and every downstream token are
+    // bit-for-bit the same -- canonical-gated).
+    float sreg[32];
     float pred = 0.f;
-#pragma unroll 8
-    for (int i = i0; i < i0 + 32; i++) {
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        int i = i0 + k;
         float s = Si[i * SK + j] * decay;
-        So[i * SK + j] = s;
+        sreg[k] = s;
         pred += sk[i] * s;
     }
     part[it][j] = pred;
@@ -214,9 +224,10 @@ __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__
 
     float d = dj[j];
     float acc = 0.f;
-#pragma unroll 8
-    for (int i = i0; i < i0 + 32; i++) {
-        float s = So[i * SK + j] + sk[i] * d;
+#pragma unroll
+    for (int k = 0; k < 32; k++) {
+        int i = i0 + k;
+        float s = sreg[k] + sk[i] * d;
         So[i * SK + j] = s;
         acc += sq[i] * s;
     }

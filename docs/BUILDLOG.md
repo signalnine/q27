@@ -5220,3 +5220,46 @@ the lever; the cap was not.
 
 New tools: tools/gate8_caphist.sh (live cap A/B), the WC_CTX/WC_PAY knobs on
 width_curve.sh, scratchpad/accept_payload_echo60k.json.
+
+## 2026-07-13 (cont.) -- k_delta_step register fusion: the GDN chain wrote its state TWICE; write it once (+1.5% ladder / +2.6% echo, bitwise, helps EVERY round)
+
+P0 flagged k_delta_step (the GDN DeltaNet recurrence) as the biggest non-weight
+kernel in a wide round -- 2.52 ms, 12%. It is bandwidth-bound, and it was moving
+2x the floor.
+
+MEASURED (tools/delta_bench.cu, isolation): the shipped kernel writes the 128x128
+per-head state So in pass 1 (decay) and reads it back + rewrites it in pass 2
+(delta update) = 12 MB traffic where the recurrence floor is 6 MB (read Si once,
+write So once). Keeping this thread's 32 decayed state values in REGISTERS across
+the two passes drops the redundant write+read:
+  SOL state read+write (6 MB):   0.0041 ms  1525 GB/s
+  k_delta_ship (48 blk):         0.0061 ms  (12 MB, So written twice)
+  k_delta_reg  (48 blk):         0.0041 ms  = SOL exactly, -33%/call
+  bitwise reg-vs-ship: state 0 diffs, o 0 diffs.
+Not occupancy-bound: 48 blocks (one per head) already saturate HBM once the
+redundant traffic is gone, so a column-split (more blocks) would buy nothing --
+the register version already hits SOL. The 07-09 "state-WRITE-bound, 3.1 MB/step
+contractual" note was RIGHT about the floor; the kernel just wasn't at it.
+
+BITWISE by construction: fp32 in a register == fp32 round-tripped through global,
+and the arithmetic is unchanged (s is the same value whether it lives in So or a
+register), so the GDN state and every downstream token are bit-for-bit identical.
+Canonical a2982c51 EXACT; test_kernels delta-wy PASS; memcheck 0 errors; 80 regs,
+0 spill.
+
+ENGINE IMPACT -- and this one helps traffic the GEMM CANNOT:
+  shortbench suite  174.7 -> 177.4 (+1.5%)   canonical 142.0 -> 144.3
+  echo W12 round    19.96 -> 19.42 ms         echo t/s 519 -> 532 (+2.6%)
+delta_step runs on EVERY GDN layer of EVERY decode round -- spec or single-token,
+ladder or suffix, novel prose or echo. So unlike the GEMM (suffix rounds only) and
+the retiers (mostly suffix), this is a universal +1.5%, INCLUDING the novel-prose
+224 t/s headline path where the suffix drafter never fires. Small but free and
+everywhere.
+
+NEXT non-weight lever (priced by the same P0 histogram): nothing else in the round
+exceeds 0.5 ms after this -- k_conv_step (0.48) and k_gemv_f16_3 (0.48, the GDN
+in/out proj) are the tail, and both are already near their floors. The round is
+now weights (GEMM, flat) + delta (at floor) + a sub-0.5ms tail. The remaining
+structural lever is the one named all along: the MTP draft ladder re-streaming the
+head, which is W-invariant and shows on no width curve -- P0's histogram is where
+to look next.
