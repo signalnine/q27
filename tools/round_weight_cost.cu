@@ -17,7 +17,7 @@
 #include "../src/device_model.h"
 #include "../src/kernels.cuh"
 #include "../src/loader.h"
-#include "mma16.cuh"
+#include "../src/vgemm.cuh"
 
 #define CUDA_CHECK(x)                                                          \
     do {                                                                       \
@@ -131,57 +131,51 @@ int main(int argc, char** argv) {
     printf("\n(theoretical counterfactual: %.2f GB at the benched 1075 GB/s = %.2f ms)\n",
            bytes / 1e9, bytes / 1e9 / 1075.0 * 1000.0);
 
-    // ---- THE REAL QUESTION: run the NT=16 GEMM over the SAME 401 weights.
-    // The bench only ever saw ffn_gate (17408x5120) and ffn_down (5120x17408).
-    // The round also streams attn_k/attn_v (1024x5120 = 2.6MB) and the vocab
-    // head (248320x5120). If the K-split grid starves on the small ones, the
-    // flat-in-W story dies here -- which is exactly why this runs first.
-    int8_t* d_nat64;
-    float* d_s64;
-    CUDA_CHECK(cudaMalloc(&d_nat64, (size_t)16 * N_FFN));
-    CUDA_CHECK(cudaMalloc(&d_s64, (size_t)16 * N_FFN / 64 * 4));
-    {   // fill with the same activation, g64-quantized, T lanes contiguous
-        q27k::XQuant tmp = q27k::xquant_alloc(N_FFN, /*g64=*/true);
-        q27k::quantize_x_g64(d_x, N_FFN, tmp);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        for (int t = 0; t < 16; t++) {
-            CUDA_CHECK(cudaMemcpy(d_nat64 + (size_t)t * N_FFN, tmp.nat64, N_FFN,
-                                  cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(d_s64 + (size_t)t * N_FFN / 64, tmp.s64, N_FFN / 64 * 4,
-                                  cudaMemcpyDeviceToDevice));
-        }
+    // ---- the PROMOTED kernel (src/vgemm.cu), over the SAME 401-weight sequence.
+    // This is the P1 perf gate: the spike measured a FORK, and it skipped the Q8
+    // weights. src/vgemm has the Q8 leg, the deterministic two-pass reduce, and
+    // the KB-align/trim fixes -- so re-measure, do not assume.
+    q27k::XLanes X{};
+    q27k::YLanes Y{};
+    float* d_ybig[16];
+    for (int t = 0; t < 16; t++) {
+        X.nat[t] = qs[t].nat;
+        X.xs[t] = qs[t].scale;
+        CUDA_CHECK(cudaMalloc(&d_ybig[t], (size_t)248320 * 4));
+        Y.y[t] = d_ybig[t];
     }
-    float* d_ybig;
-    CUDA_CHECK(cudaMalloc(&d_ybig, (size_t)16 * 248320 * 4));
-
-    printf("\n== NT=16 MMA GEMM over the SAME 401-weight round sequence ==\n");
-    printf("%3s %5s %11s %11s %10s\n", "T", "z", "weight ms", "GB/s", "vs SOL");
-    for (int T : {5, 8, 12, 16}) {
-        for (int z : {8, 16}) {
-            auto oneg = [&]() {
-                for (const q27::DevTensor* t : seq) {
-                    if (t->dtype != q27::DType::Q4_G64) continue; // q8 head stays gemv
-                    if (z == 1) launch_verify<16, true, false>(*t, d_nat64, d_s64, d_ybig, T, 1);
-                    else        launch_verify<16, true, true>(*t, d_nat64, d_s64, d_ybig, T, z);
+    size_t wsb = q27k::vgemm_ws_bytes(seq.data(), (int)seq.size());
+    float* d_ws;
+    CUDA_CHECK(cudaMalloc(&d_ws, wsb));
+    printf("\n== src/vgemm (PROMOTED, Q4+Q8, deterministic reduce) over the same round ==\n");
+    printf("   workspace %.2f MB\n", wsb / 1e6);
+    printf("%3s %11s %11s %10s   %s\n", "T", "weight ms", "GB/s", "vs SOL", "vs GEMV");
+    for (int a2 = 2; a2 < argc; a2++) {
+        int T = atoi(argv[a2]);
+        auto oneg = [&]() {
+            for (const q27::DevTensor* t : seq)
+                if (!q27k::vgemm_verify(*t, X, Y, d_ws, T, 0)) {
+                    // ineligible -> the engine falls back to the GEMV; time that too
+                    if (t->dtype == q27::DType::Q4_G64)
+                        q27k::gemv_q4_n((const uint8_t*)t->data, (const __half*)t->scales, qs, T,
+                                        ys, t->rows, t->cols, 0);
+                    else
+                        q27k::gemv_q8_n((const int8_t*)t->data, (const __half*)t->scales, qs, T,
+                                        ys, t->rows, t->cols, 0);
                 }
-            };
-            CUDA_CHECK(cudaMemset(d_ybig, 0, (size_t)16 * 248320 * 4));
-            oneg();
-            CUDA_CHECK(cudaDeviceSynchronize());
-            const int R = 5;
-            CUDA_CHECK(cudaEventRecord(e0));
-            for (int r = 0; r < R; r++) {
-                if (z > 1) CUDA_CHECK(cudaMemsetAsync(d_ybig, 0, (size_t)16 * 248320 * 4));
-                oneg();
-            }
-            CUDA_CHECK(cudaEventRecord(e1));
-            CUDA_CHECK(cudaEventSynchronize(e1));
-            float ms;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
-            ms /= R;
-            double gbs = bytes / 1e9 / (ms / 1000.0);
-            printf("%3d %5d %11.2f %11.1f %9.0f%%\n", T, z, ms, gbs, 100.0 * gbs / 1453.0);
-        }
+        };
+        oneg();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const int R = 5;
+        CUDA_CHECK(cudaEventRecord(e0));
+        for (int r = 0; r < R; r++) oneg();
+        CUDA_CHECK(cudaEventRecord(e1));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+        ms /= R;
+        double gbs = bytes / 1e9 / (ms / 1000.0);
+        printf("%3d %11.2f %11.1f %9.0f%%\n", T, ms, gbs, 100.0 * gbs / 1453.0);
     }
     return 0;
 }
