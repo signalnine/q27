@@ -5417,3 +5417,163 @@ green-light. Prefill attention (17% @65K, grows to ~130K+) and GDN (10%) remain 
 and mostly at floor. Spike tool kept for the follow-on. This is the session's discipline
 on a marginal lever: measured the ceiling, reported it honestly, did not oversell +4% as
 the 1.4x the framing hoped.
+
+## 2026-07-13 -- GDN-chunk RE-RUN corrected against the fused baseline: delta chunk is a graph-mode NO-GO, only conv survives (~2%)
+
+Re-opened the shelved GDN chunked-scan (docs/plans/2026-07-10-gdn-chunk.md,
+STOPed 07-10 at 1.21-1.29x on the 3090) because the 07-13 GEMM-verify entry
+flagged it: "k_delta_step is 2.52ms, the biggest non-weight kernel in a wide
+round (12%)... re-open AFTER P2." P2 shipped, so the re-open condition was met.
+A back-of-envelope off the ORIGINAL bench's 1.6x @W16 projected ~+7%/round.
+That projection was wrong, and re-measuring found TWO compounding confounds in
+the original bench (tools/gdn_chunk_bench.cu), both of which flatter the chunk:
+
+  (1) STALE BASELINE. The original bench's serial delta was the PRE-FUSION
+      k_delta_step (writes So in pass 1, reads it back in pass 2). Delta-fusion
+      shipped 07-13 (sreg-resident, So written ONCE, read-traffic at SOL). The
+      chunk was being compared against a kernel that no longer runs.
+  (2) EAGER-LAUNCH TIMING. The original bench timed eager back-to-back launches.
+      The engine runs these kernels inside CAPTURED CUDA GRAPHS. Graph replay is
+      itself launch-chain collapse -- exactly the chunk's headline advantage --
+      so eager timing credits the chunk for a win the graph already delivers.
+
+Corrected bench (scratchpad/gdn_chunk_bench2.cu): serial baseline = the SHIPPED
+fused kernel (qk=h%16 HEAD_TILE, OLDEST_FIRST conv taps, so the bitwise gate is
+against the real convention), timed BOTH eager and graph-replay. All legs
+bitwise OK. 5090:
+
+  delta (fused serial vs chunk):
+    W= 8  eager 1.00x | graph 0.81x   <- chunk SLOWER by 19% under graph replay
+    W=12  eager 1.04x | graph 0.87x
+    W=16  eager 1.04x | graph 0.85x
+  conv:
+    W= 8  eager 7.99x | graph 4.00x
+    W=12  eager 7.30x | graph 3.69x
+    W=16  eager 8.01x | graph 4.00x
+
+DELTA CHUNK = NO-GO, harder than the 07-10 shelving said. The shelving reason
+("state-write-bound, 1.3x") was incomplete. The fuller reason: BOTH kernels sit
+at the contractual write floor (each lane writes its own 3.1MB x 48-layer state
+snapshot -- required for commit-by-relabel, cannot be removed). With the read
+gone from both, the chunk's ONLY remaining edge is launch-chain collapse, and
+CUDA graphs already give the serial chain that for free. So graph replay speeds
+the 8-launch fused serial (26.6->from-eager) but does nothing for the single
+chunk launch, and the chunk's 64KB dynamic smem (1 CTA/SM) makes it a NET LOSS.
+Running P1 as written (swap BOTH serial loops) would REGRESS delta ~15%.
+
+CONV CHUNK = real 3.7-4.0x even under graph replay (conv has no recurrence, so a
+single wide launch is legitimately better than a serial chain). But conv is
+small: serial 12.3us/layer @W12 x 48 GDN layers = 0.59ms/round -> chunk 0.16ms,
+saving ~0.43ms on a ~21ms wide round = ~2%, bitwise, universal across every wide
+round (not just suffix). Above the usual shipping bar but a real plumbing project
+(graph recapture, per-width byte gates, the conv->l2norm->delta capture-order
+constraint) for 2% -- filed, not built. Delta stays exactly as it ships.
+
+METHOD NOTE for future kernel-swap benches: baseline against the SHIPPED kernel,
+and time under GRAPH REPLAY, not eager -- the engine lives in captured graphs, so
+any "collapse the launch chain" win must be measured net of the graph that already
+collapses it. Same discipline as the ldmatrix and W16 entries: the projected lever
+did not survive contact with the real baseline; logged at the rate of a win.
+
+## 2026-07-13 -- the suffix-verify W-optimum is CONTEXT-DEPENDENT: W16 wins +16% at short ctx. The 07-13 W16 NO-GO was a single-context-point overgeneralization; q-row tiling is the wrong lever
+
+Chasing the fork maintainer's file-re-emission gap (his ngram-mod 653 vs q27
+377). Set out to start the fdmma q-row tiling (cross the W>=14 s_q smem cliff:
+6W rows round to 80 through W=13, 96 from W=14, so 2-CTA smem 48.0->52.1KB > the
+100KB/SM budget -> occupancy halves). Before writing the kernel, two of our own
+benches said the tiling is aimed at a secondary effect:
+
+  - attn_fdw_bench (fdmma attention isolation): the S1 (2-CTA) kernel is NOT flat
+    in width. @61K, ns=85 champion: W=8 152us -> W=12 202us (~12.5us/width-step),
+    ALL in the 2-CTA regime, before any cliff. Attention grows ~linearly in W by
+    construction (6W distinct query rows x seq keys) -- no smem trick removes it,
+    unlike the weight path k_vgemm made flat.
+  - the 07-13 W16 round curve: the -15% @28K is dominated by linear ms/round
+    growth (24.3->40.0ms, +65%); the W13->W14 step (the real 2->1 CTA transition)
+    was +12%, the SAME as the pure-2-CTA W12->W13 step. The occupancy cliff is a
+    minor term. A perfect tiling holding 2 CTAs to W16 pencils to ~403 t/s @28K,
+    still under W12's 434.
+
+So the tiling can't beat W=12 at 28K. But that raised the real question: the
+07-13 W16 campaign only ever measured @28K. Attention is ctx-dependent (cheap at
+short ctx), and at short ctx the FLAT k_vgemm weight path dominates the round --
+so more accepted tokens/round (W16 vs W12) should WIN there. That is the fork
+maintainer's actual regime (a code file, not 28K).
+
+MEASURED (scratchpad/wide_ctx_sweep.sh: W12 q27-server vs W16 q27-server-w16,
+Q27_SUFFIX=1 + Q27_SUFFIX_W=W, Q27_KV=fp8, Q27_MAXD=auto, echo payloads =
+verbatim self-copy cut mid-block, last-warm whole-request tps, 5090):
+
+  ctx    W12 t/s   W16 t/s   W16
+  4K     617.7     717.6     +16.2%
+  12K    608.6     705.1     +15.8%
+  26K    291.0     298.9     +2.7%
+  60K    188.8     187.3     -0.8%   <- crossover
+
+Mechanism, straight off the sfx=fired,tok counters: @4K W16 fired 64x for 1024
+accepted (16/fire = the cap), W12 fired 84x for 1008 (12/fire). Same echo, fewer
+wider rounds, higher t/s. The win decays as fdmma attention grows with ctx and
+eats the extra-token gain, crossing zero ~30-40K.
+
+TWO conclusions:
+1. The 07-13 "W16 = NO-GO, W12 is the per-token optimum of this kernel family"
+   was measured only @28K and overgeneralized. CORRECTED: the suffix W-optimum is
+   context-dependent -- W16 by ~16% below ~13K, neutral by ~26K, negative by 60K.
+   W16 is NOT a universal repetition-heavy build; it is a SHORT-CONTEXT one.
+2. The lever is a CONTEXT-ADAPTIVE SUFFIX CAP (policy, not kernel): gate the
+   suffix verify width on sequence length -- 16 when short, 12 when long. Crucially
+   W16 wins +16% @4K WHILE RUNNING AT 1 CTA past the cliff, so the q-row tiling is
+   NOT what gates the win, and it cannot rescue the long-ctx regime (attention
+   growth, not occupancy, dominates there). Q-ROW TILING DEPRIORITIZED. Novel prose
+   is unaffected either way (suffix never fires; W16 plumbing is inert but for the
+   ~630MB W_MAX=16 role VRAM + graph capture).
+
+NEXT (filed, needs greenlight): capture suffix verify graphs at BOTH width 12 and
+16, select per-round by seqlen (wide below a ~16K threshold). Bounded engine change
+on the shipped W16 plumbing; captures the +16% on echo/file-re-emission traffic --
+the fork maintainer's regime -- with no kernel surgery. Sweep + payloads in
+scratchpad/ (wide_ctx_sweep.sh, echo_ctx{4,12,26}k.json, accept_payload_echo60k).
+
+## 2026-07-13 -- SHIPPED: context-adaptive suffix verify width (the ctx-sweep lever, no kernel work)
+
+Implemented the adaptive suffix cap from the sweep above. src/engine.cuh only.
+The suffix drafter now verifies at the WIDE width sfx_w below a sequence-length
+threshold and a NARROW width sfx_w_lo at/above it, picking per-round by ctx:
+
+  - sfx_width_at(seqlen) = sfx_adaptive() && seqlen >= sfx_ctx_thresh ? sfx_w_lo
+    : sfx_width(). sfx_width() stays the ARMED (max) width for verify_w_max /
+    reserve sizing / banner; only the fire path uses sfx_width_at.
+  - Both distinct suffix widths are captured as their own per-perm verify graphs
+    (the capture loop now walks {sfx_w, sfx_w_lo}); the fire site chooses one by
+    sfx.size() (committed stream length = prompt + emitted), stable between the
+    propose() in the else-if guard and the launch (no append until commit).
+  - Defaults: sfx_w_lo = 12 whenever sfx_w > 12 (so the W12 build is a strict
+    NO-OP -- sfx_w<=12 leaves lo=0=off, canonical-inert), sfx_ctx_thresh = 16384
+    (conservative: the sweep's clear-win region is <=13K, +2.7% by 26K). Knobs:
+    Q27_SUFFIX_W_LO overrides the narrow width, Q27_SUFFIX_CTX the threshold
+    (=0 forces always-narrow, a huge value forces always-wide -- the byte-identity
+    A/B endpoints). Bare q27-server-w16 is adaptive out of the box (server pins
+    Q27_SUFFIX_W=W_MAX=16; banner: "width 16<16384tok / 12>=").
+
+Correctness: greedy verify is width-invariant (leading-run accept), so switching
+width per-round by ctx is byte-identical to any fixed width -- same class as the
+Q27_PMIN gate. Proven, not asserted.
+
+GATES (all PASS):
+  - CANONICAL a2982c51 EXACT (CLI build/q27 --tokens; suffix never fires there +
+    W12-inert -> the greedy path is bitwise-unchanged).
+  - BYTE-IDENTITY (scratchpad/adaptive_sfx_gate.sh, W16 build): on echo_ctx12k
+    (<thresh) AND echo_ctx26k (>thresh), the completion text is md5-identical
+    across always-narrow (CTX=0), always-wide (CTX=1e9), and adaptive (CTX=16384).
+    12k: all three 4d1bd518...; 26k: all three 6f8732ed... The sfx=fired,tok
+    fingerprint PROVES the switch fired the right leg: @12k adaptive 32,512 ==
+    wide (16 tok/fire), != narrow 42,504 (12/fire); @26k adaptive 28,325 ==
+    narrow (12/fire), != wide 22,333. Adaptive picks WIDE below the threshold and
+    NARROW above, and neither changes a byte of output.
+  - OUT-OF-BOX PERF: bare q27-server-w16 @4k echo = 736.0 t/s, sfx 64,1024 (16
+    tok/fire) -- the wide-path win delivered by default (sweep had 717.6 @W16).
+
+W12 default build unaffected (feature inert by construction; rebuilt, canonical
+holds). NOTE: q27-server-w16 still has no Makefile target (built by hand
+-DQ27_W_MAX=16, as on 07-13); adding one is a sensitive-file edit, filed not done.
+Gate script + payloads in scratchpad/ (adaptive_sfx_gate.sh, echo_ctx*.json).
