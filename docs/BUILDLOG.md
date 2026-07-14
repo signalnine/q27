@@ -5333,3 +5333,52 @@ argmax per step on diverse traffic, compute per-step recall); build only if reca
 to a negative: measured the bound, priced the tradeoff, declined the speculative
 build. New tool signal: the phd/phv/phs [req] fields ARE the realized draft
 telemetry -- read them before sizing any draft work.
+
+## 2026-07-13 (cont.) -- PREFILL profiled: it is NOT attention-bound and NOT dominant-aggregate. The lever is the weight GEMM's LSU/occupancy floor (ldmatrix untried). Diagnosis banked; rewrite is a green-light decision.
+
+Chased "prefill dominates agentic wall." Two corrections to standing beliefs, both measured.
+
+PREMISE CORRECTED. On real cold T8 agentic traffic (215 reqs, this session's harness
+[req] telemetry): prefill is 34% of request wall at the MEDIAN (decode 66%), because
+generation-heavy requests dominate the aggregate. BUT prefill is 88-96% for
+large-prompt/short-output requests (read a 24-50K file, make a small edit) -- common in
+agentic coding. So prefill is a large minority overall and dominates the read-heavy
+request class, but "dominates agentic wall" (aggregate) is FALSE on this traffic; decode
+does. (These are hit=0 cold; real interactive caching lowers prefill further.)
+
+MEMORY CORRECTED. The standing belief (07-07) was that prefill-attention (O(N^2),
+k_attn_prefill_mma) is the top lever. nsys of a 65K near-pure prefill (23.6s, 2763 tok/s):
+  weight GEMM (k_gemm_mma_T)   8624 ms  63.9%   <- the real cost
+  attn O(N^2) (prefill_mma_pv8) 2330 ms  17.3%
+  GDN delta/conv                1298 ms   9.6%
+  quant/norm/elt                1180 ms   8.7%
+Attention is only 17% at 65K (it grows quadratically, so it overtakes only at ~130K+).
+At agentic context (24-65K) prefill is WEIGHT-GEMM-bound, not attention-bound.
+
+THE BOUND, ncu'd (k_gemm_mma_T, NT=128, on ffn_gate at T=1024):
+  Compute(SM) SoL 59% | DRAM 6% (NOT memory-bound) | ALU 13% (dequant is cheap)
+  LSU pipe 63% (the hottest unit) | warps_active 16.6% | issue_active 36% (schedulers
+  64% IDLE) | 168-252 regs -> 1 block/SM.
+Diagnosis: the kernel builds MMA fragments with ~80 SCALAR 32-bit smem loads per thread
+per stage; the LSU pipe is the bottleneck and low occupancy (1 block/SM, reg-limited)
+can't hide the load latency (issue 36%). NOT tensor-bound, NOT DRAM-bound, NOT
+bank-conflicted (LDX=144 padding makes the layout conflict-free -- verified by hand).
+The author already tried double-buffering + __launch_bounds__ occupancy forcing (both
+SLOWER, "local optimum, do not retry") and swept NT=64->128 (128 won, for A-fragment
+reuse). Register reduction for 2 blocks/SM is blocked by the acc[8][4]=32-reg
+accumulator (the NT=128 tile the author chose).
+
+THE UNTRIED LEVER: ldmatrix (LDSM). One ldmatrix loads a full MMA fragment vs 4 scalar
+loads, cutting LSU instruction count ~4x -- directly at the 63% bottleneck. Plausible
+1.2-1.4x on the GEMM (59% SoL -> ~80%), = ~15-25% on prefill = ~5-8% on the read-heavy
+request class. HONEST RISK: (a) it is an intricate, correctness-critical rewrite of a
+bitwise-gated kernel (canonical a2982c51); (b) reducing LSU may shift the bottleneck to
+occupancy/issue, capping the win; (c) the author's "local optimum" suggests diminishing
+returns. Realistic EV is a real-but-modest win with a genuine chance of near-floor.
+
+STATUS: diagnosis complete and banked. The ldmatrix rewrite is a materially larger,
+uncertain undertaking than this session's surgical decode wins -- a green-light decision,
+not an autonomous surgical fix. Cheapest decisive experiment = an ldmatrix fork of
+k_gemm_mma_T as a standalone microbench (fork the kernel, one shape ffn_gate T=1024,
+tolerance-check vs the shipped kernel, measure LSU% + time). Build it only on go.
+Everything else in prefill (attn 17%, GDN 10%, quant 9%) is smaller and mostly at floor.
