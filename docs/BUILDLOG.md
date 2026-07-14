@@ -5486,18 +5486,28 @@ to prefix-cache suffixes and prefill tails: prefill_chunk runs with small Tc eve
 long prompts (engine.cuh:2343 chunks [base..NP) at PF_T; short suffix Tc=NP-base ->
 NT dispatch), so the common agentic short-turn case benefits. Free, bitwise, no VRAM.
 
-SEPARATE FINDING -- serial-threshold lowering ATTEMPTED, BLOCKED by a latent bug:
-total prompts < 32 tokens skip batched prefill (engine.cuh:2291 `NP >= 32`) and take
-the SERIAL per-token path -- 230ms @T=16 (~16x14ms), NT-INDEPENDENT. Lowering the
-threshold (behind a Q27_PF_MINBATCH knob) DID give 4.0x @NP=16 (230->58ms), 2.2x
-@NP=8. BUT the --pf serial-vs-batched M6 identity FAILS under the EXACT XG32 path at
-NP=6,8,10 (and PASSES at NP=5,12,16) -- and it fails with the SHIPPED NT=128 kernel
-too (Q27_PF_NT=128), so it is NOT the NT dispatch. It is a PRE-EXISTING, latent,
-non-monotonic correctness bug in the batched prefill path at small NP, masked all
-along because NP<32 always took serial. So the 32-threshold is load-bearing for
-CORRECTNESS, not just GEMM efficiency. The knob was REVERTED (a threshold that
-silently produces wrong output for short prompts is a footgun). The 4x short-prompt
-win is real but BLOCKED pending diagnosis+fix of the batched-path small-NP bug
-(candidates: split-attention pf_part min, GDN chunk boundary, mtp_warm at tiny T).
-Filed as the next follow-on -- repro: `Q27_PF_XG=32 Q27_PF_MINBATCH=8 q27 model
---tokens ... --pf 8` FAILs the identity gate.
+SEPARATE FINDING -- serial-threshold lowering: a 4x win gated by a POLICY choice, not
+a bug (earlier "latent bug" call was a MISDIAGNOSIS, corrected here). Total prompts <
+32 tokens skip batched prefill (engine.cuh:2291 `NP >= 32`) and take the SERIAL
+per-token path -- 230ms @T=16 (~16x14ms). Lowering the threshold (Q27_PF_MINBATCH
+knob) DID give 4.0x @NP=16 (230->58ms), 2.2x @NP=8. The --pf serial-vs-batched M6
+identity FAILS under XG32 at NP=6,8,10 (PASSES 5,12,16). FIRST READ: a small-NP bug.
+WRONG -- follow-up shows XG32 batched != serial at NATIVE batched sizes TOO (N=33,64,
+128 MISMATCH; 40,512 IDENTICAL), and those sizes are what production runs every day
+without issue. So it is NOT a small-NP bug: batched prefill is INHERENTLY tolerance-
+class vs serial (different FP reduction orders in the batched attention/GDN kernels,
+NOT the GEMM -- reproduces with Q27_PF_NT=128), and the greedy continuation matches
+serial only for CONFIDENT content; tie-prone content flips. Short prompts flip more
+because short context is uncertain. The "XG32 = exact serial-vs-batched identity"
+claim (prefill.cu:219) is inaccurate -- it holds for confident content, not
+universally; the M6 gate has been passing because it is run at a size/content that
+happens to be confident.
+
+CONSEQUENCE: the 32-threshold is NOT load-bearing for a bug -- it is the boundary
+below which short prompts get the EXACT serial path. Lowering it is a POLICY choice:
+trade the 4x short-prompt speed for switching short prompts from exact-serial to the
+(already-shipped) tolerance-class batched path. That CHANGES short-prompt greedy
+outputs, INCLUDING the canonical (NP=5 -> batched -> new md5, needs re-baseline).
+Deferred to a quality/policy call, not a bug fix. No code shipped for it (knob
+reverted). Discipline note: "fix the bug" turned up that there was no bug -- the
+measurement (XG32 mismatches at native batched sizes) refuted the premise.
