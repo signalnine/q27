@@ -5263,3 +5263,73 @@ now weights (GEMM, flat) + delta (at floor) + a sub-0.5ms tail. The remaining
 structural lever is the one named all along: the MTP draft ladder re-streaming the
 head, which is W-invariant and shows on no width curve -- P0's histogram is where
 to look next.
+
+## 2026-07-13 (cont.) -- MTP draft head lever: INVESTIGATED, NO-GO. The draft is at its SOL floor; no free win, and the on-path lever is a quality tradeoff that most likely loses on novel prose.
+
+P0 flagged the MTP draft ladder as the last non-verify lever. Investigated it
+properly (3-design/3-adversarial workflow + direct profiling + the realized-cost
+telemetry nobody had read). Verdict: NO-GO for now. Plan + full reasoning in
+docs/plans/2026-07-13-mtp-draft-head.md.
+
+WHAT THE DRAFT ACTUALLY IS. Each of the (up to) 4 serial draft steps runs a full
+mtp_forward through the trained MTP module (blk.64): ~427 MB of Q8 MTP-layer
+weights + the 635 MB Q4 vocab head, ~1.1 GB/step. The head is streamed once per
+step (4x/round at full depth). Measured single-token head GEMV = 635MB/0.40ms =
+1587 GB/s = SOL. The steps are SERIAL (step k+1 embeds step k's token) so they
+cannot batch, and 635MB >> 128MB L2 so nothing caches. UNLIKE k_delta_step there
+is NO redundant traffic to reclaim -- the single-token gemv_q4/gemv_q8 are 44/48
+regs, 0 spill, already at SOL. The free-win angle is DEAD (independently confirmed
+by the adversarial pass).
+
+THE HEADLINE WAS MIS-SIZED (my error). "2.91 ms = 12% of the round" divided the
+draft by a WIDTH-12 round -- but width-12 rounds are SUFFIX rounds, and suffix
+rounds SKIP the draft ladder entirely. The 2.91 ms is a saturating (all-4-margins-
+passed) peak that never coexists with a width-12 verify. REALIZED production number
+(the dexit-averaged telemetry at server.cu:450, phd/phv, read for the first time
+on live novel codegen/testgen/docs @~25K ctx): draft = 220-227 ms vs verify
+1160-1410 ms = **14-16% of the decode wall**, at **3.0-3.7 steps/round** (adaptive
+depth + dexit ALREADY trim below the nominal 4). Matches the memory's "12-15% of
+decode wall." So the lever is real but ~14%, not a hidden 22%+, and gets smaller
+with context (<5% at 61K, attention-dominated).
+
+WHY NO ON-PATH WIN.
+- Free/bitwise: none. At SOL, serial, non-redundant.
+- SHORTLIST head (project only top-K vocab rows for the draft argmax): correctness
+  is safe (the verify recomputes the true token; a shortlist miss only lowers n,
+  the finish_round equality walk still commits the verify verdict). BUT (1) a
+  static unigram/BPE shortlist is dead -- the argmax is content-driven; the only
+  high-recall all-vocab scorer IS a low-rank/distilled head, which is an offline
+  artifact that DOES NOT EXIST in-tree (turbo3 is KV-only). (2) Acceptance
+  COMPOUNDS: a miss at step k truncates the ladder at n=k; modeled as a truncating
+  geometric, break-even against a ~10% head-only ceiling needs per-step
+  shortlist-vs-Q4 recall ~0.95 (off-shortlist p ~5%), and higher baseline
+  acceptance makes the bar TIGHTER. Novel prose is exactly where argmax is least
+  predictable and recall is lowest, and the 4 steps predict forward positions the
+  verify never scored, so recall DECAYS with depth. (3) Even a FREE head caps the
+  win at 61% of the draft (the 427 MB MTP layer stays a ~1.1 ms floor, doesn't fit
+  L2) -> ~4-6% engine at the short-ctx headline, ~0 at depth.
+  Concentration probe (small corpus, 2048 tok/631 distinct): suggestive (top-32K
+  covers this sample) but OVERFIT to 4 prompts -- the 248K vocab exists for the
+  multilingual/code/symbol tail that diverse traffic hits. Not decisive; the real
+  measurement is per-step shortlist-vs-Q4 recall on held-out diverse traffic, which
+  the plan makes P1 and which most likely fails.
+- ADAPTIVE DEPTH is already shipped and spent (depthctl, dexit): the 3.0-3.7
+  steps/round IS the shipped adaptive trim. No headroom there.
+
+THE REAL (UN-BUILT) LEVER is OFF-PATH drafting on the idle 3090 -- hides 100% of
+the draft (head + layer) at zero acceptance cost. But draft(R+1) consumes h_next
+produced at the END of verify(R), so overlap requires speculating verify(R)'s
+accepted-count n before it lands -- and n is LEAST predictable on novel prose
+(exactly where the draft cost lives). Ceiling ~14-18% if perfectly hidden (matches
+the memory's Saguaro estimate); realistic +3-9% minus misprediction, for a
+weeks-long dual-GPU pipeline on a contended sm_86 3090. Worth starting ONLY if
+decode t/s becomes the headline (today prefill dominates agentic wall) AND
+gate_n_hist comes back peaked (it will not, on novel prose).
+
+DECISION: do NOT build a shortlist kernel on spec. The draft stays at its floor.
+If revisited, P1 is the zero-cost acceptance probe (log draft argmax vs Q4-head
+argmax per step on diverse traffic, compute per-step recall); build only if recall
+>= 0.97 at steps 3-4 and >= 0.95 at 1-2. This is the session's discipline applied
+to a negative: measured the bound, priced the tradeoff, declined the speculative
+build. New tool signal: the phd/phv/phs [req] fields ARE the realized draft
+telemetry -- read them before sizing any draft work.
