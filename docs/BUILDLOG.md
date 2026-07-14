@@ -5110,3 +5110,59 @@ GEMV for the ladder (2..8), MMA GEMM for the suffix widths (>=10). That flattens
 the wide-round marginal -- which is the one thing that would make the W16 cap
 raise pay, and it is exactly the conclusion the 07-10 P3 entry reached from the
 other direction. This is the next build, not another pin.
+
+## 2026-07-13 (cont.) -- P0 of the GEMM-verify plan: RUN, and it PASSES. Build.
+
+The plan (docs/plans/2026-07-13-gemm-verify.md) put a kill-criterion in front of
+the kernel: nsys a live width-12 suffix round, sum the GEMV nodes, and STOP if
+they are under 12 ms of a ~24.3 ms round. Ran it.
+
+INSTRUMENT NOTE (cost me one run): nsys does NOT break out CUDA-graph replays by
+default, and `--cuda-graph-trace=node` did not change that here either -- every
+decode kernel reports exactly ONE round's worth of instances (gemv_q4_n<12>: 305
+= the round's 305 Q4 mm5 calls; fdmma<12>: 16 = the attn layers; finish_round: 1).
+Those instances are the EAGER warm round that build_spec_graphs executes at
+vw = sfx_width(). That turns out to be exactly the instrument we wanted: a clean,
+complete node histogram of one width-12 verify round. Window it on the single
+k_finish_round and sum.
+
+ONE WIDTH-12 VERIFY ROUND (2889 nodes, 21.38 ms GPU-busy):
+  13.89 ms  65.0%  k_gemv_q4_n<12>     <-- weight GEMV
+   2.52 ms  11.8%  k_delta_step        <-- the GDN serial chain
+   1.78 ms   8.3%  k_gemv_q8_n<12>     <-- weight GEMV
+   0.48 ms   2.3%  k_conv_step
+   0.48 ms   2.2%  k_gemv_f16_3
+   0.46 ms   2.1%  k_rmsnorm3
+   0.45 ms   2.1%  k_rmsnorm_heads
+   0.35 ms   1.6%  k_attn_fdmma<12>    (ctx ~0 in the warm round; ~2.5 ms @28K)
+   ... (nothing else above 0.35 ms)
+  WEIGHT GEMV = 15.66 ms = 73% of GPU-busy.
+
+Reconciled against the real graph-replayed round (sfxm/sfxn = 24.76 ms @28K) and
+the independent DRAM-cold replay (tools/round_weight_cost: 16.73 ms): the warm
+round runs the GEMV L2-warm at ctx 0 and its fdmma is nearly free, so the honest
+in-context figures are GEMV ~= 16.4 ms and NW ~= 8.36 ms. Both instruments agree
+to within 1 ms and the sum reproduces the 24.76 ms round.
+
+  P0 BAR: >= 15.5 BUILD | 12-15.5 re-derive | < 12 STOP.
+  MEASURED: 15.66 ms (nsys) / 16.73 (cold replay). ==> **BUILD.**
+
+RE-DERIVED PAYOFF (measured, not modelled):
+  P2 (GEMM @ W12):  round 24.76 -> 20.34 ms (-17.9%); echo 427 -> 511 t/s (+19.5%);
+                    real agentic +4.7% to +6.4%.
+  P3 (+ W16 cap):   round(16)/round(12) under the GEMM = 1.025, i.e. the cap needs
+                    only +2.5% more accepted tokens to pay -- and echo delivers
+                    +37.4%. A 15x margin. echo 662 t/s; agentic +10.7% to +15.1%.
+Slightly under the plan's estimate (+21.9% / +5.1-7.1%) because NW is ~10% bigger
+than the subtraction said. The plan's own numbers, corrected by its own P0. It
+holds.
+
+FREE FINDING, and it is a good one: **k_delta_step -- the GDN serial delta chain --
+is 2.52 ms, the biggest NON-weight kernel in the round (12%).** Once the weight
+path is flat, that is the next thing standing up. GDN chunking was SHELVED on
+2026-07-09 ("state-WRITE-bound, 1.21-1.29x, below the 2.5x bar") on the theory
+that the wide marginal was GDN-bound; it is not, it is GEMV-bound -- but delta_step
+is still 12% of a wide round and nobody has profiled it since. Re-open AFTER P2.
+
+Also priced for free: nothing else in the round is above 0.5 ms. There is no
+hidden term. The round really is weights + delta + a long tail.
