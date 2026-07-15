@@ -2,6 +2,7 @@
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <functional>
@@ -2343,6 +2344,199 @@ struct Engine {
     };
     GenStats gs;
 
+    // P1 continuous batching: everything generate()'s decode loop carries
+    // ACROSS rounds, gathered so the conductor can drive one round at a time
+    // (decode_step) for several engines. Host bookkeeping only -- no device
+    // state lives here; iteration-locals (em[], n, ...) stay in decode_step.
+    struct DecodeTask {
+        int n_max = 0;   // emit budget (generate()'s n_max)
+        int eos = -1;    // stop token id (-1 = never fires; ids are >= 0)
+        // Per-token sink; false = client-stop. In generate() this holds a
+        // std::ref to the caller's callable (the generate() frame outlives
+        // the loop, and the existing call sites all pass [&] lambdas whose
+        // copies would alias anyway); conductor mode (Task 10) installs an
+        // owning sink instead.
+        std::function<bool(int)> on_token;
+        int emitted = 0; // tokens delivered to on_token so far (return value)
+        int rounds = 0;  // decode rounds run -> gs.rounds at finish
+        int Ph = 0;      // host mirror of the last written position (ctx guard)
+        std::chrono::steady_clock::time_point g0; // decode wall start (dec_ms)
+        // decode-phase park baseline: dec_ms covers decode only, so the
+        // contended-print suffix must use decode-phase gw deltas, not
+        // request totals (prefill parks belong to pf_ms).
+        double gw_pf = 0;  // gs.gw_ms at decode start
+        int yields_pf = 0; // gs.yields at decode start
+        bool sampling = false;           // temp>0: sampled rounds, no tc hooks
+        bool force_plain_sample = false; // Q27_SAMPLE_PLAIN A/B lever
+        bool prof_decode = false; // Q27_PROF_DECODE bracket open; finish closes
+        // Cancellation (consensus addendum A3): the request thread sets this
+        // on SSE write failure / client disconnect / shutdown. Checked at
+        // ROUND BOUNDARIES ONLY (top of decode_step): a cancelled task does
+        // no further GPU work but still runs finish_decode() so GenStats and
+        // teardown land exactly like a natural exit. Nothing sets it yet --
+        // it lands with the struct; consumers arrive with the conductor.
+        std::atomic<bool> cancel{false};
+    };
+
+    // R1b preemption point (no-op when the hook is unset or nobody waits).
+    // Shared by the prefill chunk loops and decode_step; park time goes to
+    // gs.gw_ms/gs.yields wherever it fires.
+    void round_gap() {
+        if (!on_round_gap) return;
+        auto y0 = std::chrono::steady_clock::now();
+        if (on_round_gap()) {
+            gs.gw_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - y0)
+                            .count();
+            gs.yields++;
+        }
+    }
+
+    // Pre-loop decode initialization (the code that sat between generate()'s
+    // prefill epilogue and its round loop). Fills t in place: DecodeTask owns
+    // a std::atomic, so it is neither copyable nor movable -- callers
+    // default-construct one and hand it in. P = prompt.size()-1, the host
+    // position mirror the ctx guard advances.
+    template <typename F>
+    void make_decode_task(DecodeTask& t, int n_max, int eos, F& on_token, int P) {
+        // Sampling (temp>0): upload request params once; the sampled path
+        // replaces the greedy spec_round in the loop. Default = spec_sample_round
+        // (Phase 2: sampled depth-4 speculation, fast). Greedy (inv_temp<=0)
+        // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
+        // here (prefill's last advance), so the first eager draw keys the token
+        // at position NP with kind 0.
+        const bool sampling = samp.inv_temp > 0.f;
+        // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
+        // spec) even under sampling -- the A/B lever for the spec==non-spec
+        // distribution gate (docs/sampling-design.md sec 4).
+        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
+        if (sampling) {
+            CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
+            samp_first = true;
+        }
+        t.n_max = n_max;
+        t.eos = eos;
+        t.on_token = std::ref(on_token);
+        t.Ph = P;
+        t.g0 = std::chrono::steady_clock::now();
+        t.gw_pf = gs.gw_ms;
+        t.yields_pf = gs.yields;
+        t.sampling = sampling;
+        t.force_plain_sample = force_plain_sample;
+        // Q27_PROF_DECODE=1: bracket the decode loop with a cudaProfiler
+        // range so `nsys --capture-range=cudaProfilerApi` records ONLY the
+        // decode slice -- prefill otherwise floods the trace (the CLI
+        // --tokens path walks the prompt serially; see BUILDLOG nsys notes).
+        // No-op without a profiler attached; finish_decode() below is the
+        // single exit funnel, so every decode exit path closes the range.
+        t.prof_decode = getenv("Q27_PROF_DECODE") != nullptr;
+        if (t.prof_decode) {
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            (void)cudaProfilerStart();
+        }
+    }
+
+    // Decode epilogue (generate()'s old `done` lambda): closes the optional
+    // profiler bracket, finalizes GenStats, prints [gen-done]. Runs EXACTLY
+    // ONCE per task, from the decode_step call that returns false.
+    void finish_decode(DecodeTask& t, const char* why) {
+        if (t.prof_decode) {
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            (void)cudaProfilerStop();
+        }
+        double dt =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t.g0).count();
+        gs.dec = t.emitted;
+        gs.dec_ms = dt * 1000.0;
+        gs.rounds = t.rounds;
+        gs.end = why;
+        // wall-inclusive of yield parks; the suffix keeps a contended
+        // print from reading as a decode regression
+        if (gs.yields > t.yields_pf)
+            fprintf(stderr,
+                    "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; parked %.0fms/%d "
+                    "yields in decode), n_max=%d\n",
+                    why, t.emitted, dt, t.emitted / (dt > 0 ? dt : 1), gs.gw_ms - t.gw_pf,
+                    gs.yields - t.yields_pf, t.n_max);
+        else
+            fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n", why,
+                    t.emitted, dt, t.emitted / (dt > 0 ? dt : 1), t.n_max);
+        // Phase 2 acceptance-vs-temp telemetry (sampled path only; keeps the
+        // greedy [gen-done] line shortbench_suite parses untouched). tokens/
+        // round is the sampled spec acceptance -- it sags as temperature rises.
+        if (t.sampling && !t.force_plain_sample)
+            fprintf(stderr,
+                    "[sample-stats] T=%.3f top_p=%.3f: %.3f tokens/round (%d tok/%d rounds)\n",
+                    samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
+                    t.rounds > 0 ? (double)t.emitted / t.rounds : 0.0, t.emitted, t.rounds);
+    }
+
+    // One decode round + its host bookkeeping (generate()'s old loop body).
+    // Returns false when generation is done -- budget, ctx guard, EOS,
+    // client-stop, or t.cancel -- after running finish_decode(), so GenStats
+    // and [gen-done] land exactly as the inline loop produced them.
+    bool decode_step(DecodeTask& t) {
+        // A3: cancellation is a round-boundary event ONLY -- checked here at
+        // the top, before any GPU work, on the same footing (finish_decode +
+        // false) as the natural exits.
+        if (t.cancel.load()) {
+            finish_decode(t, "cancelled");
+            return false;
+        }
+        if (t.emitted >= t.n_max) {
+            finish_decode(t, "n_max");
+            return false;
+        }
+        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
+        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
+        // beyond the caches and corrupt adjacent allocations (which the prefix
+        // cache would then reuse). Stop instead -- a max-length response ends a
+        // few tokens short of the absolute ceiling rather than corrupting state.
+        if (t.Ph + ctx_round_reserve() > max_ctx) {
+            finish_decode(t, "ctx-guard");
+            return false;
+        }
+        int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
+        int n = t.sampling
+                    ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
+                    : spec_round(em);
+        t.rounds++;
+        // P15 engage-lag fix: let the host grammar scan the whole round
+        // pre-emission; on a mid-round <tool_call> completion, truncate to
+        // the marker token and re-decide the pending under the staged mask.
+        if (!t.sampling && on_round) {
+            int m = on_round(em, n);
+            if (m >= 1 && m <= n) {
+                last_pending = refinish_round(m, n, t.Ph + m);
+                n = m;
+            }
+        }
+        // suffix index tracks the committed stream (post-truncation n);
+        // the pending token rides along virtually in propose_with.
+        if (suffix_on)
+            for (int k = 0; k < n; k++) sfx.append(em[k]);
+        t.Ph += n;
+        for (int k = 0; k < n && t.emitted < t.n_max; k++) {
+            if (em[k] == t.eos) {
+                finish_decode(t, "eos");
+                return false;
+            }
+            auto c0 = std::chrono::steady_clock::now();
+            bool cont = t.on_token(em[k]);
+            gs.cb_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - c0)
+                            .count();
+            if (!cont) {
+                finish_decode(t, "client-stop");
+                return false;
+            }
+            t.emitted++;
+        }
+        if (!t.sampling && on_pending) on_pending(last_pending);
+        round_gap();
+        return true;
+    }
+
     // Prompt + speculative generation. Calls on_token(id) for each generated
     // token; stop when on_token returns false, n_max hit, or eos. Uses the spec
     // path (requires build_spec_graphs()). MTP KV warmed during prompt.
@@ -2396,17 +2590,6 @@ struct Engine {
                 clear_tool_constraint();
             }
         }
-        // R1b preemption point (no-op when the hook is unset or nobody waits)
-        auto round_gap = [&] {
-            if (!on_round_gap) return;
-            auto y0 = std::chrono::steady_clock::now();
-            if (on_round_gap()) {
-                gs.gw_ms += std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - y0)
-                                .count();
-                gs.yields++;
-            }
-        };
         if (batched_prefill && NP >= 32) {
             // prefix-cache hit: prompt extends the snapshotted prefix -> restore
             // recurrent state and prefill only the new suffix
@@ -2519,112 +2702,14 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
-        // Sampling (temp>0): upload request params once; the sampled path
-        // replaces the greedy spec_round in the loop. Default = spec_sample_round
-        // (Phase 2: sampled depth-4 speculation, fast). Greedy (inv_temp<=0)
-        // leaves d_samp untouched and runs the spec path bitwise. d_pos is NP
-        // here (prefill's last advance), so the first eager draw keys the token
-        // at position NP with kind 0.
-        const bool sampling = samp.inv_temp > 0.f;
-        // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
-        // spec) even under sampling -- the A/B lever for the spec==non-spec
-        // distribution gate (docs/sampling-design.md sec 4).
-        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
-        if (sampling) {
-            CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
-            samp_first = true;
-        }
-        int emitted = 0, rounds = 0;
-        auto g0 = std::chrono::steady_clock::now();
-        // decode-phase park baseline: dt below covers decode only, so the
-        // contended-print suffix must use decode-phase gw, not request-total
-        // (prefill parks belong to pf_ms; mixing them over-corrects t/s)
-        const double gw_pf = gs.gw_ms;
-        const int yields_pf = gs.yields;
-        // Q27_PROF_DECODE=1: bracket the decode loop with a cudaProfiler
-        // range so `nsys --capture-range=cudaProfilerApi` records ONLY the
-        // decode slice -- prefill otherwise floods the trace (the CLI
-        // --tokens path walks the prompt serially; see BUILDLOG nsys notes).
-        // No-op without a profiler attached; done() below is the single
-        // exit funnel, so every decode exit path closes the range.
-        const bool prof_decode = getenv("Q27_PROF_DECODE") != nullptr;
-        if (prof_decode) {
-            CUDA_CHECK(cudaStreamSynchronize(stm));
-            (void)cudaProfilerStart();
-        }
-        auto done = [&](const char* why) {
-            if (prof_decode) {
-                CUDA_CHECK(cudaStreamSynchronize(stm));
-                (void)cudaProfilerStop();
-            }
-            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
-                            .count();
-            gs.dec = emitted;
-            gs.dec_ms = dt * 1000.0;
-            gs.rounds = rounds;
-            gs.end = why;
-            // wall-inclusive of yield parks; the suffix keeps a contended
-            // print from reading as a decode regression
-            if (gs.yields > yields_pf)
-                fprintf(stderr,
-                        "[gen-done] %s: %d tokens in %.1fs (%.1f t/s; parked %.0fms/%d "
-                        "yields in decode), n_max=%d\n",
-                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), gs.gw_ms - gw_pf,
-                        gs.yields - yields_pf, n_max);
-            else
-                fprintf(stderr, "[gen-done] %s: %d tokens in %.1fs (%.1f t/s), n_max=%d\n",
-                        why, emitted, dt, emitted / (dt > 0 ? dt : 1), n_max);
-            // Phase 2 acceptance-vs-temp telemetry (sampled path only; keeps the
-            // greedy [gen-done] line shortbench_suite parses untouched). tokens/
-            // round is the sampled spec acceptance -- it sags as temperature rises.
-            if (sampling && !force_plain_sample)
-                fprintf(stderr,
-                        "[sample-stats] T=%.3f top_p=%.3f: %.3f tokens/round (%d tok/%d rounds)\n",
-                        samp.inv_temp > 0.f ? 1.0f / samp.inv_temp : 0.f, samp.top_p,
-                        rounds > 0 ? (double)emitted / rounds : 0.0, emitted, rounds);
-        };
-        // ctx guard: a round writes attention-KV rows P+1..P+gate_maxd+1 (and
-        // MTP rows P+1..P+gate_maxd); launching past the reserve would write
-        // beyond the caches and corrupt adjacent allocations (which the prefix
-        // cache would then reuse). Stop instead -- a max-length response ends a
-        // few tokens short of the absolute ceiling rather than corrupting state.
-        int Ph = P;
-        while (emitted < n_max) {
-            if (Ph + ctx_round_reserve() > max_ctx) { done("ctx-guard"); return emitted; }
-            int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
-            int n = sampling ? (force_plain_sample ? sample_round(em) : spec_sample_round(em))
-                             : spec_round(em);
-            rounds++;
-            // P15 engage-lag fix: let the host grammar scan the whole round
-            // pre-emission; on a mid-round <tool_call> completion, truncate to
-            // the marker token and re-decide the pending under the staged mask.
-            if (!sampling && on_round) {
-                int m = on_round(em, n);
-                if (m >= 1 && m <= n) {
-                    last_pending = refinish_round(m, n, Ph + m);
-                    n = m;
-                }
-            }
-            // suffix index tracks the committed stream (post-truncation n);
-            // the pending token rides along virtually in propose_with.
-            if (suffix_on)
-                for (int k = 0; k < n; k++) sfx.append(em[k]);
-            Ph += n;
-            for (int k = 0; k < n && emitted < n_max; k++) {
-                if (em[k] == eos) { done("eos"); return emitted; }
-                auto c0 = std::chrono::steady_clock::now();
-                bool cont = on_token(em[k]);
-                gs.cb_ms += std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - c0)
-                                .count();
-                if (!cont) { done("client-stop"); return emitted; }
-                emitted++;
-            }
-            if (!sampling && on_pending) on_pending(last_pending);
-            round_gap();
-        }
-        done("n_max");
-        return emitted;
+        // Decode: pre-loop state lives in DecodeTask, one round per
+        // decode_step (P1: the conductor drives the same step function for
+        // several engines). finish_decode() runs inside the step that
+        // returns false, so every exit path lands its GenStats/[gen-done].
+        DecodeTask t;
+        make_decode_task(t, n_max, eos, on_token, P);
+        while (decode_step(t)) {}
+        return t.emitted;
     }
 
     void build_graph() {
