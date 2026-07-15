@@ -5813,3 +5813,30 @@ tracking at a small footprint (w16 server, Q27_BATCH=1 fp8, 8K x 2 slots,
 both [req] lines; scratchpad/t12_san/sanitizer.small.log) -- the 32K w16
 config OOMs memcheck's own tracking (documented limitation, standing
 kernel-filtered+memory-capped rule).
+
+**2026-07-15 -- CONTINUOUS BATCHING P1: LIVE CC VALIDATION = PASS (stability +
+same-shape quality), merged to master f45a9ad and pushed.** Method: two
+thunderdome CC tasks (T2=bench-collab-server, T5=bench-task-queue) run
+CONCURRENTLY against the batched server, then an identical-shape control with
+Q27_BATCH=0. Vanilla qwen, W12 build, fp8, 2 slots x 49152 (the w16 build's
+2-slot shape maxes at 2x32K on 32GB -- too small for CC tasks, which grew past
+33K by turn ~17 and crashed the first attempt at that shape; W12 2x48K is the
+CC-viable batch-serving config until P2 re-prices).
+
+  leg                       task-queue      collab-server   med tps  errors
+  Q27_BATCH=1 (concurrent)  0.301 completed 0.551 completed 191.4    0
+  Q27_BATCH=0 (same shape)  0.289 completed 0.303 CRASHED   148.7    0
+
+Batched leg: 180 reqs, ZERO end=error / [req-error] / 5xx, server survived the
+full window, 53 reqs with fused rounds (mean width 1.98, deepest bat=2.0,24).
+Same-shape scores equal-or-better with batching ON (control even drew a crash
+basin on collab-server); absolute scores sit below the 131K-era bands on BOTH
+legs -- that is the 2x48K compaction squeeze (26 vs 8 ctx-limit 400s), a
+context-shape effect, not a batching effect. n=1/leg, tie-lottery caveats
+apply; the byte-level correctness claims rest on the Task 10 gates, not on
+these scores. OPS notes: two same-second `thunderdome run` invocations race on
+the results/latest symlink (stagger >=2s); first validation attempt at w16
+2x32K died at the ctx wall, not in the engine (17 clean reqs then repeated
+"prompt is too long" 400s CC could not compact out of at that window).
+Q27_BATCH stays DEFAULT-OFF; flip is a product call now that stability is
+proven -- P2 (mixer overlap, ~1.75x arithmetic) is the remaining perf lever.
