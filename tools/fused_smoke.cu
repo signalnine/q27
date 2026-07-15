@@ -22,8 +22,19 @@
 //                       claimed bitwise (gemm-verify plan declined exactly
 //                       that), so an unpinned run would fork the numeric path
 //                       and fail byte-identity for a reason that has nothing
-//                       to do with the fused plumbing. FINDING for Task 9/10:
-//                       batched gated unions >= 9 need this same policy call.
+//                       to do with the fused plumbing. Task 9 landed exactly
+//                       that policy call in build_union_view (all-gated
+//                       unions force the GEMV family), so this pin is now
+//                       REDUNDANT-BUT-HARMLESS; kept so the smoke stays a
+//                       plumbing test, independent of the policy code.
+//
+// Build (mirrors the Makefile q27 rule's file list, engine main() swapped
+// for this driver; no Makefile edit per the plan's sensitive-file rule):
+//   /usr/local/cuda/bin/nvcc -O2 -std=c++17 \
+//     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 \
+//     -Xcompiler -Wall tools/fused_smoke.cu src/blocks.cu src/prefill.cu \
+//     src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu \
+//     src/loader.cpp -o build/fused_smoke
 //
 // Run: build/fused_smoke [model.q27]   (default: the canonical vanilla qwen)
 // Success line: "FUSED SMOKE PASS: streamA identical, streamB identical".
@@ -77,8 +88,9 @@ static void prefill_serial(Engine& e, const std::vector<int>& prompt) {
 static int audit_union_view(Engine** es, int k, cudaStream_t cstm) {
     int fails = 0;
     int w[2] = {5, 5}; // widest gated shape; the mapping is width-independent
+    const bool sfx[2] = {false, false}; // gated union -> GEMV family (policy)
     for (int m = 0; m < k; m++) es[m]->set_round_width(w[m]);
-    q27::UnionView uv = q27::build_union_view(es, w, k, cstm);
+    q27::UnionView uv = q27::build_union_view(es, w, k, cstm, sfx);
     printf("[audit] union view: k=%d vw=%d (slot -> eng/lane, key ptrs)\n", k, uv.view.vw);
     for (int u = 0; u < uv.view.vw; u++) {
         const int m = uv.map[u].eng, j = uv.map[u].lane;
@@ -216,7 +228,7 @@ int main(int argc, char** argv) {
         }
         for (int m = 0; m < k; m++) es[m]->set_round_width(want[m]);
         for (int m = 0; m < k; m++) CUDA_CHECK(cudaEventRecord(ev[m], es[m]->stm));
-        q27::fused_verify_round(es, want, k, cstm, ev);
+        q27::fused_verify_round(es, want, k, cstm, ev, sfx);
         int oc[2][OUTCOME_INTS];
         for (int m = 0; m < k; m++)
             CUDA_CHECK(cudaMemcpyAsync(oc[m], es[m]->d_outcome, OUTCOME_INTS * 4,

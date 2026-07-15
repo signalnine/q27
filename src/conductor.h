@@ -81,7 +81,36 @@ struct UnionView {
 // covers any legal union; the structural bound asserted here is therefore
 // sum(w) <= W_PLUMB (the lane plumbing / vgemm NT tile). The conductor's
 // POLICY cap stays W_MAX via trim_widths.
-inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t cstm) {
+//
+// GEMM-family policy (P1 Task 9, from the Task 8 finding): mm5 keys
+// vgemm-vs-GEMV on view.vw >= view.gemm_min, so a union crossing the member
+// threshold (9) would fork the numeric family away from what each lane's
+// SOLO round took (vgemm==gemv was deliberately never claimed bitwise).
+// is_suffix[m] says whether member m fires a suffix round THIS round; the
+// union's threshold is set so every lane stays on its solo family:
+//   all gated  -> 99: force the GEMV family. Gated solo widths (<= 8) always
+//                 took the GEMV, and the GEMV lanes are N-invariant
+//                 (ninv_test), so untrimmed gated lanes stay BITWISE.
+//   all suffix -> 2: force vgemm. Solo suffix rounds verify at sfx_width()
+//                 (the serving config runs 12 >= gemm_min) on k_vgemm, and
+//                 vgemm lanes are N-invariant, so untrimmed suffix lanes
+//                 stay bitwise. (A legacy-narrow suffix config, sfx_width()
+//                 < 9, would have taken the GEMV solo -- that fork is the
+//                 documented tolerance class; the serving target is wide.)
+//   mixed      -> 99: gated lanes carry the bitwise contract, suffix lanes
+//                 numeric-fork to the GEMV family (documented tolerance
+//                 class). trim_widths evicts suffix lanes first, so mixed
+//                 unions are rare and the fork is bounded to opportunistic
+//                 re-emission bets, never depthctl-earned gated lanes.
+// Q27_BATCH_GEMM=1 overrides to always-vgemm (threshold 2) -- the
+// tolerance-class PERF leg for the Task 11 A/B (vgemm is ~flat in width, so
+// wide unions want it even where solo took the GEMV).
+inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t cstm,
+                                  const bool* is_suffix) {
+    static const bool force_vgemm = [] {
+        const char* e = getenv("Q27_BATCH_GEMM");
+        return e && atoi(e) != 0;
+    }();
     assert(k >= 1 && k <= W_PLUMB);
     // CRITICAL union-sweep precondition: every engine's lanes 0..w[m]-1 are
     // engine-owned and distinct -- an engine listed twice would hand two
@@ -125,6 +154,12 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
     uv.view.vw = u;
     uv.view.stm = cstm;
     uv.view.vgemm_ws = es[0]->d_vgemm_ws;
+    // union-class GEMM family (policy block in the header comment above):
+    // all-suffix -> vgemm (2); all-gated OR mixed -> GEMV (99, gated lanes
+    // keep the bitwise contract; mixed unions' suffix lanes tolerance-fork).
+    bool all_sfx = true; // k >= 1 asserted above, so this is never vacuous
+    for (int m = 0; m < k; m++) all_sfx &= is_suffix[m];
+    uv.view.gemm_min = (force_vgemm || all_sfx) ? 2 : 99;
     return uv;
 }
 
@@ -148,17 +183,18 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
 // the view + shared weights (dm/T(il)/EPS), so calling them on es[0] with the
 // union view sweeps every engine's lanes in one pass -- that is the whole
 // point: one weight read serves all slots.
-// NOTE mm5 dispatch: the union view's vw is what mm5 compares against
-// gemm_min, so a union >= 9 takes k_vgemm where each lane's SOLO round (width
-// <= 8) took the dp4a GEMV -- a numeric-path fork that breaks bitwise
-// solo-equivalence (vgemm==gemv was deliberately never claimed; see the
-// gemm-verify plan). Byte-identity gates must pin the path (Q27_GEMM_MIN=99)
-// or keep unions < 9; the serving-policy call lands with the conductor
-// (Task 9/10).
+// NOTE mm5 dispatch: RESOLVED by the union GEMM-family policy (Task 9) --
+// mm5 now compares the union view's vw against view.gemm_min, which
+// build_union_view sets per union class (is_suffix[0..k)) so every lane
+// stays on the numeric family its solo round took; Q27_BATCH_GEMM=1 is the
+// always-vgemm tolerance-class perf override. The old hazard (union >= 9
+// silently taking k_vgemm where solo widths <= 8 took the dp4a GEMV) can no
+// longer occur; Q27_GEMM_MIN=99 pins in older gates are redundant-but-
+// harmless.
 inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStream_t cstm,
-                               const cudaEvent_t* draft_done) {
+                               const cudaEvent_t* draft_done, const bool* is_suffix) {
     for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
-    UnionView uv = build_union_view(es, granted, k, cstm);
+    UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
     const DevTensor& emb = e0.dm.get("token_embd.weight");

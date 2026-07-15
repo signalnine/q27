@@ -981,6 +981,16 @@ struct Engine {
         float* vgemm_ws;              // k_vgemm workspace (>= union width)
         int vw;                       // live width THIS round
         cudaStream_t stm;             // stream the round runs on
+        // P1 Task 9 GEMM-family policy: mm5 keys vgemm-vs-GEMV on the VIEW's
+        // width, so a fused union crossing the member threshold (9) would
+        // silently compute logits on a different numeric family than each
+        // lane's solo round did (Task 8 finding; vgemm==gemv was never
+        // claimed bitwise). The view carries its own threshold: solo_view()
+        // copies the member (zero change); build_union_view() sets it per
+        // union class -- all-gated 99 (GEMV, bitwise vs solo), all-suffix 2
+        // (vgemm, the family solo suffix rounds took), Q27_BATCH_GEMM=1
+        // forces 2 (the tolerance-class perf leg).
+        int gemm_min;
     };
     LaneView solo_view() {
         LaneView v{};
@@ -998,6 +1008,7 @@ struct Engine {
         v.vgemm_ws = d_vgemm_ws;
         v.vw = vw;
         v.stm = stm;
+        v.gemm_min = gemm_min;
         return v;
     }
     // W16: the flat 12-pointer overloads are gone. They existed so a call site
@@ -1027,7 +1038,11 @@ struct Engine {
         // k_vgemm reuses the group-32 int8 activations quantize3 ALREADY writes
         // (xq_L[i].nat/.scale are dead stores on the dp4a GEMV path today), so this
         // adds no quantize pass, no buffer and no graph node on the activation side.
-        if (v.vw >= gemm_min && (int64_t)w.rows >= gemm_min_rows) {
+        // P1 Task 9: the threshold comes from the VIEW (solo: a copy of the
+        // member, identical branch; fused: the union-class policy set by
+        // build_union_view) so a union crossing the member's 9 cannot fork
+        // the numeric family away from what each lane's solo round took.
+        if (v.vw >= v.gemm_min && (int64_t)w.rows >= gemm_min_rows) {
             q27k::XLanes X{};
             q27k::YLanes Y{};
             for (int i = 0; i < W_PLUMB; i++) {
