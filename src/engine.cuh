@@ -995,16 +995,19 @@ struct Engine {
     // params -- the exact signature wall that pushed prep/finish onto by-value
     // structs. Every caller already had its lanes in a W_PLUMB array (or can
     // build one, as the vocab head does), so the array form is the only form.
-    void qx5(const std::array<float*, W_PLUMB>& x, int cols) {
+    // P0 batching: qx5/mm5 read per-lane state through the view (solo:
+    // pointer-identical to the members), so the fused round can hand them a
+    // union view without touching the weight-sweep code again.
+    void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
         for (int i = 0; i < W_PLUMB; i++) {
-            q.q[i] = xq_L[i]; // xq_L[0]/[1] alias xq2[0]/[1]
+            q.q[i] = v.xq[i]; // solo: xq_L (xq_L[0]/[1] alias xq2[0]/[1])
             xs.p[i] = x[i];
         }
-        q27k::quantize3(xs, cols, q, stm, vw);
+        q27k::quantize3(xs, cols, q, v.stm, v.vw);
     }
-    void mm5(const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
+    void mm5(const LaneView& v, const DevTensor& w, const std::array<float*, W_PLUMB>& ys_a) {
         // P2: WIDE rounds take the flat-in-W MMA GEMM; the ladder keeps the GEMV.
         // Both `vw` and `gemm_min` are host ints read at CUDA-GRAPH CAPTURE, so the
         // branch is baked per graph -- no per-call work, no divergence at replay.
@@ -1014,37 +1017,40 @@ struct Engine {
         // k_vgemm reuses the group-32 int8 activations quantize3 ALREADY writes
         // (xq_L[i].nat/.scale are dead stores on the dp4a GEMV path today), so this
         // adds no quantize pass, no buffer and no graph node on the activation side.
-        if (vw >= gemm_min && (int64_t)w.rows >= gemm_min_rows) {
+        if (v.vw >= gemm_min && (int64_t)w.rows >= gemm_min_rows) {
             q27k::XLanes X{};
             q27k::YLanes Y{};
             for (int i = 0; i < W_PLUMB; i++) {
-                X.nat[i] = xq_L[i].nat;
-                X.xs[i] = xq_L[i].scale;
+                X.nat[i] = v.xq[i].nat;
+                X.xs[i] = v.xq[i].scale;
                 Y.y[i] = ys_a[i];
             }
             // Honor the false: an ineligible shape MUST fall through to the GEMV
             // rather than silently produce nothing (the launch_fdmma contract).
-            if (q27k::vgemm_verify(w, X, Y, d_vgemm_ws, vw, stm)) return;
+            if (q27k::vgemm_verify(w, X, Y, v.vgemm_ws, v.vw, v.stm)) return;
         }
         q27k::XQuant qs[W_PLUMB];
         float* ys[W_PLUMB];
         for (int i = 0; i < W_PLUMB; i++) {
-            qs[i] = xq_L[i];
+            qs[i] = v.xq[i];
             ys[i] = ys_a[i];
         }
         if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
-                            w.cols, stm);
+            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
         else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, vw, ys, w.rows,
-                            w.cols, stm);
+            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
+                            w.cols, v.stm);
     }
 
-    void gdn_pair(int il) {
+    // P0 batching: the pairs take the round's LaneView for their weight-sweep
+    // calls (qx5/mm5); mixer/cache state stays member-based (solo: v.vw == vw,
+    // v.stm == stm, so the launch sequence is bit-identical to the member form).
+    void gdn_pair(int il, const LaneView& v) {
         const float eps = EPS;
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "attn_qkv.weight"), qkv_L);
-        mm5(T(il, "attn_gate.weight"), z_L);
+        qx5(v, x1_L, N_EMBD);
+        mm5(v, T(il, "attn_qkv.weight"), qkv_L);
+        mm5(v, T(il, "attn_gate.weight"), z_L);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
                          LANESW(x1),
                          LANESW(alpha), GDN_HEADS,
@@ -1077,22 +1083,22 @@ struct Engine {
         q27k::gated_norm3(LANESW(o), nw,
                           LANESW(z),
                           LANESW(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
-        qx5(og_L, GDN_V);
-        mm5(T(il, "ssm_out.weight"), y_L);
+        qx5(v, og_L, GDN_V);
+        mm5(v, T(il, "ssm_out.weight"), y_L);
     }
 
-    void attn_pair(int il) {
+    void attn_pair(int il, const LaneView& v) {
         int ci = attn_cache_idx[il];
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "attn_q.weight"), qg_L);
+        qx5(v, x1_L, N_EMBD);
+        mm5(v, T(il, "attn_q.weight"), qg_L);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
         for (int L = 0; L < vw; L++)
             q27k::rmsnorm_heads(qg_L[L], qn, qg_L[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_k.weight"), kbuf_L);
+        mm5(v, T(il, "attn_k.weight"), kbuf_L);
         for (int L = 0; L < vw; L++)
             q27k::rmsnorm_heads(kbuf_L[L], kn, kbuf_L[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm5(T(il, "attn_v.weight"), vbuf_L);
+        mm5(v, T(il, "attn_v.weight"), vbuf_L);
         q27k::IP3 P LANESW(d_pos);
         q27k::rope3(LANESW(qg),
                     N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
@@ -1124,18 +1130,18 @@ struct Engine {
                        N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
         q27k::sigmoid_gate3(LANESW(attnout),
                             LANESW(qg), N_HEAD, HEAD_DIM, stm, vw);
-        qx5(attnout_L, N_HEAD * HEAD_DIM);
-        mm5(T(il, "attn_output.weight"), y_L);
+        qx5(v, attnout_L, N_HEAD * HEAD_DIM);
+        mm5(v, T(il, "attn_output.weight"), y_L);
     }
 
-    void ffn_pair(int il) {
-        qx5(x1_L, N_EMBD);
-        mm5(T(il, "ffn_gate.weight"), ffn_g_L);
-        mm5(T(il, "ffn_up.weight"), ffn_u_L);
+    void ffn_pair(int il, const LaneView& v) {
+        qx5(v, x1_L, N_EMBD);
+        mm5(v, T(il, "ffn_gate.weight"), ffn_g_L);
+        mm5(v, T(il, "ffn_up.weight"), ffn_u_L);
         q27k::silu_mul3(LANESW(ffn_g),
                         LANESW(ffn_u), N_FFN, stm, vw);
-        qx5(ffn_g_L, N_FFN);
-        mm5(T(il, "ffn_down.weight"), y_L);
+        qx5(v, ffn_g_L, N_FFN);
+        mm5(v, T(il, "ffn_down.weight"), y_L);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
@@ -1202,6 +1208,9 @@ struct Engine {
         return t;
     }
     void spec_verify_forward() {
+        // P0 batching: one solo view for the whole forward (vw/stm snapshot at
+        // capture time, exactly when the members were read before).
+        const LaneView sv = solo_view();
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, verify_tokens(),
                      N_EMBD, LANESW(h), stm,
@@ -1213,17 +1222,17 @@ struct Engine {
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
             q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, stm, vw);
-            if (attn_layer[il]) attn_pair(il);
-            else gdn_pair(il);
+            if (attn_layer[il]) attn_pair(il, sv);
+            else gdn_pair(il, sv);
             q27k::add3(Hm, Yc, N_EMBD, stm, vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
             q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, stm, vw);
-            ffn_pair(il);
+            ffn_pair(il, sv);
             q27k::add3(Hm, Yc, N_EMBD, stm, vw);
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
         q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, stm, vw);
-        qx5(x1_L, N_EMBD);
+        qx5(sv, x1_L, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
         // lane t's logits live at logits2 + t*VOCAB (the alloc is W_MAX*VOCAB;
@@ -1231,7 +1240,7 @@ struct Engine {
         std::array<float*, W_PLUMB> lg{};
         for (int t = 0; t < W_PLUMB; t++)
             lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
-        mm5(dm.get(vhead), lg);
+        mm5(sv, dm.get(vhead), lg);
     }
 
     // P11: verify half -- batch-5 forward, masked argmax per lane, finish_round.
