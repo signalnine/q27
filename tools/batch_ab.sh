@@ -53,7 +53,8 @@ PAYLOADS=${PAYLOADS:-"codegen docs"}
 BIN=${BIN:-build/q27-server-w16}
 MAXTOK=${MAXTOK:-512}
 OUT=${OUT:-scratchpad/batch_ab_out}
-GATEENV="Q27_KV=fp8 Q27_PMIN=0.5 Q27_MAXD=auto"
+# KV env-overridable (KV=turbo3 for the t3 aggregate leg, 2026-07-15)
+GATEENV="Q27_KV=${KV:-fp8} Q27_PMIN=0.5 Q27_MAXD=auto"
 export CUDA_VISIBLE_DEVICES=0
 mkdir -p "$OUT"
 SRV=""

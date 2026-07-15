@@ -5876,3 +5876,13 @@ quality-known); Q27_KV=turbo3 is the capacity lever when >48K/slot matters
 more than speed. OPS: bare `wait` in a script that backgrounded the server
 waits forever (use explicit pids); pkill -f self-matches the invoking shell
 (use pkill -x -- relearned the hard way).
+
+**2026-07-15 addendum -- turbo3 2-slot AGGREGATE (batch_ab, w16 2x32K, same
+shape/payloads as the fp8 measurement):** FIFO 159.2 -> batched 197.6 t/s
+aggregate = 1.24x (fp8: 169.1 -> 204.0 = 1.21x). turbo3 batched aggregate
+lands within ~3% of fp8's despite the t3 attention tax -- the tax hits solo
+throughput too, so the batching RATIO is slightly better. Per-request medians
+99.4/102.2 batched vs 80.0/85.1 FIFO. bat_med=2.0, 154 fused rounds/req, 2
+trim events; one codegen rep-3 text fork (suffix-trim class, docs 3/3
+identical) -- the documented tolerance classes, nothing new. batch_ab.sh KV
+now env-overridable (KV=turbo3).
