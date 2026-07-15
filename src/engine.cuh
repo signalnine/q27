@@ -1850,17 +1850,27 @@ struct Engine {
         assert(w >= 2 && w <= W_MAX);
         vw = w;
     }
-    // Draft phase of one GATED greedy round on THIS engine's stm: the P14
-    // dexit margin loop of spec_round verbatim (per-step draft graphs, D2H
-    // margin, stop at first sub-theta), including the width-floor top-up.
-    // Returns the WANT width (cap+1, floored 2) -- the conductor trims the
-    // union, calls set_round_width(granted), then the fused verify. P1 scope:
-    // requires the gated dexit config (pmin_theta > 0, dexit_on, no tool
-    // split); the fixed ladder (Q27_MAXD=4/5) keeps md_used constant so no
-    // depthctl state diverges between solo and fused runs.
-    int draft_and_gate() {
+    // Draft phase of one GATED round on THIS engine's stm: the P14 dexit
+    // margin loop of spec_round verbatim (per-step draft graphs, D2H margin,
+    // stop at first sub-theta), including the width-floor top-up. Returns the
+    // WANT width (cap+1, floored 2) -- the conductor trims the union, calls
+    // set_round_width(granted), then the fused verify. P1 scope: requires the
+    // gated dexit config (pmin_theta > 0, dexit_on, no tool split).
+    // sampled=true mirrors spec_sample_round's gated dexit branch instead:
+    // first-token bootstrap from the retained prefill logits (samp_first) and
+    // the FIXED sampled ceiling 4 (the sampled tail is 4-draft this phase),
+    // so a sampled member's fused round consumes the identical drafts +
+    // Philox keys its solo round would.
+    // out_cap/out_md (Task 9): this round's margin-run depth and drafting
+    // ceiling, for commit_outcome's telemetry/depthctl mirror -- W alone is
+    // ambiguous at the floor (cap 0 and cap 1 both return W=2).
+    int draft_and_gate(bool sampled = false, int* out_cap = nullptr, int* out_md = nullptr) {
         assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
-        const int md_used = maxd_auto ? dctl.cur : gate_maxd;
+        if (sampled && samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+        }
+        const int md_used = sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
         int cap = 0, launched = 0;
         for (int k = 0; k < md_used; k++) {
             CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
@@ -1876,19 +1886,87 @@ struct Engine {
         // drafts, so W draft rows must exist. Only fires at cap==0.
         for (int k = launched; k < W && k < md_used; k++)
             CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        if (out_cap) *out_cap = cap;
+        if (out_md) *out_md = md_used;
         return W;
     }
-    // Post-verify host commit for one fused round: EXACTLY what spec_round
-    // does after its outcome sync -- em[] extraction, last_pending, suffix
-    // arming, perm advance. oc = this engine's d_outcome, already on host
-    // (the conductor does one D2H + sync per round for the whole batch).
-    // Deliberately NOT here: gate_cap/dctl telemetry (P1 conductor is
-    // fixed-ladder; adaptive-depth feedback under trim is a Task 9 concern).
-    int commit_outcome(const int* oc, int* emit) {
+    // Suffix branch of one GREEDY round on THIS engine's stm: the fire test +
+    // prep_round + draft-lane H2D staging of spec_round's suffix branch,
+    // verbatim, WITHOUT the verify graph launch (the fused verify replaces
+    // it). Returns the suffix verify width (sfx_width()) when the committed
+    // stream's suffix recurs (match >= sfx_L), else 0 -- the conductor then
+    // falls back to draft_and_gate(). Greedy-only, like the solo branch
+    // (spec_sample_round has no suffix path). Trim may grant less than the
+    // returned width: the verify then walks granted-1 of the staged drafts,
+    // and the extra staged lanes are never read (same contract as the gated
+    // rounds' unread draft rows). Suffix rounds skip the MTP chain, so the
+    // stale-MTP-KV note on suffix_on applies to fused rounds identically.
+    int suffix_propose() {
+        if (!(!tool_split_active && suffix_on && sfx_valid && pmin_theta > 0.f &&
+              h_mask_id0 < 0 &&
+              sfx.propose_with(last_pending, sfx_width() - 1, h_sfx_prop) >= sfx_L))
+            return 0;
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                         stm);
+        const int sw = sfx_width();
+        for (int k = 0; k < sw - 1; k++)
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], &h_sfx_prop[k], 4,
+                                       cudaMemcpyHostToDevice, stm));
+        return sw;
+    }
+    // Post-verify host commit for one fused round: EXACTLY what the solo
+    // round does after its outcome sync. Greedy (spec_round): em[]
+    // extraction, last_pending from oc[OUTCOME_INTS-1], suffix arming, perm
+    // advance, PLUS the telemetry/adaptive-depth block -- suffix counters,
+    // gate_cap/gate_n/lane histograms, and the dctl ladder update (Task 9:
+    // Q27_MAXD=auto members MUST feed dctl exactly like spec_round or the
+    // adaptive ceiling drifts between solo and fused serving). Sampled
+    // (spec_sample_round): the sampled outcome layout differs -- pending at
+    // oc[6], no suffix arming, and NO dctl/histogram updates (the sampled
+    // ceiling is fixed at 4; spec_sample_round updates nothing either).
+    // oc = this engine's d_outcome, already on host (the conductor does one
+    // D2H + sync per round for the whole batch). gate_cap/md_used come from
+    // draft_and_gate's out-params (-1 = suffix/none, skips the gated block).
+    // TRIM CLAMP (fused-only divergence, documented): under a trimmed grant,
+    // lanes past vw-1 were never verified, so cap is clamped to vw-1 for the
+    // histograms and for dctl -- `cap >= md` (the fired test) then stays
+    // false and the round contributes no spurious demote evidence for a lane
+    // that never ran. Untrimmed rounds (granted == want) have cap <= vw-1
+    // already, so solo-equivalent traffic is bitwise-identical bookkeeping.
+    int commit_outcome(const int* oc, int* emit, bool sampled = false,
+                       bool sfx_round = false, int gate_cap = -1, int md_used = -1) {
         int n = oc[0];
+        if (!sampled) {
+            if (sfx_round) {
+                sfx_fired++;
+                sfx_tok += n;
+                // suffix-round ceiling-saturation evidence (see spec_round's
+                // maxd_auto suffix arm for the full rationale)
+                if (maxd_auto && n >= dctl.cur + 1) dctl.update(dctl.cur, dctl.cur, n);
+            } else if (gate_cap >= 0) {
+                int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
+                gate_cap_hist[cap]++;
+                gate_n_hist[n]++;
+                for (int j = 1; j <= cap; j++) {
+                    gate_lane_fired[j]++;
+                    if (n >= j + 1) gate_lane_acc[j]++;
+                }
+                if (maxd_auto) dctl.update(md_used, cap, n);
+            }
+        }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
-        last_pending = oc[OUTCOME_INTS - 1];
-        sfx_valid = true;
+        if (sampled) {
+            last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
+        } else {
+            last_pending = oc[OUTCOME_INTS - 1];
+            sfx_valid = true;
+            if (sfx_dbg) {
+                fprintf(stderr, "[sfxdbg-oc] n=%d em=", n);
+                for (int k = 0; k < n; k++) fprintf(stderr, "%d,", oc[1 + k]);
+                fprintf(stderr, " pend=%d sfx_round=%d\n", oc[OUTCOME_INTS - 1],
+                        sfx_round ? 1 : 0);
+            }
+        }
         perm = (perm + (n - 1)) % W_MAX;
         return n;
     }

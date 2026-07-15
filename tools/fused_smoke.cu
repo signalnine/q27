@@ -1,10 +1,14 @@
 // fused_smoke -- 2-engine proof of the P1 fused verify round (continuous
-// batching, docs/plans/2026-07-14-continuous-batching.md Task 8).
+// batching, docs/plans/2026-07-14-continuous-batching.md Task 8) and of the
+// REAL Conductor built on it (Task 9, leg C).
 //
-// CLAIM UNDER TEST: a manual conductor loop -- per-engine gated drafts on each
+// CLAIM UNDER TEST: a conductor loop -- per-engine gated drafts on each
 // engine's OWN stream, then ONE eager fused verify (union weight sweep +
 // per-engine mixers/tails) on a dedicated conductor stream -- emits, for every
 // engine, exactly the token ids its untouched solo generate() path emits.
+// Leg B drives that loop by hand (plumbing proof); leg C drives it through
+// the production q27::Conductor (thread + registration + TokenQueues + gate),
+// so the whole Task 9 layer is covered by the same 32/32 byte-identity.
 // Widths here are 2 engines x <= 5 lanes = union <= 10 <= W_MAX (12), so the
 // trim policy never fires and the "bitwise-when-untrimmed" contract applies
 // in full (ninv_test proved the lane kernels N-invariant; this proves the
@@ -29,11 +33,12 @@
 //                       plumbing test, independent of the policy code.
 //
 // Build (mirrors the Makefile q27 rule's file list, engine main() swapped
-// for this driver; no Makefile edit per the plan's sensitive-file rule):
-//   /usr/local/cuda/bin/nvcc -O2 -std=c++17 \
-//     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 \
-//     -Xcompiler -Wall tools/fused_smoke.cu src/blocks.cu src/prefill.cu \
-//     src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu \
+// for this driver; no Makefile edit per the plan's sensitive-file rule).
+// One line:
+//   /usr/local/cuda/bin/nvcc -O2 -std=c++17
+//     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120
+//     -Xcompiler -Wall tools/fused_smoke.cu src/blocks.cu src/prefill.cu
+//     src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu
 //     src/loader.cpp -o build/fused_smoke
 //
 // Run: build/fused_smoke [model.q27]   (default: the canonical vanilla qwen)
@@ -286,5 +291,64 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("FUSED SMOKE PASS: streamA identical, streamB identical\n");
+
+    // ---- Leg C: the REAL Conductor (Task 9) -- thread, registry, queues ----
+    // Same claim as leg B, driven through the production path: re-prefill,
+    // register both engines with a running q27::Conductor, collect tokens
+    // from the TokenQueues on this (request-role) thread, join via queue
+    // close. Byte-identity vs leg A proves the whole Task 9 layer -- round
+    // loop under the GpuGate Lease, boundary membership, draft/trim/fused
+    // sequencing, commit + post_round bookkeeping, queue delivery -- adds
+    // nothing and drops nothing. (Registration order vs the first round is
+    // racy BY DESIGN: a round 1 that catches only one member runs the solo
+    // decode_step path, which is byte-identical too, so the assertion holds
+    // for every interleaving.)
+    prefill_serial(eA, pa);
+    prefill_serial(eB, pb);
+    std::vector<int> outC[2];
+    const char* whyC[2] = {"", ""};
+    {
+        q27::GpuGate gate;
+        q27::Conductor cond(gate, W_MAX);
+        Engine::DecodeTask tA, tB;
+        auto dummy = [](int) { return true; }; // replaced by the queue sink
+        eA.make_decode_task(tA, N_GEN, /*eos=*/-1, dummy, (int)pa.size() - 1);
+        eB.make_decode_task(tB, N_GEN, /*eos=*/-1, dummy, (int)pb.size() - 1);
+        q27::TokenQueue qA, qB;
+        cond.register_member(&eA, &tA, &qA);
+        cond.register_member(&eB, &tB, &qB);
+        while (qA.pop(outC[0])) {}
+        while (qB.pop(outC[1])) {}
+        whyC[0] = qA.finish_reason();
+        whyC[1] = qB.finish_reason();
+    } // ~Conductor: request_stop + thread join (both members already left)
+    fprintf(stderr, "[leg C] conductor: streamA %zu tokens (%s), streamB %zu tokens (%s)\n",
+            outC[0].size(), whyC[0], outC[1].size(), whyC[1]);
+
+    int badC = 0;
+    for (int i = 0; i < 2; i++) {
+        const std::vector<int>& r = *refs[i];
+        const std::vector<int>& f = outC[i];
+        size_t div = 0;
+        while (div < r.size() && div < f.size() && r[div] == f[div]) div++;
+        if (div == r.size() && r.size() == f.size()) {
+            printf("%s: OK (%zu tokens identical via conductor)\n", names[i], r.size());
+        } else {
+            badC++;
+            printf("%s: FAIL first divergence at index %zu (solo %s conductor %s)\n",
+                   names[i], div, div < r.size() ? std::to_string(r[div]).c_str() : "<end>",
+                   div < f.size() ? std::to_string(f[div]).c_str() : "<end>");
+            printf("  solo     :");
+            for (int t : r) printf(" %d", t);
+            printf("\n  conductor:");
+            for (int t : f) printf(" %d", t);
+            printf("\n");
+        }
+    }
+    if (badC) {
+        printf("CONDUCTOR SMOKE FAIL: %d stream(s) diverged\n", badC);
+        return 1;
+    }
+    printf("CONDUCTOR SMOKE PASS: streamA identical, streamB identical\n");
     return 0;
 }
