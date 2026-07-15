@@ -5713,3 +5713,44 @@ independent codebases converge on the same ~117 t/s MTP ceiling, and q27 is a fu
 is dead on hybrid-GDN (0% reuse) -> re-prefill every turn, plus the litellm hop. q27/llama
 reuse prefix state across turns and convert competitive decode into low wall time. Quality
 engine-independent (11-12/12). Full 5-engine table + vLLM caveats in docs/BENCHMARKING.md.
+
+**2026-07-14 -- EXTERNAL PERF-REVIEW TRIAGE: top-3 items measured, all three priced
+at <=0.5%; the review's value ranking inverted reality.** A 6-item external review
+(tokenizer prefix cache / exact-BPE heap / GPU-side draft-depth / continuous batching /
+ckpt traffic / reset clears) triaged by measurement before building anything.
+
+(1) Review #3 "keep draft-depth decisions on the GPU" (claimed strongest single-request
+lever): dexit A/B on vanilla qwen (fp8, PMIN=0.5, MAXD=auto, codegen+echo replays,
+scratchpad/dexit_ab.sh, phd/phv/phs from [req]): per-draft-step wall 818us with
+Q27_DEXIT=1 (launch+D2H+sync EVERY step) vs 810us with Q27_DEXIT=0 (monolithic, one
+sync) on codegen; echo 820 vs 813 (det=OK). The entire per-step launch+sync+pageable-
+staging overhead is ~8us/step = ~2-3ms/request = 0.15% of decode wall. A device-side
+continuation flag / conditional graph node has nothing to recover; dexit's win is
+SKIPPING steps (283 vs 405 launched, +4-6% tps), already shipped as default. NO-GO.
+
+(2) Review #1/#2 (cache tokenized prefixes; exact priority-queue BPE): whole-prompt
+re-encode measured at 2.8-3.7M tok/s (scratchpad/tok_bench.cpp on real replay prompts):
+22ms @61K-tok prompt, 9ms @26K; server-side [req] tok_ms=12 @26.8K agrees. A perfect
+prefix cache saves ~20ms of TTFT per turn on a maxed conversation -- <1% of any real
+turn. The BPE loop is O(word^2) per WORD, words are whitespace-delimited and tiny; the
+1024-byte cap only rechunks degenerate no-whitespace blobs (deliberate, 94e645a). LOW,
+not built.
+
+(3) Decode wall split, codegen @26.8K warm (the serving shape): verify 83% / draft 15% /
+suffix 2.5% / residual ~0. The wall is the verify round's weight GEMV -- already at the
+07-13 SOL floor (k_vgemm). No review item touches it.
+
+(4) Review #5 ckpt traffic: ~150MB async D2H per checkpoint every 4096 tok on the
+compute stream = ~100ms inside an 8.2s cold 26.8K prefill (1.2%); warm turns snapshot-hit
+(pf=1, ckpt never fires). Review #6 reset() clears: cold-path only, single-digit ms; the
+full-clear is deliberate (graph-capture state match, width-12 fix). Both LOW.
+
+(5) Review #4 continuous batching across slots: the only structurally real item --
+aggregate throughput under CC subagent fan-out. Scheduler+kernel refactor, needs a
+design pass; filed, not started.
+
+Hygiene noted, not built: h_draft_margin / oc[] / h_sfx_prop are pageable (each async
+copy takes a staging hop) -- but that cost is already inside the measured 8us/step, so
+pinning is worth ~1ms/request at best. Prefill datapoint banked: 3258 t/s @26.8K fp8
+cold. METHOD (again): measure before building -- the review's "highest value" item was
+worth 0.15% and its "smaller wins" were already priced into an 8us number.
