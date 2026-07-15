@@ -87,3 +87,28 @@ build/q27-server-w8: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu s
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
+
+# Continuous-batching gates (docs/plans/2026-07-14-continuous-batching.md):
+#   ninv_test      -- N-invariance: per-lane weight-kernel output must be bitwise
+#                     independent of union width and slot (the batching contract).
+#   test_conductor -- CPU: trim policy + ConductorCore membership/round-boundary.
+#   fused_smoke    -- 2-engine fused round vs solo byte-identity + conductor +
+#                     A2 error-injection legs (needs the GPU + model).
+build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh $(VGEMM_SRC) | build
+	$(NVCC) $(NVCCFLAGS) tools/ninv_test.cu $(VGEMM_SRC) -o $@
+
+build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@
+
+build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu \
+                   src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp | build
+	$(NVCC) $(NVCCFLAGS) tools/fused_smoke.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
+
+# w16 serving build (batch mode's natural target; was hand-built since part 10)
+build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
+                      src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
+	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp -o $@
