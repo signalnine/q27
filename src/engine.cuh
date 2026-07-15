@@ -67,6 +67,15 @@ static_assert(W_PLUMB == 16, "LANESW lists 16 slots -- keep it in step with W_PL
     {{F##_L[0], F##_L[1], F##_L[2], F##_L[3], F##_L[4], F##_L[5], F##_L[6],    \
       F##_L[7], F##_L[8], F##_L[9], F##_L[10], F##_L[11], F##_L[12],           \
       F##_L[13], F##_L[14], F##_L[15]}}
+// View-side twin of LANESW (P0 batching, design 2026-07-14): the identical
+// 16-slot brace list read from a LaneView array field V.F instead of the
+// member arrays, so the weight-sweep halves (pre/post) can run over a union
+// view. Solo views copy the member pointers, so the expansion is
+// pointer-identical to LANESW there.
+#define LANESV(V, F)                                                           \
+    {{(V).F[0], (V).F[1], (V).F[2], (V).F[3], (V).F[4], (V).F[5], (V).F[6],    \
+      (V).F[7], (V).F[8], (V).F[9], (V).F[10], (V).F[11], (V).F[12],           \
+      (V).F[13], (V).F[14], (V).F[15]}}
 
 struct Engine {
     // P10-A1: weights (Model + DeviceModel) are shared read-only across slots.
@@ -1043,28 +1052,42 @@ struct Engine {
                             w.cols, v.stm);
     }
 
-    // P0 batching: the pairs take the round's LaneView for their weight-sweep
-    // calls (qx5/mm5); mixer/cache state stays member-based (solo: v.vw == vw,
-    // v.stm == stm, so the launch sequence is bit-identical to the member form).
-    void gdn_pair(int il, const LaneView& v) {
-        const float eps = EPS;
-        qx5(v, x1_L, N_EMBD);
-        mm5(v, T(il, "attn_qkv.weight"), qkv_L);
-        mm5(v, T(il, "attn_gate.weight"), z_L);
+    // P0 batching split (design 2026-07-14, docs/plans/2026-07-14-continuous-
+    // batching-design.md): each pair is pre(view) -> mix(member) -> post(view).
+    // pre/post are the WEIGHT-SWEEP halves -- pure per-lane weight/elementwise
+    // ops reading everything through the LaneView -- so the P1 fused round can
+    // run them ONCE over a union view spanning engines. mix is everything
+    // touching this engine's SEQUENCE STATE (GDN role buffers RBuf/SBuf +
+    // convout, KV cache, attention scratch, the kv_kind-branched turbo3
+    // rotates) and stays member-based: member vw/stm, which in solo equal
+    // v.vw/v.stm, so the composed pair emits the bit-identical launch
+    // sequence -- graph capture records the same nodes in the same order
+    // (addendum A8). The fused driver never calls the composed pairs, only
+    // pre/mix/post individually (P1 Task 8 adds explicit stream/width params
+    // to mix; until then mix takes none by design).
+    void gdn_pre(int il, const LaneView& v) {
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "attn_qkv.weight"), v.qkv);
+        mm5(v, T(il, "attn_gate.weight"), v.z);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         LANESW(x1),
-                         LANESW(alpha), GDN_HEADS,
-                         N_EMBD, stm, vw);
+                         LANESV(v, x1),
+                         LANESV(v, alpha), GDN_HEADS,
+                         N_EMBD, v.stm, v.vw);
         q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         LANESW(x1),
-                         LANESW(betar), GDN_HEADS,
-                         N_EMBD, stm, vw);
+                         LANESV(v, x1),
+                         LANESV(v, betar), GDN_HEADS,
+                         N_EMBD, v.stm, v.vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
-        q27k::gdn_gates3(LANESW(alpha),
-                         LANESW(betar), sa, sdt,
-                         LANESW(g),
-                         LANESW(beta), GDN_HEADS, stm, vw);
+        q27k::gdn_gates3(LANESV(v, alpha),
+                         LANESV(v, betar), sa, sdt,
+                         LANESV(v, g),
+                         LANESV(v, beta), GDN_HEADS, v.stm, v.vw);
+    }
+    // -- split point: sequence state (RBuf/SBuf recurrent roles) begins here;
+    //    weight sweep above reads only the view (design 2026-07-14) --
+    void gdn_mix(int il) {
+        const float eps = EPS;
         const float* cw = (const float*)T(il, "ssm_conv1d.weight").data;
         // P12: per-lane recurrent chain -- role k reads role k-1 (written fresh
         // earlier this round) and writes role k. Only lanes < vw are live; a
@@ -1079,32 +1102,49 @@ struct Engine {
         q27k::delta_step(SBuf(il, 0), SBuf(il, 0), convout, g, beta, o, stm); // lane 0
         for (int L = 1; L < vw; L++)
             q27k::delta_step(SBuf(il, L - 1), SBuf(il, L), convout_L[L], g_L[L], beta_L[L], o_L[L], stm);
+    }
+    // -- split point: back to the weight sweep (per-lane elementwise + o-proj
+    //    on the view); mix wrote o_L in place, the view aliases it --
+    void gdn_post(int il, const LaneView& v) {
         const float* nw = (const float*)T(il, "ssm_norm.weight").data;
-        q27k::gated_norm3(LANESW(o), nw,
-                          LANESW(z),
-                          LANESW(og), GDN_HEADS, GDN_DIM, eps, stm, vw);
-        qx5(v, og_L, GDN_V);
-        mm5(v, T(il, "ssm_out.weight"), y_L);
+        q27k::gated_norm3(LANESV(v, o), nw,
+                          LANESV(v, z),
+                          LANESV(v, og), GDN_HEADS, GDN_DIM, EPS, v.stm, v.vw);
+        qx5(v, v.og, GDN_V);
+        mm5(v, T(il, "ssm_out.weight"), v.y);
+    }
+    void gdn_pair(int il, const LaneView& v) {
+        gdn_pre(il, v);
+        gdn_mix(il);
+        gdn_post(il, v);
     }
 
-    void attn_pair(int il, const LaneView& v) {
-        int ci = attn_cache_idx[il];
-        qx5(v, x1_L, N_EMBD);
-        mm5(v, T(il, "attn_q.weight"), qg_L);
+    void attn_pre(int il, const LaneView& v) {
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "attn_q.weight"), v.qg);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
-        for (int L = 0; L < vw; L++)
-            q27k::rmsnorm_heads(qg_L[L], qn, qg_L[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, stm);
-        mm5(v, T(il, "attn_k.weight"), kbuf_L);
-        for (int L = 0; L < vw; L++)
-            q27k::rmsnorm_heads(kbuf_L[L], kn, kbuf_L[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, stm);
-        mm5(v, T(il, "attn_v.weight"), vbuf_L);
-        q27k::IP3 P LANESW(d_pos);
-        q27k::rope3(LANESW(qg),
+        for (int L = 0; L < v.vw; L++)
+            q27k::rmsnorm_heads(v.qg[L], qn, v.qg[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, v.stm);
+        mm5(v, T(il, "attn_k.weight"), v.kbuf);
+        for (int L = 0; L < v.vw; L++)
+            q27k::rmsnorm_heads(v.kbuf[L], kn, v.kbuf[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, v.stm);
+        mm5(v, T(il, "attn_v.weight"), v.vbuf);
+        // rope reads the view's per-lane positions (WIP3 -> IP3: same
+        // pointers, const-qualified for the kernel wrapper)
+        q27k::IP3 P{};
+        for (int i = 0; i < W_PLUMB; i++) P.p[i] = v.pos.p[i];
+        q27k::rope3(LANESV(v, qg),
                     N_HEAD, HEAD_DIM, N_ROT, 2 * HEAD_DIM, P,
-                    FREQ_BASE, stm, vw);
-        q27k::rope3(LANESW(kbuf), N_KV, HEAD_DIM, N_ROT,
-                    HEAD_DIM, P, FREQ_BASE, stm, vw);
+                    FREQ_BASE, v.stm, v.vw);
+        q27k::rope3(LANESV(v, kbuf), N_KV, HEAD_DIM, N_ROT,
+                    HEAD_DIM, P, FREQ_BASE, v.stm, v.vw);
+    }
+    // -- split point: sequence state (KV cache + attention scratch + kv_kind-
+    //    branched turbo3 rotates) begins here (design 2026-07-14) --
+    void attn_mix(int il) {
+        int ci = attn_cache_idx[il];
+        q27k::IP3 P LANESW(d_pos);
         float kq = 1.0f / sqrtf((float)HEAD_DIM);
         // turbo3: rotate all vw Q lanes post-rope (see attn_block); host
         // branch on kv_kind only (init-fixed, graph-capture-safe)
@@ -1128,20 +1168,32 @@ struct Engine {
         if (kv_kind >= KV_T3)
             q27k::wht3(LANESW(attnout),
                        N_HEAD, HEAD_DIM, HEAD_DIM, true, stm, vw);
-        q27k::sigmoid_gate3(LANESW(attnout),
-                            LANESW(qg), N_HEAD, HEAD_DIM, stm, vw);
-        qx5(v, attnout_L, N_HEAD * HEAD_DIM);
-        mm5(v, T(il, "attn_output.weight"), y_L);
+    }
+    // -- split point: back to the weight sweep (sigmoid gate is pure per-lane
+    //    elementwise; mix wrote attnout_L in place, the view aliases it) --
+    void attn_post(int il, const LaneView& v) {
+        q27k::sigmoid_gate3(LANESV(v, attnout),
+                            LANESV(v, qg), N_HEAD, HEAD_DIM, v.stm, v.vw);
+        qx5(v, v.attnout, N_HEAD * HEAD_DIM);
+        mm5(v, T(il, "attn_output.weight"), v.y);
+    }
+    void attn_pair(int il, const LaneView& v) {
+        attn_pre(il, v);
+        attn_mix(il);
+        attn_post(il, v);
     }
 
+    // ffn_pair is all-"pre" (design 2026-07-14): every op is a per-lane
+    // weight/elementwise sweep on the view, no sequence state, so it needs no
+    // mix seam -- the P1 fused round calls it whole on the union view.
     void ffn_pair(int il, const LaneView& v) {
-        qx5(v, x1_L, N_EMBD);
-        mm5(v, T(il, "ffn_gate.weight"), ffn_g_L);
-        mm5(v, T(il, "ffn_up.weight"), ffn_u_L);
-        q27k::silu_mul3(LANESW(ffn_g),
-                        LANESW(ffn_u), N_FFN, stm, vw);
-        qx5(v, ffn_g_L, N_FFN);
-        mm5(v, T(il, "ffn_down.weight"), y_L);
+        qx5(v, v.x1, N_EMBD);
+        mm5(v, T(il, "ffn_gate.weight"), v.ffn_g);
+        mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
+        q27k::silu_mul3(LANESV(v, ffn_g),
+                        LANESV(v, ffn_u), N_FFN, v.stm, v.vw);
+        qx5(v, v.ffn_g, N_FFN);
+        mm5(v, T(il, "ffn_down.weight"), v.y);
     }
 
     // launch sequence for one speculative round (graph-capturable: all state
