@@ -2553,11 +2553,13 @@ struct Engine {
                     t.rounds > 0 ? (double)t.emitted / t.rounds : 0.0, t.emitted, t.rounds);
     }
 
-    // One decode round + its host bookkeeping (generate()'s old loop body).
-    // Returns false when generation is done -- budget, ctx guard, EOS,
-    // client-stop, or t.cancel -- after running finish_decode(), so GenStats
-    // and [gen-done] land exactly as the inline loop produced them.
-    bool decode_step(DecodeTask& t) {
+    // Round-boundary pre-checks (the top of generate()'s old loop body).
+    // Returns false when generation is done BEFORE any GPU work -- cancel,
+    // budget, ctx guard -- after running finish_decode(). Factored out of
+    // decode_step (P1 Task 9) so the conductor's fused round loop runs the
+    // IDENTICAL checks per member at each round boundary; decode_step calls
+    // it unchanged, so the solo path is byte-identical.
+    bool pre_round(DecodeTask& t) {
         // A3: cancellation is a round-boundary event ONLY -- checked here at
         // the top, before any GPU work, on the same footing (finish_decode +
         // false) as the natural exits.
@@ -2578,10 +2580,17 @@ struct Engine {
             finish_decode(t, "ctx-guard");
             return false;
         }
-        int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
-        int n = t.sampling
-                    ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
-                    : spec_round(em);
+        return true;
+    }
+
+    // Post-round host bookkeeping (the tail of generate()'s old loop body):
+    // P15 grammar scan/truncate, suffix-index append, Ph advance, per-token
+    // emission (EOS / client-stop / budget), on_pending, round_gap. Returns
+    // false when generation is done, after running finish_decode(). Factored
+    // out of decode_step (P1 Task 9): the conductor's fused round loop runs
+    // this same bookkeeping per member after commit_outcome(), so tokens,
+    // stop reasons and GenStats land exactly as the solo loop produces them.
+    bool post_round(DecodeTask& t, const int* em, int n) {
         t.rounds++;
         // P15 engage-lag fix: let the host grammar scan the whole round
         // pre-emission; on a mid-round <tool_call> completion, truncate to
@@ -2617,6 +2626,24 @@ struct Engine {
         if (!t.sampling && on_pending) on_pending(last_pending);
         round_gap();
         return true;
+    }
+
+    // One decode round + its host bookkeeping (generate()'s old loop body).
+    // Returns false when generation is done -- budget, ctx guard, EOS,
+    // client-stop, or t.cancel -- after running finish_decode(), so GenStats
+    // and [gen-done] land exactly as the inline loop produced them.
+    // P1 Task 9: pre-checks and post-round bookkeeping are factored into
+    // pre_round()/post_round() above -- the moved code is verbatim, so this
+    // composition is byte-identical -- because the conductor's FUSED round
+    // loop calls those two around fused_verify_round()+commit_outcome() in
+    // place of the solo round below.
+    bool decode_step(DecodeTask& t) {
+        if (!pre_round(t)) return false;
+        int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
+        int n = t.sampling
+                    ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
+                    : spec_round(em);
+        return post_round(t, em, n);
     }
 
     // Prompt + speculative generation. Calls on_token(id) for each generated
