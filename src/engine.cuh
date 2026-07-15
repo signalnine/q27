@@ -945,6 +945,51 @@ struct Engine {
     // dmax = # MTP drafts the draft graph produces (4 default; 5 for the gated
     // depth-5 draft graph). Capture-time only, like vw.
     int dmax = 4;
+    // Continuous-batching P0 (docs/plans/2026-07-14-continuous-batching.md):
+    // everything the verify forward's WEIGHT-SWEEP half reads or writes that
+    // is PER-LANE, gathered behind one view so the fused cross-engine round
+    // (P1) can point union slot k at any engine's lane buffers. Solo path:
+    // solo_view() returns this engine's own lanes -- pointer-identical to the
+    // member arrays, so routing the existing round through it changes nothing
+    // by construction. Deliberately NOT here: mixer state (RBuf/SBuf roles,
+    // kcache/vcache, attention scratch, convout -- all touched only inside
+    // the member-based mix sections) and the tails' d_mask_*/d_amax/
+    // finish_round state. Mixers and tails stay per-engine (design 07-14).
+    struct LaneView {
+        // sweep activations, written IN PLACE in the owning engine's buffers
+        // (its mix/tail then reads them back as members, untouched):
+        // x1/y/h = layer io; qkv/z/alpha/betar/g/beta + o/og = GDN pre/post;
+        // qg/kbuf/vbuf/attnout = attn pre/post; ffn_g/ffn_u = MLP gate/up;
+        // lg[t] = lane t's logits (logits2 + t*VOCAB; t >= W_MAX aliases
+        // lane 0, never read -- same rule as the head mm5 today).
+        std::array<float*, W_PLUMB> x1, qkv, z, alpha, betar, g, beta, o, og,
+            y, qg, kbuf, vbuf, attnout, ffn_g, ffn_u, h, lg;
+        std::array<q27k::XQuant, W_PLUMB> xq; // quantize3 dst / mm5 act src
+        q27k::IP3 vtok;               // embed3 sources (pending + drafts)
+        q27k::WIP3 pos;               // per-lane position ptrs (rope3)
+        std::array<int*, W_PLUMB> dv; // per-lane argmax outs (greedy tail)
+        float* vgemm_ws;              // k_vgemm workspace (>= union width)
+        int vw;                       // live width THIS round
+        cudaStream_t stm;             // stream the round runs on
+    };
+    LaneView solo_view() {
+        LaneView v{};
+        v.x1 = x1_L; v.qkv = qkv_L; v.z = z_L; v.alpha = alpha_L;
+        v.betar = betar_L; v.g = g_L; v.beta = beta_L; v.o = o_L;
+        v.og = og_L; v.y = y_L; v.qg = qg_L; v.kbuf = kbuf_L;
+        v.vbuf = vbuf_L; v.attnout = attnout_L; v.ffn_g = ffn_g_L;
+        v.ffn_u = ffn_u_L; v.h = h_L;
+        for (int t = 0; t < W_PLUMB; t++)
+            v.lg[t] = logits2 + (size_t)(t < W_MAX ? t : 0) * VOCAB;
+        v.xq = xq_L;
+        v.dv = d_v_L;
+        v.vtok = verify_tokens();
+        v.pos = lane_pos();
+        v.vgemm_ws = d_vgemm_ws;
+        v.vw = vw;
+        v.stm = stm;
+        return v;
+    }
     // W16: the flat 12-pointer overloads are gone. They existed so a call site
     // could name its lanes, but at W_PLUMB=16 mm5's flat form would take 17
     // params -- the exact signature wall that pushed prep/finish onto by-value
