@@ -5754,3 +5754,56 @@ copy takes a staging hop) -- but that cost is already inside the measured 8us/st
 pinning is worth ~1ms/request at best. Prefill datapoint banked: 3258 t/s @26.8K fp8
 cold. METHOD (again): measure before building -- the review's "highest value" item was
 worth 0.15% and its "smaller wins" were already priced into an 8us number.
+
+**2026-07-15 -- CONTINUOUS BATCHING P1 -- 2-slot aggregate A/B.** The headline
+gate (plan Task 11): Q27_BATCH=1 conductor vs the FIFO-interleave baseline.
+METHOD: codegen+docs accept payloads at max_tokens 512 (longer decode window =
+cleaner overlap), fired concurrently, 1 warmup pass + 3 measured reps, fresh
+q27-server-w16 per leg (fp8 KV, PMIN 0.5, MAXD auto, 32K x 2 slots), aggregate
+= summed dec / concurrent-window wall, median of 3 (tools/batch_ab.sh).
+
+MEASURED: **1.21x -- MISSES the 1.3x bar** (design projection ~1.4x). Not tuned;
+attributed (below) and shipped honest -- P2/P3 exist for exactly these levers.
+- A FIFO:            169.1 t/s agg (169.1/169.1/169.1; per-req 85.0/88.6)
+- B batched:         204.0 t/s agg (204.0/205.9/200.6; per-req 102.6/107.6;
+                     bat=2.0, 159 fused rounds/req -- batching engaged)
+- C batched+GEMM=1:  201.0 t/s agg -> C/B = -1.5%. The always-vgemm union sweep
+  is FASTER per round (27.9 vs 29.9 ms) but loses tok/round (2.99 vs 3.22; its
+  tolerance-class text is different traffic). The A1 solo-matching family
+  policy costs nothing at 2 slots -- keep it.
+- D solo regression (A10): BATCH=1 solo p50 vs BATCH=0: codegen -0.06%, docs
+  +0.00% -- the conductor k==1 fallthrough is free. PASS.
+
+ATTRIBUTION (diagnostic reps with Q27_PHASE_STATS=1 + Q27_BATCH_DBG=1, one per
+leg, unmeasured): baseline is honest -- under FIFO each request's GPU-active
+round is exactly solo pace (phd+phv = 18.2 ms/round == solo warmup; dec_ms
+36.4 ms/round-pair with yields=159 = pure serialization, zero interleave tax).
+Fused k=2 round wall = 29.9 ms vs the design price 26.0 (serial drafts 2x2.8 +
+fused weights ~11.3 + serial mixers 2x4.6 -> 1.40x). The +3.9 ms/round excess
+is the whole miss (36.4/29.9 = 1.22x observed). The plan's three suspects:
+(a) serial mixers: present AS PRICED, 9.1/29.9 = 30% of the round (plan said
+    ~27%). Not the miss; the P2 side-stream lever is worth ~4.6 ms/round.
+(c) serial drafts: as priced (5.6 ms). P2 draft-fusion lever ~2.8 ms.
+(b) the unpriced +3.9 ms splits in two, both measured: ~2.0 ms = the GEMV
+    family scaling worse at union widths 7-12 than the flat weights price
+    (leg C's family swap recovers exactly 2.0 ms of round wall); ~1.9 ms =
+    eager-launch/sync tax of the fused body (~1100 launches/round vs solo's
+    ONE graph launch; C residual after priced components = 1.9). P3
+    shape-graphs + P2 family/width tuning. Trim is NOT a factor (4/159 dbg
+    rounds, all 16->11s suffix; unions <=12 vs cap 16 otherwise), and the
+    conductor is NOT a factor (D = 0%; B codegen's 12-round solo tail runs
+    phv 15.8 ms/rnd ~= solo 15.4).
+Post-P2/P3 arithmetic from these walls: 29.9 - 4.6 (mixers) - 1.9 (graphs)
+- 2.8 (draft fusion) ~= 20.6 ms -> ~1.75x, consistent with the design's P2
+projection (~1.7x). The 1.3x bar is reachable with the mixer lever alone.
+
+TEXTS (greedy): docs A == B byte-identical 3/3 (all-gated, untrimmed --
+bitwise contract holds). codegen B forks vs A at bytes 673/429/425 across
+reps == the documented pre-existing w16-vs-w12 suffix-width fork (Task 10:
+672 cold / 428 warm), entering ONLY via the 16->11s trimmed suffix rounds
+(A1 policy fork); rep-to-rep md5s differ because join alignment + cumulative
+depthctl move the trim point. dec=512 on every request, every leg. C forks
+both payloads (vgemm tolerance family, priced) but is rep-deterministic.
+Task 9 TODO check: fused rounds have no phd/phv wall buckets -- fully-fused
+[req] prints clean zeros (phd=0.0 phv=0.0 phs=0), solo-tail rounds fill
+normally, no garbage fields.
