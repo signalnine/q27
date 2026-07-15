@@ -216,3 +216,59 @@ P3 shape-graphs / device perm indirection (only if Task 4's tax attribution
 says launch overhead is the new binding constraint -- it was ~1.9 ms at P1);
 >2-engine-specific tuning; Q27_BATCH default flip; turbo3-vs-fp8 quality
 (separate PPL+needle session).
+
+---
+
+## Consensus addenda (2026-07-15, binding)
+
+**B1. Byte-identity is the TEST GATE, not a guaranteed consequence.** If the
+Task 0 refs diverge and every named buffer is isolated, the failure is
+DIAGNOSTIC of hidden shared state (allocator, handle, metadata) -- hunt it,
+do not rationalize it. q27 uses no cublas/cudnn; there are no library
+handles, but the principle stands for anything discovered in the audit.
+
+**B2. Task 3.1 audit additions:** (a) cudaGraphExec_t instances -- draft
+graphs are ENGINE MEMBERS (per-engine captures on per-engine buffers), so
+concurrent launches use distinct execs by construction; VERIFY this and
+state it in the audit output. Concurrent launch of ONE exec instance is
+illegal. (b) any host-side mutable launch metadata shared across engines
+(e.g. static locals in launchers -- the known `static bool attr` in
+launch_fdmma is a one-shot attribute set, benign; list any others found).
+(c) no runtime allocation exists in the round path -- confirm by grep
+(cudaMalloc/cudaMallocAsync) and state it.
+
+**B3. Event-pool invariant, enforced not commented:** exactly ONE fused
+round in flight per Conductor (single conductor thread, synchronous round
+loop). Add an assert/flag (round_active) around fused_verify_round so a
+future pipelining change trips it loudly; the pool sizing argument depends
+on it.
+
+**B4. Self-determinism gate (Task 3 + Task 4):** run the Task 0 reference
+replay TWICE at each gate point; the two runs must match each other, not
+just the baseline. Concurrency bugs show up as intermittent nondeterminism
+before they show up as consistent divergence.
+
+**B5. Edge coverage (Task 3 gates):** exercise at k=2: mixed suffix+gated
+membership, asymmetric early gate-out (one engine exits at step 0, the
+other runs to md_used), md_used=1... md floor is 4 -- use MAXD=4 vs auto
+promotion asymmetry instead, and a trim-active round. fused_smoke gains a
+leg or env knobs where practical; what is not practical to force, note
+explicitly rather than claim.
+
+**B6. Primitives, explicitly:** fork/join uses cudaEventRecord +
+cudaStreamWaitEvent (DEVICE-side ordering). cudaEventSynchronize /
+cudaStreamSynchronize appear ONLY at the existing per-round host sync and
+the per-step draft sync. CUDA_CHECK wraps every stream/event call (house
+style), so side-stream failures surface at the failing call with the
+engine/layer in reach of the backtrace.
+
+**B7. Task 2 sync-pattern note:** sequential per-member
+cudaStreamSynchronize is acceptable -- the work is already launched, so the
+GPU overlaps regardless of host blocking order; wall = max(member steps) +
+sync latency. The 2-3 ms saving is a ceiling under ideal scheduling; report
+the realized number in Task 4, no tuning inside Task 2.
+
+**B8. Task 2 assert-equal:** a permanent cheap host check (integer compare
+of {cap, W, md_used} against draft_and_gate's arithmetic applied to the
+same recorded margins), always-on (asserts are live in every build; the
+cost is nanoseconds per round).
