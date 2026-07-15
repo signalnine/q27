@@ -30,8 +30,9 @@
 # runs with Q27_BATCH_DBG=1 Q27_PHASE_STATS=1 (env is process-level, so the
 # debug stderr needs its own server -- measured reps stay debug-free) to
 # capture per-round want->granted trim lines and the phase-field behavior of
-# fused rounds ([req] phd/phv under BATCH=1: fused rounds have no wall
-# buckets yet, Task 9 TODO -- fields must be zeros/absent, not garbage).
+# fused rounds ([req] phd/phv under BATCH=1: since P2 Task 1 fused rounds
+# stamp shared-wall phd/phv + per-member phs -- non-zero on fused requests;
+# vw/sfx buckets stay solo-only).
 #
 # Payloads are jq copies of the accept payloads with max_tokens raised
 # 256 -> 512: the longer decode window makes the concurrent overlap dominate

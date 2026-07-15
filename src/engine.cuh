@@ -2540,6 +2540,15 @@ struct Engine {
         // Q27_PHASE_STATS: summed gated-round draft/verify wall (ms) and MTP
         // draft steps launched, this request. dec_ms - draft_ms - verify_ms =
         // host round-gap + any unattributed (constrained/ungated) rounds.
+        // FUSED rounds (P2 Task 1): the conductor stamps draft_ms/verify_ms
+        // from coarse cstm event brackets with SHARED-WALL semantics -- the
+        // one fused-round wall is attributed IN FULL to EACH member, so
+        // summing phd/phv across concurrently-batched requests DOUBLE-COUNTS
+        // the wall (per-request phd/phv stays the honest "time my rounds
+        // spent in phase X" read). Fused draft_ms is the cstm-visible draft
+        // wait (only the unsynced draft tail while host drafts are serial;
+        // the real concurrent-draft wall after P2a). draft_steps is NOT
+        // shared: steps THIS member launched.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
         // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)

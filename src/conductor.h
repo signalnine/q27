@@ -440,10 +440,17 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
 // instead of the greedy argmax tail. The FORWARD is shared by design (both
 // solo graph sets capture the same spec_verify_forward), so sampled and
 // greedy members coexist in one union sweep; only the per-engine tail forks.
+// ev_draft_end (P2 Task 1, nullable -- the smoke driver passes none): a
+// TIMING event recorded on cstm immediately after the draft_done waits, i.e.
+// at the draft->verify phase boundary. Recording an event on an in-order
+// stream adds no ordering and no synchronization; it only timestamps the
+// point where cstm was released to begin verify work.
 inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStream_t cstm,
                                const cudaEvent_t* draft_done, const bool* is_suffix,
-                               const bool* sampled = nullptr) {
+                               const bool* sampled = nullptr,
+                               cudaEvent_t ev_draft_end = nullptr) {
     for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
+    if (ev_draft_end) CUDA_CHECK(cudaEventRecord(ev_draft_end, cstm));
     UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
     const Engine::LaneView& v = uv.view;
     Engine& e0 = *es[0];
@@ -539,6 +546,17 @@ public:
     // width cap fed to trim_widths (W_MAX; the W16 build raises it).
     explicit Conductor(GpuGate& gate_, int cap_ = W_MAX) : gate(gate_), core(cap_) {
         CUDA_CHECK(cudaStreamCreate(&cstm)); // created ONCE; all fused rounds
+        // P2 Task 1: fused-round phase-wall pool -- 3 TIMING events (default
+        // flags, NOT cudaEventDisableTiming), created once and reused every
+        // round. Reuse is sound under the B3 invariant enforced by
+        // round_active in fused_round(): exactly ONE fused round is in
+        // flight per Conductor (single conductor thread, synchronous round
+        // loop -- each round records, syncs cstm, and reads elapsed before
+        // returning), so a record can never overwrite a timestamp that is
+        // still to be read.
+        CUDA_CHECK(cudaEventCreate(&ev_round_start));
+        CUDA_CHECK(cudaEventCreate(&ev_draft_end));
+        CUDA_CHECK(cudaEventCreate(&ev_verify_end));
         core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
         core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                   int k, bool* done) {
@@ -550,6 +568,9 @@ public:
     ~Conductor() {
         request_stop();
         th.join();
+        CUDA_CHECK(cudaEventDestroy(ev_round_start));
+        CUDA_CHECK(cudaEventDestroy(ev_draft_end));
+        CUDA_CHECK(cudaEventDestroy(ev_verify_end));
         CUDA_CHECK(cudaStreamDestroy(cstm));
     }
     Conductor(const Conductor&) = delete;
@@ -750,16 +771,27 @@ private:
     // sync; per-member commit_outcome (spec_round's post-outcome mirror,
     // incl. dctl/histograms) + post_round (tokens -> queue via the sink,
     // EOS/budget/client-stop -> done).
-    // TODO(Task 10) telemetry skipped in fused rounds, deliberately:
-    // Q27_PHASE_STATS buckets (gs.draft_ms/draft_steps/verify_ms/vw_ms/vw_n/
-    // sfx_ms/sfx_rounds) -- a fused round's wall is SHARED across members,
-    // so per-engine attribution needs a design call, and [sfxdbg]'s propose
+    // Q27_PHASE_STATS in fused rounds (design call resolved, P2 Task 1):
+    // gs.draft_ms/verify_ms/draft_steps ARE stamped, from coarse cstm event
+    // brackets, with SHARED-WALL semantics -- the one fused wall is
+    // attributed IN FULL to EACH member (see the accumulation loop below).
+    // Still deliberately skipped: the per-width verify buckets vw_ms/vw_n
+    // (a fused verify runs ONE union width; binning it per member width
+    // would misprice the curve), sfx_ms/sfx_rounds, and [sfxdbg]'s propose
     // trace lines. Everything else spec_round mutates (last_pending,
     // sfx_valid/sfx.append, perm, dctl, gate_cap/n/lane hists, sfx_fired/
     // sfx_tok, gs.dec/rounds/cb_ms/end) is mirrored via commit_outcome +
     // post_round.
     void fused_round(Member** ms, const int* granted, const bool* sfx, int k,
                      bool* done) {
+        // B3 invariant, enforced not commented: exactly ONE fused round in
+        // flight per Conductor (single conductor thread, synchronous round
+        // loop). The 3-event phase pool is reused every round on the
+        // strength of this -- each round records, syncs, and reads elapsed
+        // before returning -- so a future pipelining change must trip here
+        // loudly instead of silently corrupting timestamps.
+        assert(!round_active && "B3: fused rounds must not overlap per Conductor");
+        round_active = true;
         Engine* es[ConductorCore<Member>::MAX_K] = {};
         bool sampled[ConductorCore<Member>::MAX_K] = {};
         cudaEvent_t evs[ConductorCore<Member>::MAX_K] = {};
@@ -769,13 +801,55 @@ private:
             evs[i] = ms[i]->draft_done;
             CUDA_CHECK(cudaEventRecord(evs[i], es[i]->stream()));
         }
-        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled);
+        // P2 Task 1: coarse per-round phase walls, bracketed by timing
+        // events on cstm (records on an in-order stream do not reorder or
+        // synchronize any work -- they only timestamp):
+        //   ev_round_start .. ev_draft_end = the cstm-visible DRAFT wait
+        //     (ev_draft_end is recorded by fused_verify_round right after
+        //     its draft_done waits). Under the current SERIAL host drafts,
+        //     draft_and_gate syncs every margin step on the member's own
+        //     stm before we get here, so this span is only the unsynced
+        //     draft tail (floor top-up launches / suffix prep+H2D) -- i.e.
+        //     the whole draft phase tail as cstm sees it. Post-P2a overlap
+        //     this same bracket becomes the real concurrent-draft wall.
+        //   ev_draft_end .. ev_verify_end = fused VERIFY: union sweep +
+        //     per-engine mixers/tails + the outcome D2H enqueue.
+        CUDA_CHECK(cudaEventRecord(ev_round_start, cstm));
+        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end);
         int oc[ConductorCore<Member>::MAX_K][OUTCOME_INTS];
         for (int i = 0; i < k; i++)
             CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->outcome_dev(), OUTCOME_INTS * 4,
                                        cudaMemcpyDeviceToHost, cstm));
+        CUDA_CHECK(cudaEventRecord(ev_verify_end, cstm));
         CUDA_CHECK(cudaStreamSynchronize(cstm)); // ONE sync for the batch
+        float ph_d = 0.f, ph_v = 0.f; // this round's phase walls (ms)
+        CUDA_CHECK(cudaEventElapsedTime(&ph_d, ev_round_start, ev_draft_end));
+        CUDA_CHECK(cudaEventElapsedTime(&ph_v, ev_draft_end, ev_verify_end));
         for (int i = 0; i < k; i++) {
+            // Q27_PHASE_STATS (P2 Task 1), SHARED-WALL semantics: a fused
+            // round has ONE wall, attributed IN FULL to EACH member's gs --
+            // phd/phv answer "how long did THIS request's rounds spend in
+            // each phase" (matching the [req] per-request parse). Summing
+            // phd/phv ACROSS concurrently-batched requests double-counts
+            // the wall. phs stays honest per-member (steps THIS member
+            // launched). Runs BEFORE the try block below for the same
+            // close-edge reason as the bat counters: gs must be final
+            // before any queue op can let the request thread proceed.
+            if (es[i]->phase_stats) {
+                es[i]->gs.draft_ms += ph_d;
+                es[i]->gs.verify_ms += ph_v;
+                if (ms[i]->gate_cap >= 0) {
+                    // launched = min(cap+1, md): exact identity with
+                    // draft_and_gate's margin loop (a sub-theta break at
+                    // step k has counted that step, cap+1; a full run is
+                    // md). Excludes floor top-up launches, mirroring the
+                    // solo dexit accounting (engine.cuh, gs.draft_steps +=
+                    // launched). gate_cap < 0 = suffix round, no MTP steps.
+                    int ph_s = ms[i]->gate_cap + 1;
+                    if (ph_s > ms[i]->md_used) ph_s = ms[i]->md_used;
+                    es[i]->gs.draft_steps += ph_s;
+                }
+            }
             // Task 10 [req] bat= telemetry FIRST: this member's round ran
             // k-wide (k >= 2 by the core's dispatch; on the catch path the
             // GPU work also already ran -- the throw is host bookkeeping).
@@ -807,6 +881,9 @@ private:
                 done[i] = true;
             }
         }
+        round_active = false; // B3: always reached -- the catch arms above
+                              // swallow host exceptions per member and
+                              // CUDA_CHECK exits the process, never throws
     }
 
     // Done-path epilogue (finish_decode already ran inside pre_round/
@@ -831,6 +908,11 @@ private:
     ConductorCore<Member> core;             // conductor-thread-only state
     std::vector<std::unique_ptr<Member>> owned; // conductor-thread-only
     cudaStream_t cstm = nullptr;
+    // P2 Task 1 phase-wall pool (TIMING events; ctor/dtor comments) + the
+    // B3 one-round-in-flight invariant flag (conductor-thread-only).
+    cudaEvent_t ev_round_start = nullptr, ev_draft_end = nullptr,
+                ev_verify_end = nullptr;
+    bool round_active = false;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)
     std::condition_variable cv;
