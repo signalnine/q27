@@ -600,3 +600,71 @@ git commit -m "P1: 2-slot aggregate A/B -- <measured>x vs FIFO baseline (bar 1.3
 Mixer side-stream overlap; fused draft steps; shape-graphs / device perm
 indirection; >=3-slot tuning; Q27_BATCH default-on. Each needs the P1
 measurement first.
+
+---
+
+## Consensus-review addenda (2026-07-14, resolve before Tasks 7-10)
+
+**A1. Task 5 / Task 10 contract resolution.** If `ninv_test` FAILS for a
+kernel family, the Task 10 solo-equivalence gate DOWNGRADES for traffic that
+exercises that family: the gate then requires (a) composition determinism
+(same mix twice -> same bytes) and (b) a quality spot-check, and the design
+doc's determinism section gets amended in the same commit with the measured
+finding. Solo-equivalence remains required for traffic on passing families.
+There is no configuration where Task 10 silently accepts divergence.
+
+**A2. Error/abort path.** CUDA_CHECK failures stay PROCESS-FATAL (unchanged
+single-operator posture, docs/SECURITY-MODEL.md). The conductor adds no
+recovery machinery. Non-CUDA failures are cancellations (A3). A member's
+HOST-side exception during bookkeeping must not leave the conductor holding
+the gate: the round loop's gate hold is scoped RAII (GpuGate::Lease), and
+queue `done`/error posting happens in the unwind path (mirror HookGuard).
+
+**A3. Cancellation semantics.** `DecodeTask` gains `std::atomic<bool> cancel`.
+Request thread sets it (SSE write failure / client disconnect / shutdown).
+Conductor checks at round boundaries ONLY: a cancelled member gets its
+teardown run (tc-hook clear via the HookGuard pattern, GenStats finalized,
+`done` posted, slot freed via the existing slot_guard path on the request
+thread after the queue drains). Its lanes are absent from the next round.
+No mid-round teardown, ever.
+
+**A4. Encapsulation model: thin engine-owned entrypoints.** The conductor
+calls a narrow public Engine surface only: `solo_view()`, `fused_pre/mix/
+post(il, ...)` (or equivalently pre/mix/post as split in Task 3),
+`draft_and_gate()`, `verify_tail(view)`, `decode_step` bookkeeping pieces
+(Task 7), `set_granted_width(w)`. No `friend`, no raw member reaches from
+conductor.h. If Task 8 finds itself needing another member, it adds an
+accessor in engine.cuh with a comment saying why.
+
+**A5. Trim-active gate (append to Task 10 Step 2).** On the W12 build, run
+2 concurrent suffix-saturating echo payloads (`scratchpad/echo_ctx4k.json`
+pattern) so trim MUST fire: assert both streams complete, `bat=` telemetry
+shows trim, and composition determinism holds. No solo-equivalence claim on
+this leg.
+
+**A6. build_union_view audit (append to Task 8 Step 3).** fused_smoke
+additionally dumps the union view's slot->pointer table and asserts each
+slot's pointers equal the owning engine's solo_view() entries at the mapped
+lane (host-side, exact pointer equality). Plus `assert` no engine appears
+twice and union vw <= W_MAX.
+
+**A7. Gate-ownership invariant (Task 9).** In batch mode, gate holders are
+exactly: the conductor (decode rounds) and request threads (prefill chunks).
+Invariant: the conductor never blocks on a request thread while holding the
+gate (token posts are non-blocking); request threads never hold the gate
+while waiting on a TokenQueue. State this as a comment on the conductor's
+round loop and keep it true.
+
+**A8. Graph-capture non-interference (explicit).** build_spec_graphs
+captures the SAME refactored functions (Tasks 2-4); the canonical +
+sampled-seed + replay gates are the capture-equivalence proof and run on
+every engine.cuh-touching commit. No separate capture path may be added.
+
+**A9. vgemm_ws sizing assert (Task 8).** `build_union_view` asserts
+engines[0]'s workspace covers the union width (read the allocation size, do
+not assume W_MAX).
+
+**A10. Solo-latency regression check (Task 11).** The A/B script's
+1-concurrent legs also compare per-request p50 tps: batched-mode solo must
+be within noise (<2%) of baseline solo, or the solo fallthrough is not a
+fallthrough.
