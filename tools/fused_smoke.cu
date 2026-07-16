@@ -45,7 +45,10 @@
 // Success lines: "FUSED SMOKE PASS: streamA identical, streamB identical"
 // (leg B), "CONDUCTOR SMOKE PASS: ..." (leg C), "A2 ERROR-PATH SMOKE PASS"
 // (leg D: one member's host bookkeeping throws; the other member, the
-// conductor thread and the process all survive).
+// conductor thread and the process all survive), "GRAPH SMOKE PASS: ..."
+// (leg E: the P3 T3 shape-keyed exec cache -- leg C's procedure rerun under
+// Q27_BATCH_GRAPH=1, twice through one Conductor, byte-identical to solo on
+// both the capture-populating pass and the cache-hit pass).
 
 #include <algorithm>
 #include <cstdio>
@@ -439,5 +442,74 @@ int main(int argc, char** argv) {
         }
     } // ~Conductor: request_stop + join -- (d) clean teardown, exit 0 below
     printf("A2 ERROR-PATH SMOKE PASS\n");
+
+    // ---- Leg E: P3 T3 graph leg (plan 2026-07-16-batch-p3-capture.md) ----
+    // Leg C's procedure rerun under Q27_BATCH_GRAPH=1: the graph-vs-eager
+    // first-line gate. The shape-keyed exec cache lives in
+    // Conductor::fused_round (graph_round), so the graph leg drives the REAL
+    // Conductor exactly like leg C -- leg B's hand-driven loop calls
+    // fused_verify_round directly and has no graph surface by construction
+    // (a hand-rolled capture here would test a duplicate of T3's logic, not
+    // T3). Env is read per-Conductor-INSTANCE at construction (not a process
+    // latch), which is what lets one process run eager legs B-D and then
+    // this graph leg. TWO passes through ONE conductor:
+    //   pass 1: cold cache -- every new shape is a first-sight
+    //           capture-without-execute + instantiate + launch-this-round
+    //           (T1's bitwise-on-first-sight contract);
+    //   pass 2: warm cache -- repeated shapes replay through the ALWAYS-ON
+    //           guard (hit path), the state T4 measures.
+    // Both passes must be byte-identical to leg A's solo tokens. The
+    // ~Conductor teardown prints the [gcache] final summary (hits/misses/
+    // evictions/guard-trips) -- expect misses+hits > 0, 0 trips.
+    setenv("Q27_BATCH_GRAPH", "1", 1);
+    {
+        q27::GpuGate gate;
+        q27::Conductor cond(gate, W_MAX);
+        auto dummy = [](int) { return true; }; // replaced by the queue sink
+        for (int pass = 1; pass <= 2; pass++) {
+            prefill_serial(eA, pa);
+            prefill_serial(eB, pb);
+            Engine::DecodeTask tA, tB;
+            eA.make_decode_task(tA, N_GEN, /*eos=*/-1, dummy, (int)pa.size() - 1);
+            eB.make_decode_task(tB, N_GEN, /*eos=*/-1, dummy, (int)pb.size() - 1);
+            q27::TokenQueue qA, qB;
+            cond.register_member(&eA, &tA, &qA);
+            cond.register_member(&eB, &tB, &qB);
+            std::vector<int> outE[2];
+            while (qA.pop(outE[0])) {}
+            while (qB.pop(outE[1])) {}
+            int badE = 0;
+            for (int i = 0; i < 2; i++) {
+                const std::vector<int>& r = *refs[i];
+                const std::vector<int>& f = outE[i];
+                size_t div = 0;
+                while (div < r.size() && div < f.size() && r[div] == f[div]) div++;
+                if (div == r.size() && r.size() == f.size()) {
+                    printf("%s: OK (%zu tokens identical, graph pass %d)\n", names[i],
+                           r.size(), pass);
+                } else {
+                    badE++;
+                    printf("%s: FAIL graph pass %d, first divergence at index %zu "
+                           "(solo %s graph %s)\n",
+                           names[i], pass, div,
+                           div < r.size() ? std::to_string(r[div]).c_str() : "<end>",
+                           div < f.size() ? std::to_string(f[div]).c_str() : "<end>");
+                    printf("  solo :");
+                    for (int t : r) printf(" %d", t);
+                    printf("\n  graph:");
+                    for (int t : f) printf(" %d", t);
+                    printf("\n");
+                }
+            }
+            if (badE) {
+                printf("GRAPH SMOKE FAIL: %d stream(s) diverged (pass %d)\n", badE, pass);
+                return 1;
+            }
+            fprintf(stderr, "[leg E] graph pass %d byte-identical (%zu + %zu tokens)\n",
+                    pass, outE[0].size(), outE[1].size());
+        }
+    } // ~Conductor: [gcache] final telemetry line prints here
+    unsetenv("Q27_BATCH_GRAPH");
+    printf("GRAPH SMOKE PASS: both passes byte-identical to solo\n");
     return 0;
 }

@@ -2208,6 +2208,26 @@ struct Engine {
         gs.verify_ms += verify_ms;
         gs.draft_steps += steps;
     }
+    // ---- P3 T3 exec-cache accessors (A4; plan 2026-07-16-batch-p3-capture) --
+    // why: the conductor's graph-cache shape key includes each member's
+    // KV-cache kind -- attn_mix's kv_store/attn_decode kernel family
+    // branches on it at capture time. Init-fixed per engine, keyed anyway:
+    // a recycled Engine* address must never hit a differently-configured
+    // engine's cached exec.
+    int kv_cache_kind() const { return kv_kind; }
+    // why: the T3 ALWAYS-ON hit guard re-derives the device state a cached
+    // exec's table twins consume -- the GDN role-table base, the perm
+    // scalar the twins dereference, and the pinned staging int
+    // stage_perm_async copies from -- and compares each against the
+    // capture-stored snapshot (B8 discipline) before any replay.
+    float* const* gdn_role_tab() const { return d_gdn_tab; }
+    const int* perm_scalar_dev() const { return d_perm_scalar; }
+    const int* perm_pin_host() const { return h_perm_pin; }
+    // why: the guard's staging-expectation check -- stage_perm_async(cstm)
+    // must already have run this round, so the pinned int must carry the
+    // CURRENT perm; a stale value means the copy the twins depend on was
+    // never staged and a replay would consume last round's rotation.
+    int cur_perm() const { return perm; }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on

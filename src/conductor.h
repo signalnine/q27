@@ -34,6 +34,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -315,6 +316,7 @@ struct ConductorCore {
 // policy above. Engine is header-only, so pulling it in here keeps include
 // order a non-issue for future users (server.cu, fused_smoke.cu).
 #ifdef __CUDACC__
+#include <chrono> // P3 T3: capture/instantiate walls ([gcache] telemetry)
 #include <memory>
 #include <thread>
 
@@ -425,9 +427,52 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
     return uv;
 }
 
+// P3 T3 hit-guard mirror (B8 discipline, plan 2026-07-16-batch-p3-capture.md):
+// field-wise equality over everything build_union_view derives. Before ANY
+// cached-exec replay, the conductor re-derives the union view from live host
+// state and compares it against the capture-stored copy -- a mismatch means
+// the exec's baked pointer program no longer describes reality, and it must
+// never launch. Field-wise rather than one struct memcmp because LaneView/
+// UnionView carry alignment padding (indeterminate bytes) and map[] slots at
+// and beyond vw are never written; comparing those would fault good hits.
+// MIRROR WARNING (the fused_verify_round skeleton discipline, review M3): a
+// new pointer field added to LaneView or UnionView MUST be compared here too,
+// or the guard goes blind to it.
+inline bool union_view_eq(const UnionView& a, const UnionView& b) {
+    const Engine::LaneView &x = a.view, &y = b.view;
+    auto lanes_eq = [](const std::array<float*, W_PLUMB>& p,
+                       const std::array<float*, W_PLUMB>& q) {
+        return std::memcmp(p.data(), q.data(), sizeof(float*) * W_PLUMB) == 0;
+    };
+#define Q27_UVEQ(F) if (!lanes_eq(x.F, y.F)) return false;
+    Q27_UVEQ(x1) Q27_UVEQ(qkv) Q27_UVEQ(z) Q27_UVEQ(alpha) Q27_UVEQ(betar)
+    Q27_UVEQ(g) Q27_UVEQ(beta) Q27_UVEQ(o) Q27_UVEQ(og) Q27_UVEQ(y)
+    Q27_UVEQ(qg) Q27_UVEQ(kbuf) Q27_UVEQ(vbuf) Q27_UVEQ(attnout)
+    Q27_UVEQ(ffn_g) Q27_UVEQ(ffn_u) Q27_UVEQ(h) Q27_UVEQ(lg)
+#undef Q27_UVEQ
+    for (int t = 0; t < W_PLUMB; t++) {
+        // XQuant is 4 pointers, no padding -- memcmp-safe per element
+        if (std::memcmp(&x.xq[t], &y.xq[t], sizeof(q27k::XQuant))) return false;
+        if (x.vtok.p[t] != y.vtok.p[t] || x.pos.p[t] != y.pos.p[t] ||
+            x.dv[t] != y.dv[t])
+            return false;
+    }
+    if (x.vgemm_ws != y.vgemm_ws || x.vw != y.vw || x.stm != y.stm ||
+        x.gemm_min != y.gemm_min)
+        return false;
+    if (a.k != b.k) return false;
+    for (int u = 0; u < x.vw; u++) // slots >= vw: never written, never read
+        if (a.map[u].eng != b.map[u].eng || a.map[u].lane != b.map[u].lane)
+            return false;
+    return true;
+}
+
 // One fused GREEDY verify round over engines es[0..k) at granted widths
-// granted[0..k), eager (NO graph capture -- P3 territory), on the conductor
-// stream cstm. Caller contract (the conductor / smoke driver):
+// granted[0..k) on the conductor stream cstm. Launch-only body: eager when
+// called directly, and the T3 capture target when the conductor wraps it in
+// stream capture (Q27_BATCH_GRAPH=1, graph_round -- which then passes
+// draft_done/ev_draft_end as nullptr, both hoisted outside the capture).
+// Caller contract (the conductor / smoke driver):
 //   - each engine's draft phase already ran on ITS OWN stm (draft_and_gate),
 //     widths were trimmed, and set_round_width(granted[m]) installed member
 //     vw = granted[m] (mixers + tails read it);
@@ -532,7 +577,14 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
                                const bool* sampled = nullptr,
                                cudaEvent_t ev_draft_end = nullptr,
                                const MixerFork* mf = nullptr) {
-    for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
+    // P3 T3: draft_done may be nullptr ONLY on the conductor's graph path
+    // (Q27_BATCH_GRAPH=1): Conductor::graph_round issues these waits itself
+    // on cstm BEFORE cudaStreamBeginCapture (a cudaStreamWaitEvent on an
+    // event recorded outside the capture is capture-illegal), and its eager
+    // guard-trip fallback runs after those same hoisted waits. Every other
+    // caller passes real events and takes the unchanged line below.
+    if (draft_done)
+        for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
     if (ev_draft_end) CUDA_CHECK(cudaEventRecord(ev_draft_end, cstm));
     UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
     const Engine::LaneView& v = uv.view;
@@ -790,6 +842,46 @@ public:
             CUDA_CHECK(cudaEventCreateWithFlags(&ev_mix_[i], cudaEventDisableTiming));
         }
         CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming));
+        // P3 T3 (plan 2026-07-16-batch-p3-capture.md): fused-verify exec
+        // cache config. Per-INSTANCE env read, deliberately NOT a process
+        // static: fused_smoke A/Bs an eager conductor against a graph
+        // conductor in one process (leg E sets the env between legs).
+        // Default OFF -- the Q27_BATCH precedent: eager is the reference
+        // path, capture is the opt-in lever.
+        {
+            const char* e = getenv("Q27_BATCH_GRAPH");
+            graphs_on_ = e && atoi(e) != 0;
+        }
+        if (graphs_on_) {
+            const char* c = getenv("Q27_BATCH_GRAPH_CAP");
+            if (c && atoi(c) > 0) gc_cap_ = atoi(c);
+            // Startup headroom check (T0 finding: ~7.2 MB device memory per
+            // instantiated exec; budgeted 8 MB, so cap 32 ~ 230 MB). Runs
+            // here because both the server and fused_smoke construct the
+            // Conductor AFTER the engines, so free VRAM already reflects
+            // weights + KV + the solo graph zoo. SHRINK, never abort: a
+            // smaller cache only costs LRU recapture (~2.4 ms first-sight,
+            // T1) where a hard exit would kill a server that runs fine.
+            size_t freeb = 0, totalb = 0;
+            CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
+            const size_t per_exec = 8ull << 20;
+            if (freeb < (size_t)gc_cap_ * per_exec) {
+                int shrunk = (int)(freeb / per_exec);
+                if (shrunk < 1) shrunk = 1;
+                fprintf(stderr,
+                        "[gcache] headroom: %.0f MB free < cap %d x 8 MB/exec -- "
+                        "shrinking exec-cache cap to %d (LRU recapture covers the rest)\n",
+                        freeb / 1e6, gc_cap_, shrunk);
+                gc_cap_ = shrunk;
+            }
+            // (no gcache_.reserve here: a bad_alloc before the try block
+            // below would leak the handles just created; growth to <= 32
+            // entries at round time is noise and shares the posture of the
+            // other conductor-thread vector ops -- owned/members push_back)
+            fprintf(stderr,
+                    "[gcache] fused-verify graph cache ON (Q27_BATCH_GRAPH=1, cap %d)\n",
+                    gc_cap_);
+        }
         // Exception guard (P2 exit review): a std::function assignment or
         // std::thread construction throw below (bad_alloc / system_error)
         // would leak every handle just created -- the dtor of an object
@@ -899,6 +991,20 @@ private:
     // (cstm + 3 phase events + MAX_K side streams + MAX_K mix events +
     // fork). Order mirrors the old dtor body exactly.
     void destroy_handles() {
+        // P3 T3: exec-cache teardown FIRST -- every cached exec + graph
+        // (T0: ~7.2 MB device memory per exec; leaving them leaks ~cap x
+        // 8 MB). Safe: the dtor joins the conductor thread before calling
+        // this, and every round ends on a cstm sync, so no exec is in
+        // flight; the ctor's exception path sees an empty cache. The final
+        // [gcache] line is the run's telemetry summary (T3 gate e).
+        if (graphs_on_)
+            fprintf(stderr,
+                    "[gcache] final: rounds=%ld hits=%ld misses=%ld evictions=%ld "
+                    "guard_trips=%ld entries=%zu cap=%d\n",
+                    gc_rounds_, gc_hits_, gc_misses_, gc_evictions_, gc_guard_trips_,
+                    gcache_.size(), gc_cap_);
+        for (auto& e : gcache_) gc_destroy(e);
+        gcache_.clear();
         CUDA_CHECK(cudaEventDestroy(ev_round_start));
         CUDA_CHECK(cudaEventDestroy(ev_draft_end));
         CUDA_CHECK(cudaEventDestroy(ev_verify_end));
@@ -1289,12 +1395,30 @@ private:
         //     host-side in draft_widths, before ev_round_start exists.
         //   ev_draft_end .. ev_verify_end = fused VERIFY: union sweep +
         //     per-engine mixers/tails + the outcome D2H enqueue.
+        // P3 T3 GRAPH-MODE NOTE (Q27_BATCH_GRAPH=1): the phd/phv brackets
+        // keep their meaning under graph replay -- BOTH records stay
+        // OUTSIDE the capture at the same program points (graph_round
+        // hoists the draft_done waits + the ev_draft_end record before
+        // BeginCapture), so a replayed round never re-records them and no
+        // stale timestamp node is frozen into a graph. ONE semantics
+        // delta: on a MISS round the phv span absorbs the one-time
+        // capture+instantiate host stall (~2.4 ms median, T1) while the
+        // GPU idles between ev_draft_end and the graph launch; HIT rounds
+        // show the true replay wall. GenStats phd/phv/phs keep their
+        // shared-wall per-member attribution unchanged.
         CUDA_CHECK(cudaEventRecord(ev_round_start, cstm));
         // P2b: hand the side-stream pool to the verify round so each
         // engine's mixers fork off cstm per layer (rationale + audit at
         // MixerFork / fused_verify_round).
         MixerFork mfork{side_, ev_fork_, ev_mix_};
-        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end, &mfork);
+        if (!graphs_on_) {
+            fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end,
+                               &mfork);
+        } else {
+            // P3 T3: shape-keyed exec cache -- hit: guard + replay; miss:
+            // capture-without-execute + instantiate + launch THIS round.
+            graph_round(es, granted, k, evs, sfx, sampled, &mfork);
+        }
         int oc[ConductorCore<Member>::MAX_K][OUTCOME_INTS];
         for (int i = 0; i < k; i++)
             CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->outcome_dev(), OUTCOME_INTS * 4,
@@ -1364,6 +1488,236 @@ private:
                               // CUDA_CHECK exits the process, never throws
     }
 
+    // ------------------------------------------------------------------
+    // P3 T3 (plan 2026-07-16-batch-p3-capture.md): shape-keyed fused-verify
+    // exec cache, behind Q27_BATCH_GRAPH=1 (ctor latch graphs_on_).
+    //
+    // WHY A SHAPE KEY IS SUFFICIENT (the T1-proven invariance): for a fixed
+    // key the fused verify launch sequence is ROUND-INVARIANT -- every
+    // pointer build_union_view bakes is an init-fixed engine member, and
+    // every round-varying input (tokens, positions, d_P, KV rows, margins,
+    // sampled Philox state, tool masks d_mask_ids/d_accept_cap) is DEVICE-
+    // resident and staged outside the capture: the same invariance the solo
+    // graph zoo has always replayed on. The ONE host-resolved per-round
+    // value was the GDN role-pointer set, removed by the T2 table twins
+    // (device resolve via d_gdn_tab + *d_perm_scalar); stage_perm_async is
+    // the round's mutable input and stays OUTSIDE the graph.
+    //
+    // KEY COMPONENTS (== the T1 census key: 28 keys/KV live alphabet,
+    // top-32 = 100%, so the cap-32 LRU holds the whole zoo):
+    //   eng[k]  ordered engine tuple -- capture bakes each engine's lane
+    //           buffers into specific union slots and its mix/tail launches
+    //           in slot order; a different tuple is a different pointer
+    //           program, not a variant of the same one.
+    //   gw[k]   exact granted-width vector -- per-lane grids, the union vw,
+    //           each member's mix lane walk and tail width are baked from
+    //           it (the solo analog: verify_graph_w is per-width).
+    //   sfx[k]  suffix class per member -- sets the union's gemm_min family
+    //           (all-suffix -> vgemm(2), else GEMV(99); build_union_view
+    //           policy), i.e. WHICH mm5 branch the capture recorded. Keyed
+    //           as the exact vector (finer than the derived class, so the
+    //           key stays the census key). Q27_BATCH_GEMM is a process
+    //           latch, constant for a server lifetime -- not keyed.
+    //   smp[k]  sampled mask -- per-member tail kernel choice
+    //           (spec_verify_tail vs _sampled), baked at capture.
+    //   kvk[k]  per-engine kv_kind -- attn_mix's kv_store/attn_decode
+    //           kernel-family branch. Init-fixed per engine, keyed anyway
+    //           (the plan's key spec): an embedder recycling an Engine*
+    //           address for a differently-configured engine must MISS.
+    // No hash: the alphabet is <= 32 entries, a linear key_eq scan per
+    // round is ~free next to a 20+ ms round.
+    enum { GK_MAX = ConductorCore<Member>::MAX_K };
+    struct GraphKey {
+        int k = 0;
+        Engine* eng[GK_MAX] = {};
+        int gw[GK_MAX] = {};
+        unsigned char sfx[GK_MAX] = {};
+        unsigned char smp[GK_MAX] = {};
+        int kvk[GK_MAX] = {};
+    };
+    // field-wise, never memcmp: the structs carry alignment padding and
+    // only [0..k) of each array is live
+    static bool key_eq(const GraphKey& a, const GraphKey& b) {
+        if (a.k != b.k) return false;
+        for (int i = 0; i < a.k; i++)
+            if (a.eng[i] != b.eng[i] || a.gw[i] != b.gw[i] || a.sfx[i] != b.sfx[i] ||
+                a.smp[i] != b.smp[i] || a.kvk[i] != b.kvk[i])
+                return false;
+        return true;
+    }
+    struct RoleSnap { // per-engine device state the captured twins consume
+        const float* const* tab;
+        const int* dperm;
+        const int* hpin;
+    };
+    struct GCacheEnt {
+        GraphKey key;
+        cudaGraph_t graph = nullptr; // kept alive so teardown owns both halves
+        cudaGraphExec_t exec = nullptr;
+        // ALWAYS-ON hit-guard reference (B8 discipline): the capture-time
+        // union-view pointer table + per-engine role-table/perm-staging
+        // addresses. A hit re-derives both from live host state and
+        // compares; any mismatch means the exec would replay STALE baked
+        // pointers and must never launch.
+        UnionView uv;
+        RoleSnap role[GK_MAX] = {};
+        long tick = 0;    // LRU stamp
+        size_t nodes = 0; // telemetry ([gcache] miss lines)
+    };
+    int gc_find(const GraphKey& key) const {
+        for (size_t i = 0; i < gcache_.size(); i++)
+            if (key_eq(gcache_[i].key, key)) return (int)i;
+        return -1;
+    }
+    void gc_destroy(GCacheEnt& e) {
+        CUDA_CHECK(cudaGraphExecDestroy(e.exec));
+        CUDA_CHECK(cudaGraphDestroy(e.graph));
+    }
+    // The ALWAYS-ON hit guard (B8: re-derive, never trust): rebuild the
+    // union view from live host state (build_union_view is launch-free
+    // pure host work) and re-read each engine's role-table/perm-scalar/
+    // pinned-staging addresses; memcmp-equal against the capture-stored
+    // copy or the hit is refused. The perm VALUE is deliberately NOT part
+    // of the pointer compare -- perm-invariance is the twins' whole point
+    // -- but the staging EXPECTATION is: fused_round enqueued
+    // stage_perm_async(cstm) before this guard runs, so the pinned int
+    // must already carry THIS round's perm; a stale value means the copy
+    // the graph's twins depend on was never staged this round.
+    bool gc_guard_ok(const GCacheEnt& e, Engine** es, const int* granted, int k,
+                     const bool* sfx) const {
+        UnionView now = build_union_view(es, granted, k, cstm, sfx);
+        if (!union_view_eq(e.uv, now)) return false;
+        for (int i = 0; i < k; i++) {
+            if (e.role[i].tab != es[i]->gdn_role_tab() ||
+                e.role[i].dperm != es[i]->perm_scalar_dev() ||
+                e.role[i].hpin != es[i]->perm_pin_host())
+                return false;
+            if (*es[i]->perm_pin_host() != es[i]->cur_perm()) return false;
+        }
+        return true;
+    }
+    static void gc_gwstr(char* buf, size_t n, const int* granted, const bool* sfx,
+                         const bool* sampled, int k) {
+        int off = 0;
+        buf[0] = 0;
+        for (int i = 0; i < k && off < (int)n - 8; i++)
+            off += snprintf(buf + off, n - off, "%s%d%c%s", i ? "," : "", granted[i],
+                            sfx[i] ? 's' : 'g', (sampled && sampled[i]) ? "*" : "");
+    }
+    // Graph-mode verify body. CAPTURE BOUNDARY (plan + T1 spike, verbatim):
+    //   OUTSIDE, BEFORE: the draft phase (its per-step host syncs are a
+    //     hard boundary -- the 07-14 GPU-side-depth NO-GO stands); the
+    //     draft_done waits (a cudaStreamWaitEvent on an event recorded
+    //     outside the capture is capture-illegal -- hoisted here);
+    //     stage_perm_async (already enqueued by fused_round: the round's
+    //     mutable input -- the twins make the graph perm-invariant); the
+    //     ev_round_start/ev_draft_end timing records (replay must never
+    //     re-record them; fused_round's GenStats note).
+    //   INSIDE: the whole fused_verify_round body, incl. the P2b mixer
+    //     fork/join side-stream choreography (T0/T1-proven topology) and
+    //     the T2 table-twin GDN launches, under Relaxed capture mode (the
+    //     T0-proven mode).
+    //   OUTSIDE, AFTER: outcome D2Hs + ev_verify_end + the round's ONE
+    //     host sync (the pageable-gating caveat: host gating rides on
+    //     those blocking D2H semantics -- never capture or move them).
+    // Miss = capture-without-execute, instantiate, then LAUNCH the fresh
+    // exec for the SAME round (T1: bitwise on first sight), insert LRU.
+    // Hit = guard, then replay. Guard trip = fprintf + evict + eager
+    // fallback for this round; a stale exec is never launched.
+    void graph_round(Engine** es, const int* granted, int k, const cudaEvent_t* evs,
+                     const bool* sfx, const bool* sampled, const MixerFork* mf) {
+        static const bool dbg = [] { // the [bat]/Q27_BATCH_DBG latch pattern
+            const char* e = getenv("Q27_BATCH_DBG");
+            return e && atoi(e) != 0;
+        }();
+        gc_rounds_++;
+        for (int i = 0; i < k; i++) CUDA_CHECK(cudaStreamWaitEvent(cstm, evs[i], 0));
+        CUDA_CHECK(cudaEventRecord(ev_draft_end, cstm));
+        GraphKey key;
+        key.k = k;
+        for (int i = 0; i < k; i++) {
+            key.eng[i] = es[i];
+            key.gw[i] = granted[i];
+            key.sfx[i] = sfx[i] ? 1 : 0;
+            key.smp[i] = (sampled && sampled[i]) ? 1 : 0;
+            key.kvk[i] = es[i]->kv_cache_kind();
+        }
+        char gws[96];
+        gc_gwstr(gws, sizeof gws, granted, sfx, sampled, k);
+        const int hit = gc_find(key);
+        if (hit >= 0) {
+            if (gc_guard_ok(gcache_[hit], es, granted, k, sfx)) {
+                gc_hits_++;
+                gcache_[hit].tick = ++gc_tick_;
+                CUDA_CHECK(cudaGraphLaunch(gcache_[hit].exec, cstm));
+                if (dbg)
+                    fprintf(stderr,
+                            "[gcache] r=%ld hit  k=%d gw=%s h=%ld m=%ld ev=%ld gt=%ld\n",
+                            gc_rounds_, k, gws, gc_hits_, gc_misses_, gc_evictions_,
+                            gc_guard_trips_);
+                return;
+            }
+            // guard trip: NEVER launch a stale exec. Loud regardless of dbg.
+            gc_guard_trips_++;
+            fprintf(stderr,
+                    "[gcache] GUARD TRIP r=%ld k=%d gw=%s -- capture-stored pointer/"
+                    "role/perm state != re-derived host state; evicting key, eager "
+                    "fallback this round (h=%ld m=%ld ev=%ld gt=%ld)\n",
+                    gc_rounds_, k, gws, gc_hits_, gc_misses_, gc_evictions_,
+                    gc_guard_trips_);
+            gc_destroy(gcache_[hit]);
+            gcache_.erase(gcache_.begin() + hit);
+            fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx,
+                               sampled, /*ev_draft_end=*/nullptr, mf);
+            return;
+        }
+        // MISS. No warmup pre-capture pass exists anywhere (deliberate
+        // deviation from the plan's "optional startup pre-capture" line):
+        // first-sight capture measured ~2.4 ms median (T1) -- warmup-class
+        // already -- and a pre-capture pass would need synthetic round
+        // state for shapes that may never arrive. YAGNI.
+        gc_misses_++;
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaGraph_t g = nullptr;
+        cudaGraphExec_t x = nullptr;
+        CUDA_CHECK(cudaStreamBeginCapture(cstm, cudaStreamCaptureModeRelaxed));
+        fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx, sampled,
+                           /*ev_draft_end=*/nullptr, mf);
+        CUDA_CHECK(cudaStreamEndCapture(cstm, &g));
+        CUDA_CHECK(cudaGraphInstantiate(&x, g, 0));
+        const auto t1 = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaGraphLaunch(x, cstm)); // THIS round runs via the exec
+        if ((int)gcache_.size() >= gc_cap_) { // LRU victim out first
+            size_t victim = 0;
+            for (size_t i = 1; i < gcache_.size(); i++)
+                if (gcache_[i].tick < gcache_[victim].tick) victim = i;
+            gc_evictions_++;
+            if (dbg)
+                fprintf(stderr, "[gcache] r=%ld evict (cap %d, LRU tick %ld)\n",
+                        gc_rounds_, gc_cap_, gcache_[victim].tick);
+            gc_destroy(gcache_[victim]);
+            gcache_.erase(gcache_.begin() + victim);
+        }
+        GCacheEnt ent;
+        ent.key = key;
+        ent.graph = g;
+        ent.exec = x;
+        ent.uv = build_union_view(es, granted, k, cstm, sfx); // guard reference
+        for (int i = 0; i < k; i++)
+            ent.role[i] = {es[i]->gdn_role_tab(), es[i]->perm_scalar_dev(),
+                           es[i]->perm_pin_host()};
+        ent.tick = ++gc_tick_;
+        CUDA_CHECK(cudaGraphGetNodes(g, nullptr, &ent.nodes));
+        gcache_.push_back(ent);
+        if (dbg)
+            fprintf(stderr,
+                    "[gcache] r=%ld miss k=%d gw=%s nodes=%zu cap+inst=%.2fms h=%ld "
+                    "m=%ld ev=%ld gt=%ld\n",
+                    gc_rounds_, k, gws, ent.nodes,
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(), gc_hits_,
+                    gc_misses_, gc_evictions_, gc_guard_trips_);
+    }
+
     // Done-path epilogue (finish_decode already ran inside pre_round/
     // decode_step/post_round and stamped gs.end): hand the stop reason to
     // the request thread via the queue close, release the event, free the
@@ -1395,6 +1749,14 @@ private:
     cudaStream_t side_[ConductorCore<Member>::MAX_K] = {};
     cudaEvent_t ev_fork_ = nullptr, ev_mix_[ConductorCore<Member>::MAX_K] = {};
     bool round_active = false;
+    // P3 T3 exec-cache state (conductor-thread-only after the ctor, like
+    // cstm; ctor comment for the graphs_on_/gc_cap_ latches). Counters feed
+    // the per-round dbg lines + the teardown summary (gate e telemetry).
+    bool graphs_on_ = false;
+    int gc_cap_ = 32; // LRU capacity (Q27_BATCH_GRAPH_CAP; headroom-shrunk)
+    long gc_tick_ = 0, gc_rounds_ = 0;
+    long gc_hits_ = 0, gc_misses_ = 0, gc_evictions_ = 0, gc_guard_trips_ = 0;
+    std::vector<GCacheEnt> gcache_;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)
     std::condition_variable cv;
