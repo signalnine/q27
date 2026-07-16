@@ -226,8 +226,10 @@ struct Engine {
     // pointers are byte-for-byte untouched. h_perm_pin is the PINNED
     // per-engine staging int the caller cudaMemcpyAsyncs to d_perm_scalar
     // on cstm before each fused round / graph launch (pinned: no new
-    // pageable-blocking semantics; one copy in flight at a time -- the
-    // round's existing host sync fences the next rewrite).
+    // pageable-blocking semantics; at most one DISTINCT VALUE in flight per
+    // round -- the guard-trip fallback may enqueue a second byte-identical
+    // copy (perm is constant within a round); the round sync fences the
+    // next rewrite).
     float** d_gdn_tab = nullptr;   // base == ring half
     float** d_gdn_S_tab = nullptr; // = d_gdn_tab + N_LAYER*W_MAX
     int* d_perm_scalar = nullptr;
