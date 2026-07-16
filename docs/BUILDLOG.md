@@ -6032,3 +6032,77 @@ continuous-batching campaign ends at fp8 1.41x / turbo3 1.40x (2 slots,
 solo 0%), with the residual ~0.6 ms/round booked closed-architectural and
 the remaining shelf (draft pool 0.27 ms, kernel-fusion node floor ~0.3 ms)
 priced below build cost.
+
+**2026-07-16 -- P3 LIVE CC A/B: graphs vs eager on real agentic traffic =
+TRANSFERS. Depth-matched fused phv/round -4.9 to -5.5 ms (-17 to -19%),
+fused tps +15-17%; solo untouched; zero errors both legs. One live finding:
+the CC key alphabet (44+) outruns the LRU-32 cap -- churn is benign.**
+Method: two thunderdome CC tasks (T2 collab-server + T5 task-queue, one pair
+per leg, staggered 15 s) driven CONCURRENTLY at the same server, same day,
+same build (master 765933d, build/q27-server W12), same shape: Q27_KV=turbo3
+Q27_MAXD=auto Q27_BATCH=1, 2 slots x 98304, --no-think --fast-head, port
+8081, systemd unit q27-eval; leg GRAPHS adds Q27_BATCH_GRAPH=1, leg EAGER
+omits it (GRAPHS ran first). Both legs +Q27_PHASE_STATS=1 +Q27_BATCH_DBG=1
+(phv + gcache/bat telemetry). Per the 07-15 CC-validation register: CC
+trajectories fork on wall-clock bytes, so WALLS AND SCORES ARE
+TRAJECTORY-CONFOUNDED; the engine's own [req] lines are the currency.
+Evidence: scratchpad/p3_cc_ab/{graphs,eager}/ (journal + req.lines +
+harness logs + analyze.py/bucket.py).
+
+STABILITY (gate 1): both legs ZERO end=error / [req-error] / 5xx; servers
+survived and stopped clean; GRAPHS 92 reqs (92 eos; http 92x200+2x404 HEAD
+probes), EAGER 138 reqs (137 eos, 1 n_max; 138x200+2x404). GCACHE (GRAPHS):
+rounds=954 hits=822 misses=132 evictions=100 guard_trips=0 (86.2% hit).
+The "misses ~= alphabet, 0 trips" expectation HALF-held: gt=0, but live CC
+drew 44+ distinct keys (vs the batch_ab census's 28) -- maxd-auto width
+churn on real traffic is richer than bench payloads, the LRU-32 cap binds
+and ~88 of the misses are eviction-churn recaptures. Benign: recapture tax
+~132 x 2.4 ms ~= 0.3 s across the 42 s fused window (<1%), and the hit rate
+held 86%. Q27_BATCH_GRAPH_CAP is the knob if multi-tenant traffic ever
+widens this (cap 64 would swallow the observed alphabet).
+
+THE COMPARISON (fused traffic, [req] currency). Raw distributions
+(trajectory-confounded mixes -- GRAPHS drew SHORT trajectories, EAGER long,
+see scores): fused (bat>=1.5) tps med/p75/max GRAPHS 132.5/140.0/177.0
+(n=36) vs EAGER 123.3/147.4/190.6 (n=95); fully-fused (bat=2.0) phv/round
+weighted GRAPHS 24.23 ms (1193 rounds) vs EAGER 30.31 ms (9692 rounds).
+The de-confounded cut -- fully-fused reqs bucketed by prompt depth, with
+tok/round verified matched (3.7-4.3 both legs, GRAPHS wider at [30-40K)):
+
+  ctx bucket    phv/round(w)  GRAPHS vs EAGER      tps med          phv/token
+  [20K,30K)     23.80 vs 29.33  (-5.5ms, -18.9%)   132.4 vs 114.6   6.41 vs 7.52
+  [30K,40K)     24.95 vs 29.87  (-4.9ms, -16.5%)   137.9 vs 117.8   5.76 vs 7.39
+  [40K,60K)*    26.98 vs 30.82  (-3.8ms)           151.0 vs 129.6   5.87 vs 7.15
+  [60K,100K)*   28.57 vs 31.55  (-3.0ms)           125.8 vs 120.5   4.80 vs 6.66
+  (* GRAPHS side of the deep buckets = the same-shape P3-exit CC sanity
+  dataset (graphs ON, long trajectories) -- this leg's short draw produced
+  no fused traffic past 40K; two independent graphs datasets agree at
+  every matched depth.)
+
+VERDICT: P3 TRANSFERS. Live fused rounds save 3.0-5.5 ms/round depth-matched
+(T4 bench arithmetic said -2.9 steady; mid-depth live rounds beat it --
+md-auto runs deeper draft chains per round than the w16 bench shape, so a
+round carries more launches for the graph to erase), fused-window tps +15-17%
+at matched depth (bench aggregate increment was +9.8% turbo3). Solo tps:
+raw medians 202.5 vs 232.2 look like a gap but do NOT replicate -- depth-
+matched buckets split both directions ([40-60K) 213.8 vs 235.2, [60-100K)
+261.6 vs 270.1, and the prior graphs sanity drew 266.8 at [40-60K), ABOVE
+eager) -- mix noise, consistent with T4's solo delta 0.00% (graphs only
+touch fused rounds). Aggregate tokens/overlap-window (801 vs 985 tok/s) is
+NOT comparable: dec_ms window reconstruction compresses gate waits and the
+fused samples differ 8x in size; descriptive only, non-load-bearing.
+
+SCORES (descriptive, basin-lottery caveat -- n=1/task/leg cannot separate
+anything): GRAPHS T2 0.287 (completed, 87 s, 36 turns) / T5 0.607
+(completed, 180 s); EAGER T2 0.530 (completed, 1160 s) / T5 0.615
+(completed, 960 s); prior same-shape graphs sanity T2 0.565 / T5 0.575.
+All four completed, zero crashes = the only score-shaped signal. The
+lottery cut BOTH ways on walls (GRAPHS leg drew 87/180 s, EAGER 1160/960 s)
+-- which is exactly why walls and scores are not the currency here. Context
+for the running table: 07-15 turbo3 CC validation (P1-era batching, same
+2x96K capacity): per-req decode med 113 t/s, ~900 reqs 0 errors; this A/B's
+fused medians (GRAPHS 132.5 live vs that 113) also carry P2's fusion gains,
+not graphs alone. Serving call stands: Q27_BATCH default-off is a product
+call, but when batching is on, Q27_BATCH_GRAPH=1 is now validated live --
+stability clean, solo-neutral, and the fused-round win is real on agentic
+traffic.
