@@ -305,8 +305,11 @@ see the features list above and BUILDLOG.)
 - Multi-slot serving (`--slots N`) with R1b round-granularity GPU
   time-slicing; P9 same-session checkpoint ring; P8 stable-prefix snapshot
   (warm turns ~1.3s); `/v1/messages` native incl `count_tokens`. turbo3
-  fits TWO full 131K slots on the 5090 (capacity, not vLLM-style aggregate
-  -- docs/multislot-throughput.md).
+  fits TWO full 131K slots on the 5090, and since 07-16 the slots also
+  BATCH: `Q27_BATCH=1 Q27_BATCH_GRAPH=1` fuses concurrent decodes through
+  one weight sweep + shape-keyed CUDA-graph replay -- 1.41x (fp8) / 1.40x
+  (turbo3) aggregate at 2 slots, solo cost 0%, byte-identity gated
+  (BUILDLOG 07-14..16; both flags currently opt-in).
 - Long-context: needle 6/6 at 361K on both fp8 and turbo3; measured
   allocation ceilings fp8 294,912 / turbo3 655,360 (W12 build, 5090).
 - turbo3 3-bit KV (2026-07-11, `Q27_KV=turbo3`): full stack incl. the
@@ -338,6 +341,49 @@ see the features list above and BUILDLOG.)
   box is Q5_K_M + draft-mtp10 + p_min 0.5 (**~117 t/s @2K** single-stream;
   the win over stock is p_min, not draft depth -- swept 07-06). All
   cross-engine numbers use that config; see Reference numbers.
+
+
+## Why paged-KV engines can't cache this model -- and how q27 turns that into wall time
+
+vLLM's serving story is PagedAttention: KV memory is one global pool of
+16-token blocks, sequences hold block tables instead of reservations, and
+the prefix cache shares blocks between requests by content hash. On a
+pure-attention transformer that is close to a free lunch -- attention KV is
+an append-only, position-addressed log, so any cached prefix block replays
+for free.
+
+Hybrid GDN breaks the assumption the lunch depends on. 48 of this model's
+65 layers carry no KV at all; their state is a dense recurrent summary
+(128x128 per head + a conv ring) that REPLACES the token log. That state is
+order-dependent and all-or-nothing: it cannot be paged, cannot be shared by
+hash, and cannot be reconstructed from any cached block -- only replayed
+from position 0 or restored from a snapshot you took yourself. A block
+cache covers 17/65 layers; without the matching GDN state those blocks are
+dead weight. Measured consequence (SWE-bench agentic, 07-15, 12 instances,
+5 engines): vLLM's prefix cache got **0% reuse** and re-prefilled every
+turn -- competitive decode (117 t/s) but the WORST wall time of all five
+engines (133 s/instance; a litellm Anthropic-shim hop contributes, the
+re-prefill dominates).
+
+q27 treats the GDN summary as a first-class object instead of a cache miss:
+
+- **P8 stable-prefix snapshot**: one device-side snapshot of all 48 GDN
+  states at the last ChatML-stable boundary, plus split-encode at that
+  boundary so tokenization itself is prefix-stable across turns.
+- **P9 checkpoint ring**: pinned-host copies every 4096 tokens during
+  prefill, so mid-history divergence rewinds to the nearest checkpoint
+  instead of position 0.
+- Attention KV needs neither: rows below the divergence point are
+  append-only and stay valid in place.
+
+A warm CC turn is therefore restore + suffix-only prefill -- real traffic
+looks like `prompt=25473 hit=24136 pf=1337` in the `[req]` log, ~1.3 s
+instead of a 10-20 s full re-prefill at p50 agentic depth. That arithmetic,
+times every turn of a 30-90-turn trajectory, is the whole wall-time story:
+**q27 47 s/instance vs vLLM 133 s** on identical tasks, with decode speed
+(203 vs 117 t/s) explaining less than half the gap. The continuous-batching
+stack (07-14..16) is independent of this machinery and stacks on top:
+snapshots own prefill, batching owns decode.
 
 ## Architecture facts (ground truth from GGUF metadata)
 
