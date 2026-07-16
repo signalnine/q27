@@ -1873,6 +1873,10 @@ struct Engine {
     // why: the conductor records each member's draft_done event on the
     // stream its draft phase ran on, then makes the fused stream wait on it.
     cudaStream_t stream() const { return stm; }
+    // why: the conductor's interleaved draft loop (P2a) gates each member's
+    // margin reads against ITS OWN theta (draft_and_gate's pmin_theta
+    // compare), per-member because Q27_PMIN is per-engine config.
+    float gate_theta() const { return pmin_theta; }
     // why: the conductor D2Hs every member's round outcome itself -- one
     // sync for the whole batch -- then hands the host copy to
     // commit_outcome().
@@ -1887,6 +1891,46 @@ struct Engine {
     void set_round_width(int w) {
         assert(w >= 2 && w <= W_MAX);
         vw = w;
+    }
+    // P2a step-granular draft entrypoints: draft_and_gate's margin loop,
+    // exploded so the conductor can interleave step k across all gated
+    // members (each engine's chain stays on its OWN stm; the conductor syncs
+    // and reads margins between steps). draft_and_gate below is EXACTLY these
+    // pieces reassembled -- the solo/smoke paths run the same code, so the
+    // canonical/sampled-seed gates also gate the extraction.
+    //
+    // why: the conductor bootstraps a sampled member's first token once
+    // before its step 0 (draft_and_gate's samp_first block, verbatim).
+    void draft_sample_bootstrap() {
+        if (!samp_first) return;
+        samp_first = false;
+        q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+    }
+    // why: the conductor hoists each member's drafting ceiling (the
+    // dctl/gate_maxd read at draft_and_gate's top) before its interleaved
+    // loop; also carries draft_and_gate's gated-config precondition.
+    int draft_md_used(bool sampled) const {
+        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
+        return sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+    }
+    // why: the conductor launches step k on EVERY active member's stm before
+    // syncing any of them -- graph launch + margin D2H only, deliberately NO
+    // sync (that is the whole overlap).
+    void draft_step_launch(int k) {
+        CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                   cudaMemcpyDeviceToHost, stm));
+    }
+    // why: the conductor reads step k's margin after ITS stream sync (the
+    // host value is garbage until the caller synced stm past the D2H above).
+    float draft_margin(int k) const { return h_draft_margin[k]; }
+    // why: the conductor fires draft_and_gate's width-floor top-up when a
+    // member leaves the interleaved loop. A width-W verify walks W-1 drafts,
+    // so W draft rows must exist; the range is empty except at cap==0
+    // (launched == cap+1 >= W otherwise -- see draft_and_gate).
+    void draft_floor_topup(int launched, int W, int md_used) {
+        for (int k = launched; k < W && k < md_used; k++)
+            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
     }
     // Draft phase of one GATED round on THIS engine's stm: the P14 dexit
     // margin loop of spec_round verbatim (per-step draft graphs, D2H margin,
@@ -1903,27 +1947,20 @@ struct Engine {
     // ceiling, for commit_outcome's telemetry/depthctl mirror -- W alone is
     // ambiguous at the floor (cap 0 and cap 1 both return W=2).
     int draft_and_gate(bool sampled = false, int* out_cap = nullptr, int* out_md = nullptr) {
-        assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
-        if (sampled && samp_first) {
-            samp_first = false;
-            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
-        }
-        const int md_used = sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+        if (sampled) draft_sample_bootstrap();
+        const int md_used = draft_md_used(sampled); // asserts the gated config
         int cap = 0, launched = 0;
         for (int k = 0; k < md_used; k++) {
-            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+            draft_step_launch(k);
             launched++;
-            CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
-                                       cudaMemcpyDeviceToHost, stm));
             CUDA_CHECK(cudaStreamSynchronize(stm));
-            if (h_draft_margin[k] < pmin_theta) break;
+            if (draft_margin(k) < pmin_theta) break;
             cap++;
         }
         int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
         // Width-floor top-up (see spec_round): a width-W verify walks W-1
         // drafts, so W draft rows must exist. Only fires at cap==0.
-        for (int k = launched; k < W && k < md_used; k++)
-            CUDA_CHECK(cudaGraphLaunch(draft_step_graph[k][perm], stm));
+        draft_floor_topup(launched, W, md_used);
         if (out_cap) *out_cap = cap;
         if (out_md) *out_md = md_used;
         return W;

@@ -13,11 +13,13 @@
 // The Conductor (Task 9: registry, round loop, token queues) calls a THIN
 // ENGINE-OWNED surface only: the entrypoints (solo_view()/pre/mix/post/
 // ffn_pair/qx5/mm5/tails/T()/set_round_width/draft_and_gate/suffix_propose/
+// the P2a step-granular draft pieces (draft_sample_bootstrap/draft_md_used/
+// draft_step_launch/draft_margin/draft_floor_topup)/
 // commit_outcome/pre_round/post_round/decode_step/finish_decode -- the last
 // only from the A2 catch epilogue, fail_member below) plus the named
 // ACCESSORS engine.cuh
 // declares for the conductor (shared_dm/is_attn_layer/fast_head_on/
-// vgemm_ws/round_width/stream/outcome_dev/end_reason, each with a why-
+// vgemm_ws/round_width/stream/gate_theta/outcome_dev/end_reason, each with a why-
 // comment at its declaration). No friends; every raw-member need is met by
 // adding an accessor in engine.cuh, never by reaching into the engine from
 // this header (consensus addendum A4). The trim policy, TokenQueue and the
@@ -158,7 +160,11 @@ private:
 //                            its finish path already ran inside
 //   int  want_width();       draft phase (real: suffix_propose() or
 //                            draft_and_gate() on the member engine's OWN
-//                            stream); returns the want width, >= 2
+//                            stream); returns the want width, >= 2.
+//                            P2a: only the FALLBACK when the draft_widths
+//                            hook below is unset -- the real conductor
+//                            installs the hook so gated members' draft
+//                            steps interleave across engines
 //   bool round_is_suffix();  this round's proposal class (trim + GEMM policy)
 //   void set_granted(int w); install the post-trim width (set_round_width)
 // Hooks (owned by the wrapper):
@@ -191,6 +197,12 @@ struct ConductorCore {
     std::function<bool(MemberT&)> solo_round;
     std::function<void(MemberT**, const int*, const bool*, int, bool*)> fused_round;
     std::function<void(MemberT&)> on_leave;
+    // P2a (optional): batch draft hook -- fills want[] and sfx[] for all k
+    // members at once so the real conductor can interleave the gated
+    // members' draft steps across engines (concurrent draft graphs). When
+    // unset (the CPU unit test, hookless embedders), round() falls back to
+    // the per-member want_width() calls -- the serial P1 behavior.
+    std::function<void(MemberT**, int*, bool*, int)> draft_widths;
 
     void join(MemberT* m) { joins.push_back(m); }
 
@@ -242,10 +254,20 @@ struct ConductorCore {
         MemberT* ms[MAX_K];
         int want[MAX_K];
         bool sfx[MAX_K], done[MAX_K];
-        for (int i = 0; i < k; i++) {
-            ms[i] = members[i];
-            want[i] = ms[i]->want_width();
-            sfx[i] = ms[i]->round_is_suffix();
+        for (int i = 0; i < k; i++) ms[i] = members[i];
+        // Draft phase (P2a): the batch hook interleaves gated members' draft
+        // steps so the engines' chains run concurrently on their own
+        // streams; without it, the per-member calls are the serial path.
+        // Either way this runs strictly AFTER every pre_round() above and
+        // strictly BEFORE trim/set_granted/fused_round below -- the P1
+        // ordering, unchanged.
+        if (draft_widths) {
+            draft_widths(ms, want, sfx, k);
+        } else {
+            for (int i = 0; i < k; i++) {
+                want[i] = ms[i]->want_width();
+                sfx[i] = ms[i]->round_is_suffix();
+            }
         }
         // trim mutates only on overflow (sum > cap): under the cap, granted
         // == want and untrimmed lanes keep the bitwise contract.
@@ -517,6 +539,11 @@ public:
         int gate_cap = -1, md_used = -1;  // draft_and_gate outs -> commit_outcome
         cudaEvent_t draft_done = nullptr; // recorded on e->stm after drafting
         bool pre_round() { return e->pre_round(*t); }
+        // P2a: the serial draft path. The real conductor installs the
+        // core.draft_widths hook (Conductor::draft_widths below), which
+        // supersedes this per-member call with the interleaved equivalent;
+        // this stays as the core's hookless fallback and the reference
+        // semantics the interleave must (and does -- B8) reproduce.
         int want_width() {
             gate_cap = md_used = -1;
             // mirror spec_round's branch order: the suffix drafter fires
@@ -561,6 +588,9 @@ public:
         core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                   int k, bool* done) {
             this->fused_round(ms, granted, sfx, k, done);
+        };
+        core.draft_widths = [this](Member** ms, int* want, bool* sfx, int k) {
+            this->draft_widths(ms, want, sfx, k);
         };
         core.on_leave = [this](Member& mm) { this->leave(mm); };
         th = std::thread([this] { run(); });
@@ -764,8 +794,139 @@ private:
         return true; // failed member leaves this round
     }
 
+    // P2a: the batch draft phase -- Member::want_width() over all k members,
+    // with the GATED members' margin loops INTERLEAVED so their per-step
+    // draft graphs run concurrently on the engines' own streams (the
+    // sequential host loop was the only serializer; the graphs already
+    // lived on per-engine stms). Suffix members keep suffix_propose as-is
+    // (one-shot host test + prep/H2D staging, no margin loop). Scheduling
+    // only: each engine's stm sees the IDENTICAL call sequence
+    // draft_and_gate would have enqueued, so per-member values and bytes
+    // must match the serial path -- and B1 makes that the gate (the Task 0
+    // refs), not an assumption.
+    //
+    // EQUIVALENCE to draft_and_gate's loop, side by side. draft_and_gate:
+    //   for (k = 0; k < md_used; k++) {
+    //       launch step k; launched++;
+    //       sync stm; if (margin[k] < theta) break;
+    //       cap++;
+    //   }
+    //   W = max(2, cap+1); top-up launches [launched, min(W, md_used));
+    // Interleaved, per gated member i (all active members share the step
+    // counter -- every member enters at step 0 and advances by 1 per
+    // iteration, so `step` IS member i's next k):
+    //   - each iteration launches exactly step `step` on i's stm and
+    //     increments launched[i]  == launch-k + launched++ above;
+    //   - i's stm is synced past step `step`'s D2H before margin read
+    //     == the per-step sync above (extra syncs of OTHER members' stms
+    //     order nothing on i's stm);
+    //   - margin[step] < theta  -> i exits with cap[i] unchanged. cap[i]
+    //     was incremented once per PASSED step 0..step-1, so cap[i] ==
+    //     step == draft_and_gate's cap at its break  (sub-theta break);
+    //   - margin[step] >= theta -> cap[i]++ (== step+1), and i exits iff
+    //     cap[i] == mdu[i]  == the loop bound k+1 < md_used failing after
+    //     cap++  (full run: cap == md_used, launched == md_used);
+    //   - on exit: W = max(2, cap+1) and the top-up range
+    //     [launched, min(W, mdu)) fire with the SAME values -- so the same
+    //     graph launches land on i's stm (margin steps 0..launched-1, then
+    //     top-up steps; the range is empty except at cap==0, where
+    //     launched==1 < W==2 <= mdu).
+    // The margins themselves are computed by the same per-engine graphs on
+    // the same per-engine state, so the break step is identical, hence
+    // {cap, launched, W, md_used} are identical. B8 below re-derives them
+    // from the recorded margins every round and asserts equality.
+    void draft_widths(Member** ms, int* want, bool* sfx, int k) {
+        enum { MAX_K = ConductorCore<Member>::MAX_K };
+        int act[MAX_K];                              // gated members still in the loop
+        int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
+        int na = 0;
+        for (int i = 0; i < k; i++) {
+            Member& mm = *ms[i];
+            mm.gate_cap = mm.md_used = -1;
+            // mirror spec_round's branch order (== want_width): the suffix
+            // drafter fires before the MTP chain, greedy only, on this
+            // engine's OWN stream. Suffix decisions are host one-shots over
+            // per-engine state, so member i+1's decision landing before
+            // member i's MTP steps reorders nothing observable.
+            if (!mm.sampled) {
+                int sw = mm.e->suffix_propose();
+                if (sw > 0) {
+                    mm.sfx_round = true;
+                    sfx[i] = true;
+                    want[i] = sw;
+                    continue;
+                }
+            }
+            mm.sfx_round = false;
+            sfx[i] = false;
+            // draft_and_gate's preamble, hoisted per member: sampled
+            // bootstrap once before step 0, then the drafting ceiling
+            // (the same dctl/gate_maxd read).
+            if (mm.sampled) mm.e->draft_sample_bootstrap();
+            mdu[i] = mm.e->draft_md_used(mm.sampled);
+            cap[i] = launched[i] = 0;
+            act[na++] = i;
+        }
+        for (int step = 0; na > 0; step++) {
+            for (int j = 0; j < na; j++) ms[act[j]]->e->draft_step_launch(step);
+            // B7: sequential host syncs are fine -- every active engine's
+            // step is already launched, so the GPU overlaps them regardless
+            // of host blocking order; wall = max member chain + sync latency.
+            for (int j = 0; j < na; j++)
+                CUDA_CHECK(cudaStreamSynchronize(ms[act[j]]->e->stream()));
+            int keep = 0;
+            for (int j = 0; j < na; j++) {
+                const int i = act[j];
+                Member& mm = *ms[i];
+                launched[i]++; // member i launched step `step` above
+                bool out;
+                if (mm.e->draft_margin(step) < mm.e->gate_theta()) {
+                    out = true; // sub-theta break: cap[i] stays == step
+                } else {
+                    cap[i]++;                   // == step+1
+                    out = cap[i] == mdu[i];     // draft_and_gate's loop bound
+                }
+                if (!out) {
+                    act[keep++] = i; // stable order: syncs stay member-order
+                    continue;
+                }
+                // draft_and_gate's epilogue for this member, at its exit
+                // step: floor W, width-floor top-up on ITS stm, out-params.
+                int W = cap[i] + 1 < 2 ? 2 : cap[i] + 1;
+                mm.e->draft_floor_topup(launched[i], W, mdu[i]);
+                mm.gate_cap = cap[i];
+                mm.md_used = mdu[i];
+                want[i] = W;
+            }
+            na = keep;
+        }
+        // B8 (always-on; no build defines NDEBUG, so assert is live):
+        // re-derive {cap, W, launched} for every gated member by running
+        // draft_and_gate's arithmetic over the SAME recorded margins
+        // (h_draft_margin persists on the engine; the re-run reads exactly
+        // the prefix this round refreshed, because it breaks at the same
+        // first sub-theta). Any mismatch is an interleave logic bug --
+        // caught here, before it can reach the byte gate.
+        for (int i = 0; i < k; i++) {
+            if (sfx[i]) continue;
+            const Engine& e = *ms[i]->e;
+            int rcap = 0, rlaunched = 0;
+            for (int s = 0; s < mdu[i]; s++) {
+                rlaunched++;
+                if (e.draft_margin(s) < e.gate_theta()) break;
+                rcap++;
+            }
+            int rW = rcap + 1 < 2 ? 2 : rcap + 1;
+            assert(rcap == ms[i]->gate_cap && "B8: interleaved cap != draft_and_gate cap");
+            assert(rW == want[i] && "B8: interleaved W != draft_and_gate W");
+            assert(rlaunched == launched[i] && "B8: interleaved launch count diverged");
+            (void)rcap; (void)rW; (void)rlaunched;
+        }
+    }
+
     // One fused round over k >= 2 members (under the caller's Lease).
-    // Sequence per the plan: drafts already ran inside want_width() on each
+    // Sequence per the plan: drafts already ran inside draft_widths() above
+    // (P2a: gated members' steps interleaved across engines) on each
     // engine's OWN stm; record each draft_done event; fused verify on cstm
     // (which waits on the events); per-engine outcome D2H on cstm + ONE
     // sync; per-member commit_outcome (spec_round's post-outcome mirror,
@@ -806,12 +967,11 @@ private:
         // synchronize any work -- they only timestamp):
         //   ev_round_start .. ev_draft_end = the cstm-visible DRAFT wait
         //     (ev_draft_end is recorded by fused_verify_round right after
-        //     its draft_done waits). Under the current SERIAL host drafts,
-        //     draft_and_gate syncs every margin step on the member's own
-        //     stm before we get here, so this span is only the unsynced
-        //     draft tail (floor top-up launches / suffix prep+H2D) -- i.e.
-        //     the whole draft phase tail as cstm sees it. Post-P2a overlap
-        //     this same bracket becomes the real concurrent-draft wall.
+        //     its draft_done waits). P2a interleaves the margin loops but
+        //     still host-syncs every step (draft_widths above), so this
+        //     span is only the unsynced draft tail (floor top-up launches /
+        //     suffix prep+H2D); the concurrent margin-loop wall lives
+        //     host-side in draft_widths, before ev_round_start exists.
         //   ev_draft_end .. ev_verify_end = fused VERIFY: union sweep +
         //     per-engine mixers/tails + the outcome D2H enqueue.
         CUDA_CHECK(cudaEventRecord(ev_round_start, cstm));
