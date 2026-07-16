@@ -5905,3 +5905,30 @@ only on synthetic drivers, sanitizers only in own systemd scopes); w16
 memcheck full tracking impossible on 32GB (device tracking + 26GB anchor);
 md5 refs are text+trailing-newline (a hashlib comparison without it cost a
 bisect cycle).
+
+**2026-07-16 -- P2c FUSED DRAFT STEPS: THE BAR PASSES. fp8 1.31x / turbo3
+1.35x (bar 1.3x), solo regression 0%.** The full P2 arc, all measured on the
+same shape (batch_ab REPS=3, w16 2x32K, medians):
+
+  stage                    fp8 agg (B)   ratio    turbo3 agg (B)  ratio
+  P1 (fused verify only)      204.0      1.21x       197.8        1.24x
+  +P2a draft overlap          204.5      ~1.21x      198.1        ~1.24x
+  +P2b mixer fork/join        209.6      1.25x       201.8        1.27x
+  +P2c fused draft steps      221.6      1.31x       214.6        1.35x
+
+P2c = one MTP weight sweep per draft step across active engines
+(MtpLaneView + mtp_pre/attn/post/tail seams mirror the P0 pattern;
+per-step chain pointers via Engine::mtp_step_view; k==1 falls back to the
+captured solo graphs -- no nbatch=1 multi-lane kernel exists). Margins
+bitwise identical to solo (gemv N-invariance, ninv 28/28; B8 assert silent
+across every run), so caps/widths/bytes identical: master gate 32/32
+like-composition positions across both KVs + B4 self-determinism. Solo
+regression 4/4 PASS (one anomalous turbo3 control leg at 146.0 re-run:
+151.9, -0.07% -- one-off slow control, direction was inverted anyway).
+Attribution held end-to-end: draft time yielded to FUSION not overlap
+(weight-BW-bound), mixers to OVERLAP not fusion (state-bound) -- the two
+lessons of this phase. Remaining known taxes: mixer co-residency (~3.5ms
+of ceiling unrealized; fdmma smem suspected), eager launch (~1.9ms, P3).
+Plans: docs/plans/2026-07-15-batch-p2-overlap.md +
+2026-07-16-batch-p2c-draft-fusion.md. Exit phase (reviews, CC sanity,
+merge) next; Q27_BATCH remains default-off.
