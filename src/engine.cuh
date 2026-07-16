@@ -1125,6 +1125,38 @@ struct Engine {
         mtp_post(v);
         mtp_tail(v);
     }
+    // P2c Task 2 (fused draft steps): the per-step CHAIN-POINTER TABLE, the
+    // single source of truth for both the solo capture path
+    // (spec_draft_step_launches below is its composition) and the fused
+    // cross-engine union builder (build_mtp_union_view in conductor.h reads
+    // slot m from engine m's mtp_step_view(step)). Step 0's entries are the
+    // old k==0 mtp_forward args (h_next, d_token, d_draft, d_pos_m,
+    // margin+0); step k>0 chains MTP's own post-head-norm hidden through
+    // hs[k] into draft k+1 at pos_m{k+1}. One table so the two paths can
+    // never drift -- the 8->12 widening's by-name brace-list landmine.
+    MtpLaneView mtp_step_view(int step) {
+        assert(step >= 0 && step < D_MAX_MTP);
+        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
+        const int* ts[7] = {d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6};
+        int* ds[7] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6, d_draft7};
+        const int* ps[7] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7};
+        return mtp_solo_view(hs[step], ts[step], ds[step], ps[step], d_draft_margin + step);
+    }
+    // The step's per-engine PREAMBLE, stream-parameterized for the fused
+    // path (solo passes stm): step 0 = prep_round (round bookkeeping --
+    // d_P/d_outcome reset + lane/MTP position staging); step k>0 = the
+    // x1 -> hs[k] chain D2D (MTP's post-head-norm hidden becomes the next
+    // step's h_src). Same relative order as solo: the preamble precedes the
+    // step's first kernel.
+    void draft_step_prep(int step, cudaStream_t st) {
+        if (step == 0) {
+            q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
+                             st);
+            return;
+        }
+        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
+        CUDA_CHECK(cudaMemcpyAsync(hs[step], x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, st));
+    }
 
     // vw = verify batch width (# lanes: pending + drafts), read at GRAPH-CAPTURE
     // time only. P12 gated depth captures one verify graph per width in 1..5;
@@ -1427,18 +1459,19 @@ struct Engine {
         return {{d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7}};
     }
     void spec_draft_step_launches(int k) {
-        if (k == 0) {
-            q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome,
-                             stm);
-            mtp_forward(h_next, d_token, d_draft, d_pos_m, d_draft_margin + 0);
-            return;
-        }
-        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
-        const int* ts[7] = {d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6};
-        int* ds[7] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6, d_draft7};
-        const int* ps[7] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7};
-        CUDA_CHECK(cudaMemcpyAsync(hs[k], x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
-        mtp_forward(hs[k], ts[k], ds[k], ps[k], d_draft_margin + k);
+        // P2c: prep + chain selection live in draft_step_prep/mtp_step_view
+        // (ONE pointer table shared with the fused union builder).
+        // Composition is byte-identical to the pre-P2c body: step 0 =
+        // prep_round + the (h_next, d_token, d_draft, d_pos_m, margin+0)
+        // MTP pass; step k>0 = the x1 -> hs[k] D2D + the (hs[k], ts[k],
+        // ds[k], ps[k], margin+k) pass -- same kernels, same args, same
+        // order, so every existing graph capture records the same nodes.
+        draft_step_prep(k, stm);
+        MtpLaneView v = mtp_step_view(k);
+        mtp_pre(v);
+        mtp_attn(v.pos[0], stm);
+        mtp_post(v);
+        mtp_tail(v);
     }
 
     void spec_draft_launches() {
@@ -2103,6 +2136,13 @@ struct Engine {
     // why: the conductor reads step k's margin after ITS stream sync (the
     // host value is garbage until the caller synced stm past the D2H above).
     float draft_margin(int k) const { return h_draft_margin[k]; }
+    // P2c: the margin-D2H half of draft_step_launch, stream-parameterized --
+    // fused draft steps run on the conductor stream, so their margins land
+    // via cstm (the caller syncs cstm before reading draft_margin(k)).
+    void draft_margin_d2h(int k, cudaStream_t st) {
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_margin + k, d_draft_margin + k, 4,
+                                   cudaMemcpyDeviceToHost, st));
+    }
     // why: the conductor fires draft_and_gate's width-floor top-up when a
     // member leaves the interleaved loop. A width-W verify walks W-1 drafts,
     // so W draft rows must exist; the range is empty except at cap==0

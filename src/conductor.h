@@ -600,6 +600,85 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
 }
 
 // ---------------------------------------------------------------------------
+// P2c (docs/plans/2026-07-16-batch-p2c-draft-fusion.md Task 2): fused draft
+// steps -- per step of the interleaved loop, ONE union MTP weight sweep
+// (eh_proj mm + the MTP ffn + the dominant 248320-row head mm) serves every
+// still-active gated member. This is the P0/P1 union pattern applied to
+// mtp_forward: drafts were measured WEIGHT-BW-BOUND (P2a realized ~0 from
+// pure overlap -- concurrent engines just split one DDR/L2 read stream), so
+// the win is one weight read instead of k.
+//
+// Union slot m = engine m's mtp_step_view(step) lane 0 -- the per-step
+// h_src/tok/pos/draft_dst/margin_dst chain pointers (the table lives in
+// Engine::mtp_step_view, SHARED with the solo capture path so the two can
+// never drift). Engines advance in LOCKSTEP through the interleaved loop --
+// every active member enters at step 0 and advances by 1 per iteration --
+// so `step` is shared (the caller asserts launched[m] == step per member).
+// Slots >= k keep es[0]'s solo padding (never read; the gemv_*_n
+// `i < nb ? i : 0` convention).
+inline Engine::MtpLaneView build_mtp_union_view(Engine** es, int k, int step,
+                                                cudaStream_t cstm) {
+    assert(k >= 1 && k <= W_PLUMB); // == ConductorCore MAX_K (static_assert
+                                    // at the Conductor below); MtpLaneView
+                                    // lane arrays are W_PLUMB-slotted
+    // no duplicate engines: a dup would hand two union slots the SAME chain
+    // buffers and the sweep would double-write them
+    for (int a = 0; a < k; a++)
+        for (int b = a + 1; b < k; b++) assert(es[a] != es[b]);
+    // one weight set serves every lane: all members must share the
+    // DeviceModel (the server's shared_model construction)
+    for (int m = 1; m < k; m++) assert(&es[m]->shared_dm() == &es[0]->shared_dm());
+    Engine::MtpLaneView v = es[0]->mtp_step_view(step);
+    for (int m = 1; m < k; m++) {
+        const Engine::MtpLaneView sv = es[m]->mtp_step_view(step);
+        v.e_hn[m] = sv.e_hn[0];       v.x_mtp[m] = sv.x_mtp[0];
+        v.x1[m] = sv.x1[0];           v.y[m] = sv.y[0];
+        v.lg[m] = sv.lg[0];           v.ffn_g[m] = sv.ffn_g[0];
+        v.ffn_u[m] = sv.ffn_u[0];     v.h_src[m] = sv.h_src[0];
+        v.tok[m] = sv.tok[0];         v.pos[m] = sv.pos[0];
+        v.draft_dst[m] = sv.draft_dst[0];
+        v.margin_dst[m] = sv.margin_dst[0];
+        v.xq[m] = sv.xq[0];           v.am_blk1[m] = sv.am_blk1[0];
+        v.am_blk2[m] = sv.am_blk2[0]; v.amax[m] = sv.amax[0];
+    }
+    v.vw = k;
+    v.stm = cstm;
+    v.gemm_min = 99; // A1/Task-9 policy, MTP flavor: solo drafts run the
+                     // dp4a GEMV family, so the union must NEVER take vgemm
+                     // (mtp_mm has no vgemm path and asserts this; the GEMV
+                     // lanes are ninv-proven N-invariant, so untrimmed gated
+                     // margins stay BITWISE vs solo)
+    return v;
+}
+
+// One fused draft step at chain position `step` across engines es[0..k):
+// per-engine prep (step 0: prep_round bookkeeping; step>0: the x1 -> hs[step]
+// chain D2D -- same relative order as solo, the preamble precedes the step's
+// first kernel) -> union mtp_pre (embed/norms + ONE eh_proj sweep) ->
+// per-engine MTP attention -> union mtp_post (ONE ffn + head sweep) ->
+// per-lane argmax_margin tail. Eager, all on cstm -- the solo path keeps its
+// captured per-engine draft graphs untouched.
+// The MTP attentions run SERIAL on cstm, deliberately WITHOUT the P2b
+// side-stream fork/join: each is ONE token's attention against the tiny MTP
+// KV (vs the verify mixers' W lanes), so the per-engine record+wait
+// choreography would cost a comparable wall to what it hides, and the weight
+// sweeps on either side are the actual round wall.
+// The tail runs as the union-view loop: mtp_tail is per-lane already, and
+// the union view carries each engine's OWN argmax scratch
+// (lg/draft_dst/margin_dst/am_blk1/am_blk2 per lane), so lane t launches
+// exactly the solo argmax_margin call with engine t's buffers.
+inline void fused_draft_step(Engine** es, int k, int step, cudaStream_t cstm) {
+    assert(k >= 2); // k==1 stays on the captured solo step graphs (the
+                    // multi-lane kernel family has no nbatch=1 -- Task 1)
+    for (int m = 0; m < k; m++) es[m]->draft_step_prep(step, cstm);
+    Engine::MtpLaneView v = build_mtp_union_view(es, k, step, cstm);
+    es[0]->mtp_pre(v);
+    for (int m = 0; m < k; m++) es[m]->mtp_attn(v.pos[m], cstm);
+    es[0]->mtp_post(v);
+    es[0]->mtp_tail(v);
+}
+
+// ---------------------------------------------------------------------------
 // P1 Task 9: the Conductor -- ONE dedicated thread owning every decode round
 // in batch mode; request threads own everything else (prefill, SSE, slots).
 // Server-agnostic: Task 10 wires request threads to register_member() and
@@ -916,6 +995,17 @@ private:
     // must match the serial path -- and B1 makes that the gate (the Task 0
     // refs), not an assumption.
     //
+    // P2c ON TOP: when >= 2 gated members are still active at a step, the
+    // per-engine graph launches are replaced by ONE eager fused_draft_step
+    // on cstm (union MTP weight sweep -- drafts are weight-BW-bound, so
+    // P2a's overlap realized ~0 and fusion is the lever). The margins are
+    // computed by the same dp4a GEMV family at union width, ninv-proven
+    // bitwise per lane, so the loop arithmetic below is UNCHANGED and B8
+    // still re-derives {cap, W, launched} against draft_and_gate's
+    // semantics. A single remaining active member falls back to its solo
+    // step graphs (no nbatch=1 multi-lane kernels), and top-ups stay solo
+    // by the same argument.
+    //
     // EQUIVALENCE to draft_and_gate's loop, side by side. draft_and_gate:
     //   for (k = 0; k < md_used; k++) {
     //       launch step k; launched++;
@@ -978,13 +1068,62 @@ private:
             cap[i] = launched[i] = 0;
             act[na++] = i;
         }
+        // P2c ORDER FENCE: fused steps run on cstm, but each member's prior
+        // GPU work lives on its OWN stm (the sampled bootstrap enqueued just
+        // above; prefill / solo rounds before the member's first fused
+        // round). One event per member orders cstm behind it. draft_done
+        // doubles as the fence event: this wait is issued before
+        // fused_round() re-records it (single conductor thread, program
+        // order), and cudaStreamWaitEvent snapshots the record at call time
+        // -- the ctor event-pool argument. Skipped at na < 2: the loop below
+        // then never touches cstm (pure P2a solo path on the member's stm).
+        if (na >= 2) {
+            for (int j = 0; j < na; j++) {
+                Member& mm = *ms[act[j]];
+                CUDA_CHECK(cudaEventRecord(mm.draft_done, mm.e->stream()));
+                CUDA_CHECK(cudaStreamWaitEvent(cstm, mm.draft_done, 0));
+            }
+        }
+        // draft_done ORDERING NOTE (P2c): fused_round() records each
+        // member's draft_done on the member's OWN stm after this returns,
+        // and that stays correct -- everything a member contributes OFF cstm
+        // (suffix prep/H2D staging, sampled bootstrap, floor top-ups, the
+        // k==1 fallback steps below) is on its stm and thus captured, while
+        // the fused steps here run ON cstm, the same in-order stream the
+        // verify runs on (and are host-synced per step besides), so the
+        // verify needs no event to see them.
         for (int step = 0; na > 0; step++) {
-            for (int j = 0; j < na; j++) ms[act[j]]->e->draft_step_launch(step);
-            // B7: sequential host syncs are fine -- every active engine's
-            // step is already launched, so the GPU overlaps them regardless
-            // of host blocking order; wall = max member chain + sync latency.
-            for (int j = 0; j < na; j++)
-                CUDA_CHECK(cudaStreamSynchronize(ms[act[j]]->e->stream()));
+            if (na >= 2) {
+                // P2c: ONE union MTP weight sweep serves every still-active
+                // member at this chain position. When the active set shrinks
+                // the next iteration simply fuses at the smaller na -- ninv
+                // (slot/width invariance of the GEMV lanes) keeps every
+                // remaining member's margins bitwise across the width step.
+                Engine* aes[MAX_K];
+                for (int j = 0; j < na; j++) {
+                    // LOCKSTEP invariant build_mtp_union_view relies on:
+                    // every active member is about to run exactly `step`
+                    assert(launched[act[j]] == step &&
+                           "P2c: active members must be in draft-step lockstep");
+                    aes[j] = ms[act[j]]->e;
+                }
+                fused_draft_step(aes, na, step, cstm);
+                for (int j = 0; j < na; j++) aes[j]->draft_margin_d2h(step, cstm);
+                // ONE sync for all active members' margins (replaces P2a's
+                // per-member stm syncs; B7's argument applies unchanged).
+                CUDA_CHECK(cudaStreamSynchronize(cstm));
+            } else {
+                // Active set is down to ONE member: fall back to its
+                // captured solo step graphs on its OWN stm, exactly the P2a
+                // path -- the multi-lane kernel family has no nbatch=1
+                // instantiation (gemv_*_n starts at 2; Task 1 DECIDE), so a
+                // width-1 "union" cannot run the fused kernels. Ordering vs
+                // the fused steps this member's chain already ran on cstm is
+                // by HOST program order: the per-step cstm sync above
+                // completed them before this launch is issued.
+                ms[act[0]]->e->draft_step_launch(step);
+                CUDA_CHECK(cudaStreamSynchronize(ms[act[0]]->e->stream()));
+            }
             int keep = 0;
             for (int j = 0; j < na; j++) {
                 const int i = act[j];
@@ -1003,6 +1142,13 @@ private:
                 }
                 // draft_and_gate's epilogue for this member, at its exit
                 // step: floor W, width-floor top-up on ITS stm, out-params.
+                // P2c top-up fencing: the top-up graphs (rare, cap==0 only)
+                // stay per-engine solo launches on the member's stm; they
+                // read chain state the fused steps wrote on cstm, and that
+                // is safe by HOST program order -- this exit decision runs
+                // strictly after the per-step cstm sync completed those
+                // writes. fused_round() then records draft_done on this stm,
+                // so the verify is fenced behind the top-up as before.
                 int W = cap[i] + 1 < 2 ? 2 : cap[i] + 1;
                 mm.e->draft_floor_topup(launched[i], W, mdu[i]);
                 mm.gate_cap = cap[i];
