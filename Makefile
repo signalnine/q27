@@ -94,7 +94,7 @@ build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu 
 #   test_conductor -- CPU: trim policy + ConductorCore membership/round-boundary.
 #   fused_smoke    -- 2-engine fused round vs solo byte-identity + conductor +
 #                     A2 error-injection legs (needs the GPU + model).
-build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh $(VGEMM_SRC) | build
+build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh src/blocks.cuh $(VGEMM_SRC) | build
 	$(NVCC) $(NVCCFLAGS) tools/ninv_test.cu $(VGEMM_SRC) -o $@
 
 build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
