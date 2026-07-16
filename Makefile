@@ -41,7 +41,7 @@ build/test_kernels: src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks
 	$(NVCC) $(NVCCFLAGS) src/test_kernels.cu src/kernels.cu src/prefill.cu src/blocks.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
 
-build/q27-server: src/server.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                   src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h | build
