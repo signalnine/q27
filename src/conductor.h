@@ -467,10 +467,69 @@ inline UnionView build_union_view(Engine** es, const int* w, int k, cudaStream_t
 // at the draft->verify phase boundary. Recording an event on an in-order
 // stream adds no ordering and no synchronization; it only timestamps the
 // point where cstm was released to begin verify work.
+
+// P2b (plan 2026-07-15-batch-p2-overlap.md Task 3): mixer fork/join plumbing.
+// The caller (the Conductor) owns k side streams + a fork event + k mix
+// events; fused_verify_round, per mixer layer, records `fork` on cstm after
+// the union pre, launches engine m's mix on side[m] (fenced behind `fork`),
+// records mix[m] on side[m], and makes cstm wait every mix[m] before the
+// union post. nullptr = the P1 serial path (fused_smoke leg B keeps it as
+// the serial reference; legs C/D run the fork through the real Conductor).
+//
+// WHY P2b OVERLAPS WHERE P2a REALIZED ~0%: Task 2 measured the draft-overlap
+// gain at essentially zero because draft steps are WEIGHT-BW-BOUND -- two
+// engines stepping concurrently read the SAME MTP weights and just share one
+// DDR/L2 bandwidth stream, so concurrency buys nothing. The mixers rest on
+// DIFFERENT physics: fdmma verify attention is OCCUPANCY-bound (12.5% occ,
+// documented in the fdmma plan), and the GDN conv/delta chains are small
+// LATENCY-bound kernels; each engine's mix reads and writes ONLY its own
+// sequence state (its KV cache, conv rings, S roles, lane activations -- the
+// B2 audit below), i.e. DIFFERENT memory per engine. Co-resident streams
+// therefore add real parallelism instead of splitting one shared read
+// stream. P2a's lesson ("fusion-or-nothing") applies to weight sweeps;
+// fork/join applies to state chains.
+//
+// B2 ISOLATION AUDIT (2026-07-15 at a01c110, blocking precondition -- every
+// device buffer a mix touches is Engine-owned; nothing DeviceModel-shared is
+// written):
+//   gdn_mix(il, st):  RBuf -> conv_ring[il] / ring_sp[role-1][il] (RW, the
+//     per-lane recurrent conv chain), SBuf -> S[il] / S_sp[role-1][il] (RW,
+//     delta state), qkv/qkv_L (R), convout/convout_L (W then R, l2norm3 in
+//     place), g_L/beta_L (R), o_L (W) -- all Engine members. The ONE shared
+//     read is cw = T(il,"ssm_conv1d.weight").data: a DeviceModel WEIGHT,
+//     read-only at round time (concurrent reads are safe).
+//   attn_mix(il, st): qg_L (RW: wht3 rotates in place, attn reads), kbuf_L/
+//     vbuf_L (R), kcache[ci]/vcache[ci] (W disjoint rows, then R), scratch
+//     (RW, the fd/fdmma partials buffer), attnout_L (W, wht3 inverse in
+//     place), d_pos_L (R) -- all Engine members; NO weight reads at all.
+//   Host-side reads: vw/perm/kv_kind/kv_fp8/max_ctx/attn_cache_idx --
+//     per-engine members, mutated only at init/commit boundaries, never
+//     inside a round.
+//   (a) NO cudaGraphExec launches inside either mix -- plain kernel wrappers
+//       only (conv_step/l2norm3/delta_step/wht3/kv_store3/kv_store_t3/
+//       attn_decode3). The engines' graph execs are per-engine members and
+//       are never launched from the fused round.
+//   (b) host-side statics in the launch path: launch_fdmma_w's per-
+//       instantiation `static bool attr` (fdmma.cuh:415), fd_setattr<CT>'s
+//       (spec3.cu:627), and attn_decode3's one-shot arch/stages_pin/
+//       smem_per_sm/ns_pin/smc statics -- all one-shot cudaFuncSetAttribute
+//       / device-query latches, set on the FIRST launch (engine warm-up /
+//       graph capture, long before any fused round). Every mixer launch
+//       still issues from the SINGLE conductor thread -- the fork is
+//       streams, not threads -- so no host state is ever raced.
+//   (c) NO cudaMalloc/cudaMallocAsync in the round path (grep-verified:
+//       engine allocations live in init/prefill/ckpt_save only; the fused
+//       round allocates nothing).
+struct MixerFork {
+    const cudaStream_t* side; // [k] conductor-owned side streams
+    cudaEvent_t fork;         // recorded on cstm after each union pre
+    const cudaEvent_t* mix;   // [k] recorded on side[m] after engine m's mix
+};
 inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStream_t cstm,
                                const cudaEvent_t* draft_done, const bool* is_suffix,
                                const bool* sampled = nullptr,
-                               cudaEvent_t ev_draft_end = nullptr) {
+                               cudaEvent_t ev_draft_end = nullptr,
+                               const MixerFork* mf = nullptr) {
     for (int m = 0; m < k; m++) CUDA_CHECK(cudaStreamWaitEvent(cstm, draft_done[m], 0));
     if (ev_draft_end) CUDA_CHECK(cudaEventRecord(ev_draft_end, cstm));
     UnionView uv = build_union_view(es, granted, k, cstm, is_suffix);
@@ -481,16 +540,39 @@ inline void fused_verify_round(Engine** es, const int* granted, int k, cudaStrea
                  LANESV(v, h), v.stm, v.vw);
     q27k::CP3 Hc LANESV(v, h), Yc LANESV(v, y);
     q27k::P3 Hm LANESV(v, h), X1m LANESV(v, x1);
+    // P2b: one fork/join per mixer layer. DEVICE-side ordering only (B6):
+    // cudaEventRecord + cudaStreamWaitEvent, never a host sync -- the round's
+    // one host sync stays in the caller. The stream argument is the ONLY
+    // delta vs the serial path: same kernels, same launch params, same
+    // per-engine buffers, so per-lane bytes must be identical (B1 gate).
+    auto mix_all = [&](int il, bool attn) {
+        if (!mf) { // serial P1 path (smoke leg B / embedders without a pool)
+            for (int m = 0; m < k; m++) {
+                if (attn) es[m]->attn_mix(il, cstm);
+                else      es[m]->gdn_mix(il, cstm);
+            }
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(mf->fork, cstm));
+        for (int m = 0; m < k; m++) {
+            CUDA_CHECK(cudaStreamWaitEvent(mf->side[m], mf->fork, 0));
+            if (attn) es[m]->attn_mix(il, mf->side[m]);
+            else      es[m]->gdn_mix(il, mf->side[m]);
+            CUDA_CHECK(cudaEventRecord(mf->mix[m], mf->side[m]));
+        }
+        for (int m = 0; m < k; m++)
+            CUDA_CHECK(cudaStreamWaitEvent(cstm, mf->mix[m], 0));
+    };
     for (int il = 0; il < N_LAYER; il++) {
         const float* an = (const float*)e0.T(il, "attn_norm.weight").data;
         q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
         if (e0.is_attn_layer(il)) {
             e0.attn_pre(il, v);
-            for (int m = 0; m < k; m++) es[m]->attn_mix(il, cstm);
+            mix_all(il, true);
             e0.attn_post(il, v);
         } else {
             e0.gdn_pre(il, v);
-            for (int m = 0; m < k; m++) es[m]->gdn_mix(il, cstm);
+            mix_all(il, false);
             e0.gdn_post(il, v);
         }
         q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
@@ -584,6 +666,30 @@ public:
         CUDA_CHECK(cudaEventCreate(&ev_round_start));
         CUDA_CHECK(cudaEventCreate(&ev_draft_end));
         CUDA_CHECK(cudaEventCreate(&ev_verify_end));
+        // P2b: conductor-owned mixer side streams + the fork/join event pool
+        // (MixerFork rationale + B2 audit at fused_verify_round). Side
+        // streams are NOT the engines' stms -- the draft_done/stm ordering
+        // contract stays untouched -- and are NonBlocking so they never
+        // implicitly serialize against the legacy default stream.
+        //
+        // EVENT-POOL SIZING (the plan's "justify or size 2x" call): ONE fork
+        // event + MAX_K mix events, REUSED for every mixer layer of every
+        // round. This is legal under documented CUDA semantics WITHOUT any
+        // consumption argument: cudaStreamWaitEvent snapshots the work
+        // captured by the most recent cudaEventRecord AT THE TIME OF THE
+        // WAIT CALL, so a later re-record cannot retarget an already-issued
+        // wait. All records and waits are issued by this single conductor
+        // thread in program order -- layer il's waits are issued before
+        // layer il+1 re-records -- and the B3 round_active guard forbids a
+        // second in-flight round whose records could interleave. Chosen over
+        // a 2x alternating pool because snapshot semantics make "was the
+        // prior wait consumed?" irrelevant, which is the simpler-to-justify
+        // (and assert-backed) invariant.
+        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&side_[i], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_mix_[i], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming));
         core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
         core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
                                   int k, bool* done) {
@@ -601,6 +707,11 @@ public:
         CUDA_CHECK(cudaEventDestroy(ev_round_start));
         CUDA_CHECK(cudaEventDestroy(ev_draft_end));
         CUDA_CHECK(cudaEventDestroy(ev_verify_end));
+        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
+            CUDA_CHECK(cudaStreamDestroy(side_[i]));
+            CUDA_CHECK(cudaEventDestroy(ev_mix_[i]));
+        }
+        CUDA_CHECK(cudaEventDestroy(ev_fork_));
         CUDA_CHECK(cudaStreamDestroy(cstm));
     }
     Conductor(const Conductor&) = delete;
@@ -975,7 +1086,11 @@ private:
         //   ev_draft_end .. ev_verify_end = fused VERIFY: union sweep +
         //     per-engine mixers/tails + the outcome D2H enqueue.
         CUDA_CHECK(cudaEventRecord(ev_round_start, cstm));
-        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end);
+        // P2b: hand the side-stream pool to the verify round so each
+        // engine's mixers fork off cstm per layer (rationale + audit at
+        // MixerFork / fused_verify_round).
+        MixerFork mfork{side_, ev_fork_, ev_mix_};
+        fused_verify_round(es, granted, k, cstm, evs, sfx, sampled, ev_draft_end, &mfork);
         int oc[ConductorCore<Member>::MAX_K][OUTCOME_INTS];
         for (int i = 0; i < k; i++)
             CUDA_CHECK(cudaMemcpyAsync(oc[i], es[i]->outcome_dev(), OUTCOME_INTS * 4,
@@ -1072,6 +1187,10 @@ private:
     // B3 one-round-in-flight invariant flag (conductor-thread-only).
     cudaEvent_t ev_round_start = nullptr, ev_draft_end = nullptr,
                 ev_verify_end = nullptr;
+    // P2b mixer fork/join pool (ctor comment: sizing justification). Sized
+    // MAX_K, used [0..k) per round; conductor-thread-only like cstm.
+    cudaStream_t side_[ConductorCore<Member>::MAX_K] = {};
+    cudaEvent_t ev_fork_ = nullptr, ev_mix_[ConductorCore<Member>::MAX_K] = {};
     bool round_active = false;
     std::thread th;
     std::mutex m; // guards join_q + stop (the cross-thread handoff surface)
