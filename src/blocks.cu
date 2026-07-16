@@ -142,6 +142,9 @@ void gdn_gates(const float* alpha_raw, const float* beta_raw, const float* ssm_a
     CUDA_CHECK(cudaGetLastError());
 }
 
+// MIRROR WARNING (P3 exit review M2): k_conv_step_t below is a TABLE TWIN of
+// this body -- any arithmetic change here MUST be mirrored there and re-gated
+// with ninv's TWIN leg (bitwise, both arches), or the fused path diverges.
 __global__ void k_conv_step(const float* __restrict__ rin, float* __restrict__ rout,
                             const float* __restrict__ qkv, const float* __restrict__ w,
                             float* __restrict__ out, int channels) {
@@ -205,6 +208,8 @@ void conv_step_t(float* const* ring_tab, const int* d_perm, int role_in, int rol
 // Gated delta rule, one token. Block per v-head, 512 threads = (i-tile: 4) x (j: 128).
 // The i-reductions (pred = k^T S, o = q^T S) parallelize across 4 tiles of 32 i each;
 // consecutive threads hit consecutive j -> coalesced on S[i*SK + j].
+// MIRROR WARNING (P3 exit review M2): k_delta_step_t is a TABLE TWIN of this
+// body -- mirror any change there and re-gate with ninv's TWIN leg.
 __global__ void k_delta_step(const float* __restrict__ Ssrc, float* __restrict__ Sdst,
                              const float* __restrict__ conv,
                              const float* __restrict__ g, const float* __restrict__ beta,

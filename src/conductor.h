@@ -451,7 +451,9 @@ inline bool union_view_eq(const UnionView& a, const UnionView& b) {
     Q27_UVEQ(ffn_g) Q27_UVEQ(ffn_u) Q27_UVEQ(h) Q27_UVEQ(lg)
 #undef Q27_UVEQ
     for (int t = 0; t < W_PLUMB; t++) {
-        // XQuant is 4 pointers, no padding -- memcmp-safe per element
+        // XQuant is 6 pointers (nat/scale/eo/nat64/s64/isum -- kernels.cuh:17),
+        // no padding: memcmp over sizeof covers ALL of them; do NOT "simplify"
+        // to per-field compares (a new field would silently blind the guard)
         if (std::memcmp(&x.xq[t], &y.xq[t], sizeof(q27k::XQuant))) return false;
         if (x.vtok.p[t] != y.vtok.p[t] || x.pos.p[t] != y.pos.p[t] ||
             x.dv[t] != y.dv[t])
@@ -1667,6 +1669,15 @@ private:
                     gc_guard_trips_);
             gc_destroy(gcache_[hit]);
             gcache_.erase(gcache_.begin() + hit);
+            // M1 (P3 exit review): the eager fallback runs the TABLE TWINS,
+            // which read the same d_perm_scalar a broken staging path would
+            // have left stale -- falling back without re-staging would
+            // "recover" into the same corruption the guard detected. Re-issue
+            // the staging for every member before the eager round (idempotent
+            // k pinned 4-byte copies; unreachable today since fused_round
+            // stages unconditionally, but the guard exists for the refactor
+            // that breaks that).
+            for (int i = 0; i < k; i++) es[i]->stage_perm_async(cstm);
             fused_verify_round(es, granted, k, cstm, /*draft_done=*/nullptr, sfx,
                                sampled, /*ev_draft_end=*/nullptr, mf);
             return;
