@@ -988,12 +988,23 @@ struct Engine {
             qs[i] = v.xq[i];
             ys[i] = ys_a[i];
         }
-        if (w.dtype == DType::Q4_G64)
-            q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
-                            w.cols, v.stm);
-        else
-            q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys, w.rows,
-                            w.cols, v.stm);
+        switch (w.dtype) {
+            case DType::Q4_G64:
+                q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            case DType::Q8_G128:
+                q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, v.vw, ys,
+                                w.rows, w.cols, v.stm);
+                break;
+            default:
+                // mirror mm()/mtp_mm1: fail loud on a dtype with no multi-lane
+                // twin (the old bare else silently fed any non-Q4 weight to
+                // the Q8 kernel; every MTP weight is Q4/Q8, so this is a
+                // guard, not a live-path change).
+                fprintf(stderr, "mtp_mm: unsupported dtype\n");
+                exit(1);
+        }
     }
     // single-lane mm twin reading the view's lane 0 instead of members. The
     // P2c DECIDE gate: gemv_*_n has NO nbatch=1 kernel (its switch starts at
@@ -1134,13 +1145,29 @@ struct Engine {
     // margin+0); step k>0 chains MTP's own post-head-norm hidden through
     // hs[k] into draft k+1 at pos_m{k+1}. One table so the two paths can
     // never drift -- the 8->12 widening's by-name brace-list landmine.
-    MtpLaneView mtp_step_view(int step) {
+    // The table itself lives in mtp_step_chain (P2 exit review dedup):
+    // BOTH readers -- mtp_step_view and draft_step_prep's D2D target --
+    // index the same brace lists, so a chain edit lands in one place.
+    struct MtpStepChain {
+        float* h;       // hs[step]: this step's h_src; step+1's D2D target
+        const int* tok; // ts[step]: token the step embeds
+        int* dst;       // ds[step]: draft slot the step's argmax writes
+        const int* pos; // ps[step]: the step's MTP position
+    };
+    MtpStepChain mtp_step_chain(int step) {
         assert(step >= 0 && step < D_MAX_MTP);
-        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
-        const int* ts[7] = {d_token, d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6};
-        int* ds[7] = {d_draft, d_draft2, d_draft3, d_draft4, d_draft5, d_draft6, d_draft7};
-        const int* ps[7] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4, d_pos_m5, d_pos_m6, d_pos_m7};
-        return mtp_solo_view(hs[step], ts[step], ds[step], ps[step], d_draft_margin + step);
+        float* hs[D_MAX_MTP] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
+        const int* ts[D_MAX_MTP] = {d_token, d_draft, d_draft2, d_draft3,
+                                    d_draft4, d_draft5, d_draft6};
+        int* ds[D_MAX_MTP] = {d_draft, d_draft2, d_draft3, d_draft4,
+                              d_draft5, d_draft6, d_draft7};
+        const int* ps[D_MAX_MTP] = {d_pos_m, d_pos_m2, d_pos_m3, d_pos_m4,
+                                    d_pos_m5, d_pos_m6, d_pos_m7};
+        return {hs[step], ts[step], ds[step], ps[step]};
+    }
+    MtpLaneView mtp_step_view(int step) {
+        const MtpStepChain c = mtp_step_chain(step);
+        return mtp_solo_view(c.h, c.tok, c.dst, c.pos, d_draft_margin + step);
     }
     // The step's per-engine PREAMBLE, stream-parameterized for the fused
     // path (solo passes stm): step 0 = prep_round (round bookkeeping --
@@ -1154,8 +1181,8 @@ struct Engine {
                              st);
             return;
         }
-        float* hs[7] = {h_next, h_next2, h_next3, h_next4, h_next5, h_next6, h_next7};
-        CUDA_CHECK(cudaMemcpyAsync(hs[step], x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, st));
+        CUDA_CHECK(cudaMemcpyAsync(mtp_step_chain(step).h, x1, N_EMBD * 4,
+                                   cudaMemcpyDeviceToDevice, st));
     }
 
     // vw = verify batch width (# lanes: pending + drafts), read at GRAPH-CAPTURE
@@ -2096,6 +2123,19 @@ struct Engine {
     // why: leave() hands the finish reason (stamped by finish_decode) to
     // the request thread via TokenQueue::close.
     const char* end_reason() const { return gs.end; }
+    // why: fused rounds have no spec_round to stamp the Q27_PHASE_STATS
+    // walls, so the conductor stamps them from its cstm event brackets
+    // (SHARED-WALL semantics; fused_round's accumulation comment) -- gated
+    // behind the SAME env latch the solo stamps use.
+    bool phase_stats_on() const { return phase_stats; }
+    // why: the phase fields stay engine-owned (GenStats); the conductor adds
+    // its per-round walls + this member's launched steps through one named
+    // mutator instead of reaching into gs (A4).
+    void phase_stats_add(double draft_ms, double verify_ms, long steps) {
+        gs.draft_ms += draft_ms;
+        gs.verify_ms += verify_ms;
+        gs.draft_steps += steps;
+    }
     //
     // Set the granted verify width for the NEXT (eager, fused) round. vw is
     // capture-time state for the graph zoo, so this must only be called on
@@ -2801,10 +2841,13 @@ struct Engine {
         // one fused-round wall is attributed IN FULL to EACH member, so
         // summing phd/phv across concurrently-batched requests DOUBLE-COUNTS
         // the wall (per-request phd/phv stays the honest "time my rounds
-        // spent in phase X" read). Fused draft_ms is the cstm-visible draft
-        // wait (only the unsynced draft tail while host drafts are serial;
-        // the real concurrent-draft wall after P2a). draft_steps is NOT
-        // shared: steps THIS member launched.
+        // spent in phase X" read). Fused draft_ms is only the cstm-visible
+        // draft TAIL: the draft phase (P2a interleave / P2c fused steps)
+        // runs host-synced per step inside Conductor::draft_widths, BEFORE
+        // the round's ev_round_start is recorded -- so phd brackets just the
+        // unsynced launches between round start and the draft_done waits
+        // (floor top-ups, suffix prep/H2D), never the draft wall itself.
+        // draft_steps is NOT shared: steps THIS member launched.
         double draft_ms = 0, verify_ms = 0;
         long draft_steps = 0;
         // verify wall bucketed by verify width W=cap+1 (floored 2, <=W_MAX)

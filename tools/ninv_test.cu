@@ -33,6 +33,21 @@
 // determinism contract downgrades for that family and the design doc gets the
 // measured diff. Do not touch the kernels.
 //
+// SEAM LEG (P2 exit review, 2026-07-16): the tables above prove the
+// MULTI-lane family invariant against itself (T/slot). But the SOLO draft
+// path runs the SINGLE-lane family (k_gemv_q4/q8 via mm()/mtp_mm1,
+// k_quantize_x via qx, k_rmsnorm, k_add via add_inplace, k_embed_row_q8,
+// k_silu_mul) while the fused draft step runs the multi-lane twins -- so the
+// P2c "fused margins bitwise vs solo" claim ALSO rests on single==multi for
+// the payload lane, a seam no gate covered (test_kernels compares the gemv
+// pair at 1e-5 tolerance only). The gemv twins carry different
+// __launch_bounds__ tiers and differently-shaped accumulate expressions, so
+// bitwise equality across the seam is a MEASUREMENT, not a property of "same
+// math". The leg: identical payload input -> single-lane kernel vs multi-lane
+// twin (payload in one live lane, junk elsewhere, T in {2,4}), BITWISE
+// memcmp. EITHER verdict is a valid result -- a DIFFER downgrades the
+// documented claim to tolerance-class (A1 flavor); do not touch the kernels.
+//
 // Usage: ninv_test [model.q27]   (default: the canonical qwen36-27b-mtp)
 #include <cmath>
 #include <cstdint>
@@ -42,6 +57,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/blocks.cuh" // add_inplace (the solo residual add; seam leg)
 #include "../src/device_model.h"
 #include "../src/kernels.cuh"
 #include "../src/loader.h"
@@ -205,6 +221,244 @@ static int run_table(const char* tag, Fam fam, const q27::DevTensor& w, float* d
     return fails - before;
 }
 
+// ---------------------------------------------------------------------------
+// SEAM LEG (file-header comment: single-lane kernels vs their multi-lane
+// twins across the solo/fused draft seam). Reuses the payload/junk state
+// above; junk lanes carry per-run junk so lane bleed cannot vacuously pass.
+
+static int seam_pairs_differ = 0; // pairs with >= 1 differing config
+
+// float-bit lexicographic map -> ulp distance between bitwise-unequal floats
+// (NaN/Inf just map to large deltas; we only ever print this on a DIFF).
+static int64_t ulp_delta(float a, float b) {
+    int32_t ia, ib;
+    memcpy(&ia, &a, 4);
+    memcpy(&ib, &b, 4);
+    int64_t la = ia >= 0 ? (int64_t)ia : (int64_t)0x80000000LL - ia;
+    int64_t lb = ib >= 0 ? (int64_t)ib : (int64_t)0x80000000LL - ib;
+    int64_t d = la - lb;
+    return d < 0 ? -d : d;
+}
+
+// bitwise word compare of two device f32 buffers; tracks max ulp over diffs
+static long seam_cmp(const float* d_a, const float* d_b, int64_t n, int64_t* max_ulp) {
+    std::vector<float> ha(n), hb(n);
+    CUDA_CHECK(cudaMemcpy(ha.data(), d_a, n * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hb.data(), d_b, n * 4, cudaMemcpyDeviceToHost));
+    if (memcmp(ha.data(), hb.data(), n * 4) == 0) return 0;
+    long diffs = 0;
+    for (int64_t i = 0; i < n; i++)
+        if (memcmp(&ha[i], &hb[i], 4) != 0) {
+            diffs++;
+            int64_t u = ulp_delta(ha[i], hb[i]);
+            if (u > *max_ulp) *max_ulp = u;
+        }
+    return diffs;
+}
+
+// raw byte compare (the quantize pair's int8/eo/isum sub-buffers)
+static long seam_cmp_bytes(const void* d_a, const void* d_b, int64_t bytes) {
+    std::vector<uint8_t> ha(bytes), hb(bytes);
+    CUDA_CHECK(cudaMemcpy(ha.data(), d_a, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hb.data(), d_b, bytes, cudaMemcpyDeviceToHost));
+    long diffs = 0;
+    for (int64_t i = 0; i < bytes; i++)
+        if (ha[i] != hb[i]) diffs++;
+    return diffs;
+}
+
+static void seam_row(const char* tag, int T, int slot, long diffs, int64_t max_ulp, int64_t n,
+                     bool* pair_diff) {
+    printf("  %-24s T=%d slot=%d  diffs=%ld/%lld  %s", tag, T, slot, diffs,
+           (long long)n, diffs == 0 ? "PASS" : "DIFF");
+    if (diffs) printf("  (max %lld ulp)", (long long)max_ulp);
+    printf("\n");
+    if (diffs) *pair_diff = true;
+}
+
+static void seam_leg(q27::DeviceModel& dm, const q27::DevTensor& w_down,
+                     const q27::DevTensor& w_head, const q27::DevTensor& w_sout) {
+    const q27::DevTensor& emb = dm.upload("token_embd.weight"); // Q8_G128, cols 5120
+    const int64_t NE = 5120; // rmsnorm/add/embed width (N_EMBD)
+    const int64_t NF = MAXC; // silu/quantize width (N_FFN)
+    const struct { int T, slot; } CFG[] = {{2, 0}, {4, 2}};
+
+    // leg-owned buffers: single/multi payload outputs + rmsnorm weight +
+    // fresh XQuant pair (pay_xq must stay untouched -- the gemv rows read it
+    // as the SHARED input of both runs) + token slots for the embed pair.
+    float *d_ys, *d_ym, *d_wrms;
+    CUDA_CHECK(cudaMalloc(&d_ys, NF * 4));
+    CUDA_CHECK(cudaMalloc(&d_ym, NF * 4));
+    CUDA_CHECK(cudaMalloc(&d_wrms, NE * 4));
+    fill_rand(h_scratch.data(), NE, 0xBEEFu, 0.9f);
+    CUDA_CHECK(cudaMemcpy(d_wrms, h_scratch.data(), NE * 4, cudaMemcpyHostToDevice));
+    q27k::XQuant xq_s = q27k::xquant_alloc(NF), xq_m = q27k::xquant_alloc(NF);
+    int* d_tok; // slot 0 = payload token 1234; slots 1.. = junk row ids
+    CUDA_CHECK(cudaMalloc(&d_tok, W_PLUMB * 4));
+    {
+        int htok[W_PLUMB];
+        for (int s = 0; s < W_PLUMB; s++) htok[s] = 100 + 37 * s;
+        htok[0] = 1234;
+        CUDA_CHECK(cudaMemcpy(d_tok, htok, sizeof htok, cudaMemcpyHostToDevice));
+    }
+
+    printf("\n== seam: single-lane kernels vs multi-lane twins (payload lane, bitwise) ==\n");
+    bool pd_gemv4 = false, pd_gemv8 = false, pd_q = false, pd_rms = false, pd_add = false,
+         pd_emb = false, pd_silu = false;
+
+    for (const auto& c : CFG) {
+        const int T = c.T, slot = c.slot;
+        int64_t mu;
+        long d;
+
+        // gemv_q4 vs gemv_q4_n (both engine Q4 shapes), gemv_q8 vs gemv_q8_n.
+        // Both runs read the SAME pay_xq[0] device bytes: the kernel pair is
+        // the only variable.
+        const q27::DevTensor* ws[3] = {&w_down, &w_head, &w_sout};
+        const char* wtag[3] = {"gemv_q4[ffn_down]", "gemv_q4[head]", "gemv_q8[ssm_out]"};
+        for (int wi = 0; wi < 3; wi++) {
+            const q27::DevTensor& w = *ws[wi];
+            regen_junk(0x900u + 0x10u * (uint32_t)wi + (uint32_t)T);
+            CUDA_CHECK(cudaMemset(d_y_run[0][0], 0xAA, w.rows * 4));
+            CUDA_CHECK(cudaMemset(d_y_run[1][0], 0xBB, w.rows * 4));
+            if (w.dtype == q27::DType::Q4_G64)
+                q27k::gemv_q4((const uint8_t*)w.data, (const __half*)w.scales, pay_xq[0],
+                              d_y_run[0][0], w.rows, w.cols);
+            else
+                q27k::gemv_q8((const int8_t*)w.data, (const __half*)w.scales, pay_xq[0],
+                              d_y_run[0][0], w.rows, w.cols);
+            q27k::XQuant qs[W_PLUMB];
+            float* ys[W_PLUMB];
+            for (int s = 0; s < W_PLUMB; s++) { qs[s] = junk_xq[s]; ys[s] = d_junk_y[s]; }
+            qs[slot] = pay_xq[0];
+            ys[slot] = d_y_run[1][0];
+            if (w.dtype == q27::DType::Q4_G64)
+                q27k::gemv_q4_n((const uint8_t*)w.data, (const __half*)w.scales, qs, T, ys,
+                                w.rows, w.cols);
+            else
+                q27k::gemv_q8_n((const int8_t*)w.data, (const __half*)w.scales, qs, T, ys,
+                                w.rows, w.cols);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp(d_y_run[0][0], d_y_run[1][0], w.rows, &mu);
+            seam_row(wtag[wi], T, slot, d, mu, w.rows, wi == 2 ? &pd_gemv8 : &pd_gemv4);
+        }
+
+        // quantize_x vs quantize3: all four output sub-buffers, bitwise.
+        {
+            regen_junk(0x950u + (uint32_t)T);
+            CUDA_CHECK(cudaMemset(xq_s.nat, 0xAA, NF));
+            CUDA_CHECK(cudaMemset(xq_s.eo, 0xAA, NF / 8 * sizeof(uint2)));
+            CUDA_CHECK(cudaMemset(xq_s.scale, 0xAA, NF / 32 * 4));
+            CUDA_CHECK(cudaMemset(xq_s.isum, 0xAA, NF / 32 * 4));
+            CUDA_CHECK(cudaMemset(xq_m.nat, 0xBB, NF));
+            CUDA_CHECK(cudaMemset(xq_m.eo, 0xBB, NF / 8 * sizeof(uint2)));
+            CUDA_CHECK(cudaMemset(xq_m.scale, 0xBB, NF / 32 * 4));
+            CUDA_CHECK(cudaMemset(xq_m.isum, 0xBB, NF / 32 * 4));
+            q27k::quantize_x(d_pay_x[0], NF, xq_s);
+            q27k::CP3 xs{};
+            q27k::XQ3 x3{};
+            for (int s = 0; s < W_PLUMB; s++) { xs.p[s] = d_junk_x[s]; x3.q[s] = junk_xq[s]; }
+            xs.p[slot] = d_pay_x[0];
+            x3.q[slot] = xq_m;
+            q27k::quantize3(xs, NF, x3, 0, T);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp_bytes(xq_s.nat, xq_m.nat, NF);
+            d += seam_cmp_bytes(xq_s.eo, xq_m.eo, NF / 8 * sizeof(uint2));
+            d += seam_cmp(xq_s.scale, xq_m.scale, NF / 32, &mu);
+            d += seam_cmp_bytes(xq_s.isum, xq_m.isum, NF / 32 * 4);
+            seam_row("quantize_x", T, slot, d, mu, NF + NF / 8 + 2 * (NF / 32), &pd_q);
+        }
+
+        // rmsnorm vs rmsnorm3
+        {
+            regen_junk(0x960u + (uint32_t)T);
+            CUDA_CHECK(cudaMemset(d_ys, 0xAA, NE * 4));
+            CUDA_CHECK(cudaMemset(d_ym, 0xBB, NE * 4));
+            q27k::rmsnorm(d_pay_x[0], d_wrms, d_ys, (int)NE, 1e-6f);
+            q27k::CP3 x{};
+            q27k::P3 y{};
+            for (int s = 0; s < W_PLUMB; s++) { x.p[s] = d_junk_x[s]; y.p[s] = d_junk_y[s]; }
+            x.p[slot] = d_pay_x[0];
+            y.p[slot] = d_ym;
+            q27k::rmsnorm3(x, d_wrms, y, (int)NE, 1e-6f, 0, T);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp(d_ys, d_ym, NE, &mu);
+            seam_row("rmsnorm", T, slot, d, mu, NE, &pd_rms);
+        }
+
+        // add_inplace vs add3 (in place: both sides seeded with the payload;
+        // junk lanes get d_junk_y as their mutable accumulator)
+        {
+            regen_junk(0x970u + (uint32_t)T);
+            CUDA_CHECK(cudaMemcpy(d_ys, d_pay_x[0], NE * 4, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_ym, d_pay_x[0], NE * 4, cudaMemcpyDeviceToDevice));
+            q27k::add_inplace(d_ys, d_pay_x[1], (int)NE);
+            q27k::P3 x{};
+            q27k::CP3 yy{};
+            for (int s = 0; s < W_PLUMB; s++) { x.p[s] = d_junk_y[s]; yy.p[s] = d_junk_x[s]; }
+            x.p[slot] = d_ym;
+            yy.p[slot] = d_pay_x[1];
+            q27k::add3(x, yy, (int)NE, 0, T);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp(d_ys, d_ym, NE, &mu);
+            seam_row("add", T, slot, d, mu, NE, &pd_add);
+        }
+
+        // embed_row_q8 vs embed3 (junk lanes read junk token rows; read-only
+        // weight, so a junk lane sharing the payload row would be harmless)
+        {
+            regen_junk(0x980u + (uint32_t)T);
+            CUDA_CHECK(cudaMemset(d_ys, 0xAA, NE * 4));
+            CUDA_CHECK(cudaMemset(d_ym, 0xBB, NE * 4));
+            q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_tok, NE,
+                               d_ys);
+            q27k::IP3 tk{};
+            q27k::P3 out{};
+            for (int s = 0; s < W_PLUMB; s++) { tk.p[s] = d_tok + s; out.p[s] = d_junk_y[s]; }
+            tk.p[slot] = d_tok;
+            out.p[slot] = d_ym;
+            q27k::embed3((const int8_t*)emb.data, (const __half*)emb.scales, tk, NE, out, 0, T);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp(d_ys, d_ym, NE, &mu);
+            seam_row("embed_row_q8", T, slot, d, mu, NE, &pd_emb);
+        }
+
+        // silu_mul vs silu_mul3 (solo path runs out == gate in place; the
+        // multi twin is in place on g by construction)
+        {
+            regen_junk(0x990u + (uint32_t)T);
+            CUDA_CHECK(cudaMemcpy(d_ys, d_pay_x[0], NF * 4, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(d_ym, d_pay_x[0], NF * 4, cudaMemcpyDeviceToDevice));
+            q27k::silu_mul(d_ys, d_pay_x[1], d_ys, (int)NF);
+            q27k::P3 g{};
+            q27k::CP3 u{};
+            for (int s = 0; s < W_PLUMB; s++) { g.p[s] = d_junk_y[s]; u.p[s] = d_junk_x[s]; }
+            g.p[slot] = d_ym;
+            u.p[slot] = d_pay_x[1];
+            q27k::silu_mul3(g, u, (int)NF, 0, T);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            mu = 0;
+            d = seam_cmp(d_ys, d_ym, NF, &mu);
+            seam_row("silu_mul", T, slot, d, mu, NF, &pd_silu);
+        }
+    }
+
+    seam_pairs_differ =
+        (int)pd_gemv4 + pd_gemv8 + pd_q + pd_rms + pd_add + pd_emb + pd_silu;
+    if (seam_pairs_differ == 0) printf("SEAM BITWISE: ALL PASS\n");
+    else printf("SEAM BITWISE: %d pairs DIFFER (tolerance-class)\n", seam_pairs_differ);
+
+    CUDA_CHECK(cudaFree(d_ys));
+    CUDA_CHECK(cudaFree(d_ym));
+    CUDA_CHECK(cudaFree(d_wrms));
+    CUDA_CHECK(cudaFree(d_tok));
+}
+
 int main(int argc, char** argv) {
     const char* path =
         argc > 1 ? argv[1] : "/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27";
@@ -284,6 +538,16 @@ int main(int argc, char** argv) {
     printf("\nfamily verdicts: vgemm_verify %s | gemv_q4_n/gemv_q8_n %s | gemv_f16_3 %s\n",
            fam_fail[F_VGEMM] ? "FAIL" : "PASS", fam_fail[F_GEMV] ? "FAIL" : "PASS",
            fam_fail[F_F16] ? "FAIL" : "PASS");
+
+    // P2 exit review: the single/multi-lane seam (file-header SEAM LEG note).
+    seam_leg(dm, w_down, w_head, w_sout);
+    // Measured 2026-07-16 on BOTH arches (5090/sm_120 and 3090/sm_86 -- ptxas
+    // contraction is per-arch): ALL PASS, every pair, T in {2,4}. The seam IS
+    // bitwise, so it joins the gated contract: a future divergence (compiler
+    // flag, launch_bounds retier, kernel edit) must fail this binary, not
+    // silently downgrade the fused-vs-solo margin claim.
+    fails += seam_pairs_differ;
+
     if (fails == 0) printf("NINV ALL PASS\n");
     else printf("ninv_test: %d FAILURES -- finding, not a bug: contract downgrades per A1\n",
                 fails);

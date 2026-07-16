@@ -15,6 +15,8 @@
 // ffn_pair/qx5/mm5/tails/T()/set_round_width/draft_and_gate/suffix_propose/
 // the P2a step-granular draft pieces (draft_sample_bootstrap/draft_md_used/
 // draft_step_launch/draft_margin/draft_floor_topup)/
+// the P2c fused-draft pieces (mtp_step_view/draft_step_prep/mtp_pre/
+// mtp_attn/mtp_post/mtp_tail/draft_margin_d2h)/
 // commit_outcome/pre_round/post_round/decode_step/finish_decode -- the last
 // only from the A2 catch epilogue, fail_member below) plus the named
 // ACCESSORS engine.cuh
@@ -645,9 +647,17 @@ inline Engine::MtpLaneView build_mtp_union_view(Engine** es, int k, int step,
     v.stm = cstm;
     v.gemm_min = 99; // A1/Task-9 policy, MTP flavor: solo drafts run the
                      // dp4a GEMV family, so the union must NEVER take vgemm
-                     // (mtp_mm has no vgemm path and asserts this; the GEMV
-                     // lanes are ninv-proven N-invariant, so untrimmed gated
-                     // margins stay BITWISE vs solo)
+                     // (mtp_mm has no vgemm path and asserts this). Margins
+                     // are BITWISE vs solo, and BOTH halves of that claim are
+                     // ninv-gated (tools/ninv_test.cu): the family tables pin
+                     // multi-lane N-invariance (T/slot), and the SEAM LEG
+                     // (P2 exit review 2026-07-16) pins the other half this
+                     // comment used to assume -- the solo path runs the
+                     // SINGLE-lane kernels (mtp_mm1/qx/rmsnorm/add/embed/
+                     // silu_mul) while the fused step runs the multi-lane
+                     // twins, and the leg measured every pair bitwise-equal
+                     // on both arches (T in {2,4}, payload lane vs junk).
+                     // A regression on either half now fails ninv_test.
     return v;
 }
 
@@ -736,12 +746,12 @@ public:
         CUDA_CHECK(cudaStreamCreate(&cstm)); // created ONCE; all fused rounds
         // P2 Task 1: fused-round phase-wall pool -- 3 TIMING events (default
         // flags, NOT cudaEventDisableTiming), created once and reused every
-        // round. Reuse is sound under the B3 invariant enforced by
-        // round_active in fused_round(): exactly ONE fused round is in
-        // flight per Conductor (single conductor thread, synchronous round
-        // loop -- each round records, syncs cstm, and reads elapsed before
-        // returning), so a record can never overwrite a timestamp that is
-        // still to be read.
+        // round. Reuse is sound under the B3 invariant enforced by the
+        // round_active bracket (opened in draft_widths, closed in
+        // fused_round): exactly ONE fused round is in flight per Conductor
+        // (single conductor thread, synchronous round loop -- each round
+        // records, syncs cstm, and reads elapsed before returning), so a
+        // record can never overwrite a timestamp that is still to be read.
         CUDA_CHECK(cudaEventCreate(&ev_round_start));
         CUDA_CHECK(cudaEventCreate(&ev_draft_end));
         CUDA_CHECK(cudaEventCreate(&ev_verify_end));
@@ -769,29 +779,30 @@ public:
             CUDA_CHECK(cudaEventCreateWithFlags(&ev_mix_[i], cudaEventDisableTiming));
         }
         CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming));
-        core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
-        core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
-                                  int k, bool* done) {
-            this->fused_round(ms, granted, sfx, k, done);
-        };
-        core.draft_widths = [this](Member** ms, int* want, bool* sfx, int k) {
-            this->draft_widths(ms, want, sfx, k);
-        };
-        core.on_leave = [this](Member& mm) { this->leave(mm); };
-        th = std::thread([this] { run(); });
+        // Exception guard (P2 exit review): a std::function assignment or
+        // std::thread construction throw below (bad_alloc / system_error)
+        // would leak every handle just created -- the dtor of an object
+        // whose ctor throws never runs. Tear down + rethrow.
+        try {
+            core.solo_round = [this](Member& mm) { return this->solo_round(mm); };
+            core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
+                                      int k, bool* done) {
+                this->fused_round(ms, granted, sfx, k, done);
+            };
+            core.draft_widths = [this](Member** ms, int* want, bool* sfx, int k) {
+                this->draft_widths(ms, want, sfx, k);
+            };
+            core.on_leave = [this](Member& mm) { this->leave(mm); };
+            th = std::thread([this] { run(); });
+        } catch (...) {
+            destroy_handles();
+            throw;
+        }
     }
     ~Conductor() {
         request_stop();
         th.join();
-        CUDA_CHECK(cudaEventDestroy(ev_round_start));
-        CUDA_CHECK(cudaEventDestroy(ev_draft_end));
-        CUDA_CHECK(cudaEventDestroy(ev_verify_end));
-        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
-            CUDA_CHECK(cudaStreamDestroy(side_[i]));
-            CUDA_CHECK(cudaEventDestroy(ev_mix_[i]));
-        }
-        CUDA_CHECK(cudaEventDestroy(ev_fork_));
-        CUDA_CHECK(cudaStreamDestroy(cstm));
+        destroy_handles();
     }
     Conductor(const Conductor&) = delete;
     Conductor& operator=(const Conductor&) = delete;
@@ -873,6 +884,21 @@ public:
     }
 
 private:
+    // Handle teardown shared by the dtor and the ctor's exception guard
+    // (cstm + 3 phase events + MAX_K side streams + MAX_K mix events +
+    // fork). Order mirrors the old dtor body exactly.
+    void destroy_handles() {
+        CUDA_CHECK(cudaEventDestroy(ev_round_start));
+        CUDA_CHECK(cudaEventDestroy(ev_draft_end));
+        CUDA_CHECK(cudaEventDestroy(ev_verify_end));
+        for (int i = 0; i < ConductorCore<Member>::MAX_K; i++) {
+            CUDA_CHECK(cudaStreamDestroy(side_[i]));
+            CUDA_CHECK(cudaEventDestroy(ev_mix_[i]));
+        }
+        CUDA_CHECK(cudaEventDestroy(ev_fork_));
+        CUDA_CHECK(cudaStreamDestroy(cstm));
+    }
+
     // Conductor thread body. GATE-OWNERSHIP INVARIANT (A7): in batch mode
     // the gate holders are EXACTLY this thread (one Lease per decode round)
     // and request threads (prefill chunks). The conductor never blocks on a
@@ -1037,6 +1063,15 @@ private:
     // {cap, launched, W, md_used} are identical. B8 below re-derives them
     // from the recorded margins every round and asserts equality.
     void draft_widths(Member** ms, int* want, bool* sfx, int k) {
+        // B3 bracket OPENS here, not in fused_round() (P2 exit review): the
+        // P2c draft phase below already runs fused work on cstm and
+        // re-records the members' draft_done events, so the one-round-in-
+        // flight invariant the event pools rest on must hold from the FIRST
+        // fused-phase record. core.round() always pairs this hook with
+        // fused_round() (same thread, program order), which asserts the
+        // bracket is open and CLOSES it.
+        assert(!round_active && "B3: fused rounds must not overlap per Conductor");
+        round_active = true;
         enum { MAX_K = ConductorCore<Member>::MAX_K };
         int act[MAX_K];                              // gated members still in the loop
         int cap[MAX_K], launched[MAX_K], mdu[MAX_K]; // per-member loop state
@@ -1207,9 +1242,11 @@ private:
         // loop). The 3-event phase pool is reused every round on the
         // strength of this -- each round records, syncs, and reads elapsed
         // before returning -- so a future pipelining change must trip here
-        // loudly instead of silently corrupting timestamps.
-        assert(!round_active && "B3: fused rounds must not overlap per Conductor");
-        round_active = true;
+        // loudly instead of silently corrupting timestamps. The bracket
+        // OPENS in draft_widths() (P2c: the draft phase already records on
+        // cstm/draft_done) and closes at the bottom of this function;
+        // core.round() always runs the two back to back on this thread.
+        assert(round_active && "B3: round bracket must be open (draft_widths runs first)");
         Engine* es[ConductorCore<Member>::MAX_K] = {};
         bool sampled[ConductorCore<Member>::MAX_K] = {};
         cudaEvent_t evs[ConductorCore<Member>::MAX_K] = {};
@@ -1256,20 +1293,19 @@ private:
             // launched). Runs BEFORE the try block below for the same
             // close-edge reason as the bat counters: gs must be final
             // before any queue op can let the request thread proceed.
-            if (es[i]->phase_stats) {
-                es[i]->gs.draft_ms += ph_d;
-                es[i]->gs.verify_ms += ph_v;
+            if (es[i]->phase_stats_on()) {
+                // launched = min(cap+1, md): exact identity with
+                // draft_and_gate's margin loop (a sub-theta break at
+                // step k has counted that step, cap+1; a full run is
+                // md). Excludes floor top-up launches, mirroring the
+                // solo dexit accounting (engine.cuh, gs.draft_steps +=
+                // launched). gate_cap < 0 = suffix round, no MTP steps.
+                long ph_s = 0;
                 if (ms[i]->gate_cap >= 0) {
-                    // launched = min(cap+1, md): exact identity with
-                    // draft_and_gate's margin loop (a sub-theta break at
-                    // step k has counted that step, cap+1; a full run is
-                    // md). Excludes floor top-up launches, mirroring the
-                    // solo dexit accounting (engine.cuh, gs.draft_steps +=
-                    // launched). gate_cap < 0 = suffix round, no MTP steps.
-                    int ph_s = ms[i]->gate_cap + 1;
+                    ph_s = ms[i]->gate_cap + 1;
                     if (ph_s > ms[i]->md_used) ph_s = ms[i]->md_used;
-                    es[i]->gs.draft_steps += ph_s;
                 }
+                es[i]->phase_stats_add(ph_d, ph_v, ph_s); // A4 accessor
             }
             // Task 10 [req] bat= telemetry FIRST: this member's round ran
             // k-wide (k >= 2 by the core's dispatch; on the catch path the

@@ -115,7 +115,15 @@ loop structure: launch fused step, per-engine margin D2H on cstm, one
 cstm sync, same margins/caps/drop-outs, B8 assert unchanged. draft_done
 events recorded on cstm. Solo top-up launches stay on engine stms fenced
 by an event from cstm (or move them to cstm too -- simpler, do that,
-with a comment). Gates: same battery as Task 1 + the B4 double-run.
+with a comment).
+[SHIPPED CORRECTION (P2 exit review): the implementation keeps top-ups on
+the MEMBER stm and records draft_done on e->stm (fused_round), not cstm --
+correct because the per-step cstm sync completes the fused writes before
+any top-up is issued (host program order), and draft_done on the member
+stm then fences everything a member contributed OFF cstm (top-ups, suffix
+prep/H2D, sampled bootstrap) while the fused steps need no event at all:
+the verify runs on the same in-order cstm.]
+Gates: same battery as Task 1 + the B4 double-run.
 Commit.
 
 ## Task 3: measure + close P2
