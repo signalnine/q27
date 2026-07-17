@@ -69,7 +69,11 @@ got right: ~1.9x was the no-graphs ceiling estimate at k=2; eager fusion
 measured 1.21-1.31x and graph replay carried it to 1.41x. What it got
 wrong: nothing material -- it priced the work as expensive (it was: P0-P3,
 three days, ~15 gated commits) and capped at 2 big-context users by
-per-slot GDN role VRAM (still true on 32 GB at full context).
+per-slot GDN role VRAM. (07-17 amendment: turbo3 + the w8 build boots
+FOUR 48K slots on 32 GB -- but the aggregate SATURATES at ~250 t/s by
+2 lanes (3 slots matches, 4 regresses under union-cap trim), so the
+2-slot cap is now a throughput fact rather than a VRAM one; extra
+slots buy fan-out, not tokens. BUILDLOG 2026-07-17.)
 
 ## History: the 2026-07-11 observation this doc replaced
 

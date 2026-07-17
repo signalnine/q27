@@ -6,15 +6,18 @@ A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained
 
 - **Fastest known way to run this model.** +47% decode over tuned
   llama.cpp on a 5090 (same model, GPU, harness, day; protocol filed
-  before it could pass). On a 24GB 3090: +19% decode at +60% context
-  over mainline llama.cpp. vLLM measured 4.7x slower wall on real
+  before it could pass). On a 24GB 3090: +19% decode at 2x the
+  context over mainline llama.cpp (262K turbo3 default vs their
+  100-131K class). vLLM measured 4.7x slower wall on real
   Claude-Code traffic (its prefix cache gets 0% reuse on this
   hybrid-GDN architecture); sglang 0.5.15 cannot load the model at all
   (BUILDLOG 2026-07-12).
-- **turbo3 3-bit KV cache**, symmetric K+V: 13.4 KB/token, ~1% PPL,
-  needle 6/6 at a 361K-token prompt, 655K context allocatable on a
-  5090, two full 131K tenants at once, and a 24GB card promoted from a
-  32K box to a 131K box. Ported from
+- **turbo3 3-bit KV cache**, symmetric K+V: 14.1 KB/token (14400 B,
+  18-pair accounting), ~1% PPL, needle 6/6 at a 361K-token prompt,
+  655K context allocatable on a 5090, two full 131K tenants at once,
+  and a 24GB card promoted from a 32K box to a **262K box** (turbo3 is
+  the Ampere serving default since v0.3.0; a bare w8 boot auto-sizes
+  to the full native window). Ported from
   [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant);
   that fork refuses 3-bit K on this model class and caps 33% lower; I measured K costs +0.17%.
 - **Native Anthropic Messages endpoint at Claude-Code grade**: thinking
@@ -55,9 +58,9 @@ fp16-MMA verify (h16) and fp16/turbo3 KV.
 
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
-default width-12 build OOMs at graph setup on 24GB. Serve it with
-`Q27_KV=turbo3` and prefer the q4s tier: its 2.27GB-smaller weight
-file goes straight to KV budget (~74K tokens/GB at turbo3 rates).
+default width-12 build OOMs at graph setup on 24GB. turbo3 is the
+default on Ampere (no env needed); prefer the q4s tier: its
+2.27GB-smaller weight file goes straight to KV budget (~74K tokens/GB at turbo3 rates).
 Cards with less than a true 24 GiB (A10-class cloud parts, ECC
 reserve, decimal-GB VRAM) can also add `Q27_MAXD=4`, which trims the
 captured graph zoo by ~280MB. The card must be otherwise idle: ~2.7GB
@@ -75,9 +78,9 @@ they trade decode speed for model quality:
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | 32GB | +0.35% PPL off Q5_K_M for ~5% slower decode |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | 32GB | quality matching the best GGUFs of this model, ~10% slower decode |
 
-Task scores measure the same across tiers (q4s: PPL + suite gated,
-task dome pending) -- the quality tiers buy perplexity margin, not
-benchmark wins. When in doubt take the default.
+Task scores measure the same across tiers (q4s: fully validated --
+PPL, suite, agentic NLL, needle, 18-run task dome, no deficit) -- the
+quality tiers buy perplexity margin, not benchmark wins. When in doubt take the default.
 
 ```bash
 # 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);
@@ -136,10 +139,10 @@ errors so Claude Code compacts correctly. Concurrent sessions
 (`--slots N`) batch through one weight sweep by default -- 234-239 t/s
 aggregate at 2 slots, zero config (see Serving).
 
-## State of the engine (2026-07-16)
+## State of the engine (2026-07-17)
 
 One binary serves Claude Code, Codex, and OpenAI clients at 231-246 t/s
-aggregate live decode on a 5090 (102 t/s at 131K context on a 3090),
+aggregate live decode on a 5090 (90-116 t/s at 262K context on a 3090, turbo3 default),
 with continuous batching ON by default: two concurrent slots decode
 through one fused weight sweep plus shape-keyed CUDA-graph round replay
 at **1.41x** aggregate (fp8 237.7 / turbo3 224.2 t/s), solo cost
@@ -229,10 +232,11 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
 - MTP draft head trained into the checkpoint: self-speculation without a separate draft model
 - Hybrid Gated-DeltaNet: near-O(1) memory per token for 48 of 65 layers.
   KV lives only in the 17 full-attention layers (16 + MTP, all global, no
-  windowing): 68 KB/token fp16. A dense 65-layer build would need ~68 GB
+  windowing): 72 KB/token fp16 (73728 B; the engine
+  allocates 18 K/V pairs -- 17 attention layers + the MTP head). A dense 65-layer build would need ~68 GB
   @256K.
-- Measured 5090 KV ceilings: fp16 ~180K | fp8 (34 KB/tok) **294,912** |
-  turbo3 3-bit (13.4 KB/tok) **655,360** -- 2.5x the 262K native window.
+- Measured 5090 KV ceilings: fp16 ~180K | fp8 (36 KB/tok) **294,912** |
+  turbo3 3-bit (14.1 KB/tok) **655,360** -- 2.5x the 262K native window.
   Auto-ctx caps at 262144 for fp8/turbo3, 131072 for fp16; explicit
   `--ctx` overrides. turbo3 position-bucket NLL is flat through 297K
   (tracks fp8 within +0.65-1.2% every bucket); the agentic quality gate
@@ -385,19 +389,20 @@ soft-error incident that set this policy is in the BUILDLOG appendix.
 - **KV cache**: fp16 by default; fp8 E4M3 is the server default since
   07-03 (`Q27_KV=fp8` on the CLI). Scale-free saturating conversion --
   measured amax sits 3.8x under the 448 E4M3 max, so per-row scales buy
-  nothing. 34 KB/token, +11% decode @28.5K, PPL -0.05%, KL 3.4e-5. The
+  nothing. 36 KB/token, +11% decode @28.5K, PPL -0.05%, KL 3.4e-5. The
   CLI stays fp16 so the bitwise canonicals hold.
 - **turbo3 3-bit KV** (`Q27_KV=turbo3`; `turbo3v` = fp16-K diagnostic):
   WHT-rotated 50-byte blocks per 128 dims (ported from
   [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant),
-  src/turbo3.cuh), 13.4 KB/token, full stack (decode, fdmma verify,
+  src/turbo3.cuh), 14.1 KB/token, full stack (decode, fdmma verify,
   batched prefill). PPL fp16 7.317 / fp8 7.327 / turbo3 7.381; K costs
   +0.17% -- the GQA=6 K-crater the source fork guards against does not
   exist on this model. Acceptance ties fp8 exactly on basin-matched
   replay.
 - **MTP**: first-class. Draft + verify in one pipeline under a single CUDA graph. No separate draft context, no re-prefill.
 - **Stack**: plain CUDA C++. No CUTLASS, no deps beyond CUDA runtime. Offline tools are Python: tools/repack.py (runs once; docs/FORMAT.md) and tools/gguf_to_hf.py (certified GGUF -> HF inversion, 866/866 tensors byte-exact, for cross-engine reference runs).
-- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
+- **Serving**: OpenAI, Anthropic (Claude Code-grade), and OpenAI Responses (Codex-grade) shapes on one binary. Since 2026-07-03 the SERVER defaults to fp8 KV on sm_89+ (and to
+turbo3 on sm_86 since v0.3.0) (--kv-fp16 or Q27_KV=fp16 opts out); the CLI keeps fp16 so decode canonicals stay bitwise.
 - **Numerics contracts (batching)**: every fused lane family carries
   the ninv N-invariance gate -- **bitwise-when-untrimmed** -- plus its
   seam and twin legs; fused rounds run a UNION GEMM-family policy so
@@ -420,7 +425,9 @@ make build/q27-server
 **Defaults (2026-07-16) = the measured Claude-Code stack.** A bare server
 serves the exact config every live trial and record number was earned on:
 fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV
-itself needs sm_89+, older parts default fp16 KV), `Q27_PMIN=0.5`,
+itself needs sm_89+; sm_86/Ampere defaults to turbo3 since v0.3.0 --
+a bare w8 boot serves the full 262144 window on a 24GB 3090 -- with
+fp16 via `--kv-fp16`), `Q27_PMIN=0.5`,
 `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head, no-think, phase
 stats; `--ctx` auto-sizes the KV budget to free VRAM (capped at the
 262144 native window for fp8/turbo3, 131072 fp16; single-slot).
@@ -525,15 +532,16 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
   154K-token CC transcript is within +0.39% of fp8 in every CC-depth
   bucket, and the shape-matched CC study (2x48K both legs, n=3/leg)
   ties/favors turbo3 -- the 07-15 band gap was the shape confound. No
-  quality asterisk on turbo3; fp8 stays the CC serving default on speed
-  alone, turbo3 is the capacity lever (2x96K vs 2x48K on 32GB).
+  quality asterisk on turbo3; fp8 stays the sm_89+ CC serving default
+  on speed alone -- turbo3 is the capacity lever there (2x96K vs 2x48K
+  on 32GB) and, since v0.3.0, the outright default on Ampere.
 - **Saguaro-style 3090 off-path drafting** -- the one uncommissioned
   engine idea left standing from 07-10.
-- **Prefill follow-ons**: the serial-threshold policy call (4x on
-  <32-token prompts, but it re-baselines the canonical -- deferred as
-  policy, not a bug; BUILDLOG 07-14) and the retired Phase-3's filed
-  successor (async producer/consumer + mbarrier rewrite of the
-  prefill-attention kernel).
+- **Prefill follow-ons**: the retired Phase-3's filed successor (async
+  producer/consumer + mbarrier rewrite of the prefill-attention
+  kernel). (The serial-threshold call shipped in v0.3.0 as
+  `Q27_PF_BATCH_MIN` -- TTFT 350->31-33ms / 567->53-55ms; the CLI
+  default is unchanged, so the canonical still holds.)
 - **Strict-parser zero-rescue config**: engage the constrain grammar on
   a bare `{"name"` opener too, closing the wrapper-less bypass
   (strict-parser A/B verdict: BUILDLOG 2026-07-08).

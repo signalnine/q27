@@ -340,7 +340,10 @@ Read (decode-to-decode, spec-on vs spec-on):
 - **TTFT on tiny prompts** is q27's worst number in their table: ~350 ms
   (5090) / ~610 ms (3090) prefill-pipeline floor on 25-token prompts,
   where their vLLM rows publish ~51-53 ms. Gone by the first token;
-  stated because their table shows it.
+  stated because their table shows it. *(Fixed 2026-07-17: the serial
+  prefill walk under 32 tokens was the whole floor -- Q27_PF_BATCH_MIN
+  routes tiny prompts down the chunked path; TTFT now 31-33 ms (5090)
+  / 53-55 ms (3090). See the addendum follow-up below.)*
 
 Caveats, theirs and ours, stated plainly:
 
@@ -372,7 +375,9 @@ Caveats, theirs and ours, stated plainly:
   -- measured-free sizing, exact per-token KV; picks now boot on both
   cards. See the BUILDLOG entry.)* q27's turbo3 KV serves 131072 on
   this same card at 102.2 t/s live agentic decode (BUILDLOG 2026-07-12);
-  that config was not the one benched here.
+  that config was not the one benched here. *(2026-07-17: turbo3 is now
+  the sm_86 serving default at the FULL 262144 window -- see the
+  addendum below.)*
 - **Quant tiers differ across all rows** (theirs: AutoRound-INT4,
   Q4_K_M, IQ4_KS, Q5_K_S; q27: its nvfp4-family v1.4 tier, 17.73 GB) --
   same model family, not identical checkpoints. And their rows are dated
