@@ -7026,3 +7026,53 @@ EXACT. S2/S4 medians moved -2..-3% across reruns but the FIXED binary's
 own protocol/run-to-run spread spans the delta (S4 221.4 vs 216.9 same
 binary same hour; S2 229.5 fresh-boot vs 242.4 after-S1): harness
 variance, hit path untouched by the diff.
+
+## 2026-07-17 -- sm_86 GEMV occupancy sweep = NEGATIVE (kernel win, zero round transfer)
+
+Ampere-pass item #2 (Gabe: "let's start with #2"). The 4/3/2-CTA
+launch_bounds tier boundaries (Q27_GEMV_2CTA_MIN=10, 3CTA_MIN_Q4=4,
+3CTA_MIN_Q8=6) were swept on the 5090; re-swept on the 3090 for the
+w8 ladder range N=2..8. Tool: tools/gemv_tier_sweep.cu (kept; build
+line below). Vanilla model (benchmark rule).
+
+WHAT THE MICROBENCH FOUND (isolated gemv, 100-rep cudaEvent, 3090):
+the q8 head/writers (248320-row) SPILL under the shipped 4/3-CTA
+register caps, and 2-CTA (128-reg, 0 spill) is fastest-or-tied at
+EVERY N=2..8 -- N=4 is a 2.24 ms -> 1.47 ms cliff (-52%), others
+-12..-30%. ptxas confirms: 4-CTA q8 spills at N=2,3,4,7,8; 2-CTA
+clean everywhere. q4 ffn was already near-optimal (<=3.4% off,
+non-monotonic). Looked like a clean, large, monotonic win.
+
+WHY IT DOES NOT SHIP -- adversarial round-level verify (the win did
+NOT transfer):
+- Implemented as an __CUDA_ARCH__<890-gated q8->2-CTA pin (sm_89+
+  bit-identical). Correctness PASSED cleanly: 5090 canonical
+  a2982c51/f64e7c02 EXACT; sm_86 old-vs-new CLI byte-identical on
+  BOTH models (register-alloc-only, values invariant); test_kernels
+  ALL PASS both arches.
+- Club decode A/B (3090 w8 turbo3, same-session old vs new binary):
+  narr 90.01 -> 89.42, code 116.46 -> 116.35 = FLAT (narr dip inside
+  OLD's 0.3% CV).
+- Q27_PHASE_STATS A/B (codegen payload, real ~20K prompt, per-width
+  verify-ms buckets) = the decisive read: phv 3617.6 vs 3621.7;
+  dominant width-6 bucket (59 rounds) 2044.2 vs 2044.5 ms; EVERY
+  phwm bucket identical within 0.2%. The microbench's 13% q8 win at
+  width 6 produced ZERO round change.
+
+ROOT CAUSE / LESSON: kernel-isolation microbench overstated the win.
+In a tight back-to-back loop the q8 head's spill local-mem traffic
+contends on the 3090's 6 MB L2; in the actual verify round that single
+head GEMV is bandwidth-floored (~1.4 ms streaming 1.27 GB either way)
+and dwarfed/overlapped by the 65-layer forward. The round is
+weight-stream-bound at ~78% BW efficiency (the 07-17 Ampere profile
+said exactly this) -- a register retier cannot beat the weight stream.
+REVERTED (src/kernels.cu untouched from 1c0b1b1); tool + sweep data
+kept for future arch re-sweeps. Verdict stands with the physics triad:
+BW-bound work has no occupancy lever.
+
+Sweep repro (sm_86, 3 forced-tier builds, transcriber stopped):
+  nvcc -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -DTIER_TAG='"3CTA"' \
+    -DQ27_GEMV_3CTA_MIN_Q4=0 -DQ27_GEMV_3CTA_MIN_Q8=0 -DQ27_GEMV_2CTA_MIN=99 \
+    tools/gemv_tier_sweep.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu \
+    src/prefill.cu src/device_model.cu src/loader.cpp -o gemv_3CTA
+  (4CTA: all _MIN=99; 2CTA: all _MIN=0; run on GPU 1, vanilla model)
