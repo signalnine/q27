@@ -6106,3 +6106,38 @@ not graphs alone. Serving call stands: Q27_BATCH default-off is a product
 call, but when batching is on, Q27_BATCH_GRAPH=1 is now validated live --
 stability clean, solo-neutral, and the fused-round win is real on agentic
 traffic.
+
+**2026-07-16 -- CONTINUOUS BATCHING DEFAULTS FLIPPED ON (product call,
+owner-authorized).** The CC serving profile now sets Q27_BATCH=1
+Q27_BATCH_GRAPH=1 Q27_BATCH_GRAPH_CAP=64 (setenv overwrite=0, the house
+pattern: user env always wins; Q27_PROFILE=ref skips the block entirely, so
+ref stays the conservative no-batch reference; the CLI binary is untouched
+and every bitwise canonical gate rides the CLI). Evidence line: THE BAR
+1.41x fp8 / 1.40x turbo3 aggregate at 2 slots (bar 1.38x), live CC A/B
+fused rounds -17..-19% phv/round depth-matched (+15-17% fused tps), solo
+cost 0.00%, and four clean live CC validations (07-15 turbo3 2x96K ~900
+reqs, P3-exit sanity, live A/B GRAPHS + EAGER legs) with zero errors.
+CAP=64 rationale: the live CC key alphabet drew 44+ distinct graph keys vs
+the LRU-32 default (86% hits, ~88 eviction-churn recaptures, benign at
+<1% tax) -- 64 swallows the observed alphabet at ~460 MB worst case
+(8 MB/exec budget), and the conductor ctor's headroom check
+SHRINKS-never-aborts, so tight configs self-protect. TWO-TIER M2 GUARD
+(the semantic change): batch_env_user is captured BEFORE the profile
+setenv block; user-EXPLICIT Q27_BATCH=1 + incompatible env {PMIN<=0,
+DEXIT=0, SAMPLE_PLAIN, TOOL_SPLIT} keeps the fail-fast FATAL exit(1)
+(you asked for a config that cannot run), while profile-DEFAULT +
+incompatible env prints one line -- "continuous batching: OFF
+(auto-disabled: <reason>)" -- skips conductor construction, and serves
+exactly as pre-P1 (a default must never kill a formerly-working
+invocation; ref-profile runs never even reach the guard). The banner now
+states provenance: "ON (serving default since 2026-07-16 | Q27_BATCH=1
+explicit env)" / "OFF (Q27_BATCH=0 | Q27_PROFILE=ref | auto-disabled:
+reason)". Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0, Q27_PROFILE=ref.
+Gates at this commit: make + w16 + fused_smoke rebuilds clean;
+test_kernels ALL PASS; test_conductor PASS; canonical EXACT
+a2982c5197c627551b27d76a0a94b220 + sampled-seed EXACT vs p0_baseline (the
+flip lives in the SERVER profile block only -- CLI defaults proven
+untouched); bare-server W12 codegen replay position-wise == p0_baseline r1
+with bat= present (k=1 solo fallthrough byte-identity); kill switches +
+both guard tiers exercised live; 2-slot smoke (32K+32K, concurrent
+codegen/docs) bat>=1.5 fused, gcache ON at cap 64, zero errors.

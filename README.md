@@ -309,7 +309,8 @@ see the features list above and BUILDLOG.)
   BATCH: `Q27_BATCH=1 Q27_BATCH_GRAPH=1` fuses concurrent decodes through
   one weight sweep + shape-keyed CUDA-graph replay -- 1.41x (fp8) / 1.40x
   (turbo3) aggregate at 2 slots, solo cost 0%, byte-identity gated
-  (BUILDLOG 07-14..16; both flags currently opt-in).
+  (BUILDLOG 07-14..16; serving defaults since 2026-07-16 -- `Q27_BATCH=0`
+  disables, `Q27_PROFILE=ref` = conservative reference).
 - Long-context: needle 6/6 at 361K on both fp8 and turbo3; measured
   allocation ceilings fp8 294,912 / turbo3 655,360 (W12 build, 5090).
 - turbo3 3-bit KV (2026-07-11, `Q27_KV=turbo3`): full stack incl. the
@@ -543,11 +544,17 @@ fp8 KV + `Q27_FD=mma` (e4m3 on sm_89+, fp16-MMA h16 on sm_80..88; fp8 KV itself 
 `Q27_PMIN=0.5`, `Q27_MAXD=auto7`, suffix drafter at width 12, fast-head,
 no-think, phase stats; `--ctx` auto-sizes the KV budget to free VRAM
 (capped at the 262144 native window for fp8/turbo3, 131072 fp16;
-single-slot). Every knob keeps its env/flag override
+single-slot). Continuous batching is a serving default since 2026-07-16
+(`Q27_BATCH=1 Q27_BATCH_GRAPH=1`, graph-cache cap 64 -- sized to the live
+CC key alphabet, and the conductor shrinks it to fit VRAM headroom rather
+than abort; `Q27_BATCH=0` disables, an incompatible env auto-disables it
+with a banner notice, and single-slot/solo traffic is byte-identical to
+pre-batch). Every knob keeps its env/flag override
 (user env always wins), `Q27_PROFILE=ref` restores the conservative
-reference behavior (fp16, ungated, no suffix, fd2), and the **CLI binary
-keeps reference defaults** so the bitwise canonical gates are untouched.
-Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
+reference behavior (fp16, ungated, no suffix, fd2, no batching), and the
+**CLI binary keeps reference defaults** so the bitwise canonical gates are
+untouched. Escapes: `--kv-fp16 --no-fast-head --think`, any individual
+`Q27_*`.
 
 Behavior note (`--think`): the default serving profile is no-think for
 speed -- it prefills an empty `<think></think>` block, which is what

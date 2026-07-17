@@ -167,6 +167,12 @@ int main(int argc, char** argv) {
     const bool no_think_srv = think_flag >= 0 ? think_flag == 0 : !ref_profile;
     if (no_think_srv) fprintf(stderr, "no-think: empty-think prefill on all chat paths\n");
     if (kv_fp16) setenv("Q27_KV", "fp16", 1);
+    // 2026-07-16 BATCH DEFAULTS FLIP: record whether Q27_BATCH came from the
+    // USER'S environment BEFORE the profile block below can default it on.
+    // The M2 guard at the conductor site keys its two-tier semantics on this
+    // bool: user-explicit + incompatible env = refuse (exit 1, unchanged);
+    // profile-default + incompatible env = auto-disable and serve.
+    const bool batch_env_user = getenv("Q27_BATCH") != nullptr;
     if (!ref_profile) {
         if (cc_arch >= 89) {
             setenv("Q27_KV", "fp8", 0);
@@ -186,6 +192,20 @@ int main(int argc, char** argv) {
         // else. Naming W_MAX makes a wider build use its width by default.
         setenv("Q27_SUFFIX_W", std::to_string(W_MAX).c_str(), 0);
         setenv("Q27_PHASE_STATS", "1", 0);
+        // Continuous batching (P1..P3) DEFAULTS ON since 2026-07-16 (BUILDLOG
+        // "P3 T4: THE BAR PASSES" + "P3 LIVE CC A/B"): 2-slot aggregate 1.41x
+        // fp8 / 1.40x turbo3 (bar 1.38x), live CC fused rounds -17..-19%
+        // phv/round at matched depth, solo cost 0.00% -- a single-slot server
+        // pays nothing (k=1 falls through to the proven solo path, byte-
+        // identical). GRAPH_CAP=64: live CC traffic drew a 44+ graph-key
+        // alphabet vs the LRU-32 default (86% hits, benign eviction churn);
+        // 64 swallows the observed alphabet at ~460 MB worst case, and the
+        // conductor's ctor headroom check SHRINKS-never-aborts, so tight
+        // configs self-protect. Kill switches: Q27_BATCH=0, Q27_BATCH_GRAPH=0,
+        // Q27_PROFILE=ref (ref skips this whole block, so it stays off there).
+        setenv("Q27_BATCH", "1", 0);
+        setenv("Q27_BATCH_GRAPH", "1", 0);
+        setenv("Q27_BATCH_GRAPH_CAP", "64", 0);
     }
     fprintf(stderr,
             "profile: %s (sm_%d) | kv=%s fd=%s pmin=%s maxd=%s suffix=%s/w%s fast-head=%d "
@@ -585,7 +605,9 @@ int main(int argc, char** argv) {
     };
 
     // ------------------------------------------------------------------
-    // P1 continuous batching (Q27_BATCH=1, default OFF). One Conductor owns
+    // P1 continuous batching (Q27_BATCH; SERVING DEFAULT ON since 2026-07-16
+    // via the CC profile block above -- Q27_BATCH=0 or Q27_PROFILE=ref turns
+    // it off; the CLI binary never sets it). One Conductor owns
     // every decode round; request threads keep slot claim + tokenize +
     // prefill (under their own scoped gate lease) and drain a per-request
     // TokenQueue into the existing consumer lambdas. Q27_BATCH unset/0:
@@ -620,33 +642,80 @@ int main(int argc, char** argv) {
             // parses (build_spec_graphs / make_decode_task /
             // set_tool_constraint -- the engine reads them later, so parse
             // the raw strings the same way it will).
-            const char* pm = getenv("Q27_PMIN"); // engine: atof; gate iff > 0
-            if (!pm || atof(pm) <= 0) {
-                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the gated draft "
-                                "(Q27_PMIN > 0; it is %s). Set Q27_PMIN=0.5 or drop Q27_BATCH.\n",
-                        pm ? pm : "unset");
-                exit(1);
-            }
+            //
+            // TWO-TIER SEMANTICS (2026-07-16 defaults flip): Q27_BATCH=1 can
+            // now come from the CC profile default above, not only the user's
+            // env. batch_env_user (captured BEFORE the profile setenv block)
+            // picks the tier on an incompatible config:
+            //   USER-EXPLICIT  -> FATAL exit(1), unchanged pre-flip behavior:
+            //     the user asked for a combination that cannot run; refuse
+            //     loudly rather than silently serve something else.
+            //   PROFILE-DEFAULT -> one-line auto-disable notice + skip
+            //     conductor construction; the server runs exactly as pre-P1.
+            //     A DEFAULT must never turn a formerly-working invocation
+            //     (e.g. a Q27_DEXIT=0 tuning run) into a dead server.
+            // Q27_PROFILE=ref never reaches either tier: ref skips the whole
+            // profile setenv block, so Q27_BATCH stays unset and batching is
+            // simply OFF (ref = conservative reference, not a refusal).
+            const char* why = nullptr; // non-null = config cannot batch
+            char whybuf[96];
+            const char* pm = getenv("Q27_PMIN");  // engine: atof; gate iff > 0
             const char* de = getenv("Q27_DEXIT"); // engine: atoi != 0, default on
-            if (de && atoi(de) == 0) {
-                fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the dexit draft "
-                                "loop (Q27_DEXIT=%s disables it). Drop Q27_DEXIT or Q27_BATCH.\n",
-                        de);
-                exit(1);
+            if (!pm || atof(pm) <= 0) {
+                if (batch_env_user) {
+                    fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the gated draft "
+                                    "(Q27_PMIN > 0; it is %s). Set Q27_PMIN=0.5 or drop Q27_BATCH.\n",
+                            pm ? pm : "unset");
+                    exit(1);
+                }
+                snprintf(whybuf, sizeof whybuf, "Q27_PMIN=%s, batching needs the gated draft",
+                         pm ? pm : "unset");
+                why = whybuf;
+            } else if (de && atoi(de) == 0) {
+                if (batch_env_user) {
+                    fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the dexit draft "
+                                    "loop (Q27_DEXIT=%s disables it). Drop Q27_DEXIT or Q27_BATCH.\n",
+                            de);
+                    exit(1);
+                }
+                snprintf(whybuf, sizeof whybuf,
+                         "Q27_DEXIT=%s, batching needs the dexit draft loop", de);
+                why = whybuf;
+            } else if (getenv("Q27_SAMPLE_PLAIN")) { // engine: presence-only
+                if (batch_env_user) {
+                    fprintf(stderr, "q27-server: FATAL -- Q27_SAMPLE_PLAIN (any value) forces the "
+                                    "plain sampler, which has no fused path. Drop it or Q27_BATCH.\n");
+                    exit(1);
+                }
+                why = "Q27_SAMPLE_PLAIN set, plain sampler has no fused path";
+            } else if (getenv("Q27_TOOL_SPLIT")) { // engine: presence-only
+                if (batch_env_user) {
+                    fprintf(stderr, "q27-server: FATAL -- Q27_TOOL_SPLIT (any value) enables the "
+                                    "split constrained rounds, which have no fused path. Drop it "
+                                    "or Q27_BATCH.\n");
+                    exit(1);
+                }
+                why = "Q27_TOOL_SPLIT set, split constrained rounds have no fused path";
             }
-            if (getenv("Q27_SAMPLE_PLAIN")) { // engine: presence-only
-                fprintf(stderr, "q27-server: FATAL -- Q27_SAMPLE_PLAIN (any value) forces the "
-                                "plain sampler, which has no fused path. Drop it or Q27_BATCH.\n");
-                exit(1);
+            if (why) {
+                // profile-default tier: notice + fall through with conductor
+                // null -- every call site runs the pre-batch path, exactly
+                // the pre-P1 server.
+                fprintf(stderr, "continuous batching: OFF (auto-disabled: %s)\n", why);
+            } else {
+                conductor = std::make_unique<q27::Conductor>(gpu_gate);
+                fprintf(stderr, "continuous batching: ON (%s, union cap %d)\n",
+                        batch_env_user ? "Q27_BATCH=1 explicit env"
+                                       : "serving default since 2026-07-16",
+                        W_MAX);
             }
-            if (getenv("Q27_TOOL_SPLIT")) { // engine: presence-only
-                fprintf(stderr, "q27-server: FATAL -- Q27_TOOL_SPLIT (any value) enables the "
-                                "split constrained rounds, which have no fused path. Drop it "
-                                "or Q27_BATCH.\n");
-                exit(1);
-            }
-            conductor = std::make_unique<q27::Conductor>(gpu_gate);
-            fprintf(stderr, "continuous batching: ON (Q27_BATCH=1, union cap %d)\n", W_MAX);
+        } else if (e) {
+            fprintf(stderr, "continuous batching: OFF (Q27_BATCH=%s)\n", e);
+        } else {
+            // only reachable when the profile block didn't run (ref) or a
+            // future path unsets it: report which.
+            fprintf(stderr, "continuous batching: OFF (%s)\n",
+                    ref_profile ? "Q27_PROFILE=ref" : "Q27_BATCH unset");
         }
     }
     // Batch-mode generation driver shared by every generate() call site.
@@ -747,7 +816,9 @@ int main(int argc, char** argv) {
     // request's decode rounds + how many of its rounds ran fused (k >= 2),
     // from the conductor-filled DecodeTask counters. Appended LAST (after
     // the sfx/ph/tg optionals; reqlog parsers stop at end=) and empty when
-    // Q27_BATCH is off, so the default [req] line is byte-identical.
+    // Q27_BATCH is off (Q27_BATCH=0 / ref profile / auto-disabled), where
+    // the [req] line stays byte-identical to pre-P1. Since the 2026-07-16
+    // defaults flip the default CC-profile line DOES carry bat=.
     auto bat_stats = [&conductor](const Engine::DecodeTask& t) -> std::string {
         if (!conductor) return std::string();
         char b[48];
