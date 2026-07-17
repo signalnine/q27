@@ -221,7 +221,9 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
   turbo3 3-bit (13.4 KB/tok) **655,360** -- 2.5x the 262K native window.
   Auto-ctx caps at 262144 for fp8/turbo3, 131072 for fp16; explicit
   `--ctx` overrides. turbo3 position-bucket NLL is flat through 297K
-  (tracks fp8 within +0.65-1.2% every bucket).
+  (tracks fp8 within +0.65-1.2% every bucket); the agentic quality gate
+  closed PASS 07-16 (within +0.39% at CC depths on a real 154K CC
+  transcript; shape-matched CC scores tie).
 - The catch the per-token-memory napkin misses: attention KV is RESTORABLE state (any prefix row range replays for free) while GDN recurrent state is all-or-nothing per sequence -- you can only resume from a position you snapshotted. Hybrids make per-user context cheap but make context REUSE an engineering problem (prefix cache, mid-history divergence, multi-doc serving). That trade is where P8/checkpoint work lives; the measured cost of ignoring it was 7.9x wall-clock on agentic traffic (see build log P8/P9)
 - The opponent, tuned honestly: llama.cpp's best measured config on this
   box is Q5_K_M + draft-mtp10 + p_min 0.5 (**~117 t/s @2K** single-stream;
@@ -504,10 +506,13 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
 
 ## Open items (2026-07-16, the honest list)
 
-- **turbo3-vs-fp8 quality gate**: the dedicated PPL+needle A/B owed
-  since the 07-11 port is still open; the 07-15 CC runs were
-  shape-confounded and cannot answer it. fp8 stays the CC serving
-  default meanwhile.
+- ~~**turbo3-vs-fp8 quality gate**~~ **CLOSED 2026-07-16, verdict PASS**
+  (BUILDLOG "TURBO3 AGENTIC QUALITY GATE"): agentic-corpus NLL on a real
+  154K-token CC transcript is within +0.39% of fp8 in every CC-depth
+  bucket, and the shape-matched CC study (2x48K both legs, n=3/leg)
+  ties/favors turbo3 -- the 07-15 band gap was the shape confound. No
+  quality asterisk on turbo3; fp8 stays the CC serving default on speed
+  alone, turbo3 is the capacity lever (2x96K vs 2x48K on 32GB).
 - **Saguaro-style 3090 off-path drafting** -- the one uncommissioned
   engine idea left standing from 07-10.
 - **Prefill follow-ons**: the serial-threshold policy call (4x on

@@ -6246,7 +6246,63 @@ class. Novel-content-at-depth coverage stays with the 07-11 generic
 corpus (+0.65-1.2%/bucket flat to 297K) -- the two corpora are
 complementary and BOTH clear their bars.
 
-[leg 2 results follow]
+LEG 2 -- shape-matched CC study (n=3/leg, alternating fp8,t3,...). Config:
+v0.2.0 serving defaults (batching+graphs ON), W12 build/q27-server, fresh
+server per rep as unit q27-eval on :8081, --ctx 49152 --slots 2
+--slot1-ctx 49152 BOTH legs (the fp8-max 2x48K shape -- turbo3 takes the
+SAME squeeze, removing the 07-15 confound), CUDA_VISIBLE_DEVICES=0,
+vanilla qwen. Per rep: thunderdome T2 (bench-collab-server), sleep 15
+(latest-symlink stagger), T5 (bench-task-queue) CONCURRENT; scores from
+trials meta.json composite_score (harness exit codes ignored per the
+standing note). Runner: scratchpad/t3_quality/leg2_run.sh; raw per-rep
+logs + meta in scratchpad/t3_quality/leg2/.
+
+  rep          T2-collab           T5-taskq            ctx400  med tps
+  1 fp8        0.303 crashed 271s  0.200 completed 10s   10     215.2
+  2 turbo3     0.631 completed     0.653 completed 411s  17     204.9
+  3 fp8        0.303 crashed 205s  0.200 completed 11s    7     216.8
+  4 turbo3     0.303 completed     0.200 crashed 164s    25     179.7
+  5 fp8        0.277 crashed 381s  0.200 completed 10s   19     240.8
+  6 turbo3     0.272 completed     0.293 crashed 305s     4     150.5
+
+  leg     T2 median (spread)        T5 median (spread)
+  fp8     0.303 (0.277-0.303)       0.200 (0.200-0.200)
+  turbo3  0.303 (0.272-0.631)       0.293 (0.200-0.653)
+
+Rule (b): NOT triggered -- T2 medians TIE (0.303 both), T5 turbo3 is
+HIGHER (+0.093). No deficit on either task, let alone >0.15 on both.
+Confound counters comparable: ctx-limit 400s fp8 36 vs turbo3 46 total
+(overlapping per-rep ranges; turbo3's 25 came from its longest full
+session, 804s/5.04M tok) -- the squeeze bound BOTH legs as designed.
+Stability: 549 requests across 6 reps, ZERO end=error / [req-error] /
+5xx, zero server crashes. Decode context: per-rep med tps fp8
+215-241 vs turbo3 151-205 (the known t3 decode tax; turbo3 reps also ran
+the longer, deeper sessions). Eval artifacts hit BOTH legs and are
+score-dominant: fp8's T5 leg is a DETERMINISTIC one-shot-quit (3/3 reps
+byte-identical 24,109 tokens, 10-11s -- the [drift] UN-RESCUED
+first-tool-call class, greedy determinism re-drawing the same
+trajectory), fp8's T2 crashed 3/3 (CC-agent crash class), turbo3's T5
+crashed 2/3; turbo3 drew the only two high basins (rep 2). Per the
+standing register these are basin/artifact modes, NOT KV-quality signal
+-- which is exactly why the rule demanded a GROSS consistent deficit,
+and there is none. Both legs pool well under the fp8-131K-era bands
+(0.78-0.85), confirming the band gap tracks the 2x48K squeeze, not the
+KV format.
+
+VERDICT: **PASS -- turbo3 is agentic-quality-safe.** Neither trigger
+fired: (a) agentic-corpus NLL at CC depths max +0.39% (bar >+2%
+sustained); (b) shape-matched medians tie/favor turbo3 (bar: both
+tasks -0.15). Finding of record: NO detectable turbo3 quality tax on
+agentic serving; the 07-15 "turbo3 pools below fp8-era bands"
+observation is attributed to the SHAPE CONFOUND (131K windows vs
+2x96K/2x48K squeezes), as suspected. With quality now settled on top of
+the 07-11 gates (generic NLL flat to 297K, needle 6/6 @361K, acceptance
+ties) and the capacity picture already established (turbo3 2x96K vs fp8
+2x48K on 32GB, W12), the serving guidance becomes: fp8 stays the CC
+default on SPEED (turbo3 costs ~5-30% median decode depending on depth
+mix); choose turbo3 whenever capacity matters -- >48K/slot, more slots,
+or the 3090 -- with no quality asterisk. The turbo3-vs-fp8 quality gate
+(open since the 07-11 port) is CLOSED.
 
 ## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
 
