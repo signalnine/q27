@@ -6873,3 +6873,90 @@ vox-transcriber stopped for the test window and restarted after
 OOM at these shapes). Open (unchanged): --slots still defaults --ctx
 8192 (multi-slot auto-size is its own roadmap item); test_gemv10_scaling
 q4-head fixture gap.
+## 2026-07-17 -- Ampere pass: turbo3 default on sm_86, TTFT 8x (serial-prefill fix), 4-stream 5090
+
+Three results from the afternoon block (Gabe: "we should default to
+turbo3 on ampere for sure" + "do an Ampere tuning pass" + "could we get
+4 streams on 5090?").
+
+**1. turbo3 is the sm_86 serving default** (Gabe sign-off). CC profile
+now sets Q27_KV=turbo3 on cc_arch 80..88 (overwrite=0: user env wins;
+ref profile keeps fp16). Verified: a bare `q27-server-w8 model tok`
+boots kv=turbo3, auto-ctx 262144 on the 3090.
+
+**2. Four streams on the 5090: YES, on the w8 build.** Slot-cost
+ladder measured with q4s (free 16.83 GB post-weights):
+- fp8 W12 4x48K: slots 0-1 ready, slot 2 SKIPPED (3.9 < 5.2 GB) --
+  the shipping 2x48K shape is the fp8 W12 ceiling.
+- turbo3 W12 4x48K: slots 0-2 ready (0.39 GB spare) -- turbo3 buys
+  the THIRD stream on the standard build.
+- turbo3 w8 4x48K: ALL FOUR ready, 0.18 GB spare. Per-slot fixed is
+  the wall (~4.6-4.8 GB each on W12: borrowing engines carry their own
+  role sets + graph zoo; KV is minor at these shapes), so the narrower
+  build's ~1.2 GB/slot savings is what unlocks slot 3. Aggregate
+  throughput at 4 lanes is UNMEASURED (w8 union cap = 8 -- 4 lanes at
+  trim floor 2 saturate it); capacity claim only.
+
+**3. TTFT root cause found and fixed -- the club-table anomaly dies.**
+generate_prefill routed prompts < 32 tokens down a SERIAL walk: per
+token, two ungraphed full forwards (trunk + MTP) and two stream syncs
+-- measured ~22 ms/token on sm_86, ~11 on sm_120. The club bench
+prompts are 17-23 tokens: 23 x 22 ms = the entire 567 ms "TTFT floor"
+(5090's 350 ms = same structure at its speed). Worse, the serial path
+CLEARS the slot's snapshot + checkpoint ring -- a tiny prompt routed to
+a slot destroyed its conversation cache (live-CC relevant, not just
+bench optics). The chunked path already handles arbitrary small tail
+chunks, so the fix is a threshold knob: Q27_PF_BATCH_MIN (engine
+default 32 = exact old behavior; CC profile sets 2; floor 2 because
+NP=1 would snap_save an empty prefix). Measured on the 3090: 23-token
+prompt pf_ms 533 -> 69 (7.7x); 7-token 151 -> 62.
+
+SERIAL-vs-CHUNKED IS NOT BITWISE (measured: tiny-prompt greedy text
+diverges between paths) -- expected, the chunked path is what every
+prompt >= 32 already takes, and path identity is part of the config.
+Consequences handled:
+- The 5-token canonical prompt is serial-path BY CONSTRUCTION under
+  the CLI default 32: canonical a2982c5197c627551b27d76a0a94b220
+  (vanilla) and f64e7c02252ca4c40cea62db662205e0 (q4s) both EXACT on
+  the new binary, script-exact extraction.
+- Sub-default settings print a banner ("the 5-token canonical md5 does
+  NOT hold here") -- same failure class as the gemm_min guardrail, but
+  a banner not a refusal since the server profile sets 2 deliberately.
+- test_kernels ALL PASS; same-state repeat determinism byte-identical.
+- A 3-request probe showed request 3 diverging from 1-2 on REPEATED
+  identical prompts: depth-ladder lineage carry (md4/md5 round-mix
+  shifts 51/4 -> 51/57 -> 96/67), the documented Q27_MAXD_RESET
+  semantics -- pre-existing on both paths, not this change.
+
+**Decode-side profile (the tuning-pass measurement, 3090 turbo3):**
+round wall 31 ms = verify 25.2 (81%) + draft 5.7 (18%), 3.94 tok/round
+on the code probe. Per-width verify: W2 21.3 ms -> W6 28.4 ms -- a
+gentle +1.5 ms/width slope on a ~21 ms floor, NO spill cliff. The
+floor is the weight stream itself: 15.46 GB / 936 GB/s = 16.5 ms
+theoretical => sm_86 decode already runs ~78% BW efficiency. Remaining
+per-kernel headroom ~4.5 ms/round; identified follow-up levers, NOT
+taken today: Q27_GEMV_2CTA_MIN is compile-time (=10, never fires on
+w8 widths -- an sm_86 occupancy sweep needs rebuild-per-point) and
+vgemm-below-width-9 collides with the gemm_min canonical guardrail
+(gate_maxd+1 >= gemm_min refuses). Both are half-day items for a
+bounded ~5-15%; the TTFT fix was the big fish.
+
+**Club-harness bench, both cards, post-fix (their bench.sh verbatim):**
+
+| card / leg (q4s, auto-ctx) | wall t/s | decode t/s | TTFT | pre-fix TTFT |
+|---|---|---|---|---|
+| 5090 fp8 narrative (n=5, CV 0.1%) | 161.14 | 161.97 | **31ms** | 350ms |
+| 5090 fp8 code (n=5, CV 0.0%) | 191.99 | 193.67 | **33ms** | ~350ms |
+| 3090 turbo3 narrative (n=5, CV 0.3%) | 89.65 | 90.07 | **53ms** | 567ms |
+| 3090 turbo3 code (n=5, CV 0.0%) | 115.50 | 116.43 | **55ms** | 570ms |
+
+3090 prefill unchanged (10K 1095, 90K-class 655.6 tok/s cache-busted).
+Wall throughput absorbs the TTFT win directly: 5090 narrative wall
+146.8 -> 161.1 (+9.7%), 3090 code wall 108.3 -> 115.5 (+6.6%). Decode
+rates re-roll +-1-5% with the new tiny-prompt continuation text (the
+chunked-path numerics produce a different greedy transcript; same
+class as any config change). TTFT columns vs club: their best
+single-5090 ~51ms -> we're 31-33; their 3090 class ~51ms -> 53-55 =
+parity. The last column they led is gone.
+
+vox-transcriber stopped for the window and restarted after.

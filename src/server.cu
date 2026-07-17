@@ -179,13 +179,24 @@ int main(int argc, char** argv) {
             setenv("Q27_FD", "mma", 0);
         } else if (cc_arch >= 80) {
             // H16 (fp16-MMA) verify: Ampere gets the mma path too
-            // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md); KV default
-            // stays fp16 there (no fp8 HW) -- turbo3 opt-in recommended.
+            // (2026-07-12, docs/plans/2026-07-12-fdmma-f16.md).
+            // KV defaults to turbo3 on Ampere (2026-07-17, Gabe sign-off):
+            // no fp8 HW here, and the 5090's turbo3 decode tax INVERTS on a
+            // bandwidth-starved part -- 3090 q4s decode narr +1.1% / code
+            // +9.8% over fp16 at 4.27x the context (262144 on 24 GB, needle
+            // 6/6 @233K; BUILDLOG 2026-07-17). setenv(overwrite=0): any
+            // user Q27_KV wins; Q27_PROFILE=ref keeps fp16.
+            setenv("Q27_KV", "turbo3", 0);
             setenv("Q27_FD", "mma", 0);
         }
         setenv("Q27_PMIN", "0.5", 0);
         setenv("Q27_MAXD", "auto7", 0);
         setenv("Q27_SUFFIX", "1", 0);
+        // Tiny prompts through the CHUNKED prefill path (2026-07-17, Ampere
+        // tuning pass): the serial walk below Q27_PF_BATCH_MIN costs ~22ms
+        // per token on sm_86 (TTFT 567ms on a 23-token prompt) and clears
+        // the slot's prefix cache. ref profile keeps the engine default 32.
+        setenv("Q27_PF_BATCH_MIN", "2", 0);
         // W16: was the literal "12". The suffix wants the widest verify the
         // build actually has -- the engine clamps sfx_w to W_MAX anyway, so the
         // literal silently meant "W_MAX" on the w8 build and "12" everywhere

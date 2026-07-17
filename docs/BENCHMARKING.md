@@ -475,6 +475,17 @@ leads every column at once: narrative decode 94.2 vs ik's 60.4, code
 117.4 vs beellama DFlash's 101.3, at 262K ctx vs their 102-200K
 ceilings. The context trade flagged above is closed.
 
+**Same-day follow-up -- the TTFT anomaly is dead too** (BUILDLOG
+"Ampere pass"): the 350/567ms TTFT floors were prompts <32 tokens
+taking a serial prefill walk (~22ms/token sm_86, ~11 sm_120); with
+`Q27_PF_BATCH_MIN=2` (CC profile default) tiny prompts ride the
+chunked path. Post-fix, same harness: **5090 TTFT 31-33ms** (their
+best single-5090 ~51ms), **3090 TTFT 53-55ms** (parity with their
+class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
+108.3 -> 115.5 (+6.6%). Decode rates re-roll +-1-5% on the new
+tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
+sm_86 (bare boot = turbo3 @ 262144 on a 3090).
+
 ## History / non-reproducible baselines
 
 An earlier cross-engine run used 3 **private** greenfield tasks (not

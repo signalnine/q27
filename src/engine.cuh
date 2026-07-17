@@ -189,6 +189,14 @@ struct Engine {
     // state.
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     bool batched_prefill = true;
+    // Minimum prompt tokens for the chunked prefill path (Q27_PF_BATCH_MIN).
+    // Below it, prefill walks the prompt serially: two ungraphed forwards +
+    // two stream syncs PER TOKEN (~22ms/tok on sm_86, ~11 on sm_120) AND it
+    // clears the slot's snapshot + checkpoint ring -- a tiny prompt routed to
+    // a slot destroys its conversation cache. The chunked path handles small
+    // T already (every long prompt ends in an arbitrary tail chunk). Floor 2:
+    // NP=1 would snap_save an empty prefix (have_snap on nothing).
+    int pf_batch_min = 32;
 
     // ---- batched prefill (M6) ----
     // Prefill chunk size. 256 left GEMM launches at ~320 blocks on 170 SMs
@@ -1748,6 +1756,18 @@ struct Engine {
         // same binary, GEMM off, must reproduce the old round AND byte-identical
         // output -- gate 5).
         if (const char* e = getenv("Q27_GEMM_MIN")) gemm_min = atoi(e);
+        if (const char* e = getenv("Q27_PF_BATCH_MIN")) pf_batch_min = std::max(2, atoi(e));
+        // Canonical coupling (same failure class as the gemm_min guardrail):
+        // the canonical bitwise prompt is 5 tokens, i.e. SERIAL-path under the
+        // default 32. The chunked path rounds differently (measured: greedy
+        // text diverges), so a sub-default setting here silently re-paths the
+        // canonical gate. The server profile sets 2 deliberately (serving has
+        // its own refs); anything else gets a banner, not a refusal.
+        if (pf_batch_min < 32)
+            fprintf(stderr,
+                    "q27: Q27_PF_BATCH_MIN=%d < 32 -- tiny prompts take the CHUNKED "
+                    "prefill path; the 5-token canonical md5 does NOT hold here\n",
+                    pf_batch_min);
         // THE GUARDRAIL. The canonical bitwise gate is structural only while the
         // ladder's widest verify (gate_maxd+1) stays strictly below gemm_min. If a
         // future ceiling or a careless env ever crosses that line, the ladder would
@@ -3250,7 +3270,7 @@ struct Engine {
                 clear_tool_constraint();
             }
         }
-        if (batched_prefill && NP >= 32) {
+        if (batched_prefill && NP >= pf_batch_min) {
             // prefix-cache hit: prompt extends the snapshotted prefix -> restore
             // recurrent state and prefill only the new suffix
             int base = 0;
