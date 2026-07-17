@@ -202,8 +202,16 @@ struct Engine {
     // Prefill chunk size. 256 left GEMM launches at ~320 blocks on 170 SMs
     // (27% of int8 peak) and re-read all 17.7GB of weights T/256 times; 1024
     // fills the machine and cuts weight re-reads 4x. Costs ~0.8GB scratch.
-    static constexpr int PF_T = 1024;
-    static constexpr int PF_SB = 32;  // attention sub-batch (scratch rows)
+    // -D-overridable since 2026-07-17 (sm_86 sweep: 82 SMs fill at smaller T
+    // and the scratch is turbo3 ctx budget); defaults unchanged.
+#ifndef Q27_PF_T
+#define Q27_PF_T 1024
+#endif
+#ifndef Q27_PF_SB
+#define Q27_PF_SB 32
+#endif
+    static constexpr int PF_T = Q27_PF_T;
+    static constexpr int PF_SB = Q27_PF_SB; // attention sub-batch (scratch rows)
     int* d_prompt = nullptr;          // whole prompt on device
     int d_prompt_cap = 0;
     float *hT, *x1T, *yT, *qkvT, *convT, *zT, *oT, *ogT, *qgT, *kT, *vT, *attnT;

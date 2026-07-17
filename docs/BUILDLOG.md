@@ -7158,3 +7158,32 @@ non-kernel: memory OC (hardware, moves the BW floor directly),
 2-slot batching on the 3090 (throughput, untried), prefill constants
 PF_T/PF_SB (sized for 170 SMs, long-prompt TTFT only), and the quant
 ladder (the decode floor itself).
+
+## 2026-07-17 -- PF_T/PF_SB sweep on sm_86 = shipped constants already optimal
+
+Last untried Ampere software item (Gabe: "let's look at prefill
+constants"). PF_T=1024 was sized to fill 170 SMs; hypothesis was 82
+SMs might prefer smaller (plus 0.4-0.8 GB scratch back to turbo3 ctx)
+and PF_SB=32 might matter at depth. Made both -D-overridable
+(Q27_PF_T / Q27_PF_SB, defaults unchanged -- behavior-invariant,
+canonical a2982c51 EXACT on the rebuilt binary), parallel-built five
+sm_86 w8 variants, cache-busted prefill probes (unique-head prompts,
+hit=0, pf_ms from [req]) at ~10K and ~70K tokens x3, turbo3, ctx
+98304, transcriber down:
+
+  T1024_SB32 (shipped)  10k 1175.7   70k 916.0   free@ready 2.88 GB
+  T512_SB32             -3.1%        -1.6%       +0.40 GB
+  T2048_SB32            -1.2%        +0.1%       -0.81 GB
+  T1024_SB16            -1.8%        -0.4%       --
+  T1024_SB64            -1.6%        -0.4%       --
+
+VERDICT: the 5090-sized point is ALSO the sm_86 optimum at both
+depths -- the GEMM saturates by T=1024 on 82 SMs and the T=2048
+weight-re-read halving nets ~zero. T512's 0.40 GB scratch refund
+(+29K turbo3 tokens) is not worth -3%/-1.6% with ctx already at
+262144. No change; overridability kept (future sweeps are one -D).
+This closes the Ampere software surface COMPLETELY: every lever is
+now either shipped (TTFT, turbo3 default, auto-ctx cals) or closed
+with data (occupancy, W12, vgemm<9, depth/pmin policy, prefill
+constants). Remaining: memory OC (hardware), 3090 2-slot batching
+(throughput), quant ladder (the floor).
