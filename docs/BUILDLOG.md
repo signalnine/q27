@@ -7076,3 +7076,54 @@ Sweep repro (sm_86, 3 forced-tier builds, transcriber stopped):
     tools/gemv_tier_sweep.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu \
     src/prefill.cu src/device_model.cu src/loader.cpp -o gemv_3CTA
   (4CTA: all _MIN=99; 2CTA: all _MIN=0; run on GPU 1, vanilla model)
+
+## 2026-07-17 -- W12-on-3090 = NO-GO (width ceiling is 8 on sm_86); vgemm-below-9 closed; auto-ctx W-slope fix
+
+Ampere-pass item #1 (Gabe green-light). q4s freed the VRAM that forced
+the w8 build, so the W12 fatbin was tried on the 3090 for the first
+time. VERDICT: w8 is not a VRAM compromise on Ampere -- it is the
+per-token optimum, the sm_86 twin of the 07-13 "W16 no-go, W12
+optimum" finding. Every card has a width ceiling; Ampere's is 8.
+
+GATES FIRST (h16 verify had never run widths 9-12 on sm_86): ninv on
+the 3090 ALL PASS incl. W=12 + TWIN legs (vanilla model; ninv aborts
+on the q4s Q4-head -- same fixture gap as test_gemv10_scaling, on the
+books). Serving determinism 2x byte-identical; first-request output
+byte-matched w8 (bitwise-when-untrimmed: the gated ladder is
+build-invariant, only suffix rounds differ).
+
+CAPACITY: W12 non-KV fixed on sm_86 = 6.57 GB vs w8's 4.22 (measured
+at ready, ctx 32768). The four extra widths cost 0.59 GB each -- the
+width-9..12 graph zoo runs 0.43 GB/width on sm_86 vs 0.13 on sm_120.
+turbo3 ceiling: ~143K vs w8's 262144 (-44%).
+
+THROUGHPUT (3090, turbo3, ctx 32768, q4s):
+- club bench FLAT (narr 90.00 / code 116.58 vs w8 90.01/116.46) --
+  short prompts, identical gated ladder.
+- codegen payload (26.8K prompt, 512 tok, 3 reps): W12 92.3/91.0/70.6
+  tps vs w8 100.3/96.9/96.9 -- REGRESSES. Suffix rounds DO pin at the
+  new cap (12.0 tok/round) but cost 97 ms vs 43 ms at width 8: 2.25x
+  the wall for 1.5x the tokens. The wide round is NOT flat in width on
+  sm_86 (unlike the 5090 post-GEMM-pivot).
+- echo payload: 11.6 tok/round at 98 ms -- same shape.
+- ATTRIBUTION (one boot, Q27_GEMM_MIN=13 forces the GEMV family at
+  width 12; guardrail-legal): suffix round 92.6 ms vs vgemm's 97 --
+  within 5%. vgemm is NOT the culprit; the width cost is structural
+  (attention at ntok=12 + GDN chain on 82 SMs). THIS ALSO CLOSES
+  LEVER #3 (vgemm-below-9 on sm_86): the two families are within 5%
+  at width 12, so there is no vgemm advantage to harvest at 6-8.
+
+SHIPPED (one real defect found): a bare `q27-server` (the W12 default
+binary) + turbo3 on a 3090 auto-picked 217088 and DIED in
+build_spec_graphs (engine.cuh:1967, no runtime recovery in the solo
+zoo -- same class the conductor got armored against, on the books).
+auto-ctx graph term is now piecewise: 0.13 GB/width up to 8 on all
+arches, 0.43 GB/width above 8 on sm_86 (calibrated from today's two
+measured points; sm_120 and all W<=8 arithmetic unchanged). Verified:
+W12 auto on the 3090 now picks 131072 and boots, 0.43 GB spare.
+
+AMPERE PASS CLOSES: TTFT fix + turbo3 default SHIPPED; occupancy
+sweep NEGATIVE; W12 NO-GO; vgemm-below-9 CLOSED. The 3090 config is
+settled: w8 + turbo3 + q4s @ 262144, narr 90 / code 116.5 decode,
+TTFT 53 ms. The only remaining Ampere decode lever is weight bytes
+(the quant ladder) -- the 16.5 ms weight-stream floor itself.

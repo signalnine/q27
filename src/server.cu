@@ -280,7 +280,15 @@ int main(int argc, char** argv) {
             // +0.08 -- inside slack). Retro-check: predicts the hand-found
             // v1.4 3090 ceiling (24576) and the q4s 61440 knife-edge fit.
             const double base = cc_arch >= 120 ? 0.89e9 : 1.77e9;
-            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
+            // Graph-zoo term: 0.13 GB/width holds on sm_120 and on sm_86 up
+            // to width 8, but sm_86's width-9..12 graphs cost 0.43 GB/width
+            // (measured 2026-07-17: W12 non-KV fixed 6.57 GB vs w8's 4.22 on
+            // the same card -- the unpatched estimate picked 217088 and died
+            // in build_spec_graphs). Piecewise slope from the two points.
+            const double gw8 = Q27_W_MAX < 8 ? Q27_W_MAX : 8;
+            const double gwx = cc_arch >= 89 ? 0.13e9 : 0.43e9;
+            const double graphs = gw8 * 0.13e9 + (Q27_W_MAX - gw8) * gwx;
+            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + graphs;
             // slack absorbs kv-kind fixed variance and boot-to-boot driver
             // drift; the 4096 floor adds 0-0.3GB more. 1.0GB (pre-07-17)
             // was sized for the stat-based weight estimate this replaced.
