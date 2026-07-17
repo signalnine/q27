@@ -6394,6 +6394,132 @@ fastest) / default 5.25 (reference, canonical a2982c51) / q6 6.0 /
 q6k 6.8. Shipped: README tier row + small-cards rewrite, CHECKSUMS,
 HF upload alongside the existing tiers.
 
+## 2026-07-16 -- q4s-v1 REPACK VALIDATION: full ladder GREEN, anchors minted, club-3090 matched-bpw rerun (both GPUs)
+
+Independent validation ladder on the q4s artifact above (master
+e58c063 binaries; file md5 7e5454e0c0ded717136ad3e42634ba25 verified
+against CHECKSUMS.md5). Where this ladder re-measured the SHIPPED
+entry's numbers it CONVERGED exactly (canonical md5, paired PPL) --
+two sessions, same answers. v1.4 stays the reference tier; nothing
+here changes a serving default; adoption is a product call.
+
+**q4s-v1 CANONICAL ANCHORS (new-artifact anchors -- v1.4's a2982c51 /
+8b6aacf9 are NOT replaced and still gate the default tier):**
+- canonical (`--tokens "760,6511,314,9338,369" -n 128 --ctx 2048
+  --spec`, grep '^generated:' | md5sum):
+  **f64e7c02252ca4c40cea62db662205e0**, x2 runs EXACT.
+- sampled-seed (same prompt, `-n 64 --temp 0.7 --top-p 0.95
+  --seed 42`): **900031e9b86df8f52493e6c1f4040c2e**, x2 runs EXACT.
+
+Ladder (all GPU work under systemd-run, GPU idle-checked per rung):
+
+1. SMOKE + test_kernels(q4s): generation sane both recipes, anchors
+   above. test_kernels: **83/83 executed checks PASS** -- including
+   dequant/gemv/gemv_n/gemm-MMA/g64 on the Q4 head via dtype dispatch
+   -- then the suite ABORTS (illegal memory access,
+   test_kernels.cu:498) inside `test_gemv10_scaling`: the P10-A0 perf
+   probe HARDCODES `gemv_q8_n` on `output.weight` and reads 2x past a
+   Q4 head allocation. Harness fixture assumption (default-tier Q8
+   verify head), NOT a q4s weight fault -- same-day v1.4 control on
+   the same binary: 315 checks ALL PASS (which also covers the
+   model-independent synthetics the crash skipped). LOOSE END: teach
+   test_gemv10_scaling to skip or dispatch on `q4_head` files.
+2. PPL, exact v1.4 protocol (wiki.test.qwopus.i32, `--nll --nll-chunk
+   2048 --ctx 2048`, 145 chunks, 148335 preds, fp16 KV, paired legs):
+   q4s **8.0197** / v1.4 re-run **8.0409** (recorded value reproduced
+   EXACT). q4s = **-0.26% vs v1.4 (better)**, **+1.29% vs the Q5_K_M
+   bar 7.9179** (v1.4 +1.55%). Matches the SHIPPED entry's paired run.
+3. AGENTIC NLL (t3_quality leg-1 method: 154,160-tok real-CC corpus,
+   `--nll-long 154160 --ctx 163840`, BOTH legs fp8 KV; the v1.4 leg
+   reproduces the turbo3-gate fp8 column to the 4th decimal):
+
+     bucket      n      v1.4     q4s      dNLL     dPPL%
+     0-2k        2047   2.8235   2.7857   -0.0378  -3.71
+     2k-8k       6144   1.9144   1.8949   -0.0195  -1.93
+     8k-16k      8192   2.1390   2.1823   +0.0433  +4.43
+     16k-32k    16384   2.1347   2.1607   +0.0260  +2.63  << CC range
+     32k-48k    16384   0.0248   0.0277   +0.0029  +0.29  << CC range
+     48k-64k    16384   0.0016   0.0014   -0.0002  -0.02  << CC range
+     64k-96k    32768   0.0016   0.0017   +0.0001  +0.01  << CC range
+     96k-128k   32768   0.0002   0.0002   +0.0000  +0.00
+     128k-160k  23088   0.0113   0.0123   +0.0010  +0.10
+
+   FLAG + disposition: 16k-32k (the one content-diverse CC bucket)
+   reads **+2.63%**, over the 2% red-flag bar in that single bucket;
+   every other CC bucket <= +0.29%, pooled 16k-96k +0.58%, and the
+   echo-dominated depth that IS the CC serving regime is untouched.
+   "Sustained across buckets" is structurally untestable on this
+   corpus (deeper CC buckets are all own-output echo), so the
+   established disambiguator was run: the 07-11 generic-corpus
+   position-bucket NLL (wikitext-2, one pass, both legs fp8 at the
+   262144 window -- content-diverse at EVERY depth). Result, q4s vs
+   v1.4: 0-16k **-3.6/-6.8/-7.2% (q4s better)**; 16k-96k
+   -1.29/-0.31/+0.96/+1.21% (pooled +0.35%); then FLAT
+   +1.16..+1.35% out to 256k, non-compounding. VERDICT: the agentic
+   +2.63% is content noise on an n=1 transcript (same sign-flipping
+   class as the turbo3 gate's excluded shallow wiggles), not a
+   systematic CC-depth defect. Ladder proceeded; flag on the record.
+4. NEEDLE spot (needle_deep method, haystack trimmed to the fp8
+   262144 native window -- the full 355K haystack is turbo3-only;
+   prompt 248,726 tok, deepest-first): depth 60% (~149K) and 10%
+   (~24K) both PASS EXACT -- **2/2**.
+5. SERVING SANITY (bare W12 2-slot, `--ctx 32768 --slots 2
+   --slot1-ctx 32768`, zero env): warm pass + 2 measured concurrent
+   codegen+docs reps. Composition determinism: rep1 == rep2
+   completion text BYTE-IDENTICAL both payloads (raw JSON differs
+   only in `created`). bat=2.0/1.8 fused, gcache ON cap 64, warm reps
+   pf=1 off prefix snapshots, ZERO errors. codegen solo-warm vs
+   fused-rep fork = the documented A1 suffix-trim class (docs payload
+   solo==fused) -- v1.4-identical behavior.
+6. CLUB-3090 matched-bpw rerun (their bench.sh verbatim,
+   endpoint-only, x2 passes per GPU; full table in
+   docs/BENCHMARKING.md "Matched-bpw rerun"):
+   - 5090 (bare W12, auto-ctx 262144): narr 146.8/146.6 wall
+     (154.2/153.9 decode), code 181.6/181.5 (196.2/196.0), TTFT
+     326ms, prefill 3442/3420 @10K, 2608/2562 @90K. In-run CV <=0.3%,
+     pass delta <=0.2%, [req] agrees within 0.5%.
+   - 3090 (vox-transcriber stopped for the window, restarted +
+     verified active after; w8, fp16 KV + h16, stock ~417 W,
+     `--ctx 61440`): narr 88.5/87.8 (93.2/92.4), code 99.4/99.2
+     (106.9/106.7), TTFT ~565ms, prefill 1131/1122 @10K, 90K SKIP
+     (>ctx, their documented path).
+   - **3090 ctx FINDING (boot-verified)**: q4s + fp16 KV boots
+     **61440** (49152/57344 also boot; **65536 OOMs** at
+     spec_sample_graph instantiation; auto-ctx picks 69632 and OOMs
+     -- the 5090-calibrated anchor miss again) = **2.5x** v1.4's
+     24576 on the same club-config defaults. The 2.27 GB of freed
+     weights went straight to KV, arithmetic-clean (68 KB/token).
+     The SHIPPED entry's "262144 cap by arithmetic" claim is the
+     TURBO3 ceiling; this is the fp16-KV bench config's.
+   - READ vs v1.4 (decode): narrative **+1.6% (5090) / +5.2%
+     (3090)**; code **-7% on BOTH GPUs** -- the single-Q4-head tier
+     re-rolls the code acceptance basin (5090 code 3.86 -> 3.45
+     tok/round; narrative 2.64 -> 2.58 barely moves), so the
+     shipped-entry suite gain (+5.2%, 5-prompt mean) and a code-basin
+     loss coexist: q4s wins low-acceptance traffic on bytes and gives
+     ground where acceptance was carrying v1.4. vs THEIR rows at
+     matched bpw: 3090 narr +54% over ik MTP (93.2 vs 60.39), code
+     +5.5% over beellama DFlash (106.9 vs 101.3); 5090 narr +20% over
+     their best single-5090, code -4.2% vs DFlash 204.80 (v1.4 was
+     +3%). KV-bits asymmetry stated in the doc: our 3090 leg spends
+     fp16 KV vs their q4_0/q5_0.
+   - Ops lesson RE-paid (cost: three phantom OOM readings): a failed
+     systemd-run unit needs `systemctl reset-failed` before the name
+     is reused, and journal greps must scope to
+     _SYSTEMD_INVOCATION_ID -- the ctx ladder's first three rungs
+     read ONE stale crash as three "OOMs" (24576-40960!) until the
+     identical CPU-time lines gave it away. Same trap as the 07-12
+     journalctl note, new costume.
+
+VERDICT: **q4s-v1 VALIDATED** at 0.66 bpw under the default tier.
+Quality GREEN (PPL better, agentic NLL flat at depth with one
+disambiguated content-noise flag, needle exact, serving deterministic,
+zero errors across every server boot). Speed trade legible: narrative
++2-5%, code -7% (acceptance basin), +2.27 GB KV budget, 3090 club
+config 2.5x ctx. Open items: test_gemv10_scaling q4-head skip; task
+dome before quality-critical recommendations (per the SHIPPED entry);
+phase-2 token_embd demotion unmeasured.
+
 ## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
 
 The README carried these from the start of the project; they moved here

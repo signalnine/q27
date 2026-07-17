@@ -376,6 +376,78 @@ Caveats, theirs and ours, stated plainly:
   same model family, not identical checkpoints. And their rows are dated
   2026-05..07 on the engine pins of those days; engines move.
 
+### Matched-bpw rerun: q4s-v1 in the community 4-bit band (2026-07-16)
+
+The run above carried the "quant tiers differ" caveat: the 5.25-bpw
+default tier sits above their 4-bit recipes. The q4s-v1 repack (15.46
+GB, **4.55 bpw**: Q8 promotions cut to 41 tensors, single Q4 lm_head;
+BUILDLOG "q4s tier SHIPPED" + "q4s-v1 REPACK VALIDATION") drops q27
+into their band, so this is the harness rerun with weights-bpw matched.
+Same command, endpoint-only, two passes per GPU, bare serving defaults
+(only `--ctx` differs on the 3090, see below). q27 bpw figures are the
+tier labels (whole-model bytes / params, same denominator as the 5.25
+default). Their AutoRound INT4 rows are ~4.1 bpw on the *linears* but
+~5.0-5.3 whole-model once the fp16 embeddings + lm_head are counted --
+q4s (Q8 embed, Q4 head) undercuts even that.
+
+| config (weights bpw) | ctx | narr wall (decode) t/s | code wall (decode) t/s |
+|---|---|---|---|
+| **q27 q4s-v1, 5090** (4.55), pass 1 | 262144 | **146.82 (154.20)** | **181.60 (196.16)** |
+| q27 q4s-v1, 5090, pass 2 | 262144 | 146.58 (153.94) | 181.49 (196.02) |
+| q27 v1.4, 5090 (5.25), best pass (above) | 262144 | 144.15 (151.81) | 193.04 (210.92) |
+| their 1x5090 vLLM DFlash (AutoRound INT4 ~4.1 linears / ~5.0-5.3 whole) | 49K | 126.53 (127.98) | 200.11 (204.80) |
+| **q27 q4s-v1, 3090** (4.55), pass 1 | **61440** | **88.51 (93.16)** | **99.39 (106.92)** |
+| q27 q4s-v1, 3090, pass 2 | 61440 | 87.84 (92.43) | 99.21 (106.72) |
+| q27 v1.4, 3090 (5.25), best pass (above) | 24576 | 84.06 (88.59) | 105.76 (115.08) |
+| their 1x3090 ik_llama two-stage (IQ4_KS ~4.25) | 200K | 59.4 decode | 97.8 decode |
+| their 1x3090 ik_llama MTP (IQ4_KS ~4.25) | 200K | 59.67 (60.39) | 68.78 (72.40) |
+| their 1x3090 llama.cpp MTP (Q4_K_M ~4.85) | 200K | 49.69 (50.27) | 57.50 (58.92) |
+| their 1x3090 beellama DFlash (Q5_K_S ~5.36 + IQ4_XS draft) | 102K | 50.2 (50.4) | 99.7 (101.3) |
+
+Same instruments as above: in-run CV <= 0.3%, pass-to-pass <= 0.8%;
+engine `[req]` telemetry agrees with their client-side decode within
+0.5% (5090: 153.5-153.9 t/s at 2.58 tok/round narrative, 195.1-195.3
+at 3.45 code; 3090: 92.1-93.0 at 2.67, 106.3-106.5 at 3.17). 3090 at
+stock power (observed ~417 W) vs their mostly 370 W-capped rows -- the
+power caveat from the v1.4 run stands unchanged.
+
+Read, decode-to-decode:
+
+- **3090 matched-bpw**: q4s **+54% narrative** over the best published
+  single-3090 decode (93.2 vs ik MTP 60.39, now at comparable bpw) and
+  **+5.5% code** over beellama DFlash (106.9 vs 101.3 -- and DFlash
+  carries 0.8 MORE bpw here). vs our own v1.4 rows: narrative +5.2%,
+  code **-7.2%** -- the single-Q4-head tier re-rolls the code
+  acceptance basin (tok/round 3.86 -> 3.45 on the 5090 code prompt;
+  narrative 2.64 -> 2.58 barely moves), so the byte savings win on
+  low-acceptance traffic and lose on high-acceptance code. Same
+  pattern both GPUs.
+- **5090**: q4s narrative 154.2 stays +20% over their best single-5090
+  decode (127.98); code 196.2 now cedes **-4.2%** to their DFlash
+  204.80 (v1.4 was +3%) -- the code-acceptance price above, stated
+  plainly.
+- **Context ceiling, the headline q4s buys**: the 3090 config serves
+  **61440** (boots; 65536 OOMs at spec-graph instantiation; auto-ctx
+  still 5090-calibrated, picks 69632 and OOMs) -- **2.5x** the v1.4
+  config's 24576 on the same card, same fp16-KV defaults. The 2.27 GB
+  of freed weights went straight to KV. Their 3090 rows still serve
+  102-200K; closing the rest is the turbo3 lever (131K on this card,
+  BUILDLOG 2026-07-12), not weights.
+- **KV-bits asymmetry, theirs-favoring**: our 3090 leg runs fp16 KV
+  (16 bits/token-channel) vs their 3090 rows' q4_0/q5_0 KV (~4-5
+  bits). They spend ~3x fewer bits on KV -- that is where their 200K
+  ceilings come from, and it makes the decode comparison conservative
+  in their favor on memory traffic (their KV reads are smaller).
+- **Quality ladder at 0.66 bpw less** (q4s vs v1.4, validation run
+  2026-07-16, BUILDLOG "q4s-v1 REPACK VALIDATION"): wikitext-2 PPL
+  **8.0197 vs 8.0409 (-0.26%, q4s BETTER**; +1.29% vs the Q5_K_M bar
+  vs v1.4's +1.55%); agentic-corpus NLL flat at CC depths except one
+  content-diverse bucket (16k-32k **+2.63%**, generic-corpus control
+  -1.29..+1.21% across the same depths => content noise, not
+  systematic); needle spot 2/2 exact at ~149K/~24K depth in a 248.7K
+  prompt. The cheaper quant does not pay a measured quality tax; it
+  pays a code-acceptance speed tax.
+
 ## History / non-reproducible baselines
 
 An earlier cross-engine run used 3 **private** greenfield tasks (not
