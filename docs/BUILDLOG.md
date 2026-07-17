@@ -7127,3 +7127,34 @@ sweep NEGATIVE; W12 NO-GO; vgemm-below-9 CLOSED. The 3090 config is
 settled: w8 + turbo3 + q4s @ 262144, narr 90 / code 116.5 decode,
 TTFT 53 ms. The only remaining Ampere decode lever is weight bytes
 (the quant ladder) -- the 16.5 ms weight-stream floor itself.
+
+## 2026-07-17 -- sm_86 depth/pmin policy sweep = NEUTRAL (defaults transfer; no flip)
+
+Ampere lever: the dctl bars + auto7 + pmin 0.5 encode 5090 round
+economics; the 3090's steeper width slope (+8%/width) suggested a
+shallower optimum. Env-only sweep, 3090 w8 turbo3 q4s ctx 32768,
+fresh boot per config, codegen/docs/echo x4 (rep1 warm, medians;
+scratchpad/depth_sweep_3090.sh + depth_sweep_out/).
+
+- AUTO6 == BASE EXACTLY on all three payloads: md7=0 in every BASE
+  row -- the auto7 ladder never promotes past 6 on this traffic. The
+  controller's own saturation bars already do the arch adjustment;
+  the auto7-vs-auto6 question is moot on sm_86.
+- PMIN06: docs -1.8%, codegen -15.3% (trajectory-confounded draw:
+  early-eos re-roll) -- dead.
+- PMIN04: docs +4.2% (tok/rnd 2.96->3.18), echo +2.5%, codegen -4.1%.
+  De-confound leg (BASE vs PMIN04, codegen x7, median of 6, rule
+  pre-declared at <=2% deficit to flip): deficit HOLDS at -2.7% with
+  huge per-draw variance (81.0-107.8 vs BASE's 96.2-96.3) and lower
+  acceptance (3.37 vs 3.74 tok/rnd). NO FLIP.
+
+VERDICT: the 5090-tuned policy defaults transfer to sm_86 unchanged.
+Q27_PMIN=0.4 goes on the record as a docs/echo-flavored OPTION
+(+4.2/+2.5%) that costs codegen consistency -- not a default. The
+software side of the Ampere pass is now fully closed: shipped = TTFT
+fix, turbo3 default, two auto-ctx calibrations; closed-negative =
+occupancy retier, W12, vgemm<9, policy re-tune. Remaining levers are
+non-kernel: memory OC (hardware, moves the BW floor directly),
+2-slot batching on the 3090 (throughput, untried), prefill constants
+PF_T/PF_SB (sized for 170 SMs, long-prompt TTFT only), and the quant
+ladder (the decode floor itself).
