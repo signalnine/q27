@@ -218,60 +218,11 @@ int main(int argc, char** argv) {
             getenv("Q27_SUFFIX_W") ? getenv("Q27_SUFFIX_W") : "-", fast ? 1 : 0,
             no_think_srv ? 0 : 1);
 
-    // --ctx auto (single-slot): size the KV budget to free VRAM. The fixed
-    // cost (weights + GDN role sets + graph zoo + buffers) SCALES WITH
-    // Q27_W_MAX -- each width adds one role set (~157MB) and ~one perm's
-    // worth of captured graphs (~130MB), so a narrow build frees budget.
-    // Anchor: 131072 fp8 W_MAX=12 measured ~27.0GB total on the 17.73GB
-    // v1.4 artifact => non-weight base ~1.27GB + weights (stat'd from the
-    // model file, so heavier tiers like q6-v1 at 20.49GB size correctly) +
-    // (W_MAX+1)*0.157 roles + W_MAX*0.13 graphs.
-    // per-token = 34KB fp8 / 68KB fp16 (attn + MTP KV). NOTE the anchor was
-    // calibrated on the 5090 fp8/mma path; the sm_86 fp16/fd2 fallback runs
-    // heavier, so on a 24GB card the fit can still miss -- hence no forced
-    // floor: clamp to what actually fits and warn rather than OOM.
-    if (ctx < 0) {
-        if (n_slots > 1) {
-            ctx = 8192; // legacy default; multi-slot should pass --ctx
-            fprintf(stderr, "--ctx not set with --slots %d: using %d (pass --ctx)\n", n_slots,
-                    ctx);
-        } else {
-            size_t free_b = 0, total_b = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-            const char* kvv = getenv("Q27_KV");
-            const bool fp8 = kvv && !strcmp(kvv, "fp8");
-            const bool t3 = kvv && !strcmp(kvv, "turbo3");
-            const bool t3v = kvv && !strcmp(kvv, "turbo3v");
-            struct stat wst {};
-            const double wbytes = stat(model.c_str(), &wst) == 0 ? (double)wst.st_size : 17.73e9;
-            const double fixed = wbytes + 1.27e9 + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
-            // per-token KV bytes across the 17 attn+MTP cache pairs: turbo3
-            // 2*400 B, turbo3v 2048+400 B, fp8 2*1024, fp16 2*2048
-            const double slack = 1.0e9,
-                         per_tok = t3 ? 13.6e3 : t3v ? 41.6e3 : fp8 ? 34e3 : 68e3;
-            long budget = (long)((double)free_b - fixed - slack);
-            long c = budget > 0 ? (long)(budget / per_tok) : 0;
-            // cap: native window (262144) for the compact KV formats
-            // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
-            // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
-            // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
-            // historical 131072 (it barely clears it anyway).
-            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
-            if (c > cap) c = cap;
-            ctx = (int)(c / 4096 * 4096);
-            if (ctx < 4096) {
-                fprintf(stderr,
-                        "--ctx auto: only %d fits (free %.1fGB, %s KV, W_MAX=%d) -- likely to "
-                        "OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
-                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
-                if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
-            } else {
-                fprintf(stderr, "--ctx auto: %d (free %.1fGB, %s KV, W_MAX=%d)\n", ctx,
-                        free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16", Q27_W_MAX);
-                if (ctx < 16384)
-                    fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
-            }
-        }
+    // --ctx auto: sizing moved to AFTER the weight upload (2026-07-17) so it
+    // works from MEASURED free VRAM instead of a stat-based weight estimate.
+    if (ctx < 0 && n_slots > 1) {
+        ctx = 8192; // legacy default; multi-slot should pass --ctx
+        fprintf(stderr, "--ctx not set with --slots %d: using %d (pass --ctx)\n", n_slots, ctx);
     }
 
     fprintf(stderr, "loading tokenizer...\n");
@@ -286,6 +237,69 @@ int main(int argc, char** argv) {
     shared_dm.upload_all();
     shared_dm.checksum_baseline();
     fprintf(stderr, "resident: %.2f GB (checksummed)\n", shared_dm.bytes_resident() / 1e9);
+
+    // --ctx auto (single-slot): size the KV budget to MEASURED free VRAM
+    // with the weights already resident, so tier size (q4s/v1.4/q6),
+    // upload alignment overhead, and any co-tenant process fall out of the
+    // measurement instead of a model. What remains estimated is the non-KV
+    // stack allocated after this point (GDN role sets + spec/sample graph
+    // zoo + workspaces): each width adds one role set (~157MB) and ~one
+    // perm's worth of graphs (~130MB), plus an arch base -- the sm_86
+    // fd2/h16 path carries heavier workspaces than sm_120, and the old
+    // 1.27GB anchor predates the P1-P3 graph growth (calibrated 2026-07-17
+    // from in-process free deltas on both cards; see BUILDLOG).
+    // per-token KV bytes are EXACT: 18 K/V pairs (17 attn + 1 MTP),
+    // per-buffer/token = N_KV*HEAD_DIM*esz (fp16 2048 B, fp8 1024 B) or
+    // N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3. MIRROR WARNING: matches
+    // Engine::kv_bytes -- update together.
+    {
+        size_t free_b = 0, total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        fprintf(stderr, "vram: free %.2f GB post-weights\n", free_b / 1e9);
+        if (ctx < 0) {
+            const char* kvv = getenv("Q27_KV");
+            const bool fp8 = kvv && !strcmp(kvv, "fp8");
+            const bool t3 = kvv && !strcmp(kvv, "turbo3");
+            const bool t3v = kvv && !strcmp(kvv, "turbo3v");
+            const double pair = t3 ? 800.0 : t3v ? 2448.0 : fp8 ? 2048.0 : 4096.0;
+            const double per_tok = 18.0 * pair;
+            // calibrated 2026-07-17 (in-process free deltas, q4s tier):
+            // sm_120 W12 fp8@131072: non-KV stack 4.49GB => base 0.89;
+            // sm_86 w8 fp16@61440: 4.22GB => base 1.77 (turbo3 measured
+            // +0.08 -- inside slack). Retro-check: predicts the hand-found
+            // v1.4 3090 ceiling (24576) and the q4s 61440 knife-edge fit.
+            const double base = cc_arch >= 120 ? 0.89e9 : 1.77e9;
+            const double fixed = base + (Q27_W_MAX + 1) * 0.157e9 + Q27_W_MAX * 0.13e9;
+            // slack absorbs kv-kind fixed variance and boot-to-boot driver
+            // drift; the 4096 floor adds 0-0.3GB more. 1.0GB (pre-07-17)
+            // was sized for the stat-based weight estimate this replaced.
+            const double slack = 0.25e9;
+            long budget = (long)((double)free_b - fixed - slack);
+            long c = budget > 0 ? (long)(budget / per_tok) : 0;
+            // cap: native window (262144) for the compact KV formats
+            // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
+            // 5090, turbo3 to 655360 with needle 6/6 @361K -- the cap is a
+            // TTFT/estimate-margin guard, not a VRAM fact); fp16 keeps the
+            // historical 131072 (it barely clears it anyway).
+            const long cap = (fp8 || t3 || t3v) ? 262144 : 131072;
+            if (c > cap) c = cap;
+            ctx = (int)(c / 4096 * 4096);
+            if (ctx < 4096) {
+                fprintf(stderr,
+                        "--ctx auto: only %d fits (free %.1fGB post-weights, %s KV, W_MAX=%d) -- "
+                        "likely to OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
+                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16",
+                        Q27_W_MAX);
+                if (ctx < 2048) ctx = 2048; // give the ctor a floor to fail loudly at
+            } else {
+                fprintf(stderr, "--ctx auto: %d (free %.1fGB post-weights, %s KV, W_MAX=%d)\n",
+                        ctx, free_b / 1e9, t3 ? "turbo3" : t3v ? "turbo3v" : fp8 ? "fp8" : "fp16",
+                        Q27_W_MAX);
+                if (ctx < 16384)
+                    fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
+            }
+        }
+    }
     // R1 multi-slot: N engines borrow the one uploaded weight set. Slot 0
     // gets --ctx; slots 1+ get --slot1-ctx (subagent/background conversations
     // measured 11-18K in R0). Per-slot GDN snapshot + ckpt ring + KV means an
@@ -336,6 +350,13 @@ int main(int argc, char** argv) {
         s.eng->build_spec_graphs();
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
+    }
+    {
+        // headroom line (also the auto-ctx calibration probe: this minus the
+        // post-weights line minus exact KV = the non-KV fixed stack)
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr, "vram: free %.2f GB at ready\n", free_b / 1e9);
     }
     // Admission clamps below use the LARGEST slot; the routed slot re-clamps.
     int max_slot_ctx = 0;

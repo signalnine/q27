@@ -6793,3 +6793,83 @@ Real-world (Claude Code `claude -p`, 26.7k-token system prompt):
 [historical -- cold 28.5K TTFT is ~15.0s after P1-P6 and cold 128K is 59.6s
 after the 2026-07-07/08 prefill-attn pair; the warm-turn number required the
 P8 stable-prefix snapshot to hold on real re-rendering traffic]
+## 2026-07-17 -- auto-ctx recalibrated (measured-free sizing) + turbo3 takes the 3090 to 262144
+
+Two asks in one pass: fix the 5090-calibrated auto-ctx anchor that
+over-sized on the 3090 (69632 pick vs 61440 real ceiling), and find out
+how far q4s + turbo3 pushes a 24 GB card.
+
+**Root causes, stated exactly (src/server.cu sizing block):**
+1. All four per-token KV constants omitted the MTP pair: 34e3/68e3/
+   13.6e3/41.6e3 are 17-pair (attn-only) numbers; the engine allocates
+   18 K/V pairs (17 attn + 1 MTP; Engine::kv_bytes). Exact per-token:
+   fp8 36864, fp16 73728, turbo3 14400, turbo3v 44064 B.
+2. Weights entered the estimate as stat(model file) -- upload alignment
+   and tier drift unmodeled.
+3. The non-weight base (1.27 GB) was anchored pre-P1-P3; the graph zoo
+   grew ~1.4 GB since. Measured today (in-process free deltas): 5090 W12
+   fp8@131072 non-KV stack = 4.49 GB; 3090 w8 fp16@61440 = 4.22 GB;
+   3090 w8 turbo3@262144 = 4.30 GB. The 07-16 club rerun's 61440 fit was
+   a knife edge: **free at ready = 0.00 GB**.
+
+**Fix (server.cu only):** sizing moved AFTER upload_all() -- budget from
+MEASURED free VRAM with weights resident (tier size, alignment, and any
+co-tenant process fall out of the measurement). Exact 18-pair per-token
+bytes (MIRROR WARNING against Engine::kv_bytes). Arch-calibrated base:
+sm_120 0.89 GB, sm_86 1.77 GB (fd2/h16 workspaces are heavier), + the
+existing (W_MAX+1)*0.157 role + W_MAX*0.13 graph terms. Slack 1.0 ->
+0.25 GB (it was sized for the stat-based estimate this replaces; the
+4096 floor adds 0-0.3 GB more). Two new banner lines: `vram: free X.XX
+GB post-weights` and `... at ready` -- the calibration probe is now a
+standing part of every boot.
+
+**Verification matrix (all boots real, q4s tier unless noted):**
+- 3090 fp16 auto: **57344**, boots, 0.29 GB at ready (was: picks 69632,
+  OOMs). One deliberate 4096-step below the 61440 knife edge.
+- 3090 turbo3 auto: **262144**, boots, 0.67 GB at ready.
+- 5090 fp8 auto: 262144 (cap-bound), 2.95 GB at ready.
+- 5090 fp8 tier boots: v1.4 **262144** / q6 **192512** / q6k **122880**
+  (0.75 / 0.53 / 0.31 GB at ready). README tier numbers refreshed.
+- Retro-check: the corrected model predicts the hand-found v1.4 3090
+  ceiling (24576) exactly.
+- Gates: diff is server.cu-only (sizing + two prints; no engine/kernel
+  touch); both arches build clean; serving determinism smoke 2x
+  byte-identical on the new binary.
+
+**turbo3 x q4s on the 3090 (the capacity headline):** a 24 GB card now
+boots the FULL 262144 native window (4.27x the fp16 61440, 2x the 07-11
+131K-on-v1.4 record). turbo3 KV at 262144 = 3.77 GB vs fp16's 4.53 GB
+at 61440 -- the format IS the ceiling on this card. Needle 6/6 PASS on
+a ~233K-token haystack (depths 10-95%, deepest ~222K), first-hit
+2m59s wall for the entire 6-ask run -- 3090 turbo3 prefill sustained
+>1300 tok/s, no measured 2.2x prefill tax at this shape. Club-harness
+decode bench (their bench.sh verbatim, 3 warmup + 5 measured, vs the
+07-16 fp16@61440 leg on the same card):
+
+| leg (3090, q4s, turbo3@262144) | wall t/s | decode t/s | TTFT |
+|---|---|---|---|
+| narrative (n=5, CV 0.2%) | 89.45 | 94.23 | 567ms |
+| code (n=5, CV 0.0%) | 108.32 | 117.38 | 570ms |
+| prefill 10K cache-busted (n=3) | 1096 tok/s | -- | 9.2s |
+| prefill 90K-class cache-busted (n=3, ~70K-tok runs) | 643 tok/s | -- | 145s |
+
+vs the 07-16 fp16@61440 leg, same card, same harness: narrative +0.9%
+wall / +1.1% decode, code **+9.0% wall / +9.8% decode**, TTFT equal.
+The 5090's turbo3 decode tax (5-30% by depth) INVERTS on Ampere: fp16
+streams 4096 B per KV pair per token, turbo3 800 B, and on a
+bandwidth-starved part the KV-read savings beat the dequant compute --
+the same physics triad, applied to KV bytes. Prefill tax is ~3% here
+(1096 vs 1131 tok/s at 10K), not the 5090's 2.2x. NET: on sm_86,
+turbo3 is BOTH the capacity lever and the speed pick -- narrative
+94.2 / code 117.4 decode at 262144 ctx beats every published
+single-3090 club row on both axes while quadrupling their best q27
+fp16 window. OPEN (product call, not taken here): the Ampere CC
+profile still defaults fp16 KV with "turbo3 opt-in recommended"
+(server.cu profile block); today's numbers argue for flipping that
+default on sm_86.
+
+vox-transcriber stopped for the test window and restarted after
+(3090 must be dedicated; its 2.7 GB is the difference between boot and
+OOM at these shapes). Open (unchanged): --slots still defaults --ctx
+8192 (multi-slot auto-size is its own roadmap item); test_gemv10_scaling
+q4-head fixture gap.

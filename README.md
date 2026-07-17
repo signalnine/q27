@@ -185,8 +185,9 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
   llama.cpp's strongest vanilla config.
 - Weight tiers (07-12): q6k's matched-protocol PPL 7.9127 beats every
   measured GGUF of this model incl. unsloth's 26 GB flagship. On fp8 KV
-  the quality tiers cost context (262144 / 196608 / 114688 auto-ctx on
-  a 32GB 5090) -- pair them with `Q27_KV=turbo3`, which keeps the full
+  the quality tiers cost context (262144 / 192512 / 122880 auto-ctx for
+  default/q6/q6k on a 32GB 5090, re-measured 07-17 under the calibrated
+  auto-ctx) -- pair them with `Q27_KV=turbo3`, which keeps the full
   262144 window on every tier.
 - q4s tier (07-16): 15.46 GB / 4.55 bpw. Paired-protocol PPL 8.0197
   vs default's 8.0409 (-0.26%, the third measured error-cancellation

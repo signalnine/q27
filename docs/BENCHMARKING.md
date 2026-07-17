@@ -368,7 +368,9 @@ Caveats, theirs and ours, stated plainly:
   recipes serve 102K-200K; this q27 3090 config serves 24576 (fp16 KV on
   24 GB; the 5090-calibrated auto-ctx anchor over-sizes on sm_86 -- auto
   36864 and explicit 32768 both OOM at spec-graph instantiation under
-  the 07-16 defaults, 24576 boots). q27's turbo3 KV serves 131072 on
+  the 07-16 defaults, 24576 boots). *(Auto-ctx recalibrated 2026-07-17
+  -- measured-free sizing, exact per-token KV; picks now boot on both
+  cards. See the BUILDLOG entry.)* q27's turbo3 KV serves 131072 on
   this same card at 102.2 t/s live agentic decode (BUILDLOG 2026-07-12);
   that config was not the one benched here.
 - **Quant tiers differ across all rows** (theirs: AutoRound-INT4,
@@ -432,7 +434,10 @@ Read, decode-to-decode:
   config's 24576 on the same card, same fp16-KV defaults. The 2.27 GB
   of freed weights went straight to KV. Their 3090 rows still serve
   102-200K; closing the rest is the turbo3 lever (131K on this card,
-  BUILDLOG 2026-07-12), not weights.
+  BUILDLOG 2026-07-12), not weights. *(Both flags resolved 2026-07-17:
+  auto-ctx recalibrated to measured-free sizing, and q4s + turbo3
+  boots the full 262144 window on this 3090 -- needle 6/6 at a 233K
+  prompt. See the BUILDLOG entry and the addendum below.)*
 - **KV-bits asymmetry, theirs-favoring**: our 3090 leg runs fp16 KV
   (16 bits/token-channel) vs their 3090 rows' q4_0/q5_0 KV (~4-5
   bits). They spend ~3x fewer bits on KV -- that is where their 200K
@@ -447,6 +452,28 @@ Read, decode-to-decode:
   systematic); needle spot 2/2 exact at ~149K/~24K depth in a 248.7K
   prompt. The cheaper quant does not pay a measured quality tax; it
   pays a code-acceptance speed tax.
+
+### Addendum 2026-07-17 -- turbo3 closes the 3090 context column
+
+Same card, same harness, q4s + `Q27_KV=turbo3`, auto-ctx (recalibrated
+this day) lands the **full 262144 native window on the 24 GB 3090**
+(0.67 GB spare at ready; needle 6/6 verbatim on a ~233K-token haystack,
+deepest plant ~95%). Decode does not pay for it -- it gains:
+
+| 3090 leg (q4s) | narr wall/decode | code wall/decode | TTFT | ctx |
+|---|---|---|---|---|
+| fp16 KV (07-16 leg) | 88.5 / 93.2 | 99.4 / 106.9 | ~565ms | 61440 |
+| turbo3 KV (07-17) | **89.45 / 94.23** | **108.32 / 117.38** | 567ms | **262144** |
+
+The 5090's turbo3 decode tax inverts on Ampere: 800 B vs 4096 B per KV
+pair per token, and on a bandwidth-starved part the KV-read savings beat
+the dequant compute (code +9.8% decode). Prefill tax ~3% at 10K (1096
+vs 1131 tok/s); the 90K-class prefill leg is measurable for the first
+time on this card (643 tok/s cache-busted, previously SKIPped as
+over-ctx). Against their published single-3090 rows this config now
+leads every column at once: narrative decode 94.2 vs ik's 60.4, code
+117.4 vs beellama DFlash's 101.3, at 262K ctx vs their 102-200K
+ceilings. The context trade flagged above is closed.
 
 ## History / non-reproducible baselines
 
