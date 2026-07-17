@@ -6345,6 +6345,55 @@ the miss the README warns about; turbo3 remains the 131K lever on that
 card. Full method, tables, and caveats: docs/BENCHMARKING.md "vs
 club-3090 community recipes (their harness, our silicon)".
 
+## 2026-07-16 -- q4s tier SHIPPED: 4.55 bpw for VRAM-starved cards -- 2.27 GB smaller, +5.2% suite, AND PPL beats default (-0.26%)
+
+Ask came from GitHub issue #1 (A10 cloud card: 24 DECIMAL GB minus ECC
+= 22.6 GiB usable): default weights + w8 + turbo3 measured a 28672 ctx
+ceiling -- the fixed stack eats 95% of that card, and the graph-zoo
+env knobs cap out at +280 MiB (Q27_MAXD=4, his measured sweep; DEXIT
+is not a capture knob, the per-step graphs capture unconditionally).
+The real lever is weight bytes. Design: strip the v1.4 above-Q4 mass
+that doesn't pay. repack.py grew --q4-head: emit output.weight ITSELF
+at Q4_G64 and drop the output_q4.weight dupe (one lm_head serves
+draft/verify/plain; all four name-keyed call sites fall back
+correctly -- engine change ZERO), plus no --q8, so the v1.4
+residual-writer promotion (ssm_out+attn_output) reverts to Q4.
+KEPT Q8: token_embd (phase-2 candidate, unmeasured), blk.64 MTP
+(FORMAT.md: draft/verify agreement craters), attn_k/v (~0.17 GB,
+errors persist in KV).
+
+Artifact: qwen36-27b-mtp-q4s.q27, 15.46 GB = 4.55 bpw (repack 678s,
+866 tensors, md5 7e5454e0c0ded717136ad3e42634ba25, tag q4s-v1; worst
+RMSE 0.1226 = same class as v1.4's residual Q4 worst 0.115, and the
+Q4 head is NOT in the worst-15). Bytes that moved: lm_head mass
+1.966 GB (Q8 head + Q4 dupe) -> 0.675 (one Q4 head); promotions
+2.045 -> 1.070. Total -2.27 GB = ~167K tokens of turbo3 KV budget.
+
+MEASURED (same-day, master e58c063 fresh build, 5090):
+- canonical: v1.4 a2982c51 EXACT first (build sanity); q4s canonical
+  f64e7c02252ca4c40cea62db662205e0, deterministic x2, 2.84 t/round.
+- PPL (--nll, 148335 preds, c2048, paired): v1.4 8.0409 reproduced
+  EXACT; q4s **8.0197 = -0.26% BETTER than default**. Third measured
+  error-cancellation structure (after ffn_up and GDN in-proj) -- the
+  v1.4 promotion was tuned on qwopus; on vanilla wikitext it was
+  hurting, not helping. Ladder: Q5_K_M 7.9179 / q6k 7.9127 / q6
+  7.9460 / q4s 8.0197 / v1.4 8.0409.
+- suite: 186.2 vs 177.0 t/s same-day (+5.2%) -- decode goes as weight
+  bytes; the 12.8% byte cut beats the acceptance mix shift.
+- serving: turbo3 boots, auto-ctx picks the 262144 cap on the 5090
+  (24.0 GB used), coherent completions through /v1/messages.
+- NOT run: task dome (tier-dome precedent says no score separation;
+  run before quality-critical recommendations); phase-2 token_embd
+  demotion (-0.6 GB more) unmeasured.
+
+Small-card math (A10 fixed 21907 MiB measured at maxd4): q4s fixed
+~19.7 GB -> ceiling ~215K by arithmetic, up from 49152 tuned / 28672
+stock. A 24 GiB 3090 reaches the 262144 cap by the same arithmetic
+(not boot-verified; vox resident). Tier map now: q4s 4.55 (max ctx,
+fastest) / default 5.25 (reference, canonical a2982c51) / q6 6.0 /
+q6k 6.8. Shipped: README tier row + small-cards rewrite, CHECKSUMS,
+HF upload alongside the existing tiers.
+
 ## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
 
 The README carried these from the start of the project; they moved here

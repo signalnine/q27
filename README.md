@@ -56,23 +56,28 @@ fp16-MMA verify (h16) and fp16/turbo3 KV.
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the
 default width-12 build OOMs at graph setup on 24GB. Serve it with
-`Q27_KV=turbo3` for 131K context (fp16 KV caps ~32K there). The card
-must be otherwise idle: ~2.7GB of other resident VRAM is the difference
-between boot and OOM.
+`Q27_KV=turbo3` and prefer the q4s tier: its 2.27GB-smaller weight
+file goes straight to KV budget (~74K tokens/GB at turbo3 rates).
+Cards with less than a true 24 GiB (A10-class cloud parts, ECC
+reserve, decimal-GB VRAM) can also add `Q27_MAXD=4`, which trims the
+captured graph zoo by ~280MB. The card must be otherwise idle: ~2.7GB
+of other resident VRAM is the difference between boot and OOM.
 
-Pick a quant first. Three tiers, one repo
+Pick a quant first. Four tiers, one repo
 ([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27))
 -- all serve identically,
 they trade decode speed for model quality:
 
 | tier | file | GPU | pick it when |
 |---|---|---|---|
-| **default** (5.25 bpw) | `qwen36-27b-mtp.q27` | 24GB+ | you want max speed; the only tier that fits 24GB cards |
+| **default** (5.25 bpw) | `qwen36-27b-mtp.q27` | 24GB+ | the reference tier: bitwise canonical `a2982c51`, the most measured configuration |
+| q4s (4.55 bpw) | `qwen36-27b-mtp-q4s.q27` | 24GB+ | max context on small cards; 2.27GB more KV budget, +5% decode, and wikitext PPL measures 0.26% BETTER than default (single Q4 lm_head + Q4 residual writers; error cancellation is real) |
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | 32GB | +0.35% PPL off Q5_K_M for ~5% slower decode |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | 32GB | quality matching the best GGUFs of this model, ~10% slower decode |
 
-Task scores measure the same across tiers -- the quality tiers buy
-perplexity margin, not benchmark wins. When in doubt take the default.
+Task scores measure the same across tiers (q4s: PPL + suite gated,
+task dome pending) -- the quality tiers buy perplexity margin, not
+benchmark wins. When in doubt take the default.
 
 ```bash
 # 1. tokenizer + your chosen tier from Hugging Face (Apache-2.0);
@@ -183,6 +188,13 @@ in [docs/BUILDLOG.md](docs/BUILDLOG.md) and
   the quality tiers cost context (262144 / 196608 / 114688 auto-ctx on
   a 32GB 5090) -- pair them with `Q27_KV=turbo3`, which keeps the full
   262144 window on every tier.
+- q4s tier (07-16): 15.46 GB / 4.55 bpw. Paired-protocol PPL 8.0197
+  vs default's 8.0409 (-0.26%, the third measured error-cancellation
+  win), suite +5.2% (186.2 vs 177.0 t/s same-day) -- smaller, faster,
+  AND lower perplexity. Exists for VRAM-starved cards: the 2.27 GB it
+  returns is ~167K tokens of turbo3 KV budget. Sub-24GB cloud cards
+  (A10 22.6 GiB usable) measured 28K ctx ceiling on default weights;
+  q4s arithmetic puts the same card past 200K.
 
 ### Carried state (pre-campaign, still in force)
 

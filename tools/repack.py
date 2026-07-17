@@ -27,6 +27,7 @@ GROUP_Q4, GROUP_Q8 = 64, 128
 
 
 Q8_EXTRA = None  # set from --q8 (v1.4 sensitivity experiments)
+Q4_HEAD = False  # set from --q4-head (q4s tier: single Q4 lm_head)
 
 
 def policy(name: str) -> int:
@@ -38,6 +39,8 @@ def policy(name: str) -> int:
         return DTYPE_F16
     if name == "output_q4.weight":
         return DTYPE_Q4  # v1.3: extra Q4 copy of the lm_head for MTP DRAFT passes only
+    if name == "output.weight" and Q4_HEAD:
+        return DTYPE_Q4  # q4s: the ONE lm_head, Q4 -- draft/verify/plain all read it
     if name in ("token_embd.weight", "output.weight") or name.startswith("blk.64."):
         return DTYPE_Q8
     if re.match(r"blk\.\d+\.attn_(k|v)\.weight$", name):
@@ -101,10 +104,14 @@ def main():
                     help="extra tensor-name regex forced to Q8_G128 (v1.4 policy experiments)")
     ap.add_argument("--tag", default=None,
                     help="quant_policy meta override (e.g. q6-v1 for the 6-bit tier)")
+    ap.add_argument("--q4-head", action="store_true",
+                    help="emit output.weight at Q4_G64 and skip the output_q4.weight copy "
+                         "(q4s tier; engine falls back to output.weight for drafts)")
     args = ap.parse_args()
-    global Q8_EXTRA
+    global Q8_EXTRA, Q4_HEAD
     if args.q8:
         Q8_EXTRA = re.compile(args.q8)
+    Q4_HEAD = args.q4_head
 
     t0 = time.time()
     r = GGUFReader(args.input)
@@ -114,6 +121,8 @@ def main():
             "group_q4": GROUP_Q4, "group_q8": GROUP_Q8, "nibble_order": "even=low"}
     if args.q8:
         meta["q8_extra"] = args.q8
+    if args.q4_head:
+        meta["q4_head"] = True
     for f in r.fields.values():
         if f.name.startswith(("qwen35.", "general.architecture", "general.name")):
             try:
@@ -144,7 +153,7 @@ def main():
 
     extra = []
     for t in r.tensors:
-        if t.name == "output.weight":
+        if t.name == "output.weight" and not args.q4_head:
             extra.append(("output_q4.weight", t))
     class _Alias:
         def __init__(self, name, t):
