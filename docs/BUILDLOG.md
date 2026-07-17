@@ -6520,6 +6520,125 @@ config 2.5x ctx. Open items: test_gemv10_scaling q4-head skip; task
 dome before quality-critical recommendations (per the SHIPPED entry);
 phase-2 token_embd demotion unmeasured.
 
+## 2026-07-16 -- q4s-v1 CONSISTENCY STUDY: do real agentic task scores hold on the repack? (thunderdome, single-slot 131K fp8)
+
+The validation ladder above left one open item ("task dome before
+quality-critical recommendations") and one legible trade: the
+single-Q4-head tier re-rolls the code acceptance basin (5090 code 3.86
+-> 3.45 tok/round, -7% code decode). Question: does that acceptance
+re-roll (or anything else in the tier) move REAL agentic task scores?
+Master 4d0a3c2, build/q27-server (W12, mtime after last src commit
+aa991de), q4s md5 re-verified against CHECKSUMS.md5.
+
+DESIGN (pre-declared, written before any result was collected):
+- Tasks: the CONSISTENT SCORERS at this shape -- T2 collab-server
+  (historical band 0.83-0.85; draws 0.851/0.851/0.839-0.844), T11
+  debug-nightmare (0.850 x2), T5 task-queue (0.78-0.81; draws
+  0.789/0.776-0.797). NOT the documented lottery modes (T8's
+  auth-chain basin; the T2/T5 crash classes seen only at the 2x48K
+  squeeze shape in the turbo3 gate -- the bands here were measured at
+  single-slot 131K, which is what this study reproduces).
+- Shape: single-slot --ctx 131072, Q27_KV=fp8, bare v0.2.0 defaults
+  (fast-head + no-think + fp8 are the defaults; env pins fp8
+  explicitly), port 8081, unit q27-eval, CUDA_VISIBLE_DEVICES=0,
+  vanilla model files. One task at a time, sequential -- no
+  concurrency anywhere in this study.
+- Legs: q4s-v1 (qwen36-27b-mtp-q4s.q27) vs v1.4 (qwen36-27b-mtp.q27),
+  n=3 per task per leg, alternating leg-blocks with a fresh server per
+  block: q4s[T2,T11,T5], v14[T2,T11,T5], x3 = 18 runs. GPU-free check
+  + reset-failed before each block; "slot 0 ready: ctx=131072"
+  verified from the CURRENT invocation's journal (invocation-ID
+  scoped, per the 07-16 phantom-OOM lesson).
+- Thunderdome: `./thunderdome run --orchestrator claude-code-q27-haight
+  --task TN --trials 1`; scores from trials meta.json composite_score
+  + exit_reason (harness exit codes ignored per the standing note).
+- PASS RULE: q4s passes if per-task medians land within +-0.03 of the
+  same-day v1.4 leg medians AND within/above the historical bands;
+  single outlier draws reported descriptively (standing register:
+  n=3 cannot separate small effects). A consistent multi-task deficit
+  >0.05 = flag for the owner, no rationalizing.
+- Also collected per run: decode tps + tok/round from [req] telemetry
+  (the code-acceptance question: do T2/T5 turn walls/tps shift on
+  q4s?), errors (must be zero), wall times (descriptive only).
+
+RESULTS (18/18 runs completed, ZERO [req-error]/end=error across all
+runs and 6 server boots; every boot's "slot 0 ready: ctx=131072"
+verified invocation-scoped; study wall ~53 min):
+
+  block  leg  T2 collab          T11 debug        T5 task-queue
+  b1     q4s  0.553 @175s        1.000 @38s       0.619 @141s
+  b2     v14  0.535 @212s        1.000 @39s       0.200 @9s
+  b3     q4s  0.553 @307s        1.000 @38s       0.620 @145s
+  b4     v14  0.547 @533s        1.000 @50s       0.200 @10s
+  b5     q4s  0.545 @146s        1.000 @37s       0.625 @153s
+  b6     v14  0.272 @67s         1.000 @48s       0.200 @9s
+
+  task  q4s med (spread)      v14 med (spread)      delta    hist band
+  T2    0.553 (0.545-0.553)   0.535 (0.272-0.547)   +0.018   0.83-0.85
+  T11   1.000 (1.000-1.000)   1.000 (1.000-1.000)    0.000   0.850
+  T5    0.620 (0.619-0.625)   0.200 (0.200-0.200)   +0.420   0.78-0.81
+
+Basin anatomy (sub-scores): T2 draws the SAME basin on BOTH legs all
+6 runs -- hidden_tests 0.07 / tests 0 / agent 1.00; composite spread
+is coverage/code_metrics wiggle (v14 b6 0.272 = outlier draw that
+also lost agent_tests, 67s). T11: tests+static 1.00 flat, both legs,
+all 6. T5: v14 lands the DOCUMENTED deterministic one-shot-quit 3/3
+(the [drift] UN-RESCUED first-tool-call class -- 2 reqs, 151 decode
+tokens, 9-10s, identical every rep; same class the turbo3 gate logged
+for fp8 T5 at 2x48K, now on the reference tier at single-slot 131K);
+q4s escapes it 3/3 into full 141-153s sessions (hidden 0.18, coverage
+0.88-0.91). Per the standing register that is a basin-lottery re-roll
+at the first tool call (different tier bytes, different trajectory),
+not KV/weight quality signal -- but the direction is q4s ABOVE.
+
+Telemetry ([req] aggregates per run; trajectory-confounded,
+descriptive only -- the code-acceptance question):
+
+  task  leg  tok/round (med)   per-req med tps (med of 3)   agg tps
+  T2    q4s  5.29/5.47/5.77 (5.47)   233/254/255 (253.7)    259-294
+  T2    v14  4.64/5.65/8.66 (5.65)   224/235/237 (235.2)    233-401*
+  T11   q4s  4.81/4.88/4.99 (4.88)   259/259/260 (259.9)    234-244
+  T11   v14  4.70/4.80/4.87 (4.80)   232/239/246 (238.6)    227-235
+  T5    q4s  4.53/4.59/5.27 (4.59)   235/240/241 (240.2)    228-263
+  T5    v14  (151-token quits, not comparable)
+  (* v14 b4 = 533s/140K-tok echo-deep outlier: tok/round 8.66, agg 401)
+
+The club-bench -7% code-decode re-roll does NOT reproduce on real CC
+traffic: q4s tok/round is -3% on T2 (5.47 vs 5.65) and at parity on
+T11, while per-request median tps reads q4s +8% (T2 253.7 vs 235.2)
+and +9% (T11 259.9 vs 238.6) -- the 12.8% byte cut outruns the
+acceptance mix shift on agentic turn shapes, exactly as it did on the
+5-prompt suite. Wall times: T11 q4s 37-38s vs v14 39-50s every draw;
+T2/T5 walls are volume-basin dominated (T2 v14 67-533s).
+
+VERDICT (against the pre-declared rule, stated plainly): the rule as
+written does NOT return a clean PASS -- the band clause fails on T2
+(0.553 < 0.83) and T5 (0.620 < 0.78), and T5's median delta (+0.420)
+is outside +-0.03. But every one of those violations is either shared
+by or in favor of q4s: the same-day v1.4 CONTROL misses the same
+bands identically (T2 0.535) or worse (T5 0.200), and the +0.420 is
+q4s ABOVE the control. The deficit flag (consistent multi-task
+deficit >0.05) does NOT fire -- q4s median >= v1.4 median on all
+three tasks. Finding of record: **NO q4s-attributable score deficit;
+real agentic task scores HOLD on the repack** (T2 +0.018, T11 tie at
+ceiling, T5 +0.420 via basin escape). The historical bands themselves
+did not reproduce ON THE REFERENCE TIER -- thunderdome is unchanged
+since 03-18 (same tasks, same rubrics, same image), so the band drift
+is the ENGINE era: the bands were minted on 07-08/07-10 binaries and
+defaults, and the documented cross-build tie-lottery (fdmma/fast-head
+defaults, W12, gemm-verify, suffix/auto7 -- many rebuilds since) has
+re-rolled the greedy trajectories. FLAGS FOR THE OWNER (independent
+of q4s, no rationalizing): (1) the fp8-131K-era bands are STALE under
+master 4d0a3c2 -- re-base before using them as gates again; (2) v1.4
+now draws T2's hidden_tests-0.07 basin and T5's deterministic
+one-shot-quit at the canonical single-slot 131K shape -- the [drift]
+first-tool-call rescue miss is worth a look on its own; (3) T11's
+composite now reads 1.000 both legs (tests+static only in the
+rubric's fired components) vs the 0.850 era draws. The validation
+ladder's open item "task dome before quality-critical
+recommendations" is CLOSED: q4s holds real agentic task scores at the
+reference shape.
+
 ## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
 
 The README carried these from the start of the project; they moved here
