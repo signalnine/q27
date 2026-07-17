@@ -1,91 +1,83 @@
-# Why q27 multi-slot doesn't scale aggregate throughput like vLLM
+# How q27 multi-slot scales aggregate throughput (and what it cost)
 
-> **SUPERSEDED 2026-07-16.** The limitation documented below was real on
-> 07-11 -- and was then ELIMINATED by the continuous-batching campaign
-> (P1-P3, BUILDLOG 2026-07-14..16): concurrent slots now decode through one
-> fused weight sweep with shape-keyed CUDA-graph replay, and the 2-slot
-> aggregate measures **1.41x over FIFO on both KV formats** (fp8 168.9 ->
-> 237.7 t/s, turbo3 158.5 -> 224.2; solo cost <=0.07%), on by default since
-> v0.2.0. Current numbers: docs/BENCHMARKING.md, "Single-box serving:
-> 2-slot continuous-batching aggregate". This document stays as the record
-> of WHY the FIFO design could not scale and what the campaign had to
-> change (per-request decode preserved, engine-busy ceiling shared).
+2026-07-16, v0.2.0. Rewritten from the 2026-07-11 original ("Why q27
+multi-slot doesn't scale aggregate throughput like vLLM") after the
+continuous-batching campaign (P1-P3, BUILDLOG 2026-07-14..16) eliminated
+the limitation that doc recorded. Its analysis and history are preserved
+below -- it predicted the shape of the fix almost exactly.
 
-2026-07-11, written against the day's 2-slot turbo3 measurements. Companion
-to docs/P10-decision.md (which priced the alternative and rejected it).
+## Current reality (measured, batch_ab REPS=3, w16 2x32K, v0.2.0)
 
-## The observation
+| KV | FIFO (old behavior) | batched + graphs | ratio | solo cost |
+|---|---|---|---|---|
+| fp8 | 168.9 t/s | **237.7 t/s** | **1.41x** | <=0.06% |
+| turbo3 | 158.5 t/s | **224.2 t/s** | **1.41x** | <=0.07% |
 
-Two turbo3 slots at 131K each on the 5090 (30.6/32.6 GB), real CC sessions:
+Zero-config: a bare 2-slot `q27-server` spot-checks at 234-239 t/s
+aggregate (90.9% graph-cache hits). ON by default since v0.2.0
+(`Q27_BATCH=0` restores FIFO time-slicing; `Q27_BATCH_GRAPH=0` keeps
+batching but drops graph replay; `Q27_PROFILE=ref` = conservative
+reference). Serving shapes of record for CC traffic: fp8 2x48K, turbo3
+2x96K (the w16 build caps at 2x32K on 32 GB). One edge: `--slots N` does
+not auto-size `--ctx` -- pass the window you want per slot.
 
-- Solo T8: 132-148s wall, per-request decode median ~205 t/s.
-- Concurrent T8 pair: 253/256s (~1.8x per session), per-request median
-  103.5 t/s, p90 200.8. Engine busy-aggregate stays ~200 t/s -- the same
-  total rate, split between tenants.
-- Concurrent T2 pair: 152/162s -- NEAR-SOLO walls two-up. T11 pair: 69/70s.
+Per-stream trade: each concurrent stream runs at ~63% of its solo rate
+while the box produces ~41% more total tokens. Bursty agentic traffic
+often does better than that arithmetic suggests -- tool-execution gaps
+mean decode bursts frequently don't collide, and a stream that briefly
+has the GPU alone runs the k==1 solo path (captured graphs, bitwise
+identical to single-slot serving, 0.00% measured regression).
 
-vLLM at c=2 on the same class of hardware gains ~1.6x aggregate (P10 brief:
-160.7 t/s c=2 vs 102 single). q27 gains ~1.0x. That is not a bug; it is the
-engine's central design bet, and the p90=200.8 shows there is no scheduler
-tax -- a slot that briefly holds the GPU alone runs at full solo rate.
+## The physics (unchanged from 07-11 -- what changed is who amortizes)
 
-## Why: the weight stream is spent on speculative width, not users
+Decode on this box is bandwidth-bound on the 17.7 GB weight stream; every
+round streams (nearly) the full weight set once. The only lever is
+amortization -- more tokens through each weight read:
 
-Decode on this box is bandwidth-bound on the 17.7 GB weight stream. Every
-decode round streams (nearly) the full weight set once. The only way any
-engine beats that per token is amortization: feed MORE tokens through each
-weight read.
+- q27's original bet amortized WITHIN one user: the MTP ladder + wide
+  verify feed up to ~13 lanes of ONE sequence per weight read. That is
+  what 200+ t/s single-stream is made of -- batching pointed at latency.
+- The campaign added amortization ACROSS users ON TOP: a conductor thread
+  fuses concurrent slots' verify rounds so one weight sweep serves the
+  UNION of everyone's lanes (weight kernels were already per-lane pointer
+  structs; cross-engine lanes are plumbing). Per-engine state work
+  (attention on own KV, GDN chains) stays per-engine: attention shares
+  nothing across sequences and is KV-saturated at depth (P4 measured
+  no-go on further overlap), GDN chains fork onto side streams.
+- Draft steps fuse the same way (one MTP head sweep per step for all
+  active engines) -- overlap alone recovered ~nothing because drafts are
+  weight-bound too. The campaign's physics triad: BW-bound work yields
+  only to fusion; state-latency-bound work yields to overlap; saturated
+  work yields to neither.
 
-- vLLM amortizes ACROSS USERS: continuous batching concatenates live
-  sequences, one weight read feeds N users' tokens. Aggregate scales until
-  compute or KV bandwidth binds.
-- q27 amortizes WITHIN ONE USER: the MTP ladder + width-12 verify feed up
-  to ~13 lanes of ONE sequence through each weight read (tok/rnd 5.8 on
-  cctx2 means each weight stream yields ~5.8 committed tokens). That
-  amortization is what makes 200+ t/s single-stream possible at all --
-  it IS "batching", pointed at latency instead of throughput.
+## The price P10-A named, and P3 paid
 
-R1b multi-slot is therefore round-granularity TIME-SLICING: at any instant
-one slot's kernels own the GPU; the other waits for a round boundary
-(handovers are measured in Engine::GenStats gw_ms). Two sustained decoders
-each stream the weights for their own rounds -- 2x the weight traffic per
-token-pair vs a batched engine -- hence the clean ~2x per-request split on
-decode-heavy traffic. No cross-slot kernel launches share anything.
+The 2026-07-11 P10-A rejection (docs/P10-decision.md) identified the
+killer cost: the CUDA-graph zoo cannot bake per-perm role pointers across
+independent mod-12 rotations, "forcing device-side indirection through
+the round-critical path that every canonical bitwise gate protects."
+That is, almost verbatim, what shipped: conv/delta TABLE TWINS resolve
+role pointers through a device-resident table + per-engine perm scalar
+(P10-spill-safe, ptxas spill 0, bitwise vs the direct kernels -- gated by
+ninv's TWIN leg on both arches), making fused rounds perm-invariant so a
+shape-keyed LRU cache can replay whole verify rounds as CUDA graphs
+(~28-44 live shapes, 86-100% hits). The bitwise gates the 07-11 doc
+worried about HELD: batched output is byte-identical to the pre-batching
+references at every phase (master-gate refs, canonical, sampled-seed),
+and solo serving is untouched by construction. What the 07-11 estimate
+got right: ~1.9x was the no-graphs ceiling estimate at k=2; eager fusion
+measured 1.21-1.31x and graph replay carried it to 1.41x. What it got
+wrong: nothing material -- it priced the work as expensive (it was: P0-P3,
+three days, ~15 gated commits) and capped at 2 big-context users by
+per-slot GDN role VRAM (still true on 32 GB at full context).
 
-Why CC traffic often doesn't feel it: agentic sessions are BURSTY. T2/T11
-sessions spend most wall time in host-side tool execution; the slots'
-decode bursts rarely collide, so both ride near-solo (152/162s two-up).
-Only sustained simultaneous decode (T8-class synthesis turns) pays the
-full interleave split.
+## History: the 2026-07-11 observation this doc replaced
 
-## Why we didn't build cross-user batching (and still haven't)
-
-P10 Option A ("fused batch-10", 2026-07-03) priced it: extend the n-lane
-GEMVs 5->10(now 12->24) lanes, per-lane SEQUENCE plumbing in verify
-attention (lanes assume one sequence today -- separate KV base pointers,
-positions, GDN states per lane group), and -- the killer -- the CUDA-graph
-zoo cannot bake per-perm pointers across two independent mod-12 rotations
-(a 12^2 permutation product), forcing device-side indirection through the
-round-critical path that every canonical bitwise gate protects. Estimated
-~1.9x aggregate, hard-capped at 2 users by per-slot GDN role VRAM (each
-slot carries its own 12-set rotation; turbo3 shrinks KV, NOT that), for a
-~0-15% wall edge over just routing c>=2 elsewhere. Rejected then; nothing
-today changes the cost side. turbo3 does not lift the 2-user cap either:
-17.7 + 3x(~4.8 fixed + 1.78 KV) > 32.6 GB.
-
-## What multi-slot IS for (what turbo3 changed)
-
-Capacity and admission, not aggregate: two FULL-context tenants (131K+131K
-vs fp8's 131K+~23K), zero queue latency for the second user, fair splits
-under contention, near-zero cost on bursty real traffic. The six concurrent
-sessions of 2026-07-11 (T8/T2/T11 pairs) completed 6/6 with T2/T11 at
-solo-class scores AND walls. [2026-07-13 update: rerun under the
-fixed binary (>= e16c394) reproduced solo-class T2/T11 scores and walls
-and the T8 basin profile -- the provisional flag is lifted; see the
-BUILDLOG rerun entry.]
-
-If aggregate throughput ever becomes the goal on this box: that's vLLM's
-game (with its own measured costs here -- 0% prefix-cache reuse on
-hybrid-GDN, 4.7x wall on CC agentic traffic, thunderdome 2026-07-09), or
-it's reopening P10-A with the graph-indirection price paid. The latency
-engine keeps its bet.
+Two turbo3 slots at 131K, FIFO time-slicing, real CC sessions: solo T8
+~205 t/s per-request median; concurrent T8 pair split to ~103.5 each
+(engine busy-aggregate ~200 t/s -- same total, divided); bursty T2/T11
+pairs rode near-solo walls. vLLM gained ~1.6x aggregate at c=2 where q27
+gained ~1.0x -- by design, then. Full text in git history
+(docs/multislot-throughput.md @ 361b0a2 and earlier); the decision record
+it accompanied is docs/P10-decision.md; the campaign that changed the
+answer is BUILDLOG 2026-07-14..16.
