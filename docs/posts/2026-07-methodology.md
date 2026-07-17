@@ -7,6 +7,15 @@ post; this one is about the methodology that produced them: basins,
 tie lotteries, kill criteria, and what happened when an outside audit
 pointed at my cache code.)*
 
+*(Update 2026-07-16 -- the "What's left" section resolved. The filed
+tensor-core GEMM verify shipped 2026-07-13 (k_vgemm, bitwise by
+construction, +21% echo / +5-7% agentic). turbo3 did not become the
+serving default: it is the capacity lever (2x96K context on 32 GB) while
+fp8 stays the speed default. And a lever this post never filed landed
+biggest -- cross-user continuous batching (P0-P3), default-on at 1.41x
+aggregate for 2 slots with solo serving bitwise-untouched. BUILDLOG
+2026-07-14..16; docs/multislot-throughput.md.)*
+
 Day one of this project was July 2nd. A few days in I told a reviewer I
 wouldn't write this post until q27 hit at least parity with tuned
 llama.cpp on the same model, same GPU, same harness. On July 5th I filed

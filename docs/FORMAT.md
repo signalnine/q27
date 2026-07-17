@@ -51,6 +51,11 @@ reduction axis for every matmul weight in this model.
 | everything in `blk.64.*` (MTP layer) | Q8_G128 (matmuls) / F32 (norms) | draft/verify agreement must survive quantization or MTP acceptance craters |
 | all other matmul weights (blk.0-63) | Q4_G64 | the ~14 GB bulk |
 
+This table is the DEFAULT tier (~5.25 bpw overall). The q6 / q6k quality tiers
+(2026-07-12, BUILDLOG) promote selected bulk tensors to Q8_G128 within the same
+container and dtype set; the tier is recorded in the header meta as
+`quant_policy` (e.g. `q6-v1`). No new dtypes, no version bump.
+
 ## Per-step read budget (decode)
 
 Q4 bulk ~13.2 GB + Q8 lm_head ~1.3 GB + MTP layer ~0.4 GB + f16/f32 small tensors

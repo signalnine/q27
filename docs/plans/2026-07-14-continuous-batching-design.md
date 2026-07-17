@@ -147,6 +147,9 @@ These are planning numbers, not promises; the P1 A/B is the arbiter.
   their own early-exit depth); re-measure at 2-4 slots.
 - P3 (conditional): shape-graphs via device-side perm indirection, only if
   P1/P2 measure the eager host tax > ~2-3% of round wall.
+  [RESOLVED 2026-07-16: condition met (eager dispatch tax measured 3.4
+  ms/round); P3 built (table twins + shape-keyed LRU graph cache) and
+  passed its bar -- 1.41x fp8 / 1.40x turbo3, BUILDLOG 2026-07-16 "P3 T4".]
 
 ## Risks
 
@@ -161,6 +164,10 @@ These are planning numbers, not promises; the P1 A/B is the arbiter.
 - Eager host tax: bounded and measured at P1; priced escape hatch at P3.
 - Env: Q27_BATCH=1 gates the whole feature (default off until the P1 gates
   pass; flips default only after live CC validation).
+  [RESOLVED 2026-07-16: exactly that sequence ran -- gates passed, live CC
+  validated (4 clean validations, zero errors), defaults flipped ON in the
+  serving profile (Q27_BATCH=1 Q27_BATCH_GRAPH=1 CAP=64; Q27_PROFILE=ref
+  stays the no-batch reference). BUILDLOG 2026-07-16 "DEFAULTS FLIPPED ON".]
 
 ## Not in scope
 

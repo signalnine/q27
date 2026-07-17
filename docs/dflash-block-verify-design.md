@@ -216,7 +216,13 @@ commissioned.
 **DO-NOT-RETRY unless:** (a) a drafter retrained on q27-quant hiddens
 exists, or (b) any block drafter shows AL >= 6 on agent-transcript
 traffic, or (c) the serving profile shifts to low-acceptance flavors
-AND the small-T verify gets built for another reason. The rig stays:
+AND the small-T verify gets built for another reason.
+[2026-07-16 note: leg (c)'s second half has since materialized -- a
+dedicated small-T tensor-core GEMM verify shipped 2026-07-13 as k_vgemm
+(for the MTP/suffix ladder, union widths >= 9; BUILDLOG "GEMM-verify").
+The serving profile has NOT shifted to low-acceptance flavors, so this
+NO-GO stands; only the verify-cost half of any future re-evaluation is
+now free.] The rig stays:
 `--dump-taps <file>` (eager tap capture, graphs untouched, canonical
 EXACT) and `--p0b` (S=16 cycle timing) in engine.cu;
 scratchpad/dflash_p0a.py.

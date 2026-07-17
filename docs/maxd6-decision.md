@@ -1,5 +1,15 @@
 # maxd6 decision brief: raise gate_maxd to 6 (speculatively 7-8)?
 
+> **OUTCOME: the 2026-07-08 GO at the bottom was executed same day --
+> auto-ladder 4..6 SHIPPED** (BUILDLOG 2026-07-08 "maxd6 build": cctx auto
+> +4.2% vs d5 same-harness (the entry's +4.7% headline mixed harnesses,
+> corrected in the 07-09 review rerun), byte-identical, canonical EXACT;
+> the width-7 lane cost, the last extrapolation, was measured in the
+> build). Follow-on maxd7
+> (BUILDLOG 2026-07-09): depth-7 machinery BUILT, ships OPT-IN; auto stays
+> 4..6 (the width-8 round cost came in ~2x the extrapolation). The 07-07
+> NO-GO and its 07-08 reversal below are both preserved as decision history.
+
 2026-07-07. The question: now that P14 landed per-width verify graphs (Task 3),
 draft early-exit with the `min(W, md_used)` width-floor top-up (Task 4), fused
 draft argmax+margin (Task 2), and the fd2 lane-innermost L2 fix (Task 5), does

@@ -1,5 +1,16 @@
 # Drafter probe plan (PARKED -- decode-side, not active)
 
+> 2026-07-16 status: still parked, and the revisit condition below has
+> since fired without changing the verdict. Decode t/s did become the
+> headline again (the 07-13 campaign), and the draft path was
+> re-investigated: NO-GO -- the MTP draft head is at its SOL floor, no free
+> win, and the on-path lever (a shortlist draft head) is a quality tradeoff
+> that most likely loses on novel prose (BUILDLOG 2026-07-13 "MTP draft
+> head lever" + docs/plans/2026-07-13-mtp-draft-head.md). A pre-trained block drafter
+> was separately probed and killed on measurement (AL 2.1 vs the ladder's
+> 5.29; docs/dflash-block-verify-design.md). The Eagle-MLP probe below
+> remains unrun.
+
 Question this answers before any DSpark-grade work: **does a purpose-trained
 drafter beat Qwopus's existing MTP head enough to justify a q27 draft-path
 fork?** Cheap experiment first (days), full parallel-backbone build only if

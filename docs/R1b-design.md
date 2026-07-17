@@ -1,5 +1,14 @@
 # R1b: round-granularity interleaved scheduling
 
+> **2026-07-16: the scoped-out upgrade shipped.** R1b's GpuGate time-slicing
+> carried multi-slot serving from 07-04 to 07-16; the continuous-batching
+> campaign (P0-P3, BUILDLOG 2026-07-14..16) then fused concurrent slots'
+> rounds across users -- the "fused batch-10" successor this design
+> deliberately scoped out -- and it is default-ON since v0.2.0 (1.41x
+> aggregate at 2 slots, solo cost 0%). The machinery below stays live: it is
+> the Q27_BATCH=0 fallback, the k==1 solo path, and the gate the conductor's
+> per-round lease rides on. Current analysis: docs/multislot-throughput.md.
+
 2026-07-04. Prereq landed (c874500 + aadd111): WY scratch per-engine.
 
 ## Problem

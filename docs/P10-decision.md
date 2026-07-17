@@ -1,5 +1,24 @@
 # P10 decision brief: fused batch-10 serving vs latency-engine positioning
 
+> **2026-07-16 OUTCOME: Option A is what shipped -- and the price this brief
+> named is the price paid.** The recommendation below was left unpicked;
+> the program took C's stepping stone (R1/R1b, "A1") and the 2026-07-11
+> multislot doc re-affirmed the Option-A rejection. Then the
+> continuous-batching campaign (P0-P3, BUILDLOG 2026-07-14..16) built
+> exactly A's core: conductor-fused cross-user verify (one weight sweep
+> serves the union of everyone's lanes), with all three costs paid --
+> (a) the graph indirection through the round-critical path (conv/delta
+> table twins + a shape-keyed LRU graph cache replacing the per-perm
+> baked-pointer zoo, spill-0, bitwise-gated), (b) union-width lane
+> plumbing, (c) per-lane sequence/KV plumbing. Measured at 2 slots:
+> **1.41x aggregate both KVs, solo cost 0.00%, byte-identity held at every
+> phase; default-ON since v0.2.0.** What the estimate got right: it priced
+> the work as expensive (three days, ~15 gated commits) and the ~1.9x was
+> the no-graphs k=2 ceiling (eager fusion measured 1.21-1.31x; graph
+> replay carried it to 1.41x). The 2-big-context-user VRAM cap (GDN role
+> sets) still stands. Current analysis: docs/multislot-throughput.md
+> ("The price P10-A named, and P3 paid").
+
 2026-07-03. The question: build fused 2-slot batch-10 multi-slot serving, or keep
 q27 a single-user latency engine and route concurrent work to vLLM. All numbers
 same box, RTX 5090.

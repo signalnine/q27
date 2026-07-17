@@ -465,6 +465,9 @@ did not collapse to the draft floor): the 5090's L2 absorbs a minority of the ~6
 fp8 KV slice per co-scheduled wave, not all of it -- which is why the win is real but
 marginal (+2.7%), not the full R~4.25 headroom. That residual headroom is the Task 6
 (lane-pair fusion) target, still DEFERRED pending Gabe's call on this marginal result.
+[RESOLVED 2026-07-07/09: Task 6 was built as attn-fd3 and KILLED on its perf gate
+(-4.0% @61K vs the >= +5% floor); the whole KV-sharing-restructure family was then
+closed with data on 07-09. See docs/attn-fd3-design.md.]
 
 Commands: pre binary from `git stash push -- src/spec3.cu` + `make` (fingerprint helper
 retained), saved to `scratchpad/pre/`; server A/B via `scratchpad/srv5.sh BIN PMIN DEXIT` +

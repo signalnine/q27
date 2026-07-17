@@ -16,6 +16,9 @@ numeric paths: every kernel receives byte-identical inputs and parameters,
 so per-stream output must be BITWISE identical to P1's -- and that is the
 main gate. (P2c, conditional) True draft fusion (union MTP weight sweep)
 only if post-P2a measurement still shows >1.5 ms/round of draft wall.
+[RESOLVED 2026-07-16: triggered -- P2a overlap recovered ~0 (draft steps
+are weight-BW-bound; fusion, not overlap, is the lever); P2c built and
+passed the bar, fp8 1.31x / turbo3 1.35x. BUILDLOG 2026-07-16 "P2c".]
 
 **Tech Stack:** CUDA streams/events, plain CUDA C++, md5 gates. No Makefile
 changes (targets exist since f45a9ad).

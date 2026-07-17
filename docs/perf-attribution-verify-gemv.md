@@ -1,5 +1,16 @@
 # Verify-GEMV Phase 0 attribution (ncu, 2026-07-08)
 
+> **2026-07-13 SUPERSEDED in part: the Task-3-class tensor-core verify
+> SHIPPED as k_vgemm.** The "Plan verdict after Task 2" below rejected a
+> tensor-core verify as canonical-breaking and said re-open only with a new
+> fact; the new fact was a construction, not a layout -- k_vgemm (flat-in-W
+> m16n8k32 MMA, src/vgemm.cu) is deterministic with no atomics and
+> canonical-bitwise BY CONSTRUCTION, dispatched at union verify widths >= 9
+> (gemm_min). Suffix round 24.3 -> 20.0 ms; +5-7% agentic, +21% echo. The
+> GEMV-family attribution below still describes the dispatch at widths
+> below gemm_min. See BUILDLOG 2026-07-13 "GEMM-verify" +
+> docs/plans/2026-07-13-gemm-verify.md.
+
 **Verdict: PROCEED to Task 2.** The batched verify GEMV (`k_gemv_q4_n<5>`) at 61K decode is
 **latency-bound at ~40% of DRAM peak**, not at the weight roofline. The dominant stall is a
 single class -- **long-scoreboard on L1TEX (90.4% of the 68.8-cycle inter-issue gap)** -- and
