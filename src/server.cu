@@ -893,6 +893,18 @@ int main(int argc, char** argv) {
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
         int n_max = body.value("max_tokens", 256);
         bool stream = body.value("stream", false);
+        // stream_options.include_usage (OpenAI streaming spec, both API
+        // shapes): when true, one extra SSE chunk -- empty choices + the
+        // usage totals -- goes out after the finish_reason chunk, before
+        // [DONE]. Tolerant parse: a non-object stream_options or non-bool
+        // include_usage reads as false (a malformed option must not throw
+        // out of the handler). Absent/false -> zero framing change.
+        bool inc_usage = false;
+        if (stream && body.contains("stream_options") && body["stream_options"].is_object()) {
+            const auto& so = body["stream_options"];
+            inc_usage = so.contains("include_usage") && so["include_usage"].is_boolean() &&
+                        so["include_usage"].get<bool>();
+        }
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt = build_prompt(body);
         ReqTrace rt{req_counter++, chat ? "oai" : "cmpl", conv_fp(body),
@@ -994,7 +1006,7 @@ int main(int argc, char** argv) {
         q27k::SampleParams samp = parse_sample(body);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, samp, prompt, n_max, created, chat, obj, objd, rt](size_t, httplib::DataSink& sink) {
+            [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
@@ -1046,6 +1058,14 @@ int main(int argc, char** argv) {
                     send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
                               {"model", served_name}, {"choices", json::array({fchoice})}});
                 }
+                // stream_options.include_usage: final usage chunk (empty
+                // choices) mirroring the non-stream usage body above.
+                if (inc_usage)
+                    send(json{{"id", "q27-0"}, {"object", objd}, {"created", created},
+                              {"model", served_name}, {"choices", json::array()},
+                              {"usage", {{"prompt_tokens", (int)prompt.size()},
+                                         {"completion_tokens", produced},
+                                         {"total_tokens", (int)prompt.size() + produced}}}});
                 req_log(rt, qw, eng, sl.id, bat_stats(bt));
                 std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
