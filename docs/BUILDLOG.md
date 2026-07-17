@@ -6304,6 +6304,47 @@ mix); choose turbo3 whenever capacity matters -- >48K/slot, more slots,
 or the 3090 -- with no quality asterisk. The turbo3-vs-fp8 quality gate
 (open since the 07-11 port) is CLOSED.
 
+**2026-07-16 -- CLUB-3090 HARNESS ON OUR SILICON (their bench.sh verbatim,
+endpoint-only; 5090 + 3090, two passes each).** Prerequisite shipped
+first: the OpenAI streaming paths now emit the spec
+`stream_options.include_usage` final usage chunk (`aa991de`; both
+/v1/chat/completions and /v1/completions, one shared handler; absent
+option = framing byte-identical). Gates on that change: make + w16 + w8
+rebuilds; canonical a2982c5197c627551b27d76a0a94b220 + sampled-seed
+8b6aacf912d8e4c7a50a021623c6c276 EXACT (CLI untouched); bare-server W12
+codegen replay text == p0_baseline r1 EXACT; live curl A/B -- no usage
+chunk without the option, spec-shape chunk with it, both API shapes.
+Then their harness unmodified from their repo (read end-to-end first;
+endpoint-only mode): `URL=http://localhost:8020 CONTAINER=none PP=1 bash
+scripts/bench.sh` -- 3 warm + 5 measured per prompt (narrative 1000 tok /
+code 800 tok), temp 0.6 top_p 0.95, streamed usage counts, salted prefill
+probes at 10K/90K. q27 = vanilla qwen, single slot, bare defaults,
+systemd-run, GPU-exclusive.
+  5090 (W12, fp8+fdmma, auto-ctx 262144), two passes: narr 144.15/143.97
+wall (151.81/151.62 decode), code 193.04/192.82 (210.92/210.65), TTFT
+350 ms, prefill 3372/3350 t/s @10K, 2559/2560 @90K (client-observed);
+in-run CV <=0.2%, pass delta <=0.15%. [req] cross-check: 151.4 / 209.8
+t/s engine at 2.64 / 3.86 tok/round.
+  3090 (w8, fp16 KV + h16, banner fd=mma, `--ctx 24576`), two passes:
+narr 84.06/83.41 (88.59/87.88), code 105.76/105.67 (115.08/114.97), TTFT
+~610 ms, prefill 1124/1123 @10K; the 90K depth SKIPped by their harness
+on q27's context-limit 400 -- their documented over-ctx path, not a
+failure. Engine cross-check 88.2 / 114.5 t/s.
+  vs their published rows (decode-to-decode, all spec-on): 5090 +19%
+narr / +3% code over their best single-5090 (vLLM DFlash 127.98/204.80
+decode), within 2-6% of their DUAL-5090 row on wall; 3090 +47% narr /
++14% code over the best published single-3090 decode (ik MTP 60.39 narr,
+beellama DFlash 101.3 code), ~91% of their 2x3090 vLLM dual decode row
+(96/127) on one card -- honest asterisks: their 3090 rows are mostly
+370W-capped (ours drew ~417 W; they document -29..-42% at 230 W) and
+serve 102-200K ctx vs our 24576 on this config. ANOMALY logged: bare
+auto-ctx (36864) and explicit `--ctx 32768` both OOM at
+verify_sample_graph instantiation on the 24 GB card under the 07-16
+defaults; 24576 boots -- the auto-ctx anchor is 5090-calibrated, exactly
+the miss the README warns about; turbo3 remains the 131K lever on that
+card. Full method, tables, and caveats: docs/BENCHMARKING.md "vs
+club-3090 community recipes (their harness, our silicon)".
+
 ## Appendix: early milestones, progress log, and M6 prefill history (moved verbatim from the README, 2026-07-16)
 
 The README carried these from the start of the project; they moved here
