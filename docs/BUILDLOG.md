@@ -7231,3 +7231,22 @@ banner's three-state marker covers D/V independently). One false
 alarm en route: a "determinism DIVERGE" that was md5-of-full-JSON
 (created timestamp) -- text-only extraction passes; harness lesson
 re-learned same-day.
+
+## 2026-07-17 -- v0.3.0 RELEASED (tag @ e8a6e46)
+
+github.com/signalnine/q27/releases/tag/v0.3.0 -- "small cards get the
+whole window". 23 commits since v0.2.0, one day: turbo3 = Ampere
+serving default (262144 on a 24GB 3090, decode faster than fp16 was),
+TTFT 8-11x (Q27_PF_BATCH_MIN), q4s tier validated end-to-end with its
+own anchors, auto-ctx rebuilt on measured free VRAM + exact 18-pair
+KV bytes + capture-gate awareness, Q27_SAMPLED=0 + mono auto-skip
+(~750MB back on sm_86), gcache OOM fix, 4-stream measured (~250 t/s
+ceiling at 2 lanes), four negative results on the record (occupancy,
+W12-on-3090, vgemm<9, depth/pmin), tools needle_check.py +
+gemv_tier_sweep.cu. Pre-tag doc-staleness sweep: 4-reader parallel
+audit vs ground truth found 19 stale claims (5 blocking: front-page
+131K headline, fp16-default claim, serial-threshold listed as open,
+multislot 2-cap rationale, notes fp8-opt-in) -- all fixed in e8a6e46.
+Assets: q27-v0.3.0-linux-x86_64.tar.gz (4 binaries + MIT LICENSE,
+sha256 af7118e4...) + SHA256SUMS-0.3.0. Release-binary canonical
+a2982c51 EXACT re-verified at package time.
