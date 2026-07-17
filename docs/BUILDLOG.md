@@ -6960,3 +6960,41 @@ single-5090 ~51ms -> we're 31-33; their 3090 class ~51ms -> 53-55 =
 parity. The last column they led is gone.
 
 vox-transcriber stopped for the window and restarted after.
+
+## 2026-07-17 -- 4-stream aggregate: fits, but the ceiling is ~250 t/s at 2 lanes
+
+Gabe asked what 4 slots actually yield. Scaling curve on the 5090, q4s,
+turbo3 KV, campaign payload methodology (tools/batch_ab.sh style: warmup
+lands per-slot snapshots, N payloads fired simultaneously, aggregate =
+sum(dec)/window, median of 3; scripts scratchpad/batch_ab_4slot*.sh;
+q4s BY NECESSITY -- v1.4 cannot boot the 4-slot shape):
+
+| streams | build | aggregate t/s | per-stream | vs solo |
+|---|---|---|---|---|
+| 1 | w8  | 161.9 | 161.9 | 1.00x |
+| 2 | w8  | 250.4 | 136.2 | 1.55x |
+| 3 | W12 (3x45056) | 248.6 | 86.9 | 1.54x |
+| 4 | w8  (4x40960) | 221.2 | 60.6 | 1.37x |
+
+READ: the union weight sweep amortizes the full weight stream by 2
+lanes -- aggregate PLATEAUS at ~250 and 4 lanes REGRESSES (w8 union cap
+8 = ~2-wide verify per lane at 4 lanes; acceptance collapses, bat 3.0-
+3.1 avg lanes steady). Stream count past 2 buys concurrent users, not
+tokens: 2x136 / 3x87 / 4x61. The 07-15 "W12 2x48K = CC-viable batch
+shape" default stands; 3-4 slots are a fan-out option, not a
+throughput lever.
+
+**CRASH FOUND + WORKAROUND (open robustness item):** the first 4-lane
+attempt (4x49152, GRAPH_CAP=64 default, 0.18 GB headroom) served 23
+fused rounds then DIED: cudaGraphInstantiate OOM at conductor.h:1698
+-- the P3 exec cache instantiates graphs LAZILY per new shape key, and
+the boot-time cap-shrink guard does not cover runtime growth. A tight
+boot passes health and then crashes mid-traffic. Workaround measured:
+step ctx down one notch (4x40960 frees 0.47 GB) + Q27_BATCH_GRAPH_CAP
+=24 (LRU evicts within headroom) -> 16/16 clean. PROPOSED FIX (not
+implemented): wrap the instantiate site in evict-LRU-and-retry, then
+fall back to the ungraphed fused round -- same shrink-never-abort
+philosophy as the ctor guard; the 4x49152/cap-64 shape is the natural
+regression test. Second finding: rep 1 of a fresh 4-lane server ran
+95.3 t/s vs 221 steady (graph-capture warmup tax at 4-lane alphabet
+size); W12 3-lane showed no such dip.
