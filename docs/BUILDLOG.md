@@ -7458,3 +7458,31 @@ correlations (commit suspects, tri-vs-dual fatbin) that n=1 crash
 observations manufactured. The sanitizer's DETERMINISTIC address was
 the only honest witness, and its "nearest allocation 512 B" line was
 pointing at input data, not engine state, from the first report.
+
+## 2026-07-18 -- q8-v1 ladder CLOSED on the RTX PRO 6000; default-tier PPL anchor reproduced cross-machine
+
+Final rungs, correct corpus (wiki.test.qwopus.i32 -- the tokenizer is
+byte-identical across vanilla/qwopus), exact anchor protocol
+(--nll-chunk 2048, 148,335 predictions):
+- **default tier: PPL 8.0409 -- the 07-16 anchor to FOUR DECIMALS**,
+  on different silicon (PRO 6000 vs 5090), different toolchain (12.8
+  vs 13.2), different machine. The measurement stack reproduces.
+- **q8-v1: PPL 7.9942** (-0.58% vs default). Better than default and
+  q4s (8.0197); NOT the family floor -- q6 7.9460 / q6k 7.9127 still
+  lead on wikitext. Third data point on error cancellation: the
+  tuned mixed promotions beat blanket-Q8; PPL is non-monotonic in
+  bits in this family. q8's distinct value is elsewhere: the
+  acceptance recovery (code decode 132 on this card vs ~105 pure
+  byte-scaling -- the q4s Q4-head acceptance loss un-happens) and
+  near-lossless verify-side weights as the reference point.
+
+q8-v1 LADDER SUMMARY (all on the PRO 6000, v0.3.0-era HEAD):
+canonical a5eddc71 x2 + sampled-seed e85bded3 x2 MINTED; build-sanity
+a2982c51 EXACT; needle 6/6 @233K; serving deterministic; club narr
+97.99 / code 132.42 @ fp8 auto-262144; 2-slot aggregate ~181 t/s
+(bat 2.0, the 1.55x multiplier holds on Blackwell-Pro); quad-slot
+4x262144 turbo3 ALL READY with 28.89 GB spare. Not run: the task
+dome (Gabe's call whether q8 needs one; q4s precedent says the
+score-lottery dominates PPL-class deltas anyway). README tier table
+gains the q8 row + the release-binary driver floor (r580+) is now
+stated in the Quickstart.

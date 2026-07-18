@@ -84,6 +84,7 @@ they trade decode speed for model quality:
 | q4s (4.55 bpw) | `qwen36-27b-mtp-q4s.q27` | 24GB+ | max context on small cards; 2.27GB more KV budget, +5% decode, and wikitext PPL measures 0.26% BETTER than default (single Q4 lm_head + Q4 residual writers; error cancellation is real) |
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | 32GB | +0.35% PPL off Q5_K_M for ~5% slower decode |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | 32GB | quality matching the best GGUFs of this model, ~10% slower decode |
+| q8 (8.1 bpw) | `qwen36-27b-mtp-q8.q27` | 48GB+ | the near-lossless reference for big cards; PPL 7.9942 (better than default; q6/q6k's tuned promotions still edge it on wikitext -- error cancellation is non-monotonic in bits), and the acceptance-recovery tier: decode runs +26% over pure byte-scaling. Does not fit 32GB cards |
 
 Task scores measure the same across tiers (q4s: fully validated --
 PPL, suite, agentic NLL, needle, 18-run task dome, no deficit) -- the
@@ -100,7 +101,9 @@ huggingface-cli download signalnine/Qwen3.6-27B-MTP-q27 \
 
 # 2. build (CLI + server + test suites) -- or skip the toolchain and
 #    grab prebuilt linux x86_64 binaries (CUDA runtime statically
-#    linked) from https://github.com/signalnine/q27/releases
+#    linked; NEEDS NVIDIA driver r580+/CUDA 13 -- on older drivers
+#    build from source with your driver's toolkit, 12.4+ for sm_89,
+#    12.8+ for sm_120) from https://github.com/signalnine/q27/releases
 git clone https://github.com/signalnine/q27 && cd q27
 make
 
