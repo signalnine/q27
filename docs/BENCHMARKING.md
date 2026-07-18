@@ -120,6 +120,34 @@ does not differentiate engines. The file-overlap signal is enough to confirm the
 agent did something on-target; anyone wanting the resolve % can run the `swebench`
 harness over the same pinned patches.
 
+### n=3 seal (2026-07-17 late, engine @ de5564c)
+
+The 07-14 table above is n=1 per instance (disclosed). Re-run at n=3
+on the two engines that carry the headline claim -- q27 and the
+mainstream ceiling (mainline llama.cpp + the same MTP head):
+
+| engine | decode t/s (3x12 instances, journal-aggregated) | wall (sum, 3 reps) | nonempty | gold-file |
+|---|---|---|---|---|
+| **q27** (vanilla, bare boot) | **192.4** (678 reqs, 143.7K tok) | 1734 s | 10-11/12 per rep | 9-10/12 |
+| llama.cpp + MTP (13e67386) | 120.9 (703 reqs, 213.6K tok) | 2742 s | 12/12 | 11-12/12 |
+
+Sealed ratio: **1.59x decode, 1.58x wall** at n=3 (vs 1.74x at the
+07-14 n=1; both engines' absolute numbers moved a few percent with
+n and with the engine's own evolution since 07-14 -- the current q27
+carries the TTFT fix and capture gates).
+
+The quality column is the honest cost of the reroll: q27 drew a
+DETERMINISTIC early-eos basin on `pallets__flask-5014` (main turn:
+23.7K-token prompt, 45 tokens, end=eos, byte-identical across all
+three reps -- the same one-shot-quit class the 07-16 task-dome
+found on v1.4 at 131K) plus a 2-of-3 lottery basin on
+`pydata__xarray-4094` (agent works, never lands the edit; one
+63-turn spin). llama drew neither. Greedy basins re-roll across
+legitimate engine changes; this pair is now the standing regression
+probe for the early-quit class, and the [drift] first-tool-call
+rescue miss (flagged at the dome) graduates from "deserves a look"
+to "has a reproducer".
+
 ## Reproduce
 
 Prereqs: Docker + the `thunderdome/claude-code` image (or any image with node +

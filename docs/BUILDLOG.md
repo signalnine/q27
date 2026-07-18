@@ -7352,3 +7352,20 @@ follow-up). UNVALIDATED: no card in the house fits it (weights +
 fixed stack > 32 GB); upload to HF in progress; the ladder runs on
 rented 48 GB+ hardware (PRO 6000 / RTX 6000 Ada -- doubles as those
 cards' field test).
+
+## 2026-07-17 (late) -- Method B n=3 seal: 1.59x sealed; an early-quit reproducer surfaces
+
+Review item #3 executed: 12 pinned SWE-bench instances x3 reps, q27
+(bare-boot reproduce recipe, vanilla, HEAD de5564c) then mainline
+llama+MTP (13e67386, doc launch line verbatim). Throughput SEALED:
+q27 192.4 t/s (678 reqs / 143.7K tok) vs llama 120.9 (703 / 213.6K)
+= 1.59x decode, 1.58x wall (n=1 claim was 1.74x; both engines moved
+a few percent with n and engine evolution). llama's 12/12 nonempty
+reproduced exactly; q27 drew 10-11/12: pallets__flask-5014 is a
+DETERMINISTIC early-eos (45 tok, end=eos, byte-identical x3, the
+dome's one-shot-quit class, was 12/12 on the 07-14 build) and
+pydata__xarray-4094 a 2-of-3 no-edit lottery (one 63-turn spin =
+the drift-loop shape). Doc updated with the sealed table + honest
+quality columns. flask-5014 = the standing reproducer for the
+early-quit class; the [drift] first-tool-call rescue item now has a
+deterministic test case. Results archived scratchpad/results.*.rep*.
