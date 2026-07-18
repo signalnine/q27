@@ -7597,3 +7597,18 @@ slot auto-ctx DONE; #4 slots 4->8 DONE; #5 tier fixtures DONE; #6
 sm_89 slope N/A-by-analysis; #7 v0.3.1 RELEASED. Follow-on worth
 running: a fresh n=3 SWE-bench seal to measure how much drift-mode-10
 moves the fleet number (was 10-11/12 nonempty, partly this bug).
+
+## 2026-07-18 -- n=3 re-seal on the drift-mode-10 fix: quality 12/12, 1.66x decode
+
+Re-ran the Method B seal, q27 leg only (llama+MTP 120.9/12-12 is a
+fixed anchor, unchanged binary/commit). Vanilla, bare boot, current
+build (601d7c3+, drift mode 10 fixed). ALL THREE reps: 12/12 nonempty
+(was 10-11/12), 11/12 gold (was 9-10/12), still-empty NONE. Both
+pre-fix failures gone -- flask-5014 (the deterministic drift-mode-10
+quit) and xarray-4094 (was a lottery) now complete every rep. Decode
+201.2 t/s over 780 reqs (was 192.4; higher because the two instances
+that used to short-circuit now run full sessions cleanly). Wall rose
+1734->1876s for the same reason -- more real work done, not slower.
+SEALED CLAIM NOW: q27 matches llama+MTP's 12/12 task-solve quality at
+1.66x its decode (201.2 vs 120.9). The 07-17 seal's quality asterisk
+is retired. BENCHMARKING seal table + Reddit draft updated.

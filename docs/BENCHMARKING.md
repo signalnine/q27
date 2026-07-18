@@ -128,13 +128,19 @@ mainstream ceiling (mainline llama.cpp + the same MTP head):
 
 | engine | decode t/s (3x12 instances, journal-aggregated) | wall (sum, 3 reps) | nonempty | gold-file |
 |---|---|---|---|---|
-| **q27** (vanilla, bare boot) | **192.4** (678 reqs, 143.7K tok) | 1734 s | 10-11/12 per rep | 9-10/12 |
+| **q27** (vanilla, bare boot, post drift-mode-10 fix) | **201.2** (780 reqs, 178.2K tok) | 1876 s | **12/12** all reps | 11/12 all reps |
 | llama.cpp + MTP (13e67386) | 120.9 (703 reqs, 213.6K tok) | 2742 s | 12/12 | 11-12/12 |
+| q27 pre-fix (07-17, drift bug) | 192.4 | 1734 s | 10-11/12 | 9-10/12 |
 
-Sealed ratio: **1.59x decode, 1.58x wall** at n=3 (vs 1.74x at the
-07-14 n=1; both engines' absolute numbers moved a few percent with
-n and with the engine's own evolution since 07-14 -- the current q27
-carries the TTFT fix and capture gates).
+Sealed ratio: **1.66x decode** at n=3 (201.2 vs 120.9), and q27
+now MATCHES llama's 12/12 nonempty quality. The 07-17 pre-fix seal was
+1.59x with a 10-11/12 quality asterisk -- that asterisk was drift mode
+10 (a tool-parser miss ending some first tool calls early, root-caused
++ fixed in 601d7c3). Re-seal 07-18 on the fixed build: both previously
+-empty instances (flask-5014 deterministic, xarray-4094 lottery) now
+complete, still-empty NONE across all 3 reps. Wall rose 1734->1876s
+BECAUSE the fixed agent does real work on the two instances that used
+to quit at turn 1 -- decode t/s is the clean speed metric.
 
 The quality column is the honest cost of the reroll: q27 drew a
 DETERMINISTIC early-eos basin on `pallets__flask-5014` (main turn:
