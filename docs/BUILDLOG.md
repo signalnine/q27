@@ -7278,3 +7278,51 @@ buffers (delta = 0). His 253952 row confirms: 96.88 -> 98 MiB granule,
 a 72 MiB step (he measured 68). Reproduced on the 3090: both ctx
 values read 1.70 GB at ready. The window's last 4096 tokens are
 allocation-free. Benign; physics, not engine.
+
+## 2026-07-18 -- first 4090 (sm_89): field test on a RunPod pod; tri-arch fatbin ships
+
+Gabe spun up a RunPod 4090 for q27's first Ada run. Everything below
+was executed remotely over SSH on the pod.
+
+TOOLCHAIN FINDING: **CUDA 12.4+ is a hard floor for sm_89** -- the
+pod's stock CUDA 12.0 ptxas rejects the e4m3 MMA forms ("Unexpected
+instruction types specified for 'mma'", prefill.ptx). Installed the
+12.6 toolkit alongside (driver untouched); tri-arch (86/89/120)
+compiles clean there and on our 13.2.
+
+GATES on sm_89 -- ALL PASS, with a cross-arch determinism result:
+- CLI canonical (q4s) = **8196e65e... = the sm_86 anchor, byte-exact.**
+  One canonical anchor per SASS family (8.x vs 12.x), not per chip.
+- Serving greedy probe = byte-identical to the 5090's output for the
+  same prompt (fp8 path agreeing across sm_89/sm_120).
+- Serving determinism 2x byte-identical. Model md5 verified.
+
+NUMBERS (q4s, w8 build, their bench.sh verbatim on-pod, CVs <=0.1%):
+fp8 (arch default): narr 102.06/102.58, code 135.48/136.64, TTFT 49ms
+@ auto-ctx 110592. turbo3: code 130.95/132.03, TTFT 50ms @ the FULL
+262144 (0.27 GB spare). vs their best published single-4090 (ik
+two-stage 82.5/120.9 @160K): +24% narr / +13% code at 1.6x context.
+turbo3 tax ladder across arches complete: 5090 fp8-wins-big, 4090
+fp8-wins-small (-3.4% code on turbo3), 3090 turbo3-wins-outright.
+Prefill on Ada near-5090-class (~3.1K tok/s @10K on turbo3).
+
+SHIPPED:
+- Makefile (Gabe-approved): sm_89 gencode added -- the fatbin now
+  covers 3090/4090/5090. v0.3.0 release binaries predate this; README
+  notes the workaround (build from source with 12.4+, or Q27_KV=turbo3
+  explicit) until the next release.
+- auto-ctx sm_89 base = 2.13 GB (two pod boots agreeing within 75 MB;
+  Ada's fixed stack runs ~1 GB over the sm_120 constants -- the
+  pre-calibration pick survived on a 40 MB margin). The >8-width graph
+  slope on sm_89 is unmeasured and deliberately shares sm_86's fat
+  slope (under-pick beats a dead boot).
+- README: CUDA 12.4 floor, tri-arch build, 4090 guidance; BENCHMARKING
+  4090 addendum.
+- Post-change gates on the tri-arch binaries: canonical a2982c51 +
+  f64e7c02 + sampled-seed 900031e9 EXACT, test_kernels ALL PASS.
+
+ODDITY on the record: the tokenizer file vanished from the pod's
+overlay disk between download (listed, 7.2 MB) and first use
+("cannot open"). Re-downloaded + checksummed, did not recur. Cloud
+overlay-fs distrust noted; CHECKSUMS verification is now part of the
+pod recipe.

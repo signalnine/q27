@@ -1,6 +1,6 @@
 # Quasar
 
-A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (also supports 3090). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
+A narrow inference engine for **Qwen3.6-27B-MTP** (hybrid GDN+attention, trained-in MTP heads) and its fine-tunes on a single RTX 5090 (3090 and 4090/Ada also supported). One model family, one GPU, as fast as possible. In the spirit of [antirez/ds4](https://github.com/antirez/ds4)
 
 ## Why this is interesting
 
@@ -50,11 +50,14 @@ unless noted.
 
 ## Quickstart
 
-Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.x at
-`/usr/local/cuda`, and gcc. `make` builds ONE dual-arch binary
-(sm_86 + sm_120: 3090 and 5090 class); arch dispatch is at runtime --
-fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80) runs the
-fp16-MMA verify (h16) and fp16/turbo3 KV.
+Requirements: an NVIDIA GPU with 24GB+ VRAM, CUDA toolkit 12.4+ at
+`/usr/local/cuda` (12.4 is a hard floor: older ptxas rejects the sm_89
+e4m3 MMA forms), and gcc. `make` builds ONE tri-arch binary (sm_86 +
+sm_89 + sm_120: 3090, 4090/Ada, and 5090 class); arch dispatch is at
+runtime -- fp8-KV and the e4m3 MMA paths need sm_89+, Ampere (sm_86/80)
+runs the fp16-MMA verify (h16) and fp16/turbo3 KV. NOTE: the v0.3.0
+release binaries predate the sm_89 target -- on a 4090 either build
+from source or pass `Q27_KV=turbo3` explicitly until the next release.
 
 24GB cards (3090-class): build `make build/q27-server-w8` as well --
 `Q27_W_MAX=8` shrinks the fixed VRAM stack so the server fits; the

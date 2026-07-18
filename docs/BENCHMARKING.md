@@ -491,6 +491,30 @@ class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
 tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
 sm_86 (bare boot = turbo3 @ 262144 on a 3090).
 
+### Addendum 2026-07-18 -- first 4090 (sm_89) numbers, RunPod field test
+
+q27's first run on Ada silicon (RunPod RTX 4090 24GB, CUDA 12.6
+toolkit -- 12.4+ is a hard floor, older ptxas rejects the sm_89 e4m3
+MMA forms). q4s tier, w8 build, their bench.sh verbatim on-pod:
+
+| 4090 leg (q4s, auto-ctx) | narr wall/decode | code wall/decode | TTFT | ctx |
+|---|---|---|---|---|
+| fp8 KV (sm_89 default) | 102.06 / 102.58 | 135.48 / 136.64 | 49ms | 110592 |
+| turbo3 KV | -- | 130.95 / 132.03 | 50ms | **262144** |
+
+vs their best published single-4090 (ik two-stage, 82.5/120.9 decode
+@160K): **+24% narrative / +13% code at 1.6x the context** (fp8), or
+the full native window at a 3.4% code toll (turbo3). The turbo3 tax
+ladder now spans three arches: 5090 fp8-wins-big, 4090 fp8-wins-small,
+3090 turbo3-wins-outright -- compute-vs-bandwidth, exactly as the
+physics predicts. Cross-arch determinism: the sm_89 CLI canonical is
+byte-identical to the sm_86 anchor (8196e65e... for q4s -- one anchor
+per SASS family, 8.x and 12.x), and the fp8 serving probe matched the
+5090's greedy output byte-for-byte. Prefill on Ada is near-5090-class
+(~3.1K tok/s at 10K on turbo3). auto-ctx gained an sm_89 base (Ada's
+fixed stack measured ~1 GB over the sm_120 constants; the
+pre-calibration pick survived with 40 MB to spare).
+
 ## History / non-reproducible baselines
 
 An earlier cross-engine run used 3 **private** greenfield tasks (not

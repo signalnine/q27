@@ -1,8 +1,10 @@
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -std=c++17 -Wall -Wextra
 NVCC      ?= /usr/local/cuda/bin/nvcc
-# sm_120 = RTX 5090, sm_86 = RTX 3090 (fallback device for tests)
+# sm_120 = RTX 5090, sm_89 = RTX 4090/Ada (needs CUDA 12.4+ for e4m3 MMA),
+# sm_86 = RTX 3090 (fallback device for tests)
 NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
 .PHONY: all clean

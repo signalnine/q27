@@ -300,7 +300,13 @@ int main(int argc, char** argv) {
             // sm_86 w8 fp16@61440: 4.22GB => base 1.77 (turbo3 measured
             // +0.08 -- inside slack). Retro-check: predicts the hand-found
             // v1.4 3090 ceiling (24576) and the q4s 61440 knife-edge fit.
-            const double base = cc_arch >= 120 ? 0.89e9 : 1.77e9;
+            // sm_89 calibrated 2026-07-18 (RunPod 4090 field test, two boots
+            // agreeing within 75 MB): Ada's fixed stack runs ~1 GB fatter
+            // than sm_120's -- the pre-calibration pick survived with 40 MB
+            // to spare. >8-width graph slope on sm_89 is UNMEASURED; it
+            // deliberately shares sm_86's fat slope below (under-pick beats
+            // a dead boot).
+            const double base = cc_arch >= 120 ? 0.89e9 : cc_arch >= 89 ? 2.13e9 : 1.77e9;
             // Graph-zoo term: 0.13 GB/width holds on sm_120 and on sm_86 up
             // to width 8, but sm_86's width-9..12 graphs cost 0.43 GB/width
             // (measured 2026-07-17: W12 non-KV fixed 6.57 GB vs w8's 4.22 on
