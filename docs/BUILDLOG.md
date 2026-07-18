@@ -7569,3 +7569,31 @@ VERIFIED: unit test (flask string -> Read{file_path}, prose-unknown ->
 EXACT (parser is host-side, CLI path untouched). This is the serving-
 quality half of the n=3 seal's 10-11/12; a full re-seal is the
 measurement to confirm the fleet number moves.
+
+## 2026-07-18 -- fix program COMPLETE (7/7); v0.3.1 RELEASED
+
+#6 (sm_89 W12 auto-ctx slope): RESOLVED BY ANALYSIS, no calibration
+needed. The >8-width graph slope only applies to a W12 build; the only
+sm_89 card class in reach (4090, 24GB) runs the w8 build where W_MAX=8
+zeroes that term. It would matter only on a 48GB sm_89 card (RTX 6000
+Ada) running W12 -- none in hand; the defensive sm_86-slope default
+under-picks safely there. Both pods were down at close, so no live
+recheck; noted for the next 48GB-Ada trip.
+
+#7: v0.3.1 RELEASED (tag @ HEAD,
+github.com/signalnine/q27/releases/tag/v0.3.1). Tri-arch fatbin
+(sm_86/89/120 confirmed via cuobjdump) -- 4090 users get native SASS.
+Ships the q8 tier reference, drift-mode-10 fix, multi-slot auto-ctx,
+slots-8 clamp, spec-graph OOM guidance, dtype-dispatch fixtures.
+KNOWN LIMITATION documented: 13.2-static runtime needs driver r580+
+(no local 12.8 toolkit to lower the floor; future item). Clean
+tri-arch build + full gate battery green at tag (canonical x2 EXACT,
+test_kernels/ninv/fused_smoke PASS). Assets: tarball (4 binaries +
+MIT LICENSE, sha256 c38985c0) + SHA256SUMS-0.3.1.
+
+7-DEFECT SCORECARD: #1 drift-mode-10 (biggest -- serving quality,
+flask 1->13 turns) DONE; #2 spec-graph OOM guidance DONE; #3 multi-
+slot auto-ctx DONE; #4 slots 4->8 DONE; #5 tier fixtures DONE; #6
+sm_89 slope N/A-by-analysis; #7 v0.3.1 RELEASED. Follow-on worth
+running: a fresh n=3 SWE-bench seal to measure how much drift-mode-10
+moves the fleet number (was 10-11/12 nonempty, partly this bug).
