@@ -7486,3 +7486,16 @@ dome (Gabe's call whether q8 needs one; q4s precedent says the
 score-lottery dominates PPL-class deltas anyway). README tier table
 gains the q8 row + the release-binary driver floor (r580+) is now
 stated in the Quickstart.
+
+## 2026-07-18 -- PRO 6000 q4s club leg completes the four-card table
+
+Same tier, same harness, apples-to-apples at last: PRO 6000 Server
+Edition q4s fp8 @ auto-262144 = narr 138.55/139.32, code
+169.35/170.81, TTFT 40ms (CV <=0.5%). ~12% UNDER the 5090 despite
+the bigger die: the Server Edition's inline GDDR7 ECC + passive-SKU
+clocks tax exactly the bandwidth decode lives on. Fleet reading:
+5090 = single-stream king (162/194); PRO 6000 = the capacity card
+(85.1 GB post-weights free, quad-262K, 181 t/s 2-slot, q8 host);
+4090 = the fp8 midpoint; 3090 = the 262K value card. Same-card tier
+read: q8 costs 22% decode vs q4s for 84% more weight bytes --
+acceptance recovery holds it sublinear. Pod work complete.
