@@ -7369,3 +7369,58 @@ the drift-loop shape). Doc updated with the sealed table + honest
 quality columns. flask-5014 = the standing reproducer for the
 early-quit class; the [drift] first-tool-call rescue item now has a
 deterministic test case. Results archived scratchpad/results.*.rep*.
+
+## 2026-07-18 -- q8 ladder on an RTX PRO 6000 (96GB): anchors minted, quad-262K boots; TWO bugs surfaced
+
+Gabe rented an RTX PRO 6000 Blackwell Server (96GB, sm_120, driver
+570/CUDA 12.8, 224 cores) for the q8-v1 ladder. Results and the two
+bugs the trip surfaced, in order:
+
+**BUG 1 -- v0.3.0 release binaries have an undocumented driver floor.**
+The tarball's statically-linked CUDA 13.2 runtime refuses drivers
+older than r580: "driver version is insufficient" at first CUDA call
+on this pod's 570.195 (CUDA 12.8) stack. Every ladder rung silently
+produced empty output on the release binaries (and the ladder's
+2>/dev/null ate the diagnostic -- harness lesson re-learned AGAIN;
+ladder v2 keeps stderr and fail-fasts on build-sanity). Workaround:
+source-build with the driver's toolkit (CUDA 12.8 = first sm_120
+support; builds clean, canonical EXACT). TODO: state the driver floor
+in the release notes + README; consider a 12.8-runtime build for the
+next release's binaries.
+
+**LADDER (source-built sm_120 @ HEAD, all on-pod):**
+- Build sanity: vanilla canonical a2982c51 EXACT (fourth silicon).
+- q8-v1 canonical MINTED: a5eddc71c12a1f3a43ebec479cb1458b x2 EXACT.
+- q8-v1 sampled-seed MINTED: e85bded3f5e2b99481b812bbe263cd62 x2.
+- Serving: bare boot = fp8 @ auto 262144, 56 GB spare at ready;
+  determinism 2x byte-identical; needle 6/6 at ~233K.
+- Club bench (their bench.sh): narr 97.45/97.99, code 131.11/132.42,
+  TTFT 56ms. Code decode 132 vs the pure byte-scaling prediction
+  ~105 from q4s's 192: the Q8 ACCEPTANCE RECOVERY IS REAL (+26%
+  over bytes -- the q4s Q4-head acceptance loss un-happens at Q8).
+- **Quad-slot: 4 x 262144 turbo3 ALL READY with 28.89 GB still
+  free** -- 1,048,576 tokens of resident context on one card, W12
+  build, stock binary. The --slots clamp (4) is now the binding
+  limit on this hardware, not VRAM.
+- PPL: paired serial-path run IN PROGRESS (see bug 2); absolute
+  serial numbers are not comparable to the batched-path anchors
+  (g64 regroup, notes.md #6), but the paired delta is valid.
+
+**BUG 2 -- batched --nll path has a latent OOB read, sanitizer-
+deterministic, lottery in the wild.** First seen as sm_0 + "illegal
+memory access" at prefill.cu:2085 on the pod (both tiers), then
+reproduced at HEAD on the 5090. Bisect misdirection: four suspect
+commits all tested clean; a tri-vs-dual-arch build split also
+evaporated on 3x reruns (n=1 observations -- the harness-variance
+lesson applied to crashes). Ground truth via compute-sanitizer
+memcheck: k_embed_rows_q8_T reads emb + tok*cols with a GARBAGE
+token -- Invalid __global__ read, block (1,17,0), IDENTICAL address
+across runs and across dual/tri builds, 3426 errors. So: not a
+race in the upload (same-stream ordered), not codegen, not arch --
+a deterministic-under-instrumentation bad token index in the
+batched nll flow, timing-lottery without instrumentation. The
+serving prefill path shows no such fault (needle at 233K, live CC,
+club prefill legs all clean + sanitizer-clean runs elsewhere).
+REPRODUCER: compute-sanitizer --tool memcheck build/q27 <model>
+--nll wiki.test.raw --ctx 2048 (fires in <60s). Scope: quality
+measurement only; serving unaffected. OPEN, top of tomorrow's list.
