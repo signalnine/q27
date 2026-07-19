@@ -7777,3 +7777,24 @@ leg-1 gate (a74fca9).
   2026-07-19 (v0.3.3): battery re-verified under the flip -- all 3 canonicals
   EXACT (CLI eager-forwards, only server splits), test_kernels/ninv/fused_smoke
   PASS. Q27_GEMM_SPLITK=0 opts out.
+
+## 2026-07-19 -- v0.3.3 RELEASED (tag @ bd8964f)
+
+github.com/signalnine/q27/releases/tag/v0.3.3. Prefill split-K DEFAULT ON
+(Q27_GEMM_SPLITK unset/auto): short cold prompts (<=128 tok, stateless single-
+shot / first turn) prefill in one underfilling pass where down_proj/o_proj tile
+5120 rows into 80 blocks on a 170-SM 5090; split-K fills the idle half. Server-
+measured ~8% faster prefill (62.4->57.4ms @70 tok); auto-disables the moment the
+grid saturates (blocks*2>SMs), so the common case is untouched. Non-bitwise
+(~3e-7 float regrouping) -> the flip cleared the agentic NLL gate (full 154K CC
+corpus +0.018% aggregate / +0.063% worst segment vs pre-registered >+2%; rule
+committed before results) + end-to-end greedy seal (20/20 @16 tok, 5/5 @128).
+Only the SERVER path fires it -- the CLI eager-forwards prompts, so all three
+canonicals stay bitwise. Shipped with the llama.cpp-MMQ / vLLM-Marlin prefill
+study (q27's GEMM already converged with SOTA hand-rolled int8-MMA; split-K was
+the one open in-regime lever) + the llama-benchy independent benchmark. GATES
+green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke PASS, split-K NLL gate +0.018%. Tri-arch build
+(sm_86/89/120 cuobjdump-confirmed on all 4 binaries). Assets: tarball (4
+binaries + MIT LICENSE, sha256 bfa0f366) + SHA256SUMS-0.3.3. Driver floor r580+
+unchanged. Q27_GEMM_SPLITK=0 opts out.
