@@ -534,6 +534,43 @@ class), 5090 narrative wall 146.8 -> 161.1 (+9.7%), 3090 code wall
 tiny-prompt transcripts. turbo3 is also now the serving DEFAULT on
 sm_86 (bare boot = turbo3 @ 262144 on a 3090).
 
+### Independent tool: llama-benchy (2026-07-19, RTX 5090, q4s fp8)
+
+[llama-benchy](https://github.com/eugr/llama-benchy) is a community
+llama-bench-style benchmarker for any OpenAI endpoint -- MTP-aware, real
+Gutenberg-text prompts, correct TTFT (to first usable token), and it can
+separate cold prefill from prompt-processing over already-cached context.
+That last mode is the one that quantifies q27's actual differentiator.
+
+Cold sweep (`--pp 512 --tg 128 --depth 0 4096 16384 65536 --runs 3`,
+tokenizer `Qwen/Qwen3.6-27B`):
+
+| depth | prefill pp (t/s) | decode tg (t/s) | cold TTFT |
+|---|---|---|---|
+| 0     | 3386 | 159.2 | 193 ms |
+| 4096  | 3548 | 127.3 | 1.34 s |
+| 16384 | 3361 | 120.9 | 5.07 s |
+| 65536 | 2779 | 102.4 | 23.8 s |
+
+tg=159 at depth 0 cross-checks the club-harness narrative decode (162).
+Prefill holds 2.8-3.5K t/s on the 5090's fp8-MMA path. Cold TTFT grows
+with depth because a cold turn re-prefills the whole context -- which is
+exactly what q27's GDN-state checkpoint avoids on warm turns:
+
+**Cached-context follow-up at d65536 (`--enable-prefix-caching`): a
+512-token turn over already-cached 65K context = TTFT 2.13 s vs the
+cold 23.8 s -- 11x.** The checkpoint engages on `/v1/chat/completions`,
+not just the Anthropic `/v1/messages` path. This is the "q27 doesn't
+re-prefill" claim measured by a third-party tool: on multi-turn agentic
+traffic (every turn a warm follow-up at growing depth) q27 pays the 2 s,
+a paged-KV engine pays the 24 s -- the mechanism behind the 4.7x wall
+gap vs vLLM.
+
+Honest reads: the cold deep-prefill (23.8 s at 65K) is real -- q27 has
+no fp8-MMA prefill leg on sm_86, and even on the 5090 a cold 65K prefill
+is 24 s; the win is entirely in NOT paying it twice. Decode holds
+~100 t/s at 65K depth (KV-streaming bound, cache-independent).
+
 ### Addendum 2026-07-17 -- first 4090 (sm_89) numbers, RunPod field test
 
 q27's first run on Ada silicon (RunPod RTX 4090 24GB, CUDA 12.6

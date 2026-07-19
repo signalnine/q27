@@ -7678,3 +7678,19 @@ fused_smoke/drift-corpus pass, OpenAI tool-calling smoke on the
 release binary (proper tool_calls). Assets: tarball (4 binaries + MIT
 LICENSE, sha256 889b9f32) + SHA256SUMS-0.3.2. Driver floor r580+
 unchanged (documented).
+
+## 2026-07-19 -- independent-tool benchmark: llama-benchy on the 5090
+
+Ran eugr/llama-benchy (community llama-bench-style, MTP-aware, OpenAI
+endpoint) against q27 5090 q4s fp8, tokenizer Qwen/Qwen3.6-27B. Cold
+sweep: prefill 2.8-3.5K t/s, decode 159->102 t/s over depth 0->65K,
+cold TTFT 193ms->23.8s. tg@d0=159 cross-checks the club narrative 162.
+KEY: cached-context mode (--enable-prefix-caching) at d65536: a
+512-token follow-up over already-cached 65K = TTFT 2.13s vs cold 23.8s
+= 11x. The GDN checkpoint ENGAGES on /v1/chat/completions (not just
+/v1/messages) -- first third-party quantification of the no-re-prefill
+win, the mechanism behind the 4.7x vLLM wall gap. Honest: cold 65K
+prefill is genuinely 24s (no sm_86 fp8-MMA leg; even 5090 pays it once);
+win is not paying it every turn. BENCHMARKING.md addendum added. Tool
+read before running (network = endpoint + HF tokenizer + Gutenberg only,
+no exec); uvx install, deps mainstream.
