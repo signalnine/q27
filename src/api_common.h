@@ -1077,6 +1077,19 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
         fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
                 tools ? (int)tools->size() : -1, text_in.c_str());
+        // Corpus capture: Q27_DRIFT_CORPUS=<file> appends the FULL untruncated
+        // miss (the stderr line caps at 400 chars, which is why issue #4's
+        // payload wasn't visible). Each miss is a replayable fixture for
+        // tools/test_tool_drift_corpus.cpp -- turns an unknown drift mode into
+        // a permanent regression the next time it recurs. NUL-separated
+        // records so embedded newlines don't confuse the reader.
+        if (const char* cp = getenv("Q27_DRIFT_CORPUS")) {
+            if (FILE* f = fopen(cp, "ab")) {
+                fwrite(text_in.data(), 1, text_in.size(), f);
+                fputc('\0', f);
+                fclose(f);
+            }
+        }
     }
     return out;
 }

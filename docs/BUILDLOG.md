@@ -7638,3 +7638,26 @@ the call at the end of the model output, which is the UN-RESCUED reality.
 Committed test tools/test_tool_drift.cpp (6 cases, mode 10 + 11 +
 negatives; standalone g++, no Makefile target). Gates: canonical
 a2982c51 EXACT (host-side change), mode-10 test + PR-#3 tests unchanged.
+
+## 2026-07-19 -- proactive tool-drift testing (answering "we should've caught this")
+
+Why mode 11 hid until production: every prior drift test used TRIVIAL arg
+values ("hello", short paths). The bug lived in the value CONTENT (raw
+code with inner quotes), an axis we never tested. Two additions close it:
+
+1. tools/test_tool_drift_corpus.cpp -- a mutation harness: realistic value
+   fixtures (go/python/json/markdown/braces/unicode/empty + a JSON-tail
+   lookalike) CROSSED with the drift transforms (well-formed, raw-unescaped
+   content-last, scalar-after, prose-preamble). Proven to catch the class:
+   RED on the pre-mode-11 parser (18 FAIL, every quote-bearing fixture) and
+   GREEN on current. The lookalike fixture asserts graceful under-capture
+   (prefix), not exact. Standalone g++, no Makefile target.
+
+2. Q27_DRIFT_CORPUS=<file> (api_common.h) -- appends the FULL untruncated
+   UN-RESCUED text (NUL-separated) on every real miss. The stderr line caps
+   at 400 chars, which is exactly why issue #4's payload wasn't visible.
+   Point a serving box at a corpus file; any new drift mode becomes a
+   replayable fixture the next time it recurs. Proactive harness for known
+   transforms + capture for unknown ones.
+
+Gates: canonical a2982c51 EXACT, both drift tests + PR-3 tests pass.
