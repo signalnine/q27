@@ -7661,3 +7661,20 @@ code with inner quotes), an axis we never tested. Two additions close it:
    transforms + capture for unknown ones.
 
 Gates: canonical a2982c51 EXACT, both drift tests + PR-3 tests pass.
+
+## 2026-07-19 -- v0.3.2 RELEASED (tag @ ca2d2bb)
+
+github.com/signalnine/q27/releases/tag/v0.3.2. 8 commits since v0.3.1,
+led by two serving-robustness items: OpenAI /v1/chat/completions
+tool-calling (PR #3, @chaudhryfaisal -- messages-gated, /v1/completions
+byte-identical) and tool-parser drift mode 11 (raw code-body content
+values, issue #4 -- forward-scan terminator recovery). Plus proactive
+drift tests (test_tool_drift_corpus.cpp, red on pre-fix parser) +
+Q27_DRIFT_CORPUS capture, the RunPod serverless example, and the n=3
+re-seal (12/12 quality, 1.66x). Clean tri-arch build (sm_86/89/120
+cuobjdump-confirmed) + full gate battery green at tag: canonical
+a2982c51 + f64e7c02 + sampled 900031e9 EXACT, test_kernels/ninv/
+fused_smoke/drift-corpus pass, OpenAI tool-calling smoke on the
+release binary (proper tool_calls). Assets: tarball (4 binaries + MIT
+LICENSE, sha256 889b9f32) + SHA256SUMS-0.3.2. Driver floor r580+
+unchanged (documented).
