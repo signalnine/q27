@@ -12,12 +12,27 @@
 
 namespace q27k {
 
+// Caller-owned split-K partial buffer for the prefill weight GEMM. Passing a
+// reserved SplitKScratch* to gemm_q4_T/gemm_q8_T lets the launcher auto-split
+// the K axis across gridDim.z when the output grid underfills the SMs (short-
+// prompt / suffix-round prefill), filling idle SMs at 1.8-2.3x. Split output
+// is tolerance-gated (non-bitwise vs the single-CTA path -- the group-scaled
+// float K-sum is regrouped), same class as the attention P4 split, so only
+// the g64 serving path splits; sk==nullptr (the default) disables splitting
+// entirely, keeping the canonical --pf leg and the kernel tests bitwise.
+// Pinned to one stream for its lifetime (each engine owns its own).
+struct SplitKScratch {
+    float* buf = nullptr;
+    size_t cap = 0; // floats
+};
+void splitk_scratch_reserve(SplitKScratch* sk);
+
 // Batched GEMM: y[t*rows + row]. Activations quantized token-major with
 // quantize_x(xT, T*cols, xq) — token t's chunk data at offset t*(cols/32).
 void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
-               int64_t cols, int T, cudaStream_t st);
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
-               int64_t cols, int T, cudaStream_t st);
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st);
 

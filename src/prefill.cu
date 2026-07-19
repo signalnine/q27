@@ -236,9 +236,17 @@ static __device__ __forceinline__ void mma_s8_acc(int& d0, int& d1, int& d2, int
 // the pf-identity gate (policy sign-off 2026-07-04). XG64=false is the exact
 // legacy path, bit-identical to the pre-regroup kernel.
 template <bool Q4IN, bool XG64, int NT>
+// tmp: split-K partial buffer (nsp slices of T*rows). When gridDim.z==1 the
+// kernel is byte-identical to the pre-split path (writes acc straight to y,
+// tmp untouched). When gridDim.z>1 each z-block owns a contiguous stage range
+// and writes its float partial to tmp[sp]; k_gemm_splitk_reduce sums the nsp
+// partials in sp order into y. The reduction REGROUPS the group-scaled float
+// K-sum, so split output is NOT bitwise vs nsp==1 -- tolerance-gated, same
+// class as the attention P4 split and the delta-scan split.
 __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                              const int8_t* __restrict__ nat, const float* __restrict__ xs,
-                             float* __restrict__ y, int64_t rows, int64_t cols, int T) {
+                             float* __restrict__ y, float* __restrict__ tmp, int64_t rows,
+                             int64_t cols, int T) {
     constexpr int MR = 64, KS = 128;  // block tile: rows, staged K (NT = token tile, templated)
     constexpr int XGS = XG64 ? 64 : 32;         // activation quant group
     constexpr int XSC = KS / XGS;               // x-scales per token per stage
@@ -266,6 +274,13 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
     const int64_t r0 = (int64_t)blockIdx.y * MR; // block row base
     const int t0 = blockIdx.x * NT;              // block token base
     const int n_stages = (int)(cols / KS);
+    // Split-K: this z-block owns stages [st_lo, st_hi). nsp==1 -> full range,
+    // identical to the pre-split loop.
+    const int nsp = gridDim.z, sp = blockIdx.z;
+    const int chunk = (n_stages + nsp - 1) / nsp;
+    const int st_lo = sp * chunk;
+    int st_hi = st_lo + chunk;
+    if (st_hi > n_stages) st_hi = n_stages;
 
     float acc[TS][4];
 #pragma unroll
@@ -375,11 +390,11 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
         }
     };
 
-    load_stage(0);
-    for (int st = 0; st < n_stages; st++) {
+    if (st_lo < st_hi) load_stage(st_lo);
+    for (int st = st_lo; st < st_hi; st++) {
         __syncthreads();
         store_stage();
-        if (st + 1 < n_stages) load_stage(st + 1);
+        if (st + 1 < st_hi) load_stage(st + 1);
         __syncthreads();
         if constexpr (!XG64) {
             // 4 chunks of 32 per stage; per chunk, TS mma pairs (token subtiles of 8)
@@ -468,6 +483,7 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
         }
     }
 
+    float* out = (nsp == 1) ? y : (tmp + (size_t)sp * (size_t)T * rows);
     const int64_t row0 = r0 + wm * 16 + gid;
 #pragma unroll
     for (int s = 0; s < TS; s++) {
@@ -476,9 +492,68 @@ __global__ void k_gemm_mma_T(const uint8_t* __restrict__ W, const __half* __rest
         for (int e = 0; e < 4; e++) {
             int64_t row = row0 + (e >= 2 ? 8 : 0);
             int tok = tok0 + (e & 1);
-            if (row < rows && tok < T) y[(size_t)tok * rows + row] = acc[s][e];
+            if (row < rows && tok < T) out[(size_t)tok * rows + row] = acc[s][e];
         }
     }
+}
+
+// Ordered split-K reduce: y[i] = sum_{sp=0..nsp-1} tmp[sp*stride + i], fixed
+// sp order so the (non-bitwise vs nsp==1) result is at least reproducible.
+__global__ void k_gemm_splitk_reduce(const float* __restrict__ tmp, float* __restrict__ y,
+                                     size_t n, int nsp, int64_t stride) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * blockDim.x) {
+        float a = 0.f;
+        for (int sp = 0; sp < nsp; sp++) a += tmp[(size_t)sp * stride + i];
+        y[i] = a;
+    }
+}
+
+// SM count for the current device, cached per device index.
+static int cur_nsm() {
+    static int cache[16] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16 && cache[dev]) return cache[dev];
+    cudaDeviceProp p;
+    cudaGetDeviceProperties(&p, dev);
+    int n = p.multiProcessorCount;
+    if (dev >= 0 && dev < 16) cache[dev] = n;
+    return n;
+}
+
+// Split count for the prefill GEMM. DEFAULT ON (auto) since 2026-07-19: the
+// agentic NLL quality gate cleared it (full 154K CC corpus +0.018% aggregate,
+// worst segment +0.063%, vs a >+2% pre-registered trigger; BUILDLOG "SPLIT-K
+// AGENTIC QUALITY GATE"). Only the SERVER batched-prefill path fires it -- the
+// CLI generate/spec path eager-forwards prompts, so every canonical md5 gate
+// (a2982c51 / f64e7c02 / 900031e9, all short --tokens prompts) stays bitwise-
+// exact, and the XG64=false --pf leg is hard-excluded. Q27_GEMM_SPLITK:
+// unset/auto = ON, 0/off = OFF, N = force nsp (bench).
+//
+// The auto-gate splits only when the output grid leaves >=2x SM headroom --
+// below that the reduce overhead exceeds the fill gain (measured: 160
+// blocks/170 SMs regresses to 0.96x; 80 blocks wins 1.8-2.3x).
+static int gemm_splitk_nsp(int64_t blocks, int nsm, int T, int n_stages) {
+    static int mode = -3; // -3 unread; -2 off; -1 auto; >=1 forced
+    if (mode == -3) {
+        const char* e = getenv("Q27_GEMM_SPLITK");
+        if (!e || !strcmp(e, "auto")) mode = -1;
+        else if (!strcmp(e, "0") || !strcmp(e, "off")) mode = -2;
+        else { int n = atoi(e); mode = n >= 1 ? n : -2; }
+    }
+    if (mode == -2) return 1; // off: greedy canonical stays bitwise
+    if (mode >= 1) {          // forced nsp (bench)
+        int n = mode > PF_SPLIT_MAX ? PF_SPLIT_MAX : mode;
+        if (n > n_stages) n = n_stages;
+        return n < 1 ? 1 : n;
+    }
+    if (blocks <= 0 || blocks * 2 > nsm) return 1; // saturated: don't split
+    int nsp = (int)((nsm + blocks - 1) / blocks);  // ~1 wave after the split
+    if (T <= 32) nsp *= 2;                          // tiny T tolerates deeper split
+    if (nsp > 4) nsp = 4;                           // auto cap (nsp=8 never wins)
+    if (nsp > n_stages) nsp = n_stages;
+    return nsp < 2 ? 1 : nsp;
 }
 
 // Re-read each launch (a getenv is noise next to a kernel launch) so tests
@@ -506,7 +581,7 @@ static int prefill_nt() {
 
 template <bool Q4IN, bool XG64, int NT>
 static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
-                           int64_t rows, int64_t cols, int T, cudaStream_t st) {
+                           int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     constexpr int MR = 64, KS = 128, LDW = KS + 16, LDX = KS + 16;
     constexpr int XSC = XG64 ? 2 : 4;
     const size_t SM = (size_t)MR * LDW + (size_t)NT * LDX + (MR * (Q4IN ? 2 : 1) + NT * XSC) * 4;
@@ -516,10 +591,38 @@ static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, 
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
         attr = true;
     }
-    dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR));
-    k_gemm_mma_T<Q4IN, XG64, NT><<<grid, 256, SM, st>>>(W, S, XG64 ? xq.nat64 : xq.nat,
-                                                        XG64 ? xq.s64 : xq.scale, y, rows, cols, T);
+    dim3 grid((unsigned)((T + NT - 1) / NT), (unsigned)((rows + MR - 1) / MR), 1);
+    // Split-K only on the g64 (already tolerance-gated) path with an engine
+    // scratch present; the XG64=false leg feeds the canonical --pf gate and
+    // stays unsplit. Auto-gate fires only when the output grid underfills.
+    int nsp = 1;
+    if constexpr (XG64) {
+        if (sk && sk->buf) {
+            int64_t blocks = (int64_t)grid.x * grid.y;
+            int want = gemm_splitk_nsp(blocks, cur_nsm(), T, (int)(cols / KS));
+            if (want > 1 && (size_t)want * T * rows <= sk->cap) nsp = want;
+        }
+    }
+    grid.z = (unsigned)nsp;
+    if (nsp > 1) {
+        static bool announced = false;
+        if (!announced && getenv("Q27_GEMM_SPLITK_DBG")) {
+            fprintf(stderr, "splitk: engaged (first fire nsp=%d T=%d rows=%ld)\n", nsp, T,
+                    (long)rows);
+            announced = true;
+        }
+    }
+    float* tmp = nsp > 1 ? sk->buf : nullptr;
+    k_gemm_mma_T<Q4IN, XG64, NT><<<grid, 256, SM, st>>>(
+        W, S, XG64 ? xq.nat64 : xq.nat, XG64 ? xq.s64 : xq.scale, y, tmp, rows, cols, T);
     CUDA_CHECK(cudaGetLastError());
+    if (nsp > 1) {
+        size_t nout = (size_t)T * rows;
+        int th = 256, bl = (int)((nout + th - 1) / th);
+        if (bl > 65535) bl = 65535;
+        k_gemm_splitk_reduce<<<bl, th, 0, st>>>(sk->buf, y, nout, nsp, (int64_t)T * rows);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 // Short-tail dispatch (P2): the NT=128 tile collapses below T~32 (mostly-empty
@@ -529,7 +632,7 @@ static void launch_gemm_nt(const uint8_t* W, const __half* S, const XQuant& xq, 
 // changes speed. Prefill is not graph-captured, so the launch-time choice is free.
 template <bool Q4IN, bool XG64>
 static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
-                              int64_t rows, int64_t cols, int T, cudaStream_t st) {
+                              int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     constexpr int KS = 128;
     if (cols % KS) {
         fprintf(stderr, "gemm_mma: cols %ld not a multiple of %d\n", (long)cols, KS);
@@ -538,26 +641,26 @@ static void launch_gemm_mma_x(const uint8_t* W, const __half* S, const XQuant& x
     int nt = prefill_nt();
     if (nt == 0) nt = T <= 16 ? 16 : T <= 32 ? 32 : T <= 64 ? 64 : 128;
     switch (nt) {
-        case 16: launch_gemm_nt<Q4IN, XG64, 16>(W, S, xq, y, rows, cols, T, st); break;
-        case 32: launch_gemm_nt<Q4IN, XG64, 32>(W, S, xq, y, rows, cols, T, st); break;
-        case 64: launch_gemm_nt<Q4IN, XG64, 64>(W, S, xq, y, rows, cols, T, st); break;
-        default: launch_gemm_nt<Q4IN, XG64, 128>(W, S, xq, y, rows, cols, T, st); break;
+        case 16: launch_gemm_nt<Q4IN, XG64, 16>(W, S, xq, y, rows, cols, T, st, sk); break;
+        case 32: launch_gemm_nt<Q4IN, XG64, 32>(W, S, xq, y, rows, cols, T, st, sk); break;
+        case 64: launch_gemm_nt<Q4IN, XG64, 64>(W, S, xq, y, rows, cols, T, st, sk); break;
+        default: launch_gemm_nt<Q4IN, XG64, 128>(W, S, xq, y, rows, cols, T, st, sk); break;
     }
 }
 
 template <bool Q4IN>
 static void launch_gemm_mma(const uint8_t* W, const __half* S, const XQuant& xq, float* y,
-                            int64_t rows, int64_t cols, int T, cudaStream_t st) {
+                            int64_t rows, int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_xg64() && xq.nat64)
-        launch_gemm_mma_x<Q4IN, true>(W, S, xq, y, rows, cols, T, st);
+        launch_gemm_mma_x<Q4IN, true>(W, S, xq, y, rows, cols, T, st, sk);
     else
-        launch_gemm_mma_x<Q4IN, false>(W, S, xq, y, rows, cols, T, st);
+        launch_gemm_mma_x<Q4IN, false>(W, S, xq, y, rows, cols, T, st, sk);
 }
 
 void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
-               int64_t cols, int T, cudaStream_t st) {
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_use_mma()) {
-        launch_gemm_mma<true>(W, S, xq, y, rows, cols, T, st);
+        launch_gemm_mma<true>(W, S, xq, y, rows, cols, T, st, sk);
         return;
     }
     constexpr int TB = 32, CS = 32, RB = 16;
@@ -577,9 +680,9 @@ void gemm_q4_T(const uint8_t* W, const __half* S, const XQuant& xq, float* y, in
 }
 
 void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int64_t rows,
-               int64_t cols, int T, cudaStream_t st) {
+               int64_t cols, int T, cudaStream_t st, SplitKScratch* sk) {
     if (prefill_use_mma()) {
-        launch_gemm_mma<false>((const uint8_t*)W, S, xq, y, rows, cols, T, st);
+        launch_gemm_mma<false>((const uint8_t*)W, S, xq, y, rows, cols, T, st, sk);
         return;
     }
     constexpr int TB = 32, CS = 32, RB = 16;
@@ -596,6 +699,18 @@ void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int
         k_gemm_q8_T<TB, CS><<<grid, RB * 32, SM, st>>>(W, S, xq.nat, xq.scale, y, rows, cols, T,
                                                        t0);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Fixed split-K partial buffer, sized once at engine init (no mid-serving
+// regrow). Bound: the split only fires when the output grid underfills
+// (blocks <= nsm/2), so T*rows <= (nsm/2)*NT_max*MR = (nsm/2)*128*64; times
+// PF_SPLIT_MAX slices. Scales with the device SM count. Never split without
+// this (sk==nullptr disables), so test/canonical callers stay bitwise.
+void splitk_scratch_reserve(SplitKScratch* sk) {
+    if (!sk || sk->buf) return;
+    size_t cap = (size_t)PF_SPLIT_MAX * ((cur_nsm() / 2) + 1) * 128 * 64;
+    CUDA_CHECK(cudaMalloc((void**)&sk->buf, cap * sizeof(float)));
+    sk->cap = cap;
 }
 
 // F16 weights (ssm alpha/beta: 48x5120). Block per (row, token) with the same

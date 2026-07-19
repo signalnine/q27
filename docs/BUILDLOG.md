@@ -7694,3 +7694,86 @@ prefill is genuinely 24s (no sm_86 fp8-MMA leg; even 5090 pays it once);
 win is not paying it every turn. BENCHMARKING.md addendum added. Tool
 read before running (network = endpoint + HF tokenizer + Gutenberg only,
 no exec); uvx install, deps mainstream.
+
+**Prefill split-K (short-prompt underfill): DONE + OPT-IN 2026-07-19.**
+Motivation: the llama.cpp-MMQ / vLLM-Marlin prefill study concluded q27's
+k_gemm_mma_T already converged with SOTA hand-rolled int8-MMA on every
+major axis (int8 m16n8k32 + quantized-weights-end-to-end + one-scale-per-32
++ single-buffer-no-cp.async + padding-not-swizzle + ldmatrix-the-unamortized-
+operand). The ONE in-regime lever both digs flagged and q27 lacked on the
+weight GEMM: Stream-K/split-K to fill idle SMs on the short-prompt / suffix-
+round prefill where the (T/NT)x(rows/MR) grid underfills.
+- SPIKE (tools/gemm_splitk_spike.cu, ffn_down 5120x17408, 5090/170 SMs):
+  split fills the idle SMs exactly at underfill. nsp=4 T<=32 = 2.23-2.29x;
+  nsp=2 T=64-128 = 1.80-1.82x; T>=256 (>=160 blocks) REGRESSES 0.80-0.96x
+  (reduce overhead > fill gain). Non-bitwise vs nsp==1 (rel 3e-7, ~90% of
+  outputs differ in low bits) -- the group-scaled float K-sum is regrouped;
+  tolerance-gated, same class as the attention P4 split + delta-scan split.
+- INTEGRATION (k_gemm_mma_T gains gridDim.z split + tmp partials + ordered
+  k_gemm_splitk_reduce; SplitKScratch per-engine, fal-reserved, no mid-serving
+  regrow; threaded through gemm_q4_T/q8_T as a nullptr-default arg). nsp==1 is
+  byte-identical to the pre-split path. Auto-gate (gemm_splitk_nsp): split only
+  when blocks*2<=nsm, nsp=ceil(nsm/blocks) (x2 at T<=32), cap 4; XG64=false
+  (canonical --pf leg) hard-excluded via `if constexpr`. Verified in-engine at
+  T=65: fires nsp=3 on rows=5120 (down/o, 80 blocks) + nsp=4 on rows=1024,
+  correctly nsp=1 on rows=17408/12288/10240/6144 (gate/up/qkv, saturated).
+- DEFAULT OFF (Q27_GEMM_SPLITK: unset/0=off, auto=occupancy-gate, N=force).
+  Split output is non-bitwise, so defaulting on would move the greedy canonical
+  -- a product call + quality seal, same posture as batching/sampling. NOTE:
+  the shortbench canonical (a2982c51, 5-token prompt) is eager-forwarded, never
+  hits batched prefill, so it's bitwise-safe regardless; a2982c51 reproduced
+  both off and (vacuously) under auto. Gates green: test_kernels ALL PASS, ninv
+  twin-bitwise ALL PASS (no-sk default path untouched).
+- HONEST payoff: down_proj is the big split-eligible chunk (~1/3 of FFN GEMM),
+  o_proj + small qkv the rest; gate/up (the other 2/3) never underfill. FLOP-
+  weighted aggregate ~1.1-1.2x prefill-GEMM at T~65, higher at T<=32, zero
+  above T~130. First-turn / stateless-short-prompt (RunPod single-shot) only;
+  warm agentic turns already skip prefill via the GDN checkpoint.
+- END-TO-END SEAL (q27-server, 5090, cold ~70-tok prompts, server-logged
+  pf_ms; PF_T=1024 so <=128-tok prompts are one underfilling pass): OFF mean
+  62.35ms (62-63, n=20) -> auto 57.4ms (57-58, n=20) = ~8% faster prefill,
+  non-overlapping variance. On the FULL prefill (attention/GDN/norms don't
+  split) so GEMM-only is higher. HTTP wall ~155ms both (too noisy; pf_ms is
+  the clean signal). QUALITY: greedy byte-identical 20/20 @16 tok AND 5/5
+  @128 tok (split-perturbed prefill + KV, 3e-7, flips zero argmaxes downstream).
+  Default stays OFF pending Gabe's flip call; the seal says the flip is
+  quality-safe on this corpus (n small vs a full agentic-NLL gate).
+
+**SPLIT-K AGENTIC QUALITY GATE -- RULE PRE-REGISTERED 2026-07-19 (verdict below).**
+Greedy-identical (the end-to-end seal) is necessary but NOT sufficient: it only
+checks the argmax, while split perturbs the whole distribution (the 3e-7 per-GEMM
+float regrouping compounds through 65 layers of residual + GDN recurrence). So
+the default-on decision needs the agentic-corpus NLL A/B, mirroring the turbo3
+leg-1 gate (a74fca9).
+- Corpus: scratchpad/t3_quality/corpus/agentic_req0031.i32 -- the SAME real
+  154,160-token CC transcript as the turbo3 gate (sha256 c0a623b1...8394096047464).
+- Config: `--nll <corpus> --nll-chunk 128` (batched). C=128 is the underfill
+  window where split fires (verified: fires nsp=3/4 on rows<=5120, nsp=1 on the
+  big GEMMs). NOTE why NOT --nll-long/position-buckets like turbo3: split is a
+  prefill-time perturbation that only fires at underfilling T, and is depth-
+  INDEPENDENT; a single long saturated pass would never fire it (false PASS).
+- Legs: baseline OFF vs candidate Q27_GEMM_SPLITK=auto. Deterministic (greedy
+  teacher-forced NLL, run-to-run identical per leg).
+- Metric: aggregate mean NLL over the full corpus, plus per-corpus-segment
+  buckets (localized-regression check).
+- TRIGGER (pre-registered, turbo3 precedent): FAIL if auto mean NLL exceeds OFF
+  by >+2% sustained, aggregate OR in any segment bucket. Reference: turbo3
+  passed at +0.39%; smoke @10 chunks (unrepresentative corpus start) showed
+  +0.77%, so the full-corpus number is required before any verdict.
+- VERDICT: **PASS -- split-K is agentic-quality-safe.** Full corpus (75,852
+  predictions, 1204 chunks of 128): OFF mean NLL 0.855073 -> auto 0.855231 =
+  +0.018% aggregate. Six 200-chunk content buckets: worst +0.063% (seg5), and
+  seg3/seg4 go NEGATIVE (-0.031%/-0.040%, split marginally better) -- the
+  perturbation sits at the noise floor, not a systematic tax. Every bucket is
+  30x+ under the +2% trigger and tighter than turbo3's +0.39%. (The pre-reg
+  smoke's +0.77% was the tiny first-10-chunk start; over seg0's 200 chunks it
+  washes to +0.014%.) Neither trigger fired. Artifacts + runner in
+  scratchpad/splitk_quality/ (off_full.txt, auto_full.txt, buckets.txt, seg*.i32;
+  uncommitted per scratchpad policy). Corpus sha256 c0a623b1...096047464.
+  CONCLUSION: the default-on flip is quality-cleared (no asterisk). It stays a
+  product call only because the WIN is narrow (~8% prefill, short cold prompts
+  <=128 tok only); with quality clean + auto-disable on saturated shapes +
+  canonical unaffected, the downside of flipping is ~nil. FLIPPED default ON
+  2026-07-19 (v0.3.3): battery re-verified under the flip -- all 3 canonicals
+  EXACT (CLI eager-forwards, only server splits), test_kernels/ninv/fused_smoke
+  PASS. Q27_GEMM_SPLITK=0 opts out.

@@ -148,7 +148,7 @@ errors so Claude Code compacts correctly. Concurrent sessions
 (`--slots N`) batch through one weight sweep by default -- 234-239 t/s
 aggregate at 2 slots, zero config (see Serving).
 
-## State of the engine (2026-07-17)
+## State of the engine (2026-07-19)
 
 One binary serves Claude Code, Codex, and OpenAI clients at 231-246 t/s
 aggregate live decode on a 5090 (90-116 t/s at 262K context on a 3090, turbo3 default),
@@ -164,6 +164,16 @@ Single-stream, the 07-13 pass (k_vgemm flat-in-W verify GEMM, GEMV
 occupancy retiers, GDN delta-step fusion) holds the short-bench suite
 at 177.4 t/s. Full chronology, per-phase receipts, and every negative:
 [docs/BUILDLOG.md](docs/BUILDLOG.md) (the 2026-07-13..16 entries).
+
+Short cold prompts (<=128 tokens, the stateless single-shot / first-turn
+case) get a prefill split-K that fills the SMs the small-output GEMMs
+leave idle: ~8% faster prefill (server-measured, 62.4->57.4ms at 70
+tokens), on by default since v0.3.3. The agentic NLL gate cleared it
+(+0.018% on the full 154K CC corpus, worst segment +0.063%, vs a >+2%
+bar); it auto-disables once the grid saturates, and every canonical
+stays bitwise (the CLI eager-forwards, only the server path splits).
+`Q27_GEMM_SPLITK=0` opts out. Warm agentic turns don't see it -- the
+checkpoint already skips their prefill.
 
 ### Reference numbers (v0.2.0, 2026-07-16, vanilla model, 5090)
 

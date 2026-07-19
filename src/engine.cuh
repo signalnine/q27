@@ -92,7 +92,8 @@ struct Engine {
     cudaStream_t stm;
     cudaGraphExec_t graph_exec = nullptr;
     cudaGraphExec_t sample_graph = nullptr; // plain forward + sample (temp>0)
-    q27k::WyScratch wy_scratch; // per-engine WY prefill panels (R1b prereq)
+    q27k::WyScratch wy_scratch;    // per-engine WY prefill panels (R1b prereq)
+    q27k::SplitKScratch splitk_ws; // per-engine split-K partials (short-prompt prefill)
 
     // activations (device)
     float *h, *x1, *y, *qg, *kbuf, *vbuf, *attnout, *scratch;
@@ -742,6 +743,7 @@ struct Engine {
         pf_part = fal((size_t)N_HEAD * PF_T * q27k::PF_SPLIT_MAX * 258);
         xqT = q27k::xquant_alloc((size_t)PF_T * N_FFN, /*g64=*/true);
         q27k::wy_scratch_reserve(&wy_scratch, PF_T); // fixed cap: no mid-serving regrow
+        q27k::splitk_scratch_reserve(&splitk_ws);    // fixed cap: no mid-serving regrow
         for (int il = 0; il < N_LAYER; il++)
             if (!attn_layer[il]) {
                 CUDA_CHECK(cudaMalloc((void**)&S_snap[il],
@@ -2716,11 +2718,11 @@ struct Engine {
         switch (w.dtype) {
             case DType::Q4_G64:
                 q27k::gemm_q4_T((const uint8_t*)w.data, (const __half*)w.scales, xqT, yout,
-                                w.rows, w.cols, T, stm);
+                                w.rows, w.cols, T, stm, &splitk_ws);
                 break;
             case DType::Q8_G128:
                 q27k::gemm_q8_T((const int8_t*)w.data, (const __half*)w.scales, xqT, yout,
-                                w.rows, w.cols, T, stm);
+                                w.rows, w.cols, T, stm, &splitk_ws);
                 break;
             case DType::F16:
                 q27k::gemm_f16_T((const __half*)w.data, xT, yout, w.rows, w.cols, T, stm);
