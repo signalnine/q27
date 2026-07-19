@@ -736,6 +736,84 @@ inline void scan_namedropped(const std::string& text, const json* tools,
 // never closes); a trailing truncated {"name" candidate gets framing repair
 // (close open string, strip junk tags, close braces). prefix = text before
 // the first recovered call. `tools` (optional) enables mode-6 name inference.
+// Drift mode 11 (2026-07-19, issue #4): a tool call whose big string argument
+// is a raw code body with unescaped inner quotes / newlines / braces
+// ({"name":"Write","arguments":{"content":"<raw source, to end>"}}). Normal
+// JSON parsing dies on the first inner `"`, and no local escape heuristic is
+// safe (code has `",` `"}` `[]string{"a","b"}` everywhere). Recover
+// positionally: the raw value runs to the end of the object, so its terminator
+// is the last `"` before the object's closing braces. Extract that span
+// literally, then parse the object with the big value blanked to pick up name
+// + any other scalar args. Registered-tool + shell-parses gating keeps prose
+// out. Handles content-last and scalar-args-before-content; a scalar AFTER the
+// big value (rare ordering) over-captures -- accepted vs the current total
+// failure (the UN-RESCUED session death). Only runs when nothing else parsed.
+inline bool recover_raw_value_call(const std::string& text, const json& tools,
+                                   std::vector<ToolCall>& out) {
+    size_t mo = text.rfind("{\"name\"");
+    if (mo == std::string::npos) return false;
+    size_t colon = text.find(':', mo + 6);
+    if (colon == std::string::npos) return false;
+    size_t q1 = text.find('"', colon + 1);
+    if (q1 == std::string::npos) return false;
+    size_t q2 = text.find('"', q1 + 1);
+    if (q2 == std::string::npos) return false;
+    const std::string nm = text.substr(q1 + 1, q2 - q1 - 1);
+    const json* fn = nullptr;
+    for (const auto& t : tools)
+        if (t.contains("function") && t["function"].value("name", std::string()) == nm) {
+            fn = &t["function"];
+            break;
+        }
+    if (!fn) return false;
+    std::vector<std::string> strkeys;
+    if (fn->contains("parameters") && (*fn)["parameters"].is_object()) {
+        const json& pr = (*fn)["parameters"];
+        if (pr.contains("properties") && pr["properties"].is_object())
+            for (auto it = pr["properties"].begin(); it != pr["properties"].end(); ++it)
+                if (it.value().is_object() &&
+                    it.value().value("type", std::string()) == "string")
+                    strkeys.push_back(it.key());
+    }
+    if (strkeys.empty()) return false;
+    // For each string param, forward-scan candidate terminators of ITS value:
+    // escape the span [opener+1, cand), keep the tail after cand literal, and
+    // parse the reconstructed object. The FIRST candidate that parses is the
+    // real terminator -- inner quotes leave the tail as un-parseable raw code,
+    // and a scalar arg after the value forces the correct earlier terminator
+    // (making that arg a valid sibling). Ordering-independent. The call must
+    // be at the end of the model output, which is the UN-RESCUED reality.
+    for (const auto& k : strkeys) {
+        size_t kp = text.find("\"" + k + "\"", mo);
+        if (kp == std::string::npos) continue;
+        size_t kc = text.find(':', kp + k.size() + 2);
+        if (kc == std::string::npos) continue;
+        size_t opener = text.find('"', kc + 1);
+        if (opener == std::string::npos) continue;
+        for (size_t cand = text.find('"', opener + 1); cand != std::string::npos;
+             cand = text.find('"', cand + 1)) {
+            // json(str).dump() yields a fully-escaped, quoted JSON string
+            const std::string esc = json(text.substr(opener + 1, cand - opener - 1)).dump();
+            const std::string recon = text.substr(mo, opener - mo) + esc + text.substr(cand + 1);
+            json obj;
+            try { obj = json::parse(recon); } catch (...) { continue; }
+            if (!obj.is_object() || obj.value("name", std::string()) != nm) continue;
+            json args = obj.contains("arguments") && obj["arguments"].is_object()
+                            ? obj["arguments"]
+                            : json::object();
+            ToolCall tc;
+            tc.ok = true;
+            tc.name = nm;
+            tc.arguments = std::move(args);
+            fprintf(stderr, "[drift] mode-11 raw-value rescue: %s.%s (%zu bytes)\n", nm.c_str(),
+                    k.c_str(), cand - opener - 1);
+            out.push_back(std::move(tc));
+            return true;
+        }
+    }
+    return false;
+}
+
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
@@ -968,6 +1046,15 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 break;
             }
         }
+    }
+    // mode 11: raw code-body string value (unescaped inner quotes/newlines).
+    // Last resort -- runs only when everything above failed. Sets the prefix
+    // to the text before the call object so a preamble ("Let me write...")
+    // still streams as text.
+    if (out.empty() && tools && tools->is_array() &&
+        recover_raw_value_call(text, *tools, out) && prefix) {
+        size_t mo = text.rfind("{\"name\"");
+        *prefix = mo != std::string::npos ? strip_ws2(text.substr(0, mo)) : std::string();
     }
     // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
     // drift mode(s) the fallback chain rescued, or flag an intended call it could

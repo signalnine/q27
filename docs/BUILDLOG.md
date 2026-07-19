@@ -7612,3 +7612,29 @@ that used to short-circuit now run full sessions cleanly). Wall rose
 SEALED CLAIM NOW: q27 matches llama+MTP's 12/12 task-solve quality at
 1.66x its decode (201.2 vs 120.9). The 07-17 seal's quality asterisk
 is retired. BENCHMARKING seal table + Reddit draft updated.
+
+## 2026-07-19 -- fix: tool-parser drift mode 11 (raw code-body string value), issue #4
+
+chaudhryfaisal reported CC sessions dying on a Write call whose `content`
+is a large source file: `{"name":"Write","arguments":{"content":"// go\n
+package main\nimport "context"\n...`. UN-RESCUED, tool call leaks to text,
+agent stops. Reproduced in a unit test: the parser's string sanitizer
+escapes literal newlines (mode 5) but treats every `"` as a terminator,
+so the first unescaped inner quote (`"context"`) closes the JSON string
+early and the rest is garbage. No local escape heuristic is safe -- code
+carries `",` `"}` `[]string{"a","b"}` `map["k"]` everywhere.
+
+Fix (recover_raw_value_call, api_common.h): forward-scan the value's
+candidate terminators. For each `"` after the opener, escape the span,
+keep the tail literal, reconstruct the object, and parse. The FIRST
+candidate that yields a valid object (registered tool name) is the real
+terminator -- inner quotes leave the tail as un-parseable raw code, and a
+scalar arg AFTER the value forces the correct earlier terminator (making
+that arg a valid sibling). Ordering-independent (handles content-last,
+scalar-before, scalar-after, inner-braces). Gated on out.empty() +
+registered tool, so well-formed calls and prose never hit it. Requires
+the call at the end of the model output, which is the UN-RESCUED reality.
+
+Committed test tools/test_tool_drift.cpp (6 cases, mode 10 + 11 +
+negatives; standalone g++, no Makefile target). Gates: canonical
+a2982c51 EXACT (host-side change), mode-10 test + PR-#3 tests unchanged.
