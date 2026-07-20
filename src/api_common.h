@@ -822,10 +822,25 @@ inline std::string first_balanced_object(const std::string& s) {
     return "";
 }
 
+// True if `pos` sits inside an open ```...``` fenced code block (an odd number
+// of ``` precede it). A tool call the model INTENDS to emit is never markdown-
+// fenced; a call shown as an example, or echoed from an injected file/page, is.
+// We look ONLY before `pos`, so a write whose VALUE contains fences (its ``` are
+// after the call's opener) is not mistaken for a fenced call.
+inline bool inside_fence(const std::string& s, size_t pos) {
+    size_t f = 0, count = 0;
+    while ((f = s.find("```", f)) != std::string::npos && f < pos) {
+        count++;
+        f += 3;
+    }
+    return (count & 1) != 0;
+}
+
 inline bool recover_raw_value_call(const std::string& text, const json& tools,
                                    std::vector<ToolCall>& out) {
     size_t mo = text.rfind("{\"name\"");
     if (mo == std::string::npos) return false;
+    if (inside_fence(text, mo)) return false; // fenced example, not a real call
     size_t colon = text.find(':', mo + 6);
     if (colon == std::string::npos) return false;
     size_t q1 = text.find('"', colon + 1);
@@ -972,6 +987,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     size_t first = std::string::npos;
     size_t i = text.find('{');
     while (i != std::string::npos) {
+        // A {...} sitting inside a ```fenced``` block is a displayed example /
+        // echoed injection, not a call the model is making -- don't recover it.
+        if (inside_fence(text, i)) {
+            i = text.find('{', i + 1);
+            continue;
+        }
         int depth = 0;
         bool in_str = false, esc = false;
         size_t end = std::string::npos;

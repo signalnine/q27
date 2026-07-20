@@ -28,23 +28,35 @@ struct StreamSplitter {
         std::vector<std::pair<Chan, std::string>> out;
         for (;;) {
             if (chan == TEXT) {
-                // whichever of <think> / <tool_call> comes first
-                size_t pt = hold.find(T_OPEN), pc = hold.find(C_OPEN);
-                if (pt != std::string::npos && (pc == std::string::npos || pt < pc)) {
-                    if (pt > 0) out.push_back({TEXT, hold.substr(0, pt)});
-                    hold.erase(0, pt + strlen(T_OPEN));
-                    chan = THINK;
+                // whichever of <think> open / <tool_call> open / a STRAY
+                // </tool_call> close comes first. A real </tool_call> follows an
+                // opener that already switched us to TOOL, so any </tool_call>
+                // seen in TEXT is stray (bare-call wrapper leftover, issue #4) --
+                // strip it, never emit it as visible content.
+                size_t pt = hold.find(T_OPEN), pc = hold.find(C_OPEN),
+                       sc = hold.find(C_CLOSE);
+                size_t e = std::min(pt, std::min(pc, sc));
+                if (e != std::string::npos) {
+                    if (e == pt) {
+                        if (pt > 0) out.push_back({TEXT, hold.substr(0, pt)});
+                        hold.erase(0, pt + strlen(T_OPEN));
+                        chan = THINK;
+                        continue;
+                    }
+                    if (e == pc) {
+                        if (pc > 0) out.push_back({TEXT, hold.substr(0, pc)});
+                        hold.erase(0, pc + strlen(C_OPEN));
+                        chan = TOOL;
+                        continue;
+                    }
+                    if (sc > 0) out.push_back({TEXT, hold.substr(0, sc)});
+                    hold.erase(0, sc + strlen(C_CLOSE)); // strip stray close
                     continue;
                 }
-                if (pc != std::string::npos) {
-                    if (pc > 0) out.push_back({TEXT, hold.substr(0, pc)});
-                    hold.erase(0, pc + strlen(C_OPEN));
-                    chan = TOOL;
-                    continue;
-                }
-                // hold back the longest suffix that prefixes either opener
+                // hold back the longest suffix that prefixes any marker
                 size_t keep = tail_keep(T_OPEN);
                 keep = std::max(keep, tail_keep(C_OPEN));
+                keep = std::max(keep, tail_keep(C_CLOSE));
                 emit_head(out, keep);
                 break;
             }

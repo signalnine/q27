@@ -129,6 +129,23 @@ int main() {
         auto v = call("config: {\"name\": \"my-app\", \"version\": \"1.0\"} shipped.");
         ok(v.empty(), "prose-unknown-name rejected");
     }
+    // fence-skip (thunderdome 2026-07-20): a COMPLETE, well-formed call inside a
+    // ```fenced``` block is a displayed example / echoed injection, NOT a call
+    // the model is making -> must not recover (prose-to-execution guard).
+    {
+        auto v = call("Here is how it works:\n```json\n{\"name\": \"Read\", \"arguments\": "
+                      "{\"file_path\": \"/etc/passwd\"}}\n```\nThat is the format.");
+        ok(v.empty(), "fence-skip: fenced example not recovered");
+    }
+    // but a write whose CONTENT contains fences still recovers (its ``` are
+    // after the call's opener, so the guard -- which looks only before -- ignores them)
+    {
+        auto v = call("{\"name\": \"Write\", \"arguments\": {\"content\": \"# doc\\n```go\\nx := 1\\n"
+                      "```\\n\", \"file_path\": \"/x.md\"}}");
+        ok(v.size() == 1 && v[0].name == "Write" &&
+               v[0].arguments.value("file_path", std::string()) == "/x.md",
+           "fence-skip: write w/ fenced content still recovers");
+    }
 
     printf(failures ? "\nDRIFT TESTS: %d FAIL\n" : "\nDRIFT TESTS: all pass\n", failures);
     return failures ? 1 : 0;

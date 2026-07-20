@@ -7905,3 +7905,22 @@ inside a ```json fence or inline prose ("emit {"name":"bash",...}") -> a prose/
 example -> unintended-execution vector. Fence-skip is the candidate fix but
 must not misfire on writes whose CONTENT contains fences, and must not weaken
 the wrapper-drop recovery Faisal depends on. Product/security call pending.
+
+## 2026-07-20 -- fence-skip guard + streaming stray-close strip
+
+Two robustness fixes from the thunderdome + Faisal's 3rd report:
+- FENCE-SKIP (api_common.h inside_fence): the bare-call recovery no longer
+  recovers a complete tool call whose { sits inside a ```fenced``` block -- a
+  displayed example or echoed injection is not a call the model is making
+  (prose->execution guard). Counts ``` ONLY before the call's opener, so a
+  write whose VALUE contains fences still recovers. Faisal-style bare calls
+  (no fence before them) unaffected. test_tool_drift.cpp fence-skip x2.
+- STREAMING STRAY-CLOSE (stream_split.h): a </tool_call> in the TEXT channel is
+  always stray (a real one follows an opener that switches to TOOL first), so
+  it's stripped instead of leaked into visible text -- fixes Faisal's "</tool_call>
+  still there" (bare multi-call sessions). Token-boundary safe (tail_keep).
+  Real pairs / <think> / split tags unaffected. tools/test_stream_split.cpp (7).
+Residual (documented, not fixed): the bare-call JSON itself still streams as
+text before post-hoc recovery (inherent to stream-then-recover); only the
+wrapper TAGS are stripped. Inline (un-fenced) prose tool calls also still
+recover -- rarer than the fenced shape.
