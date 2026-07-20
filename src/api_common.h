@@ -1347,7 +1347,8 @@ inline std::string extract_api_key(const std::string& authorization_header,
 inline bool api_key_valid(const std::string& provided, const std::vector<std::string>& keys) {
     if (provided.empty()) return false;
     bool any = false;
-    for (auto& k : keys) any = any || secure_compare(provided, k);
+    for (auto& k : keys) any |= secure_compare(provided, k);
+
     return any;
 }
 
