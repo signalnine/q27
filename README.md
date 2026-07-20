@@ -113,10 +113,12 @@ make
 
 # 4. serve -- zero config; defaults resolve the full measured stack
 #    and --ctx auto-sizes to your VRAM (see Serving for escapes).
-#    Binds 127.0.0.1 only: the server has NO auth. To reach it from
-#    other machines or from containers (Claude Code in docker resolves
-#    the host via the bridge, not loopback), opt in explicitly:
-#      --host 0.0.0.0
+#    Binds 127.0.0.1 only. To reach it from other machines or from
+#    containers (Claude Code in docker resolves the host via the
+#    bridge, not loopback), opt in explicitly -- and set an API key
+#    at the same time, since --host 0.0.0.0 with no key accepts
+#    unauthenticated requests from anyone who can reach the port:
+#      --host 0.0.0.0 --api-key <your-key>
 ./build/q27-server ../models/qwen36-27b-mtp/qwen36-27b-mtp.q27 \
   ../models/qwen36-27b-mtp/qwen36-27b-mtp.tok --port 8080
 ```
@@ -468,6 +470,22 @@ Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
 One sharp edge: `--slots N` does NOT auto-size `--ctx` (it defaults to
 8192 and warns) -- pass the slot-0 window you want, or a >8K prompt
 serializes onto slot 1 and nothing fuses.
+
+**Auth.** Off by default -- loopback-only binding is the actual safety net
+(see `docs/SECURITY-MODEL.md`); this is a convenience for the cases that
+doc's own recommendation (put a real reverse proxy in front) is overkill
+for, not a replacement for it under real multi-tenant/production exposure.
+`--api-key KEY` (repeatable), `--api-key-file PATH` (one key per line, `#`
+comments ignored), and `Q27_API_KEY` (env -- preferred in containers, where
+CLI args are visible via `ps` but orchestrator-injected env vars are not)
+all add keys; any of them is accepted. Every endpoint except `/health`
+requires one once at least one key is configured. Both header conventions
+work, so neither client family needs special handling:
+`Authorization: Bearer <key>` (set via `OPENAI_API_KEY` for OpenAI-compatible
+clients, or Codex's `env_key` in `~/.codex/config.toml`) or `x-api-key: <key>`
+(set via `ANTHROPIC_API_KEY` for `claude` / Claude Code). Binding non-loopback
+with no key configured prints a warning at boot but is not refused --
+some deployments intentionally terminate auth at their own reverse proxy.
 
 Behavior note (`--think`): the default profile is no-think for speed --
 it prefills an empty `<think></think>` block. A reasoning model handed
