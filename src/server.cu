@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C]\n"
+                "  [--api-key KEY] [--api-key-file PATH]\n"
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
@@ -111,7 +112,14 @@ int main(int argc, char** argv) {
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
                 "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
-                "  defaults (bitwise canonical).\n",
+                "  defaults (bitwise canonical).\n"
+                "  Auth: no API key is required by default (loopback-only is the\n"
+                "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
+                "  one key per line (# comments ignored); Q27_API_KEY adds one more.\n"
+                "  Any configured key is accepted via 'Authorization: Bearer <key>'\n"
+                "  (OpenAI/llama.cpp convention) or 'x-api-key: <key>' (Anthropic\n"
+                "  convention, what Claude Code sends) on every endpoint except\n"
+                "  /health.\n",
                 argv[0]);
         return 1;
     }
@@ -129,6 +137,7 @@ int main(int argc, char** argv) {
     int think_flag = -1;
     bool kv_fp16 = false;
     bool constrain_tools = false;
+    std::vector<std::string> api_keys;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -141,7 +150,33 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
+        else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) api_keys.push_back(argv[++i]);
+        else if (!strcmp(argv[i], "--api-key-file") && i + 1 < argc) {
+            if (!q27::load_api_key_file(argv[++i], &api_keys)) {
+                fprintf(stderr, "error: --api-key-file %s: could not open\n", argv[i]);
+                return 1;
+            }
+        }
     }
+    // Q27_API_KEY: a second, additive source (not exclusive with the CLI
+    // flags above -- all configured keys are valid simultaneously, matching
+    // --api-key-file's multi-key semantics). Preferred for containerized
+    // deployments where CLI args are visible via `ps` but env vars set
+    // through the orchestrator's secret store are not.
+    if (const char* envkey = getenv("Q27_API_KEY"))
+        if (envkey[0]) api_keys.push_back(envkey);
+    // The existing loopback-by-default posture (see the comment above host's
+    // declaration) was this server's ONLY safety net before auth existed.
+    // Now that --api-key/--api-key-file/Q27_API_KEY exist, warn loudly
+    // (not refuse -- some deployments intentionally run without auth behind
+    // their OWN reverse-proxy auth layer, and silently breaking that on
+    // upgrade would be worse) when binding non-loopback with none configured.
+    if (api_keys.empty() && host != "127.0.0.1" && host != "localhost" && host != "::1")
+        fprintf(stderr,
+                "WARNING: binding %s with NO API key configured (--api-key / "
+                "--api-key-file / Q27_API_KEY) -- this server will accept "
+                "unauthenticated requests from anyone who can reach it.\n",
+                host.c_str());
     // CC-SERVING DEFAULTS (width-12 + tuning day, 2026-07-10): a bare
     // `q27-server model tok` serves the full measured stack -- the exact
     // config every live trial and record number was earned on. Mechanism:
@@ -950,6 +985,36 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(),
                 res.status);
     });
+
+    // Opt-in API key auth (no-op, zero overhead beyond one empty-vector
+    // check per request, when api_keys is empty -- the loopback-only
+    // default is unchanged). /health is intentionally exempt: infra health
+    // checks (load balancers, container orchestrators) need it reachable
+    // without distributing the secret to that infrastructure. Every other
+    // endpoint requires a valid key. Runs before route dispatch, so an
+    // invalid/missing key never reaches slot allocation, tokenization, or
+    // any generation work.
+    if (!api_keys.empty()) {
+        srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+            if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
+                                                         req.get_header_value("x-api-key"));
+            if (q27::api_key_valid(provided, api_keys))
+                return httplib::Server::HandlerResponse::Unhandled;
+            // Anthropic-shaped error for the Anthropic-shaped endpoint
+            // family (Claude Code's SDK reads error.message off this exact
+            // shape -- see anthropic_error_json's own comment); OpenAI-
+            // shaped for everything else, matching the 400-error split
+            // already used elsewhere in this file.
+            bool anthropic_shape = req.path.rfind("/v1/messages", 0) == 0;
+            res.status = 401;
+            if (!anthropic_shape) res.set_header("WWW-Authenticate", "Bearer");
+            res.set_content(q27::auth_error_json(anthropic_shape), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+        fprintf(stderr, "API key authentication enabled (%zu key%s configured)\n",
+                api_keys.size(), api_keys.size() == 1 ? "" : "s");
+    }
 
     srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
         // /health?verify=1 recomputes the resident-weight checksums (~20 ms;

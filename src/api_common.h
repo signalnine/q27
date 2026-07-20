@@ -4,10 +4,12 @@
 //   model emits  <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
 //   results go back as user content wrapped in <tool_response>...</tool_response>
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1292,6 +1294,94 @@ inline json openai_tool_call_delta(int index, const std::string& id, const ToolC
                                          {"type", "function"},
                                          {"function", {{"name", c.name},
                                                        {"arguments", c.arguments.dump()}}}}})}};
+}
+
+// ---- API key authentication -----------------------------------------------
+// q27 has no auth by default (loopback-only is the safety net) -- these are
+// the pure, testable pieces of an opt-in bearer/x-api-key check, wired into
+// a pre-routing handler in server.cu when --api-key/--api-key-file/
+// Q27_API_KEY configure at least one key.
+
+// Constant-time string comparison: prevents a timing side-channel where an
+// early-exit compare leaks how many leading bytes of a guessed key matched
+// via response-time variance. Deliberately does not early-exit on length
+// mismatch either (still walks max(a,b) bytes) or on the first bit
+// difference (accumulates via OR instead of returning).
+inline bool secure_compare(const std::string& a, const std::string& b) {
+    size_t n = std::max(a.size(), b.size());
+    unsigned char diff = (unsigned char)(a.size() != b.size());
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < a.size() ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < b.size() ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+// q27 serves two API families with two different native auth header
+// conventions -- support both, so neither client population needs special
+// configuration:
+//   Authorization: Bearer <key>   -- OpenAI / llama.cpp convention (Kilocode
+//                                    and other OpenAI-compatible clients)
+//   x-api-key: <key>              -- Anthropic convention (what Claude Code
+//                                    actually sends to /v1/messages)
+// x-api-key wins if a request somehow sends both (arbitrary but
+// deterministic; no client sends both in practice). Returns "" if neither
+// header is present/well-formed.
+inline std::string extract_api_key(const std::string& authorization_header,
+                                   const std::string& x_api_key_header) {
+    if (!x_api_key_header.empty()) return x_api_key_header;
+    static const std::string prefix = "Bearer ";
+    if (authorization_header.size() > prefix.size() &&
+        authorization_header.compare(0, prefix.size(), prefix) == 0)
+        return authorization_header.substr(prefix.size());
+    return "";
+}
+
+// True if `provided` matches ANY configured key. Always scans every key
+// (no early return on the first match) so total compare time depends only
+// on key count/length, not on which key -- if any -- matched, or how far
+// into it a wrong guess got. An empty `provided` is always rejected without
+// comparing (an empty key is never configured -- see set_api_keys below --
+// so this is a fast path, not a security-relevant branch).
+inline bool api_key_valid(const std::string& provided, const std::vector<std::string>& keys) {
+    if (provided.empty()) return false;
+    bool any = false;
+    for (auto& k : keys) any = any || secure_compare(provided, k);
+    return any;
+}
+
+// 401 body shaped per API family, matching the existing anthropic_error_json
+// / OpenAI-error-shape split already used elsewhere in this file for 400s --
+// each client SDK gets the error shape it actually parses.
+inline std::string auth_error_json(bool anthropic_shape) {
+    if (anthropic_shape) return anthropic_error_json("authentication_error", "invalid x-api-key");
+    json e = {{"error", {{"message", "Incorrect API key provided"},
+                         {"type", "invalid_request_error"},
+                         {"code", "invalid_api_key"}}}};
+    return e.dump();
+}
+
+// Load newline-separated keys from a file (llama.cpp --api-key-file
+// convention: one key per line, blank lines and lines starting with '#'
+// ignored, surrounding whitespace trimmed). Returns false (and leaves `out`
+// untouched) if the file can't be opened, so the caller can fail loudly
+// with the actual path rather than silently starting with no auth.
+inline bool load_api_key_file(const std::string& path, std::vector<std::string>* out) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    std::vector<std::string> keys;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t a = line.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) continue;
+        size_t b = line.find_last_not_of(" \t\r\n");
+        line = line.substr(a, b - a + 1);
+        if (line.empty() || line[0] == '#') continue;
+        keys.push_back(line);
+    }
+    for (auto& k : keys) out->push_back(std::move(k));
+    return true;
 }
 
 } // namespace q27

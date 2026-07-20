@@ -54,7 +54,12 @@ a network-exposure or adversarial-input concern. On localhost with a cooperative
 there is no attacker to send an oversized body or a pathological merge word, and the
 operator does not DoS themselves. *Update 2026-07-12 (0b34934): the default bind is now
 `127.0.0.1`; a non-loopback bind is an explicit `--host` opt-in, so the bind half of this
-finding is closed in code, not just dispositioned.* *One caveat with a self-inflicted
+finding is closed in code, not just dispositioned.* *Update 2026-07-19: opt-in
+`--api-key`/`--api-key-file`/`Q27_API_KEY` auth exists now (see the addendum below) --
+the auth half of this finding has a mitigation available, but it is a shared-secret
+gate, not the TLS/rate-limiting/request-size-bounding the finding also names. Those
+remain open; see "When this model breaks" for the recommended disposition if any of them
+become relevant.* *One caveat with a self-inflicted
 edge:* the quadratic BPE (`tokenizer.cpp:110-121`, erase-in-loop, no word-length cap) can
 bite the operator's own coding-agent workload -- a single large no-whitespace blob
 (minified JS, base64) collapses to one word and tokenizes O(n^2) single-threaded before
@@ -235,7 +240,53 @@ multi-tenant / hostile-artifact scoping is unaffected.
 
 ---
 
-## When this model breaks (re-activation triggers)
+## Addendum 2026-07-19: opt-in API key authentication
+
+`--api-key`/`--api-key-file`/`Q27_API_KEY` add an optional shared-secret gate
+(`server.cu`, httplib pre-routing handler; `api_common.h` for the constant-time
+compare and header parsing). This does **not** change the threat model or
+tenancy row above, and does not supersede this doc's closing recommendation
+("bind `127.0.0.1`, terminate auth/TLS/rate-limiting at an authenticated
+reverse proxy" for real exposure) -- it is a lighter-weight option for the
+middle ground between pure loopback-trust and standing up a full proxy: a
+trusted-LAN deployment, a quick tunnel, or a container where the operator
+wants *something* between "wide open" and "not reachable at all" without the
+operational overhead of nginx/Caddy in front.
+
+**What it is:** a single shared secret (or a small rotation set via
+`--api-key-file`/multiple `--api-key` flags), checked via
+`Authorization: Bearer <key>` or `x-api-key: <key>` before route dispatch.
+Constant-time comparison; `/health` stays open for infra health checks.
+
+**What it explicitly is NOT** -- the rest of finding #3 and the DoS/tenancy
+findings above are otherwise unchanged by this:
+- Not TLS. The key travels in plaintext over an unencrypted connection
+  unless the operator adds TLS separately (a reverse proxy, an SSH tunnel,
+  a VPN). A shared secret sent in the clear over an untrusted network is
+  interceptable.
+- Not rate-limiting or request-size bounding (finding #3's other
+  sub-points -- unbounded httplib payload size, unbounded work queue --
+  are still open).
+- Not multi-tenant isolation. One valid key authenticates the caller as
+  *the* operator, full stop -- there is still one principal, one KV/mask
+  cache, one set of slots. This narrows "who can send requests" without
+  adding any of the per-tenant isolation findings #2/#8 above would need
+  for actual multi-tenant serving.
+- Not a defense against a compromised or malicious *client* -- it defends
+  the boundary between "has the key" and "does not," not what a key-holder
+  can do once authenticated (still everything, per the existing threat
+  model).
+
+**Revised tripwire guidance:** the first bullet under "When this model
+breaks" below (non-loopback bind) is now a *spectrum* rather than a binary
+-- non-loopback + no key is unchanged (fully open, findings #3/#5/#8 fully
+live); non-loopback + `--api-key` narrows the exposure to "anyone with the
+key" but the rest of finding #3 (no TLS, no size/rate bounding) and the
+tenancy findings (#2 leak-half, #8) are unaffected and still require the
+proxy-based disposition this doc recommends if the deployment is genuinely
+multi-tenant or internet-facing.
+
+
 
 This entire doc is contingent. The out-of-scope findings become live again the instant any
 of these becomes true -- treat this list as the tripwire:
