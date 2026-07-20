@@ -1082,7 +1082,12 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
-        int n_max = body.value("max_tokens", 256);
+        // Default when the client omits max_tokens: a generous floor, unified
+        // across all three API shapes. Clamped to the context window below, so a
+        // big default can't over-reserve; 8192 covers a real answer plus a short
+        // think trace. A long *thinking* request should still set max_tokens
+        // explicitly (a grad-level trace wants 16K+).
+        int n_max = body.value("max_tokens", 8192);
         bool stream = body.value("stream", false);
         // stream_options.include_usage (OpenAI streaming spec, both API
         // shapes): when true, one extra SSE chunk -- empty choices + the
@@ -1597,7 +1602,7 @@ int main(int argc, char** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
-        int n_max = body.value("max_tokens", 1024);
+        int n_max = body.value("max_tokens", 8192); // unified default (see /v1/chat/completions)
         bool stream = body.value("stream", false);
         json tools = q27::anthropic_tools_json(body);
         std::vector<std::string> tool_names_v;
@@ -2051,7 +2056,7 @@ int main(int argc, char** argv) {
                 merged.push_back(m);
         }
 
-        int n_max = body.value("max_output_tokens", 4096);
+        int n_max = body.value("max_output_tokens", 8192); // unified default (see /v1/chat/completions)
         auto tk0 = std::chrono::steady_clock::now();
         bool thinking = q27::resolve_think(body, !no_think_srv);
         std::vector<int> prompt =

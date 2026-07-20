@@ -7976,3 +7976,17 @@ answer -- a tight budget is spent entirely on reasoning (empty content,
 finish=length). Tests: tools/test_think_resolve.cpp (16 cases) + 2 pre-seeded-
 THINK cases in test_stream_split.cpp (now 9). Server-only; canonicals (CLI path)
 unaffected by construction.
+
+## 2026-07-20 -- unified default max_tokens 8192 (was 256/1024/4096)
+
+The three API shapes defaulted max_tokens inconsistently and too low when a
+client omits it: /v1/chat/completions **256**, /v1/messages 1024, /v1/responses
+4096. 256 truncates even simple inline reasoning (~300 tokens) and mangles any
+thinking response (the trace alone blows the budget). Unified all three to
+**8192** -- a generous floor, clamped to the context window by the existing
+prompt.size()+n_max bound (server.cu:1176/1215), so a big default can't
+over-reserve a slot's budget or reject a prompt. Clients that set max_tokens
+(Claude Code always does -- Anthropic requires it) are unaffected; this fixes
+the omit-max_tokens case (curl, Kilo, OpenAI-compatible clients that leave it
+off). A long *thinking* request should still set max_tokens explicitly -- 8192
+is a floor, not enough for a grad-level trace (those want 16K+).
