@@ -173,7 +173,12 @@ tokens), on by default since v0.3.3. The agentic NLL gate cleared it
 bar); it auto-disables once the grid saturates, and every canonical
 stays bitwise (the CLI eager-forwards, only the server path splits).
 `Q27_GEMM_SPLITK=0` opts out. Warm agentic turns don't see it -- the
-checkpoint already skips their prefill.
+checkpoint already skips their prefill. Deep cold prefill (the saturated
+large-T grid) gets a complementary lever since v0.3.4: an ntx M-minitile
+GEMM that shares one activation `ldmatrix` load across two row-tiles
+(+3.4% GEMM / ~6% cold-prefill wall, bitwise, sm_120; `Q27_PF_NTX=0`
+opts out). fp4/`tcgen05` is a hardware dead end here -- consumer/
+workstation Blackwell has no fp4 MMA in PTX, so int8 is the ceiling.
 
 ### Reference numbers (v0.2.0, 2026-07-16, vanilla model, 5090)
 

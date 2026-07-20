@@ -7854,3 +7854,22 @@ does not crater quality). Two artifacts + one real fix:
   independent): code 2.91 tok/round (~48% @depth-4), prose 2.46 (~37%); adaptive
   ceiling holds at 4 (deeper drafts don't promote) -- the 116/89 code/narrative
   mechanism. gemm/ntx binaries unaffected; drift fix is api_common.h only.
+
+## 2026-07-19 -- v0.3.4 RELEASED (tag @ 54d0a42)
+
+github.com/signalnine/q27/releases/tag/v0.3.4. Two changes since v0.3.3:
+(1) prefill ntx M-minitile GEMM (5db46e4) -- each warp computes 2 row-minitiles
+sharing one B ldmatrix load, cutting LSU-loads/MMA 1.5->1.0 (ncu: LSU 50% top
+pipe, occupancy-invariant); +3.4% GEMM / ~6% cold-prefill wall, BITWISE, fires
+on the saturated large-T grid (stacks with v0.3.3 split-K's underfill regime),
+gated sm_120 where measured (Q27_PF_NTX=0 opts out). fp4/tcgen05 confirmed a
+hardware dead end for hand-written kernels on sm_120/121 (ptxas feature-gates
+to sm_100). (2) tool-drift mode 12 (54d0a42) -- recover unquoted tool-name value
+{"name": bash, ...} by quoting a bareword that exactly matches a registered
+tool; cli-40 35%->48% on the club-3090 quality harness, 0 unrecoverable. GATES
+green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke/tool-drift/drift-corpus PASS, tri-arch
+(sm_86/89/120 cuobjdump-confirmed on all 4 binaries). Assets: tarball (4
+binaries + MIT LICENSE, sha256 6bcbd783) + SHA256SUMS-0.3.4. Driver floor r580+
+unchanged. Also this session: club-3090 8-pack canonical 110/150 (q4s+turbo3,
+into the W4A16 band), issue #741; sm_86/89 ntx measurement still open.
