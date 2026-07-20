@@ -7941,3 +7941,38 @@ test_kernels/ninv/fused_smoke/tool-drift/stream-split/drift-corpus PASS, tri-arc
 LICENSE, sha256 13a89d62) + SHA256SUMS-0.3.5. Driver floor r580+ unchanged.
 Residual: bare-call JSON still streams as text before post-hoc recovery (only
 wrapper tags stripped); un-fenced inline-prose calls still recover (rarer).
+
+## 2026-07-20 -- per-request thinking opt-in (all three API shapes)
+
+Thinking is now a per-request choice, not only a boot flag. The server profile
+sets the DEFAULT (no-think for CC, on for `--think`/ref); an explicit request
+field overrides it either direction. `resolve_think` (api_common.h) reads all
+three client conventions -- `enable_thinking:<bool>` (OpenAI/Qwen top-level),
+`chat_template_kwargs.enable_thinking` (llama.cpp/GLM), `thinking:{type:...}`
+(Anthropic, Claude Code's toggle) -- wired into every prompt-build site (both
+OpenAI, both Anthropic, Responses). Malformed fields are ignored, not thrown
+(Security #1).
+
+Mechanism: this checkpoint (q4s AND vanilla qwen36-27b-mtp) reasons INLINE and
+never opens `<think>` on its own, but given a prefilled OPEN `<think>` tag it
+fills a trace and closes with `</think>` (verified via raw /v1/completions). So
+`chatml_prompt`'s think=true branch now prefills `<think>\n` (mirror of
+think=false's empty `<think></think>`), and the generation paths pre-seed the
+StreamSplitter into the THINK channel (same trick as FORCED tool_choice's TOOL
+pre-seed) so the model's first generated token -- already inside the block --
+routes to `reasoning_content` (OpenAI) / a `thinking` block (Anthropic), and its
+`</think>` flips back to text for the answer. Both prefills sit in the volatile
+tail past `stable_off`, so P8 prefix reuse is untouched. FORCED tool_choice
+suppresses thinking (can't be inside a think block AND a forced `<tool_call>`).
+`apply_chat_template` (the legacy build_prompt fallback, not a real chat path)
+left unchanged, so test_tokenizer stays green.
+
+Verified live on the 5090 (default no-think server): `enable_thinking:true` ->
+reasoning_content 2147ch + answer (finish=stop); `thinking:{type:"enabled"}` ->
+a 2147ch thinking block + answer; silent request unchanged (inline reasoning,
+default preserved); no `<think>`/`</think>` leak into the answer on any path.
+Caveat: a thinking request needs enough `max_tokens` for BOTH the trace and the
+answer -- a tight budget is spent entirely on reasoning (empty content,
+finish=length). Tests: tools/test_think_resolve.cpp (16 cases) + 2 pre-seeded-
+THINK cases in test_stream_split.cpp (now 9). Server-only; canonicals (CLI path)
+unaffected by construction.

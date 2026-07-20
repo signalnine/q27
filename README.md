@@ -487,12 +487,27 @@ clients, or Codex's `env_key` in `~/.codex/config.toml`) or `x-api-key: <key>`
 with no key configured prints a warning at boot but is not refused --
 some deployments intentionally terminate auth at their own reverse proxy.
 
-Behavior note (`--think`): the default profile is no-think for speed --
-it prefills an empty `<think></think>` block. A reasoning model handed
-zero reasoning budget over-refuses a narrow class of borderline
-requests; mitigated 2026-07-13 by injecting a minimal default system
+Behavior note (thinking): the default profile is no-think for speed -- it
+prefills an empty `<think></think>` block so the model answers directly.
+`--think` flips the server default the other way (prefills an open `<think>`
+so the model reasons in a real block, closed with `</think>`, before it
+answers).
+
+Either default is overridable **per request** -- the server profile just sets
+the default a request can override in either direction, via any of:
+`enable_thinking: <bool>` (OpenAI/Qwen top-level), nested
+`chat_template_kwargs.enable_thinking` (llama.cpp/GLM), or
+`thinking: {"type": "enabled"|"disabled"}` (Anthropic -- Claude Code's own
+toggle). Thinking-on routes the reasoning trace to `reasoning_content`
+(OpenAI) / a `thinking` content block (Anthropic), never into the answer text.
+Give a thinking request enough `max_tokens` to cover the trace **and** the
+answer -- a tight budget is spent entirely on reasoning and truncates the
+answer.
+
+A reasoning model handed zero reasoning budget over-refuses a narrow class of
+borderline requests; mitigated 2026-07-13 by injecting a minimal default system
 prompt when the client sends none (never fires for real Claude Code;
-`Q27_BARE=1` opts out). For compliance-sensitive workloads `--think`
+`Q27_BARE=1` opts out). For compliance-sensitive workloads default-on `--think`
 remains the stronger lever (BUILDLOG 2026-07-13).
 
 Three API shapes on one server:

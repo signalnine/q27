@@ -214,7 +214,17 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
              "<|im_end|>\n";
     if (stable_off) *stable_off = p.size();
     p += "<|im_start|>assistant\n";
+    // think=false: the empty CLOSED block signals "reasoning done" so the model
+    // answers directly. think=true: prefill the OPEN <think> tag so the model
+    // enters a real thinking block -- this checkpoint reasons inline and never
+    // opens <think> on its own, but given the opener it fills a trace and closes
+    // with </think> before answering. Both sit in the volatile tail (past
+    // stable_off), so P8 prefix reuse is untouched. Generation paths pre-seed the
+    // StreamSplitter to THINK when think=true so the model's first generated
+    // token (already inside the block) routes to the think channel -- mirrors the
+    // FORCED tool_choice TOOL pre-seed.
     if (!think) p += "<think>\n\n</think>\n\n";
+    else p += "<think>\n";
     return p;
 }
 
@@ -225,6 +235,40 @@ inline std::string tool_call_text(const std::string& name, const json& args) {
 
 inline std::string tool_response_text(const std::string& out) {
     return "<tool_response>\n" + out + "\n</tool_response>";
+}
+
+// Per-request thinking resolution. `server_default` is the server profile's
+// stance (!no_think_srv): no-think serving passes false, --think / the ref
+// profile pass true. An explicit request field OVERRIDES that default in
+// either direction, so a no-think-default server can serve thinking on
+// request (and a --think server can suppress it) without a reboot. Three
+// client conventions, all honored -- a given client sends exactly one:
+//   OpenAI / Qwen   : top-level  "enable_thinking": <bool>
+//   llama.cpp / GLM : "chat_template_kwargs": {"enable_thinking": <bool>}
+//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (what
+//                     Claude Code's own thinking toggle emits; budget_tokens
+//                     is ignored -- q27 thinks until done, capped by max_tokens)
+// Malformed or wrong-typed fields are ignored rather than thrown out of the
+// handler (Security #1), leaving the server default in force. Later checks win
+// over earlier ones; in practice the conventions never co-occur on one request.
+inline bool resolve_think(const json& body, bool server_default) {
+    bool think = server_default;
+    if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
+        think = body["enable_thinking"].get<bool>();
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+        const auto& k = body["chat_template_kwargs"];
+        if (k.contains("enable_thinking") && k["enable_thinking"].is_boolean())
+            think = k["enable_thinking"].get<bool>();
+    }
+    if (body.contains("thinking") && body["thinking"].is_object()) {
+        const auto& t = body["thinking"];
+        if (t.contains("type") && t["type"].is_string()) {
+            const std::string ty = t["type"].get<std::string>();
+            if (ty == "enabled") think = true;
+            else if (ty == "disabled") think = false;
+        }
+    }
+    return think;
 }
 
 // Anthropic error envelope, exactly the real API's shape: the SDK inside

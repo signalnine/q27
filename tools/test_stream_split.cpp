@@ -23,4 +23,10 @@ int main(){
   { StreamSplitter s; auto t=collect(s,{"abc</tool","_call>def"},StreamSplitter::TEXT); check("split stray tag held+stripped",t,"abcdef"); }
   { StreamSplitter s; auto th=collect(s,{"<think>","reason","</think>","ans"},StreamSplitter::THINK); check("think still routes",th,"reason"); }
   { StreamSplitter s; auto tx=collect(s,{"<think>","reason","</think>","ans"},StreamSplitter::TEXT); check("think text=ans",tx,"ans"); }
+  // enable_thinking: the <think>\n opener is prompt-injected (not generated), so the
+  // generation paths start the splitter already in THINK. The model's reasoning
+  // routes to THINK and its </think> flips to TEXT for the answer -- no opening tag
+  // ever appears in the generated stream.
+  { StreamSplitter s; s.chan=StreamSplitter::THINK; auto th=collect(s,{"reason","ing","</think>","\n\nans"},StreamSplitter::THINK); check("preseeded THINK: reasoning routes",th,"reasoning"); }
+  { StreamSplitter s; s.chan=StreamSplitter::THINK; auto tx=collect(s,{"reason","ing","</think>","\n\nans"},StreamSplitter::TEXT); check("preseeded THINK: answer after </think>",tx,"\n\nans"); }
 }
