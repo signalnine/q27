@@ -7924,3 +7924,20 @@ Residual (documented, not fixed): the bare-call JSON itself still streams as
 text before post-hoc recovery (inherent to stream-then-recover); only the
 wrapper TAGS are stripped. Inline (un-fenced) prose tool calls also still
 recover -- rarer than the fenced shape.
+
+## 2026-07-20 -- v0.3.5 RELEASED (tag @ a2cc8b8)
+
+github.com/signalnine/q27/releases/tag/v0.3.5. Tool-call parser hardening, 3
+commits since v0.3.4 (all api_common.h / stream_split.h -- no kernel changes),
+from issue #4 (@chaudhryfaisal) + a Kilocode-format replay sweep (thunderdome):
+(1) mostly-escaped content values recover (minimal-escape + first-balanced-
+object, 546d7bf); (2) dropped-opening-quote name {"name": read", ...} (9d9dcd5);
+(3) fence-skip -- don't recover a complete call inside a ```fence``` (prose/echo-
+injection -> execution guard) + streaming stray-</tool_call> strip (a2cc8b8).
+Regression: test_tool_drift.cpp (12 cases) + tools/test_stream_split.cpp (7).
+GATES green at tag: canonical a2982c51 + f64e7c02 + sampled 900031e9 EXACT,
+test_kernels/ninv/fused_smoke/tool-drift/stream-split/drift-corpus PASS, tri-arch
+(sm_86/89/120 cuobjdump-confirmed on all 4). Assets: tarball (4 binaries + MIT
+LICENSE, sha256 13a89d62) + SHA256SUMS-0.3.5. Driver floor r580+ unchanged.
+Residual: bare-call JSON still streams as text before post-hoc recovery (only
+wrapper tags stripped); un-fenced inline-prose calls still recover (rarer).
