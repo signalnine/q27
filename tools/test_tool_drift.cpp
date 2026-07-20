@@ -101,6 +101,15 @@ int main() {
                v[0].arguments.value("file_path", std::string()) == "/x/y.py",
            "mode12 unquoted-name");
     }
+    // mode 12b: dropped OPENING quote of the name value -> {"name": Read", ...}
+    // (thunderdome 2026-07-20: model emitted {"name": read", ...} -- bareword +
+    // stray closing quote; naive quoting would make "Read"" (invalid)).
+    {
+        auto v = call("{\"name\": Read\", \"arguments\": {\"file_path\": \"/x/y.py\"}}");
+        ok(v.size() == 1 && v[0].name == "Read" &&
+               v[0].arguments.value("file_path", std::string()) == "/x/y.py",
+           "mode12b dropped-opening-quote");
+    }
     // mode 12 negative: an unquoted name that is NOT a registered tool must be
     // left untouched (never quote arbitrary barewords).
     {

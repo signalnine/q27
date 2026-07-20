@@ -7890,3 +7890,18 @@ correct content ("fmt" quotes preserved). Regression: test_tool_drift.cpp
 green. Kilocode tools confirmed lowercase (write/read/bash/...). Distinct from
 the truncated raw-shell-in-name case (still genuinely unrecoverable). NOT in
 v0.3.4 -- needs v0.3.5 or build-from-master.
+
+## 2026-07-20 -- thunderdome (Kilo-format replay) -> tool-drift mode 12b
+
+Replayed Kilocode's exact wire format (system + tool schema from issue #4)
+against q27 /v1/messages on hard coding tasks, stubbed tool results, drift
+capture on. Found+fixed one real edge: mode 12b -- dropped OPENING quote of the
+name value {"name": read", ...} (bareword + stray closing quote). Mode 12's
+naive quoting made "read"" (invalid); fix: add the closing quote only if one
+isn't already present. test_tool_drift.cpp mode12b. Non-findings: a max_tokens
+truncation was a test-budget artifact (clean at 16384). OPEN (surfaced, NOT
+fixed -- tradeoff): the bare-call recovery recovers a COMPLETE tool call even
+inside a ```json fence or inline prose ("emit {"name":"bash",...}") -> a prose/
+example -> unintended-execution vector. Fence-skip is the candidate fix but
+must not misfire on writes whose CONTENT contains fences, and must not weaken
+the wrapper-drop recovery Faisal depends on. Product/security call pending.

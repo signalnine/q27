@@ -952,7 +952,10 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                         break;
                     }
                 if (match) {
-                    s.insert(e, "\"");
+                    // Add the closing quote only if one isn't already there:
+                    // {"name": bash,   -> both quotes; {"name": read"  (dropped
+                    // OPENING quote, stray close) -> opening only (thunderdome).
+                    if (!(e < s.size() && s[e] == '"')) s.insert(e, "\"");
                     s.insert(c, "\"");
                     p = e + 2;
                     continue;
