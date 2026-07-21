@@ -502,7 +502,9 @@ toggle). Thinking-on routes the reasoning trace to `reasoning_content`
 (OpenAI) / a `thinking` content block (Anthropic), never into the answer text.
 Give a thinking request enough `max_tokens` to cover the trace **and** the
 answer -- a tight budget is spent entirely on reasoning and truncates the
-answer.
+answer. When a client omits `max_tokens` the server defaults it to 8192
+(unified across all three API shapes, clamped to the context window); a long
+thinking trace wants more, set it explicitly.
 
 A reasoning model handed zero reasoning budget over-refuses a narrow class of
 borderline requests; mitigated 2026-07-13 by injecting a minimal default system
