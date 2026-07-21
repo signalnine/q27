@@ -8020,3 +8020,26 @@ artifact: our 3090 at full 420W does **126-150 t/s** decode on short code-gen
 (server `[gen-done]`: 149.8/147.5/130.6/126.0/128.0, median ~130); the
 reporter's card was 200W-capped, which roughly halves decode. README now
 states the full-power number + the power sensitivity.
+
+## 2026-07-21 -- v0.4.0 RELEASED (tag @ c244a73)
+
+github.com/signalnine/q27/releases/tag/v0.4.0. Two features + a behavior change
++ a 24GB fix since v0.3.5; NO kernel changes (decode/prefill bitwise EXACT).
+(1) opt-in API-key auth (PR #5, @chaudhryfaisal): --api-key / --api-key-file /
+Q27_API_KEY, x-api-key + Bearer, constant-time compare, /health exempt,
+pre-routing so a bad key never hits slot/token work. (2) per-request thinking
+across all 3 API shapes (resolve_think: top-level enable_thinking /
+chat_template_kwargs / Anthropic thinking:{type}); server profile = default,
+request overrides; <think>-opener prefill + generation-path StreamSplitter
+THINK-seed -> reasoning_content (OpenAI) / thinking block (Anthropic). (3)
+max_tokens default unified 256/1024/4096 -> 8192 (clamped to ctx). (4) --ctx
+auto fixes (issue #6, NHClimber87): atoi("auto")=0 silent-ctx-0 bug + arch-aware
+slack (1.0 GB sm_86/89, 0.25 sm_120) so 24GB auto-ctx leaves graph-zoo headroom
+instead of OOMing at cudaGraphInstantiate. GATES green at tag: canonical
+a2982c51 (vanilla) + f64e7c02 (q4s greedy) + sampled 900031e9 (q4s seed-42,
+-n64 t0.7 p0.95) EXACT; test_kernels / ninv / fused_smoke / tokenizer /
+toolconstrain / tool-drift / stream-split / drift-corpus / think-resolve / auth
+/ auth-integration PASS; tri-arch (sm_86/89/120) cuobjdump-confirmed on all 4
+binaries. Assets: tarball (4 binaries + MIT LICENSE, sha256 def23b70) +
+SHA256SUMS-0.4.0. Driver floor r580+ unchanged. Field-validated same day: 3090
+full-power decode 126-150 t/s (issue #6 P2, a power-cap not an engine limit).
