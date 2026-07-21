@@ -141,7 +141,12 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
-        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
+            ++i; // "auto" -> -1 (VRAM auto-size). atoi("auto") is 0, which would
+                 // SILENTLY start a ctx-0 server (issue #6); the docs advertise
+                 // --ctx auto, so honor it. (Omitting --ctx also auto-sizes.)
+            ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
+        }
         else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) slot1_ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
@@ -373,7 +378,14 @@ int main(int argc, char** argv) {
                                         (sampled_on ? 0.0 : kEngSampSave);
             long budget, c;
             if (n_slots <= 1) {
-                const double slack = 0.25e9;
+                // sm_86/89 carry a fatter, ctx-scaled graph zoo + a larger
+                // cudaGraphInstantiate transient than the fixed calibration
+                // constant captures; the old 0.25 GB margin got eaten during
+                // graph build and OOMed on 24GB cards that size below the 262144
+                // cap (issue #6, NHClimber87: sized 184320 -> OOM). Give
+                // Ampere/Ada ~1 GB of real headroom; sm_120 (32GB, cap usually
+                // binds) keeps the tight margin.
+                const double slack = cc_arch >= 120 ? 0.25e9 : 1.0e9;
                 budget = (long)((double)free_b - single_fixed - slack);
                 c = budget > 0 ? (long)(budget / per_tok) : 0;
             } else {
@@ -393,7 +405,7 @@ int main(int argc, char** argv) {
                             fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
                     n_slots = fit;
                 }
-                const double slack = 0.25e9 * n_slots;
+                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * n_slots; // arch margin (issue #6), per slot
                 budget = (long)((double)free_b - n_slots * per_slot - slack);
                 c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
             }

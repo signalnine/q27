@@ -72,6 +72,14 @@ both knobs boots the FULL 262,144 native window; default weights
 reach 102,400. The card must be otherwise idle: ~2.7GB of other
 resident VRAM is the difference between boot and OOM.
 
+3090 decode is power-sensitive: a fully-powered card (350-420W) runs
+**~130 t/s** on short code-gen turns (q4s/w8, measured 126-150); a
+200W-capped card gives roughly half that (issue #6). And `--ctx auto`
+(or just omitting `--ctx`) sizes to measured free VRAM with an
+arch-scaled safety margin -- ~254K on a 24GB Ampere card (q4s/turbo3)
+with ~0.9 GB headroom, rather than sizing to the brim and OOMing at
+`cudaGraphInstantiate` on cards that land below the 262K cap (issue #6).
+
 Pick a quant first. Four tiers, one repo
 ([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27))
 -- all serve identically,

@@ -7990,3 +7990,33 @@ over-reserve a slot's budget or reject a prompt. Clients that set max_tokens
 the omit-max_tokens case (curl, Kilo, OpenAI-compatible clients that leave it
 off). A long *thinking* request should still set max_tokens explicitly -- 8192
 is a floor, not enough for a grad-level trace (those want 16K+).
+
+## 2026-07-21 -- --ctx auto fixes + arch-aware safety margin (issue #6)
+
+Two auto-ctx bugs from a 3090 field report (issue #6, NHClimber87 -- otherwise
+glowing: flat depth curve, turbo3 12/12 needles @124K, temp-invariant spec,
+defaults-optimal, mode-12 drift recovery in live CC, all independently
+reproduced).
+
+(1) `--ctx auto` (the literal string, which the docs advertise) parsed via
+`atoi("auto")` = 0, which fails the `if (ctx < 0)` auto-size gate and SILENTLY
+starts a ctx-0 server (unusable). Auto-sizing only ever fired when `--ctx` was
+OMITTED (default -1). Fixed the parse to map "auto" -> -1.
+
+(2) Auto-sizing over-fills on 24GB cards. The single-slot `slack` was a flat
+0.25 GB, but the true non-KV stack (measured on our 3090: 4.175 GB at 262144,
+vs the 4.07 GB estimate) plus the transient `cudaGraphInstantiate` peak eats
+more than that. On cards that size BELOW the 262144 cap (the reporter's:
+184320 picked, then OOM at engine.cuh graph build) the thin margin is fatal;
+our card only survived because the 262144 cap accidentally left 0.80 GB.
+Fix: arch-scale the slack -- **sm_86/89 get 1.0 GB**, sm_120 (32GB, cap
+usually binds) keeps 0.25 GB. Same for the multi-slot slack. Verified on the
+3090: `--ctx auto` now sizes 253952 (was the 0.80 GB knife-edge at 262144)
+with 0.87 GB free at ready and serves cleanly; a tighter card (the reporter's
+~7 GB free) now lands ~135K instead of OOMing at 184320.
+
+P2 from the same report -- "102 t/s reads ~60 on a 3090" -- is a power
+artifact: our 3090 at full 420W does **126-150 t/s** decode on short code-gen
+(server `[gen-done]`: 149.8/147.5/130.6/126.0/128.0, median ~130); the
+reporter's card was 200W-capped, which roughly halves decode. README now
+states the full-power number + the power sensitivity.
