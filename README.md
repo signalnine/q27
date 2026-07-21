@@ -595,7 +595,7 @@ Full methodology, fairness controls, the payload microbench, and reproduce
 steps: [docs/BENCHMARKING.md](docs/BENCHMARKING.md). Harness, pinned task set,
 and raw per-instance results: [bench/swebench/](bench/swebench/).
 
-## Open items (2026-07-16, the honest list)
+## Open items (2026-07-16)
 
 - ~~**turbo3-vs-fp8 quality gate**~~ **CLOSED 2026-07-16, verdict PASS**
   (BUILDLOG "TURBO3 AGENTIC QUALITY GATE"): agentic-corpus NLL on a real
