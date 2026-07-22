@@ -8071,3 +8071,30 @@ chat_template_kwargs.enable_thinking:True, which v0.4.0 honored -> thinking-on -
 model runaway -> ~50% verifier_fail (thinking-on is worse for this model, per the
 GPQA A/B). resolve_think gained an `allow_request` param; test_think_resolve +3
 gating cases. Server compiles, all CPU suites green.
+
+## 2026-07-22 -- q6f: the 32GB tier (full ladder green) + thunderdome resolved
+
+**q6f** = the q5f recipe + one more promotion (Q4-head + ffn_down + ffn_gate at
+Q8), 6.11 bpw / 21.0 GB. Displaces q6 as the 32GB pick: wikitext PPL **7.9189**
+vs q6 7.9460 at the same size (q6k 7.9127 still edges it at +2.25 GB). FULL
+LADDER GREEN: canonical greedy 2a4d22eafcde63e962bf2408605fe502 / sampled
+fc73f835adf3b457856c67fe1b5d6939 (final artifact repro EXACT = deterministic
+repack); needle 6/6 all depths to 120K (turbo3); --ctx auto = 184320 on the
+5090 (fp8/W12, 0.43 GB at ready), serves clean; code A/B vs q6 (no-think):
+HumanEval+ 30/30 vs 29/30, LCB 22/30 tied. Artifact qwen36-27b-mtp-q6f.q27;
+README tier rows (q6 marked superseded) + sampling_gate anchor. HF upload
+pending (Gabe), alongside q5f's.
+
+**Thunderdome "breakage" resolved -- it was never broken.** Every dome failure
+traced to port-8081 squatters: q27-server on an occupied port prints
+"listening" then CLEAN-EXITS (exit 0, ~2.5s CPU; the bind failure is silent),
+so the dome's claude sees ConnectionRefused mid-task and it reads as harness
+infra. Squatters included a leftover debug `python3 -m http.server 8081`. Also:
+run_task.sh requires ABSOLUTE outdir paths (it cd's into thunderdome; a
+relative outdir makes the harness.log redirect fail, which silently prevents
+`thunderdome run` from executing at all). q4s_dome/boot.sh now refuses up front
+if 8081 is occupied. Verified end-to-end: dome T2 against q5f = harness_exit 0,
+meta.json produced, score 0.631, q5f agentic 214 t/s aggregate / 195 median,
+4.33 tok/round, 0 errors. Follow-up candidate: q27-server should FAIL LOUDLY
+(nonzero exit + error line) when the listen bind fails, instead of the silent
+exit-0 -- that silence is what made this look like three different bugs.

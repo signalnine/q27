@@ -12,6 +12,7 @@ BIN="$(dirname "$0")/../build/q27"
 # 2026-07-09); other tiers/fine-tunes override via CANON_MD5= env --
 #   q4s: f64e7c02252ca4c40cea62db662205e0
 #   q5f: 683f7f4450ca4c60837abdb603ee3237  (Q4-head + ffn_down, 5.30bpw)
+#   q6f: 2a4d22eafcde63e962bf2408605fe502  (Q4-head + ffn_down + ffn_gate, 6.11bpw)
 #   Qwopus: 4c4120c7...
 CANON_MD5="${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}"
 CANON_IDS="760,6511,314,9338,369"
