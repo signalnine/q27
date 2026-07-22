@@ -8144,3 +8144,23 @@ Q5_K_M and above, but Q4_K_M collapses on this model -- q4s (15.5 GB,
 4.55 bpw) beats it by 4.2% PPL at 1.3 GB smaller (~6 sigma), q5f by 5.6%.
 Below 19.5 GB there is no GGUF on this model that competes with the q27
 low tiers.
+
+## 2026-07-22 -- v0.5.0 RELEASED (tag @ 5bedab3)
+
+github.com/signalnine/q27/releases/tag/v0.5.0. Since v0.4.0 (same day + 1):
+(1) q5f (5.30 bpw, PPL 7.9491, best 24GB quality) + q6f (6.11 bpw, 7.9189,
+the 32GB pick, supersedes q6) -- the Q4-head + FFN-promotion family, closed
+(ffn_up 8.0703 / attn+ssm 8.1154 both break cancellation); both tiers live on
+HF with checksums + card. Q4_K_M matched-protocol 8.4205 = q4s beats it 4.2%
+at 1.3GB smaller. (2) BEHAVIOR CHANGE: per-request thinking now requires
+--request-think (v0.4.0 honored request fields unconditionally; harnesses
+sending enable_thinking:true silently flipped no-think servers). (3) bind
+fixes: bind-first + FATAL exit-1 (was listening-then-exit-0) +
+SO_REUSEADDR-only (REUSEPORT allowed silent two-server co-bind). GATES at
+tag: canonicals EXACT x5 (a2982c51 / f64e7c02 / 900031e9 / 683f7f44 /
+2a4d22ea), 9 CPU suites + ninv + fused_smoke PASS, tri-arch on all 4
+binaries, live bind-fail proof. Assets: tarball sha256 ae684e1e +
+SHA256SUMS-0.5.0. Driver floor r580+ unchanged. NOTE (harness lesson): the
+q4s sampled anchor REQUIRES `--ctx 2048 --spec` -- sampled spec-vs-plain
+trajectories are different-but-both-valid, so omitting --spec yields a
+plausible-looking wrong md5.
