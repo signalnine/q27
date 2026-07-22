@@ -80,7 +80,7 @@ arch-scaled safety margin -- ~254K on a 24GB Ampere card (q4s/turbo3)
 with ~0.9 GB headroom, rather than sizing to the brim and OOMing at
 `cudaGraphInstantiate` on cards that land below the 262K cap (issue #6).
 
-Pick a quant first. Four tiers, one repo
+Pick a quant first. Seven tiers, one repo
 ([signalnine/Qwen3.6-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.6-27B-MTP-q27))
 -- all serve identically,
 they trade decode speed for model quality:
@@ -475,7 +475,7 @@ pre-batch). Every knob keeps its env/flag override (user env always
 wins), `Q27_PROFILE=ref` restores the conservative reference behavior
 (fp16, ungated, no suffix, fd2, no batching), and the **CLI binary keeps
 reference defaults** so the bitwise canonical gates are untouched.
-Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
+Escapes: `--kv-fp16 --no-fast-head --think --request-think`, any individual `Q27_*`.
 
 `--slots N` auto-sizes too (since 2026-07-18): with `--ctx` omitted the
 free-VRAM budget is split across the N co-resident engines and every slot
