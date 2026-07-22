@@ -89,6 +89,7 @@ they trade decode speed for model quality:
 |---|---|---|---|
 | **default** (5.25 bpw) | `qwen36-27b-mtp.q27` | 24GB+ | the reference tier: bitwise canonical `a2982c51`, the most measured configuration |
 | q4s (4.55 bpw) | `qwen36-27b-mtp-q4s.q27` | 24GB+ | max context on small cards; 2.27GB more KV budget, +5% decode, and wikitext PPL measures 0.26% BETTER than default (single Q4 lm_head + Q4 residual writers; error cancellation is real) |
+| q5f (5.30 bpw) | `qwen36-27b-mtp-q5f.q27` | 24GB+ | **best quality that fits a 24GB card**: the q4s single-Q4 lm_head + `ffn_down` promoted to Q8. wikitext PPL **7.9491** -- beats q4s, default, and even q8, and matches q6 (7.9460) at 2.3GB less. Auto-ctx ~69K on a 3090 (vs q4s's ~315K), so it trades context for quality. HumanEval+ 30/30, LCB 23/30 (>= q4s). The FFN promotion stacks with the Q4-head cancellation where attn/ssm promotions don't |
 | q6 (6.0 bpw) | `qwen36-27b-mtp-q6.q27` | 32GB | +0.35% PPL off Q5_K_M for ~5% slower decode |
 | q6k (6.8 bpw) | `qwen36-27b-mtp-q6k.q27` | 32GB | quality matching the best GGUFs of this model, ~10% slower decode |
 | q8 (8.1 bpw) | `qwen36-27b-mtp-q8.q27` | 48GB+ | the near-lossless reference for big cards; PPL 7.9942 (better than default; q6/q6k's tuned promotions still edge it on wikitext -- error cancellation is non-monotonic in bits), and the acceptance-recovery tier: decode runs +26% over pure byte-scaling. Does not fit 32GB cards |
@@ -503,13 +504,17 @@ prefills an empty `<think></think>` block so the model answers directly.
 so the model reasons in a real block, closed with `</think>`, before it
 answers).
 
-Either default is overridable **per request** -- the server profile just sets
-the default a request can override in either direction, via any of:
-`enable_thinking: <bool>` (OpenAI/Qwen top-level), nested
+Per-request thinking control is **opt-in behind `--request-think`**. Boot with
+that flag and a request can override the server default in either direction, via
+any of: `enable_thinking: <bool>` (OpenAI/Qwen top-level), nested
 `chat_template_kwargs.enable_thinking` (llama.cpp/GLM), or
 `thinking: {"type": "enabled"|"disabled"}` (Anthropic -- Claude Code's own
-toggle). Thinking-on routes the reasoning trace to `reasoning_content`
-(OpenAI) / a `thinking` content block (Anthropic), never into the answer text.
+toggle). **Without `--request-think` (the default), those fields are ignored**
+and thinking stays a boot decision (`--think`) -- so a benchmark or client that
+sends `enable_thinking:True` (many harnesses do) can't silently flip a no-think
+server into thinking mode. Thinking-on routes the reasoning trace to
+`reasoning_content` (OpenAI) / a `thinking` content block (Anthropic), never
+into the answer text.
 Give a thinking request enough `max_tokens` to cover the trace **and** the
 answer -- a tight budget is spent entirely on reasoning and truncates the
 answer. When a client omits `max_tokens` the server defaults it to 8192

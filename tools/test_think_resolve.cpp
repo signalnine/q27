@@ -16,7 +16,19 @@ static void ok(bool c, const char* n) {
 }
 
 int main() {
-    using q27::resolve_think;
+    // existing cases exercise the honoring path (allow_request=true, i.e. the
+    // server booted with --request-think); a local wrapper supplies that arg.
+    auto resolve_think = [](const json& b, bool sd) { return q27::resolve_think(b, sd, true); };
+
+    // --- GATING: without --request-think (allow_request=false) the request's
+    // thinking fields are IGNORED and the server default stands (the fix for
+    // benchmarks that send enable_thinking:True flipping a no-think server). ---
+    ok(q27::resolve_think(json{{"enable_thinking", true}}, false, false) == false,
+       "gated: enable_thinking:true IGNORED when allow_request=false -> server default (no-think)");
+    ok(q27::resolve_think(json{{"enable_thinking", false}}, true, false) == true,
+       "gated: enable_thinking:false IGNORED when allow_request=false -> server default (think)");
+    ok(q27::resolve_think(json{{"thinking", {{"type", "enabled"}}}}, false, false) == false,
+       "gated: anthropic thinking IGNORED when allow_request=false");
 
     // --- server default honored when the request says nothing ---
     ok(resolve_think(json::object(), false) == false, "no-think server + silent -> no-think");

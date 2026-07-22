@@ -8043,3 +8043,31 @@ toolconstrain / tool-drift / stream-split / drift-corpus / think-resolve / auth
 binaries. Assets: tarball (4 binaries + MIT LICENSE, sha256 def23b70) +
 SHA256SUMS-0.4.0. Driver floor r580+ unchanged. Field-validated same day: 3090
 full-power decode 126-150 t/s (issue #6 P2, a power-cap not an engine limit).
+
+## 2026-07-22 -- q5f: new best-quality 24GB tier (quant ladder) + thinking gated behind --request-think
+
+**q5f tier.** A repack sweep for better PPL (tools/repack.py: --q4-head +
+--q8 REGEX) found a Pareto-better recipe family: on the q4s single-Q4 lm_head,
+promoting FFN tensors to Q8 STACKS the error cancellation, while promoting
+attn/ssm BREAKS it (that's why q4s already beat the default, which promoted
+attn/ssm). q5f = Q4-head + ffn_down->Q8, 5.30 bpw / 18.2 GB, wikitext PPL
+(--nll wiki.test.qwopus.i32 --nll-chunk 2048 --ctx 2048) **7.9491** -- beats
+q4s (8.0197), default (8.0409), q8 (7.9942); matches q6 (7.9460) at 2.3 GB
+less. FULL LADDER GREEN: canonical greedy 683f7f4450ca4c60837abdb603ee3237 /
+sampled 06451b011bc2acb335468085e69f2259 (repack repro EXACT); needle 6/6 all
+depths to 120K; --ctx auto = 69632 on a 24GB 3090 w/ 0.72 GB headroom, serves
+clean; task A/B vs q4s (no-think): HumanEval+ 30/30 == q4s, LiveCodeBench 23/30
+> q4s 20/30. Trades context for quality (q5f ~69K vs q4s ~315K on a 3090).
+Artifact qwen36-27b-mtp-q5f.q27; README tier row + sampling_gate anchor added;
+HF upload pending (Gabe). C6 (Q4-head + ffn_down + ffn_gate, 21 GB, PPL 7.9189,
+beats q6) being validated as a 32GB tier.
+
+**--request-think.** v0.4.0's per-request thinking (resolve_think honoring
+enable_thinking / chat_template_kwargs / Anthropic thinking:{type}) is now GATED
+behind a new `--request-think` flag, OFF by default. Without it, request thinking
+fields are IGNORED and thinking is a pure boot decision (--think). Fixes the
+v0.4.0 footgun found during the q5f task A/B: the club HumanEval+ pack sends
+chat_template_kwargs.enable_thinking:True, which v0.4.0 honored -> thinking-on ->
+model runaway -> ~50% verifier_fail (thinking-on is worse for this model, per the
+GPQA A/B). resolve_think gained an `allow_request` param; test_think_resolve +3
+gating cases. Server compiles, all CPU suites green.

@@ -237,21 +237,28 @@ inline std::string tool_response_text(const std::string& out) {
     return "<tool_response>\n" + out + "\n</tool_response>";
 }
 
-// Per-request thinking resolution. `server_default` is the server profile's
-// stance (!no_think_srv): no-think serving passes false, --think / the ref
-// profile pass true. An explicit request field OVERRIDES that default in
-// either direction, so a no-think-default server can serve thinking on
-// request (and a --think server can suppress it) without a reboot. Three
-// client conventions, all honored -- a given client sends exactly one:
+// Per-request thinking resolution, GATED behind the server's --request-think
+// flag (`allow_request`). `server_default` is the server profile's stance
+// (!no_think_srv): no-think serving passes false, --think / the ref profile
+// pass true.
+//
+// Without --request-think (the default), the request's thinking fields are
+// IGNORED and the server default stands -- so a benchmark or client that sends
+// enable_thinking:True (many do) can't silently flip a no-think server into
+// thinking mode. Thinking is then purely a boot decision (--think).
+//
+// With --request-think, an explicit request field OVERRIDES the default in
+// either direction (a no-think server serves thinking on request; a --think
+// server suppresses it). Three client conventions, all honored -- a given
+// client sends exactly one:
 //   OpenAI / Qwen   : top-level  "enable_thinking": <bool>
 //   llama.cpp / GLM : "chat_template_kwargs": {"enable_thinking": <bool>}
-//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (what
-//                     Claude Code's own thinking toggle emits; budget_tokens
-//                     is ignored -- q27 thinks until done, capped by max_tokens)
-// Malformed or wrong-typed fields are ignored rather than thrown out of the
-// handler (Security #1), leaving the server default in force. Later checks win
-// over earlier ones; in practice the conventions never co-occur on one request.
-inline bool resolve_think(const json& body, bool server_default) {
+//   Anthropic       : "thinking": {"type": "enabled"|"disabled"}   (Claude
+//                     Code's own thinking toggle; budget_tokens ignored)
+// Malformed/wrong-typed fields are ignored rather than thrown (Security #1).
+// Later checks win over earlier ones; the conventions never co-occur in practice.
+inline bool resolve_think(const json& body, bool server_default, bool allow_request) {
+    if (!allow_request) return server_default;
     bool think = server_default;
     if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean())
         think = body["enable_thinking"].get<bool>();

@@ -111,7 +111,8 @@ int main(int argc, char** argv) {
                 "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
-                "  --kv-fp16 --no-fast-head --think. The CLI binary keeps reference\n"
+                "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
+                "  request enable_thinking; off by default). The CLI keeps reference\n"
                 "  defaults (bitwise canonical).\n"
                 "  Auth: no API key is required by default (loopback-only is the\n"
                 "  safety net). --api-key KEY may repeat; --api-key-file PATH loads\n"
@@ -137,6 +138,7 @@ int main(int argc, char** argv) {
     int think_flag = -1;
     bool kv_fp16 = false;
     bool constrain_tools = false;
+    bool req_think = false; // --request-think: honor per-request thinking fields (else ignored)
     std::vector<std::string> api_keys;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
@@ -153,6 +155,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
         else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
+        else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         else if (!strcmp(argv[i], "--api-key") && i + 1 < argc) api_keys.push_back(argv[++i]);
@@ -1084,7 +1087,7 @@ int main(int argc, char** argv) {
             // explicit enable_thinking / chat_template_kwargs / Anthropic
             // thinking field overrides it either way (resolve_think in
             // api_common.h). Silent request on a no-think server -> no-think.
-            bool think = q27::resolve_think(body, !no_think_srv);
+            bool think = q27::resolve_think(body, !no_think_srv, req_think);
             return tok.apply_chat_template(msgs, think);
         }
         return tok.encode(body.value("prompt", std::string()));
@@ -1139,7 +1142,7 @@ int main(int argc, char** argv) {
         int stable_len = -1; // -1 = legacy tail snapshot (build_prompt's fallback path)
         bool thinking = false; // request wants a real <think> block; seeds the splitter below
         if (routed_chat) {
-            thinking = q27::resolve_think(body, !no_think_srv);
+            thinking = q27::resolve_think(body, !no_think_srv, req_think);
             // thinking and a FORCED tool call are mutually exclusive: FORCED
             // injects <tool_call>\n into the tail (below), leaving no room for a
             // think block, so suppress the opener when a tool is forced.
@@ -1605,7 +1608,7 @@ int main(int argc, char** argv) {
         }
         std::string rendered = q27::chatml_prompt(
             q27::anthropic_msgs(body), q27::anthropic_tools_json(body),
-            q27::resolve_think(body, !no_think_srv));
+            q27::resolve_think(body, !no_think_srv, req_think));
         json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
         res.set_content(jdump(out), "application/json");
     });
@@ -1624,7 +1627,7 @@ int main(int argc, char** argv) {
                     tool_names_v.push_back(t["function"]["name"].get<std::string>());
         auto tk0 = std::chrono::steady_clock::now();
         size_t stable_off = 0;
-        bool thinking = q27::resolve_think(body, !no_think_srv);
+        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         std::string rendered =
             q27::chatml_prompt(q27::anthropic_msgs(body), tools, thinking, &stable_off);
         auto tk1 = std::chrono::steady_clock::now();
@@ -2070,7 +2073,7 @@ int main(int argc, char** argv) {
 
         int n_max = body.value("max_output_tokens", 8192); // unified default (see /v1/chat/completions)
         auto tk0 = std::chrono::steady_clock::now();
-        bool thinking = q27::resolve_think(body, !no_think_srv);
+        bool thinking = q27::resolve_think(body, !no_think_srv, req_think);
         std::vector<int> prompt =
             tok.encode(q27::chatml_prompt(merged, tools, thinking));
         ReqTrace rt{rid, "resp", conv_fp(body), std::chrono::steady_clock::now(),

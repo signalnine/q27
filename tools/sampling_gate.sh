@@ -9,7 +9,10 @@ set -u
 MODEL="${1:-/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.q27}"
 BIN="$(dirname "$0")/../build/q27"
 # baseline greedy canonical: vanilla qwen36-27b-mtp (benchmark standard
-# 2026-07-09); fine-tunes override via env (Qwopus: 4c4120c7...)
+# 2026-07-09); other tiers/fine-tunes override via CANON_MD5= env --
+#   q4s: f64e7c02252ca4c40cea62db662205e0
+#   q5f: 683f7f4450ca4c60837abdb603ee3237  (Q4-head + ffn_down, 5.30bpw)
+#   Qwopus: 4c4120c7...
 CANON_MD5="${CANON_MD5:-a2982c5197c627551b27d76a0a94b220}"
 CANON_IDS="760,6511,314,9338,369"
 export CUDA_VISIBLE_DEVICES=0
