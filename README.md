@@ -475,9 +475,11 @@ wins), `Q27_PROFILE=ref` restores the conservative reference behavior
 reference defaults** so the bitwise canonical gates are untouched.
 Escapes: `--kv-fp16 --no-fast-head --think`, any individual `Q27_*`.
 
-One sharp edge: `--slots N` does NOT auto-size `--ctx` (it defaults to
-8192 and warns) -- pass the slot-0 window you want, or a >8K prompt
-serializes onto slot 1 and nothing fuses.
+`--slots N` auto-sizes too (since 2026-07-18): with `--ctx` omitted the
+free-VRAM budget is split across the N co-resident engines and every slot
+gets the same computed window (logged `--ctx auto: <ctx> per slot`). Pass an
+explicit `--ctx` to set slot 0 by hand and `--slot1-ctx` for the background
+slots.
 
 **Auth.** Off by default -- loopback-only binding is the actual safety net
 (see `docs/SECURITY-MODEL.md`); this is a convenience for the cases that
@@ -615,9 +617,6 @@ and raw per-instance results: [bench/swebench/](bench/swebench/).
 - **Strict-parser zero-rescue config**: engage the constrain grammar on
   a bare `{"name"` opener too, closing the wrapper-less bypass
   (strict-parser A/B verdict: BUILDLOG 2026-07-08).
-- **`--slots N` does not auto-size `--ctx`** (v0.2.0 sharp edge: ctx
-  defaults to 8192 + a warning, so a >8K prompt serializes onto slot 1
-  and nothing fuses). Ergonomics fix candidate.
 - **Graph-cache cap under churn**: live CC already draws 44+ keys vs
   the bench's 28; cap 64 swallows today's alphabet, revisit
   `Q27_BATCH_GRAPH_CAP` if multi-tenant composition churn widens it.
