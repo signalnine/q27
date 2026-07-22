@@ -8123,3 +8123,24 @@ serves clean with the override.
 Also: HF uploads for q5f + q6f COMPLETE same day (weights + CHECKSUMS.md5 +
 model-card tier sections; xet dedup made the 39 GB transfer ~157 kB of new
 chunks). All six tiers now live on signalnine/Qwen3.6-27B-MTP-q27.
+
+## 2026-07-22 -- qxf family CLOSED (q7f negative) + Q4_K_M on the board
+
+**q7f (Q4-head + ffn_down + ffn_gate + ffn_up, 23.75 GB) = PPL 8.0703 --
+NO-GO.** Worse than q6f (7.9189), q5f (7.9491), and even plain q4s (8.0197):
+ffn_up promotion actively breaks the Q4-head cancellation, exactly as the q6k
+study predicted on the Q8 head (its Q4 noise cancels inside the SwiGLU
+product). The recipe family is now fully mapped: promotions that STACK with
+the Q4 head = ffn_down, ffn_gate; promotions that BREAK it = ffn_up, ssm_out,
+attn_output (C4, 8.1154). q4s -> q5f -> q6f is the complete Pareto set over
+the format's existing dtypes. Candidate artifact deleted; further points on
+the curve need a real intermediate dtype (Q6-granularity kernels) -- engine
+work, not a repack.
+
+**llama.cpp Q4_K_M measured on the matched protocol** (llama-perplexity,
+wiki.test.raw, c2048 -- same board as the Q5_K_M 7.9179 bar): **8.4205
++/- 0.067**. That flips the low-end story: K-quant bit-efficiency holds at
+Q5_K_M and above, but Q4_K_M collapses on this model -- q4s (15.5 GB,
+4.55 bpw) beats it by 4.2% PPL at 1.3 GB smaller (~6 sigma), q5f by 5.6%.
+Below 19.5 GB there is no GGUF on this model that competes with the q27
+low tiers.
