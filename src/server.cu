@@ -2430,9 +2430,34 @@ int main(int argc, char** argv) {
     srv.Post("/v1/completions",
              [&](const httplib::Request& r, httplib::Response& s) { handle(r, s, false); });
 
+    // SO_REUSEADDR only (2026-07-22, thunderdome postmortem pt.2): httplib's
+    // Linux default socket option is SO_REUSEPORT, which lets a SECOND
+    // q27-server co-bind the same port -- the kernel then load-balances
+    // incoming connections across both, silently splitting an eval's traffic
+    // between two servers (potentially two different models). REUSEADDR keeps
+    // the fast rebind-after-TIME_WAIT behavior without permitting live
+    // co-binding, so a second bind fails and hits the FATAL below.
+    srv.set_socket_options([](socket_t sock) {
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&opt),
+                   sizeof(opt));
+    });
+    // Bind FIRST, print "listening" only on success (2026-07-22, thunderdome
+    // postmortem): the old unconditional print + listen() meant a bind failure
+    // (port squatter) logged "listening" and then CLEAN-EXITED 0 -- downstream
+    // clients saw ConnectionRefused mid-task and the failure masqueraded as
+    // harness infra. Fail loudly instead.
+    if (!srv.bind_to_port(host.c_str(), port)) {
+        fprintf(stderr,
+                "FATAL: cannot bind %s:%d (port already in use? see `ss -tlnp | grep %d`)\n",
+                host.c_str(), port, port);
+        if (conductor) conductor->request_stop();
+        conductor.reset();
+        return 1;
+    }
     fprintf(stderr, "q27-server listening on http://%s:%d (ctx %d, %s head)\n", host.c_str(),
             port, ctx, fast ? "fast" : "faithful");
-    srv.listen(host.c_str(), port);
+    srv.listen_after_bind();
     // P1 Task 10 shutdown: stop the conductor (its thread cancels + closes
     // any remaining members) and join it BEFORE the engines it drives tear
     // down with `slots` at scope exit.

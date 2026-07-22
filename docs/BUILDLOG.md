@@ -8098,3 +8098,28 @@ meta.json produced, score 0.631, q5f agentic 214 t/s aggregate / 195 median,
 4.33 tok/round, 0 errors. Follow-up candidate: q27-server should FAIL LOUDLY
 (nonzero exit + error line) when the listen bind fails, instead of the silent
 exit-0 -- that silence is what made this look like three different bugs.
+
+## 2026-07-22 -- loud bind failure + SO_REUSEADDR-only (thunderdome postmortem, shipped)
+
+Both halves of the silent-bind class fixed in server.cu:
+
+(1) **Bind-first, fail loudly.** The old flow printed "listening" then called
+srv.listen(); a bind failure returned false and main fell through to a CLEAN
+exit 0 -- the "listening" line was a lie and downstream clients saw
+ConnectionRefused with nothing in the server log. Now: bind_to_port() first;
+on failure print `FATAL: cannot bind host:port` and exit 1; print "listening"
+only after a successful bind; listen_after_bind(). PROVEN live: systemd-durable
+squatter on the port -> FATAL + exit code 1 (was: "listening" + exit 0).
+
+(2) **SO_REUSEADDR only.** httplib's Linux default socket option is
+SO_REUSEPORT, which allows a SECOND q27-server to co-bind the same port -- the
+kernel then load-balances connections across both, silently splitting traffic
+between two servers (potentially two different models: an eval-integrity
+hazard, and why port collisions produced inconsistent symptoms). Overridden via
+srv.set_socket_options() to SO_REUSEADDR alone: fast rebind after TIME_WAIT is
+kept, live co-binding is refused and hits the FATAL above. Normal-boot sanity:
+serves clean with the override.
+
+Also: HF uploads for q5f + q6f COMPLETE same day (weights + CHECKSUMS.md5 +
+model-card tier sections; xet dedup made the 39 GB transfer ~157 kB of new
+chunks). All six tiers now live on signalnine/Qwen3.6-27B-MTP-q27.
