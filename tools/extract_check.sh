@@ -27,6 +27,7 @@ real = open('src/server.cu').read()
 fake = open('tools/test_chat_completions_integration.cpp').read()
 ok = True
 for marker, label in (('auto build_prompt = [&]', 'build_prompt'),
+                      ('auto prepare_anthropic_prompt = [&]', 'prepare_anthropic_prompt'),
                       ('auto handle = [&]', 'handle')):
     r, f = extract(real, marker), extract(fake, marker)
     if r != f:

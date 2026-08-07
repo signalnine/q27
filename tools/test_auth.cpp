@@ -50,7 +50,9 @@ static void test_secure_compare_no_early_exit_timing_class() {
 static void test_extract_api_key_bearer() {
     CHECK(q27::extract_api_key("Bearer sk-abc123", "") == "sk-abc123");
     CHECK(q27::extract_api_key("Bearer ", "") == ""); // empty token after prefix
-    CHECK(q27::extract_api_key("bearer sk-abc123", "") == ""); // case-sensitive, matches llama.cpp
+    CHECK(q27::extract_api_key("bearer sk-abc123", "") == "sk-abc123");
+    CHECK(q27::extract_api_key("bEaReR\t  sk-abc123", "") == "sk-abc123");
+    CHECK(q27::extract_api_key("BearerX sk-abc123", "") == "");
     CHECK(q27::extract_api_key("Basic sk-abc123", "") == ""); // wrong scheme
     CHECK(q27::extract_api_key("", "") == "");
 }
