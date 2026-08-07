@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include "markdown_lex.h"
+
 namespace q27 {
 
 struct StreamSplitter {
@@ -27,6 +29,8 @@ struct StreamSplitter {
     // been emitted since. The next structural opener may need an empty segment
     // to flush consumers' pending tool buffer.
     bool tool_boundary = false;
+    JsonStringLexState text_string_state;
+    MarkdownFenceLexState text_markdown_state;
 
     static constexpr const char* T_OPEN = "<think>";
     static constexpr const char* T_CLOSE = "</think>";
@@ -38,37 +42,40 @@ struct StreamSplitter {
         std::vector<std::pair<Chan, std::string>> out;
         for (;;) {
             if (chan == TEXT) {
-                // whichever of <think> open / <tool_call> open / a STRAY
-                // </tool_call> close comes first. A real </tool_call> follows an
-                // opener that already switched us to TOOL, so any </tool_call>
-                // seen in TEXT is stray (bare-call wrapper leftover, issue #4) --
-                // strip it, never emit it as visible content.
+                // Only markers in executable model text are structural.
+                // Markdown/HTML code, quotes, list examples, and JSON strings
+                // remain visible bytes; treating those as TOOL output would
+                // let echoed or retrieved documentation trigger a client call.
                 size_t pt = hold.find(T_OPEN), pc = hold.find(C_OPEN),
                        sc = hold.find(C_CLOSE);
                 size_t e = std::min(pt, std::min(pc, sc));
                 if (e != std::string::npos) {
+                    const char* marker=e==pt?T_OPEN:e==pc?C_OPEN:C_CLOSE;
+                    emit_text_head(out,e);
+                    if(e) tool_boundary=false;
+                    text_string_state.settle_pending(marker[0]);
+                    const bool structural=!text_string_state.in_inert_container() &&
+                        display_text_context_is_executable(
+                            hold,0,text_string_state,text_markdown_state,false);
+                    if(structural) text_string_state.discard_pending_containers();
+                    if (!structural) {
+                        emit_text_head(out,strlen(marker));
+                        tool_boundary=false;
+                        continue;
+                    }
                     if (e == pt) {
-                        if (pt > 0) {
-                            out.push_back({TEXT, hold.substr(0, pt)});
-                            tool_boundary = false;
-                        }
-                        hold.erase(0, pt + strlen(T_OPEN));
+                        hold.erase(0, strlen(T_OPEN));
                         chan = THINK;
                         continue;
                     }
                     if (e == pc) {
-                        if (pc == 0 && tool_boundary) out.push_back({TEXT, ""}); // adjacent-call boundary
+                        if (tool_boundary) out.push_back({TEXT, ""});
                         tool_boundary = false;
-                        if (pc > 0) out.push_back({TEXT, hold.substr(0, pc)});
-                        hold.erase(0, pc + strlen(C_OPEN));
+                        hold.erase(0, strlen(C_OPEN));
                         chan = TOOL;
                         continue;
                     }
-                    if (sc > 0) {
-                        out.push_back({TEXT, hold.substr(0, sc)});
-                        tool_boundary = false;
-                    }
-                    hold.erase(0, sc + strlen(C_CLOSE)); // strip stray close
+                    hold.erase(0, strlen(C_CLOSE)); // executable stray close
                     continue;
                 }
                 // hold back the longest suffix that prefixes any marker
@@ -100,14 +107,28 @@ struct StreamSplitter {
 
     std::vector<std::pair<Chan, std::string>> flush() {
         std::vector<std::pair<Chan, std::string>> out;
-        if (!hold.empty()) out.push_back({chan, hold});
-        else if (chan == THINK && tool_boundary) out.push_back({THINK, ""});
+        if (!hold.empty()) {
+            if (chan == TEXT)
+                consume_display_text_context(
+                    text_string_state,text_markdown_state,hold);
+            out.push_back({chan, hold});
+        } else if (chan == THINK && tool_boundary) out.push_back({THINK, ""});
         hold.clear();
         tool_boundary = false;
         return out;
     }
 
   private:
+    void emit_text_head(std::vector<std::pair<Chan, std::string>>& out,
+                        size_t count) {
+        if (!count) return;
+        std::string text=hold.substr(0,count);
+        consume_display_text_context(
+            text_string_state,text_markdown_state,text);
+        out.push_back({TEXT,std::move(text)});
+        hold.erase(0,count);
+    }
+
     size_t tail_keep(const char* marker) const {
         size_t mlen = strlen(marker);
         size_t maxk = std::min(hold.size(), mlen - 1);
@@ -116,12 +137,14 @@ struct StreamSplitter {
         return 0;
     }
     bool emit_head(std::vector<std::pair<Chan, std::string>>& out, size_t keep) {
-        if (hold.size() > keep) {
-            out.push_back({chan, hold.substr(0, hold.size() - keep)});
-            hold.erase(0, hold.size() - keep);
-            return true;
+        if (hold.size() <= keep) return false;
+        const size_t count=hold.size()-keep;
+        if (chan == TEXT) emit_text_head(out,count);
+        else {
+            out.push_back({chan, hold.substr(0,count)});
+            hold.erase(0,count);
         }
-        return false;
+        return true;
     }
 };
 

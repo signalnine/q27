@@ -233,17 +233,23 @@ static int anthropic_api_selftest() {
         json body = json::parse(R"({"tools":[
             {"name":"ls","description":"list","input_schema":{"type":"object"}},
             {"description":"nameless skipped"},
+            {"name":123},
+            {"name":"typed","description":123,"input_schema":"bad"},
             {"name":"noschema"}]})");
         json t = q27::anthropic_tools_json(body);
-        expect(t.is_array() && t.size() == 2, "nameless skipped");
-        expect(t.size() == 2 && t[0]["type"] == "function" &&
+        expect(t.is_array() && t.size() == 3, "malformed or nameless tools skipped");
+        expect(t.size() == 3 && t[0]["type"] == "function" &&
                    t[0]["function"]["name"] == "ls" &&
                    t[0]["function"]["description"] == "list" &&
                    t[0]["function"]["parameters"]["type"] == "object",
                "function shape");
-        expect(t.size() == 2 && t[1]["function"]["parameters"].is_object() &&
+        expect(t.size() == 3 && t[1]["function"]["parameters"].is_object() &&
                    t[1]["function"]["parameters"].empty() &&
                    t[1]["function"]["description"] == "",
+               "malformed optional fields default");
+        expect(t.size() == 3 && t[2]["function"]["parameters"].is_object() &&
+                   t[2]["function"]["parameters"].empty() &&
+                   t[2]["function"]["description"] == "",
                "schema/description defaults");
         expect(q27::anthropic_tools_json(json::object()).is_array(), "no tools -> empty array");
     }

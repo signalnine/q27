@@ -4,8 +4,9 @@
 // exercises the exact same handler shape wired into server.cu's main(),
 // verbatim, against real HTTP requests over a real loopback socket --
 // not a mock of the HTTP layer.
-// NOTE: this test keeps a verbatim copy of the server.cu handler and must stay in sync with server.cu would still pass the test if only the copy were correct.
-// Build+run: g++ -std=c++17 -I src -I third_party -pthread tools/test_auth_integration.cpp -o build/test_auth_integration && ./build/test_auth_integration
+// This copied-handler fixture is supplemental. tools/test_responses_integration.py
+// exercises authentication against the exact production server binary.
+// Build+run: make build/test_auth_integration && ./build/test_auth_integration
 #include "api_common.h"
 #include "../third_party/httplib.h"
 
@@ -53,8 +54,15 @@ struct TestServer {
     void start(std::vector<std::string> keys) {
         api_keys = std::move(keys);
         install_auth(srv, api_keys);
-        srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content("{\"status\":\"ok\"}", "application/json");
+        srv.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+            const std::string provided = q27::extract_api_key(
+                req.get_header_value("Authorization"), req.get_header_value("x-api-key"));
+            nlohmann::json body = {{"status", "ok"}};
+            if (api_keys.empty() || q27::api_key_valid(provided, api_keys)) {
+                body["model"] = "fixture-model";
+                body["boot_id"] = "fixture-boot";
+            }
+            res.set_content(body.dump(), "application/json");
         });
         srv.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
             res.set_content("{\"object\":\"list\",\"data\":[]}", "application/json");
@@ -88,6 +96,7 @@ static void test_no_auth_configured_everything_open() {
     httplib::Client cli("127.0.0.1", s.port);
     auto r1 = cli.Get("/health");
     CHECK(r1 && r1->status == 200);
+    if (r1) CHECK(json::parse(r1->body).contains("boot_id"));
     auto r2 = cli.Get("/v1/models");
     CHECK(r2 && r2->status == 200);
     auto r3 = cli.Post("/v1/messages", "{}", "application/json");
@@ -100,7 +109,18 @@ static void test_health_exempt_others_require_auth() {
     s.start({"secret-key"});
     httplib::Client cli("127.0.0.1", s.port);
     auto health = cli.Get("/health");
-    CHECK(health && health->status == 200); // no Authorization header sent at all
+    CHECK(health && health->status == 200); // liveness remains unauthenticated
+    if (health) {
+        const json body = json::parse(health->body);
+        CHECK((body == json{{"status", "ok"}}));
+    }
+    httplib::Headers health_auth = {{"Authorization", "Bearer secret-key"}};
+    auto detailed_health = cli.Get("/health", health_auth);
+    CHECK(detailed_health && detailed_health->status == 200);
+    if (detailed_health) CHECK(json::parse(detailed_health->body).contains("boot_id"));
+    httplib::Headers health_wrong = {{"x-api-key", "wrong-key"}};
+    auto wrong_health = cli.Get("/health", health_wrong);
+    CHECK(wrong_health && (json::parse(wrong_health->body) == json{{"status", "ok"}}));
 
     auto models_noauth = cli.Get("/v1/models");
     CHECK(models_noauth && models_noauth->status == 401);
@@ -182,6 +202,7 @@ static void test_malformed_header_no_crash_rejected() {
     auto r = cli.Get("/v1/models", h);
     CHECK(r && r->status == 401);
 }
+
 
 int main() {
     test_no_auth_configured_everything_open();

@@ -387,6 +387,55 @@ static std::string jdump(const json& j) {
 json g_last_response;
 std::vector<json> g_sse_events; // parsed "data: {...}" payloads, [DONE] excluded
 
+struct PreparedAnthropicPrompt {
+    std::string rendered;
+    q27::ToolChoice tchoice;
+    json tools;
+    std::vector<std::string> tool_names;
+    bool thinking=false;
+    q27::ThinkCfg tcfg;
+};
+
+static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
+        const json& body, bool no_think_srv) {
+    const bool req_think=true;
+    auto prepare_anthropic_prompt = [&](const json& body,
+                                         q27::ToolChoice& tchoice,
+                                         json& tools,
+                                         std::vector<std::string>& tool_names,
+                                         bool& thinking,
+                                         q27::ThinkCfg& tcfg,
+                                         size_t* stable_off,
+                                         size_t* sys_off) {
+        tchoice=q27::parse_anthropic_tool_choice(body);
+        json all_tools=q27::anthropic_tools_json(body);
+        json normalized={{"tools",all_tools}};
+        q27::OpenAIToolSelection selected=q27::select_openai_tools(normalized,tchoice);
+        const json unavailable=q27::unselected_openai_tools(all_tools,selected);
+        // Only eligible schemas enter the callable interface; the rest remain
+        // in a separately labelled accounting block.
+        tools=std::move(selected.tools);
+        tool_names=std::move(selected.names);
+        tcfg=q27::resolve_think_cfg(body,!no_think_srv,req_think,-1);
+        q27::validate_anthropic_tool_choice_thinking(tchoice,tcfg);
+        thinking=tcfg.enabled;
+        if(tchoice.mode==q27::ToolChoice::FORCED) {
+            thinking=false;
+            tcfg=q27::ThinkCfg{false,-1,false,true};
+        }
+        std::string rendered=q27::chatml_prompt(
+            q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
+            q27::anthropic_tool_choice_instruction(tchoice),&unavailable);
+        if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
+        return rendered;
+    };
+    PreparedAnthropicPrompt result;
+    result.rendered=prepare_anthropic_prompt(
+        body,result.tchoice,result.tools,result.tool_names,result.thinking,
+        result.tcfg,nullptr,nullptr);
+    return result;
+}
+
 static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv,
                         bool constrain_tools, bool sampled_on, int max_prompt,
                         int max_slot_ctx, std::atomic<long>& req_counter,
@@ -400,7 +449,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
     const bool req_think = true;
     const int think_budget_flag = budget_flag;
     const std::vector<int> think_close_ids = tok.encode("</think>\n\n");
-    struct FakePfxCache { bool enabled() const { return false; } } pfx_cache;
+    struct DisabledPrefixCache { bool enabled() const { return false; } } pfx_cache;
 
     auto ms_since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t)
@@ -566,17 +615,21 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         q27::ToolChoice tchoice;
         std::vector<std::string> tool_names_v;
         if (routed_chat) {
-            tchoice = q27::parse_tool_choice(body);
-            tools = tchoice.mode == q27::ToolChoice::NONE ? json::array() : q27::openai_tools_json(body);
-            if (constrain_tools && tools.is_array())
-                for (auto& t : tools)
-                    if (t.contains("function") && t["function"].contains("name"))
-                        tool_names_v.push_back(t["function"]["name"].get<std::string>());
-            // named-forced tool_choice restricts the grammar to that one name;
-            // "required" (no name) leaves every registered tool eligible.
-            if (tchoice.mode == q27::ToolChoice::FORCED && !tchoice.forced_name.empty())
-                tool_names_v = {tchoice.forced_name};
+            try {
+                tchoice = q27::parse_tool_choice(body);
+                q27::apply_openai_parallel_tool_calls(body,tchoice);
+                q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
+                tools=std::move(selected.tools);
+                tool_names_v=std::move(selected.names);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(json{{"error",{{"message",e.what()},
+                                                 {"type","invalid_request_error"}}}}.dump(),
+                                "application/json");
+                return;
+            }
         }
+        const std::set<std::string> allowed_tool_names(tool_names_v.begin(),tool_names_v.end());
         long rid = req_counter++;
         auto tk0 = std::chrono::steady_clock::now();
         std::vector<int> prompt;
@@ -759,18 +812,20 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             q27::ThinkBudgetState tb{think_budget};
             Engine::DecodeTask bt;
             q27::Utf8Gate ugate;
-            std::string think, text, tool_buf;
-            std::vector<q27::ToolCall> calls;
-            auto flush_tool = [&]() {
-                auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
-                tool_buf.clear();
-                if (c.ok) calls.push_back(std::move(c));
-                else text += c.raw; // stream parity: preserve generation order
-            };
+            std::vector<std::pair<StreamSplitter::Chan,std::string>> segments;
             auto route = [&](StreamSplitter::Chan ch, const std::string& t) {
-                if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
-                if (!tool_buf.empty()) flush_tool();
-                (ch == StreamSplitter::THINK ? think : text) += t;
+                if (ch == StreamSplitter::TOOL &&
+                    tchoice.mode == q27::ToolChoice::NONE)
+                    ch = StreamSplitter::TEXT;
+                if (t.empty()) {
+                    if (ch != StreamSplitter::TOOL && !segments.empty() &&
+                        segments.back().first == StreamSplitter::TOOL)
+                        segments.emplace_back(ch, std::string());
+                    return;
+                }
+                if (!segments.empty() && segments.back().first == ch)
+                    segments.back().second += t;
+                else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
             tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
@@ -837,29 +892,39 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 return;
             }
             for (auto& [ch, t] : sp.feed(ugate.flush())) route(ch, t);
+            const bool final_tool_incomplete=q27::unfinished_tool_wrapper(
+                n,n_max,bt.budget_truncated,sp.chan);
             for (auto& [ch, t] : sp.flush()) route(ch, t);
-            if (!tool_buf.empty()) flush_tool();
-
-            std::string tx = text;
-            if (tools.is_array() && !tools.empty()) {
-                // wrapper-less call recovery (see parse_bare_tool_calls)
-                std::string pre;
-                auto bcs = q27::parse_bare_tool_calls(tx, &pre, &tools);
-                if (!bcs.empty()) {
-                    fprintf(stderr,
-                            "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
-                            bcs.size());
-                    tx = pre;
-                    for (auto& bc : bcs) calls.push_back(bc);
-                }
+            std::string unclosed_tool=q27::take_unclosed_final_tool_segment(
+                segments,final_tool_incomplete);
+            auto ordered = q27::resolve_ordered_tool_segments(
+                segments, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                n < n_max && !bt.budget_truncated,
+                [&](const std::string& name, size_t accepted) {
+                    return q27::tool_choice_allows_call(
+                        tchoice, allowed_tool_names, name, accepted);
+                });
+            ordered.text+=unclosed_tool;
+            std::string tx = ordered.text;
+            std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
+            if (ordered.recovered)
+                fprintf(stderr,
+                        "[tool-fallback] %zu bare call(s) recovered (oai-nonstream)\n",
+                        ordered.recovered);
+            const bool any_call = !eligible_calls.empty();
+            if (q27::forced_tool_choice_missing_is_error(
+                    tchoice, any_call, n >= n_max || bt.budget_truncated)) {
+                res.status = 500;
+                res.set_content(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                                 {"type","api_error"}}}}.dump(),
+                                "application/json");
+                return;
             }
-            bool any_call = false;
-            for (auto& c : calls)
-                if (c.ok) any_call = true;
-            json msg = q27::openai_chat_message_json(tx, calls, rid, think);
+            json msg = q27::openai_chat_message_json(
+                tx, eligible_calls, rid, ordered.reasoning);
             json choice = {{"index", 0},
-                          {"finish_reason", any_call ? "tool_calls" :
-                              ((n >= n_max || bt.budget_truncated) ? "length" : "stop")},
+                          {"finish_reason", q27::openai_tool_finish_reason(
+                              any_call,final_tool_incomplete,n>=n_max || bt.budget_truncated)},
                           {"message", msg}};
             json out = {{"id", "chatcmpl-q27-" + std::to_string(rid)}, {"object", obj},
                         {"created", created}, {"model", served_name},
@@ -885,9 +950,9 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             // handler's frame is dead (routing() and write_response() are
             // sibling calls in Server::process_request). `thinking` shipped as
             // a by-reference read of that dead frame from 2026-07-20 until the
-            // 07-24 audit -- benign only by stack-layout luck.
-            [&, samp, prompt, n_max, created, chat, obj, objd, rt, inc_usage, routed_chat,
-             tools, tool_names_v, tchoice, stable_len, has_tools, rid,
+            // fix; the bug was benign only by stack-layout luck.
+            [&, samp, prompt, n_max, created, chat, objd, rt, inc_usage, routed_chat,
+             tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware);
                 auto sl_lease = slot_guard(sl);
@@ -989,17 +1054,19 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 bool alive = true; // cleared when a write fails (client disconnected)
                 int tool_idx = 0;
                 bool any_call = false;
-                std::string tool_buf, text_accum;
+                std::string tool_buf;
+                q27::BareToolTextHoldback bare_text;
                 bool forced_control_token = false;
-                auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
-                    tool_buf.clear();
-                    if (!c.ok) { // malformed: surface as text so nothing is lost
-                        if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
-                                                           json{{"content", c.raw}})))
-                            alive = false;
-                        return;
-                    }
+                auto emit_text = [&](const std::string& t) {
+                    if (t.empty()) return;
+                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
+                                                       json{{"content", t}})))
+                        alive = false;
+                };
+                auto emit_call = [&](const q27::ToolCall& c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                        tchoice,allowed_tool_names,c.name,any_call?1u:0u))
+                        return false;
                     any_call = true;
                     std::string tid =
                         "call_q27_" + std::to_string(rid) + "_" + std::to_string(tool_idx);
@@ -1008,9 +1075,46 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                         q27::openai_tool_call_delta(tool_idx, tid, c)));
                     tool_idx++;
                     if (!ok) alive = false;
+                    return true;
+                };
+                auto classify_bare = [&](const std::string& source,bool allow_repair,
+                                         auto&& visible) {
+                    std::string pre,residual;
+                    auto bcs = q27::parse_bare_tool_calls(
+                        source,&pre,&tools,true,allow_repair,&residual);
+                    if (bcs.empty()) return q27::BareToolCandidateResult{};
+                    size_t cursor=0,recovered=0;
+                    for (const auto& bc : bcs) {
+                        visible(source.substr(cursor,bc.source_begin-cursor));
+                        cursor=bc.source_end;
+                        if (emit_call(bc)) recovered++;
+                        else visible(source.substr(
+                            bc.source_begin,bc.source_end-bc.source_begin));
+                    }
+                    visible(source.substr(cursor));
+                    if (recovered)
+                        fprintf(stderr,
+                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
+                                recovered);
+                    return q27::BareToolCandidateResult{true,recovered!=0};
+                };
+                auto emit_tool = [&]() {
+                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    tool_buf.clear();
+                    if (!c.ok) {
+                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                    } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
-                    if (ch == StreamSplitter::TOOL) { tool_buf += t; return; }
+                    if (ch == StreamSplitter::TOOL) {
+                        if (tool_buf.empty()) {
+                            bare_text.finish(false,allowed_tool_names,
+                                             emit_text,classify_bare);
+                            bare_text.reset_context();
+                        }
+                        tool_buf += t;
+                        return;
+                    }
                     if (!tool_buf.empty()) emit_tool();
                     if (t.empty()) return;
                     // reasoning_content (no official OpenAI field for this;
@@ -1019,6 +1123,9 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     // tags into `content` (the bug this whole path also
                     // happens to fix).
                     if (ch == StreamSplitter::THINK) {
+                        bare_text.finish(false,allowed_tool_names,
+                                         emit_text,classify_bare);
+                        bare_text.reset_context();
                         if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                             q27::openai_reasoning_delta(t))))
                             alive = false;
@@ -1028,10 +1135,10 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     // Preserve ordinary leading whitespace, including when
                     // thinking is disabled or the model closes naturally.
                     if (forced_control_token && q27::strip_ws2(t).empty()) return;
-                    text_accum += t;
-                    if (!send(q27::openai_stream_chunk(cid, objd, created, served_name,
-                                                       json{{"content", t}})))
-                        alive = false;
+                    if (has_tools)
+                        bare_text.route(t,allowed_tool_names,
+                                        emit_text,classify_bare);
+                    else emit_text(t);
                 };
                 eng.on_pending = [&](int id) { tc.on_pending(id); };
                 eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
@@ -1064,38 +1171,36 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 eng.on_round_gap = nullptr;
                 req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
                 for (auto& [ch, t] : sp.feed(ugate.flush())) emit_seg(ch, t);
+                const bool final_tool_incomplete=q27::unfinished_tool_wrapper(
+                    produced,nm,bt.budget_truncated,sp.chan);
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
-                if (!tool_buf.empty()) emit_tool();
-                if (has_tools) {
-                    // wrapper-less call recovery: text already streamed as a
-                    // content delta (cosmetic); the tool_calls delta still fires
-                    std::string pre;
-                    auto bcs = q27::parse_bare_tool_calls(text_accum, &pre, &tools);
-                    if (!bcs.empty()) {
-                        fprintf(stderr,
-                                "[tool-fallback] %zu bare call(s) recovered (oai-stream)\n",
-                                bcs.size());
-                        any_call = true;
-                        for (auto& bc : bcs) {
-                            std::string tid = "call_q27_" + std::to_string(rid) + "_" +
-                                              std::to_string(tool_idx);
-                            bool ok = send(q27::openai_stream_chunk(
-                                cid, objd, created, served_name,
-                                q27::openai_tool_call_delta(tool_idx, tid, bc)));
-                            tool_idx++;
-                            if (!ok) alive = false;
-                        }
-                    }
+                if (!tool_buf.empty()) {
+                    if (final_tool_incomplete) {
+                        emit_text(tool_buf);
+                        tool_buf.clear();
+                    } else emit_tool();
                 }
+                if (!final_tool_incomplete)
+                    bare_text.finish(produced < nm && !bt.budget_truncated,
+                                     allowed_tool_names,emit_text,classify_bare);
                 // TODO(batch error surfacing): no standard OpenAI mid-stream
                 // error chunk exists (matches the plain-text leg's TODO
                 // above); end=error lands in the [req] line, [req-error]
                 // carries the what() (batch_generate logs it unconditionally
                 // when err_out is null, same as that leg's nullptr err_out).
+                if (q27::forced_tool_choice_missing_is_error(
+                        tchoice, any_call, produced >= nm || bt.budget_truncated)) {
+                    send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
+                                         {"type","api_error"}}}});
+                    std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                }
                 {
-                    const char* fr = any_call ? "tool_calls"
-                                              : ((produced >= nm || bt.budget_truncated)
-                                                     ? "length" : "stop");
+                    const char* fr=q27::openai_tool_finish_reason(
+                        any_call,final_tool_incomplete,
+                        produced>=nm || bt.budget_truncated);
                     send(q27::openai_stream_chunk(cid, objd, created, served_name,
                                                   json::object(), fr));
                 }
@@ -1162,6 +1267,10 @@ int main() {
     CHECK(!responses_completed.incomplete &&
           std::string(responses_completed.status)=="completed" &&
           std::string(responses_completed.event)=="response.completed");
+    const auto responses_exact_stop=q27::responses_terminal_state(false);
+    CHECK(!responses_exact_stop.incomplete &&
+          std::string(responses_exact_stop.status)=="completed" &&
+          std::string(responses_exact_stop.event)=="response.completed");
     const auto responses_limited=q27::responses_terminal_state(2,2,false);
     CHECK(responses_limited.incomplete &&
           std::string(responses_limited.status)=="incomplete" &&
@@ -1170,6 +1279,17 @@ int main() {
     CHECK(responses_budget_limited.incomplete &&
           std::string(responses_budget_limited.status)=="incomplete" &&
           std::string(responses_budget_limited.event)=="response.incomplete");
+    CHECK(q27::unfinished_tool_wrapper(
+        4,4,false,q27::StreamSplitter::TOOL));
+    CHECK(q27::unfinished_tool_wrapper(
+        3,4,true,q27::StreamSplitter::TOOL));
+    CHECK(!q27::unfinished_tool_wrapper(
+        4,4,false,q27::StreamSplitter::TEXT));
+    CHECK(!q27::unfinished_tool_wrapper(
+        3,4,false,q27::StreamSplitter::TOOL));
+    std::string responses_text="\nanswer ";
+    const std::string responses_done=q27::take_responses_output_text(responses_text);
+    CHECK(responses_done=="\nanswer " && responses_text.empty());
 
     // ---- Test 1: plain chat, no tools -> plain content, no tool_calls ----
     {
@@ -1522,6 +1642,35 @@ int main() {
         }
         CHECK(saw_reasoning);
         CHECK(saw_content);
+    }
+
+    // ---- Test 8c: a request reasoning budget closes THINK at the token
+    // boundary, routes subsequent output to content, and reports the trip. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            /*0*/ "<eos>",
+            /*1*/ "first thought",
+            /*2*/ " then answer",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1, 2}; // prompt already injected <think>
+        std::atomic<long> rc{0};
+        json body = {
+            {"enable_thinking", true},
+            {"thinking_token_budget", 1},
+            {"max_tokens", 4},
+            {"messages", json::array({{{"role","user"},{"content","answer"}}})},
+        };
+        run_request(tok, "q27-test", /*no_think_srv=*/false, false, true,
+                    100000, 100000, rc, cache, slots, body, true);
+        const auto& msg = g_last_response["choices"][0]["message"];
+        CHECK(msg["reasoning_content"] == "first thought");
+        CHECK(msg["content"] == " then answer");
+        CHECK(g_last_response["usage"]["reasoning_tokens"] == 1);
+        CHECK(g_last_response["usage"]["reasoning_budget_exceeded"] == true);
     }
 
     // ---- Test 9: malformed tool call body -> surfaced as content, not
@@ -2062,6 +2211,519 @@ int main() {
                           .get<std::string>();
         }
         CHECK(content == " beforenot valid json after");
+    }
+    // ---- Test 20: allowed_tools filters streamed wrapped calls. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            /*0*/ "<eos>",
+            /*1*/ "<tool_call>\n{\"name\":\"privileged\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1};
+        std::atomic<long> rc{0};
+        json declared=json::array({
+            {{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","privileged"},{"parameters",json::object()}}}}
+        });
+        json allowed=json::array({
+            {{"type","function"},{"function",{{"name","safe"}}}}
+        });
+        json body = {
+            {"stream",true}, {"tools",declared},
+            {"tool_choice",{{"type","allowed_tools"},
+                {"allowed_tools",{{"mode","auto"},{"tools",allowed}}}}},
+            {"messages",json::array({{{"role","user"},{"content","run safe"}}})},
+        };
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_tool=false, saw_raw=false, saw_stop=false;
+        for (auto& ev : g_sse_events) {
+            if (!ev.contains("choices") || ev["choices"].empty()) continue;
+            auto& choice=ev["choices"][0];
+            if (choice["delta"].contains("tool_calls")) saw_tool=true;
+            if (choice["delta"].contains("content") &&
+                choice["delta"]["content"].get<std::string>().find("privileged")!=std::string::npos)
+                saw_raw=true;
+            if (choice["finish_reason"] == "stop") saw_stop=true;
+        }
+        CHECK(!saw_tool);
+        CHECK(saw_raw);
+        CHECK(saw_stop);
+    }
+
+    // ---- Test 21: invalid named choice is a non-retryable client error. ----
+    {
+        FakeTok tok;
+        tok.pieces = {"<eos>"};
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        std::atomic<long> rc{0};
+        json body = {
+            {"tools",json::array({
+                {{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}
+            })},
+            {"tool_choice",{{"type","function"},{"function",{{"name","missing"}}}}},
+            {"messages",json::array({{{"role","user"},{"content","run"}}})},
+        };
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"] == 400);
+        CHECK(g_last_response["error"]["type"] == "invalid_request_error");
+    }
+
+    // ---- Test 12: parallel_tool_calls=false keeps only the first wrapped call. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "<tool_call>\n{\"name\":\"first\",\"arguments\":{}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        auto& msg=g_last_response["choices"][0]["message"];
+        CHECK(msg["tool_calls"].size()==1);
+        CHECK(msg["tool_calls"][0]["function"]["name"]=="first");
+        CHECK(msg["content"].get<std::string>().find("second")!=std::string::npos);
+    }
+
+    // ---- Test 13: the same single-call contract holds for SSE output. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "<tool_call>\n{\"name\":\"first\",\"arguments\":{}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"stream",true},{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        int call_count=0;
+        bool saw_first=false,saw_second_raw=false;
+        for(auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls")) {
+                call_count++;
+                saw_first=delta["tool_calls"][0]["function"]["name"]=="first";
+            }
+            if(delta.contains("content") &&
+               delta["content"].get<std::string>().find("second")!=std::string::npos)
+                saw_second_raw=true;
+        }
+        CHECK(call_count==1);
+        CHECK(saw_first);
+        CHECK(saw_second_raw);
+    }
+
+    // ---- Test 13b: an earlier bare call beats a later wrapped call. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "{\"name\":\"fi",
+            "rst\",\"arguments\":{}}",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2,3};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"stream",true},{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        int call_count=0;
+        bool saw_first=false,saw_first_raw=false,saw_second_raw=false;
+        for(auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls")) {
+                call_count++;
+                saw_first=delta["tool_calls"][0]["function"]["name"]=="first";
+            }
+            if(delta.contains("content")) {
+                const auto content=delta["content"].get<std::string>();
+                if(content.find("\"name\":\"first\"")!=std::string::npos)
+                    saw_first_raw=true;
+                if(content.find("second")!=std::string::npos)
+                    saw_second_raw=true;
+            }
+        }
+        CHECK(call_count==1);
+        CHECK(saw_first);
+        CHECK(!saw_first_raw);
+        CHECK(saw_second_raw);
+    }
+
+    // ---- Test 13c: a wrapper nested in an incomplete bare-call value stays text. ----
+    {
+        FakeTok tok;
+        tok.pieces = {
+            "<eos>",
+            "{\"name\":\"first\",\"arguments\":{\"x\":",
+            "<tool_call>\n{\"name\":\"second\",\"arguments\":{}}\n</tool_call>",
+        };
+        std::vector<std::string> vb = tok.pieces;
+        auto cache = fresh_cache(vb);
+        auto slots = fresh_slots();
+        slots[0].eng->script = {1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"stream",true},{"tools",tools},{"parallel_tool_calls",false},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        int call_count=0;
+        std::string visible;
+        for(auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls")) call_count++;
+            if(delta.contains("content"))
+                visible+=delta["content"].get<std::string>();
+        }
+        CHECK(call_count==0);
+        CHECK(visible.find("\"name\":\"first\"")!=std::string::npos);
+        CHECK(visible.find("<tool_call>")!=std::string::npos);
+        CHECK(visible.find("\"name\":\"second\"")!=std::string::npos);
+    }
+
+    // ---- Test 13d: max-token truncation cannot expose an unclosed wrapper. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","<tool_call>{\"name\":\"first\",\"arguments\":{}}"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}}
+        });
+        json body={{"max_tokens",1},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        const auto& choice=g_last_response["choices"][0];
+        CHECK(!choice["message"].contains("tool_calls"));
+        CHECK(choice["message"]["content"].get<std::string>().find("first")!=std::string::npos);
+        CHECK(choice["finish_reason"]=="length");
+    }
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","<tool_call>{\"name\":\"first\",\"arguments\":{}}"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}}
+        });
+        json body={{"stream",true},{"max_tokens",1},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_tool=false,saw_raw=false,saw_length=false;
+        for(const auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& choice=ev["choices"][0];
+            const auto& delta=choice["delta"];
+            if(delta.contains("tool_calls")) saw_tool=true;
+            if(delta.contains("content") &&
+               delta["content"].get<std::string>().find("first")!=std::string::npos)
+                saw_raw=true;
+            if(choice["finish_reason"]=="length") saw_length=true;
+        }
+        CHECK(!saw_tool);
+        CHECK(saw_raw);
+        CHECK(saw_length);
+    }
+
+    // ---- Test 13e: a closed call remains actionable at the exact token cap. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","<tool_call>{\"name\":\"first\",\"arguments\":{}}</tool_call>"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}}
+        });
+        json body={{"max_tokens",1},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        const auto& choice=g_last_response["choices"][0];
+        CHECK(choice["message"]["tool_calls"].size()==1);
+        CHECK(choice["message"]["tool_calls"][0]["function"]["name"]=="first");
+        CHECK(choice["finish_reason"]=="tool_calls");
+    }
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","<tool_call>{\"name\":\"first\",\"arguments\":{}}</tool_call>"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}}
+        });
+        json body={{"stream",true},{"max_tokens",1},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_tool=false,saw_tool_finish=false;
+        for(const auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& choice=ev["choices"][0];
+            if(choice["delta"].contains("tool_calls")) saw_tool=true;
+            if(choice["finish_reason"]=="tool_calls") saw_tool_finish=true;
+        }
+        CHECK(saw_tool);
+        CHECK(saw_tool_finish);
+    }
+
+    // ---- Test 13f: a malformed wrapper can contain multiple valid calls. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>",
+            "<tool_call>{\"name\":\"first\",\"arguments\":{}}"
+            "{\"name\":\"second\",\"arguments\":{}}</tool_call>"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","first"},{"parameters",json::object()}}}},
+            {{"type","function"},{"function",{{"name","second"},{"parameters",json::object()}}}},
+        });
+        json body={{"stream",true},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        std::vector<std::string> call_names;
+        std::string visible;
+        for(const auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls"))
+                call_names.push_back(delta["tool_calls"][0]["function"]["name"]);
+            if(delta.contains("content")) visible+=delta["content"].get<std::string>();
+        }
+        CHECK(call_names==std::vector<std::string>({"first","second"}));
+        CHECK(visible.find("\"name\":\"first\"")==std::string::npos);
+        CHECK(visible.find("\"name\":\"second\"")==std::string::npos);
+    }
+
+    // ---- Test 13g: balanced raw-value drift waits for tolerant final recovery. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>",R"({"name":"Write","arguments":{"content":"const s = "x";"}})"," tail"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1,2};
+        std::atomic<long> rc{0};
+        json tools=json::array({
+            {{"type","function"},{"function",{{"name","Write"},{"parameters",{
+                {"type","object"},{"properties",{{"content",{{"type","string"}}}}}
+            }}}}}
+        });
+        json body={{"stream",true},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        int call_count=0;
+        std::string visible;
+        for(const auto& ev:g_sse_events) {
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& delta=ev["choices"][0]["delta"];
+            if(delta.contains("tool_calls")) {
+                call_count++;
+                const auto& fn=delta["tool_calls"][0]["function"];
+                CHECK(fn["name"]=="Write");
+                CHECK(json::parse(fn["arguments"].get<std::string>())["content"]==
+                      "const s = \"x\";");
+            }
+            if(delta.contains("content")) visible+=delta["content"].get<std::string>();
+        }
+        CHECK(call_count==1);
+        CHECK(visible==" tail");
+    }
+
+    // ---- Test 14: malformed parallel_tool_calls is a client error. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        std::atomic<long> rc{0};
+        json body={{"parallel_tool_calls","no"},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"]==400);
+        CHECK(g_last_response["error"]["type"]=="invalid_request_error");
+    }
+
+    // ---- Test 15: forced non-stream truncation preserves partial output. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","not a tool call"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json body={{"max_tokens",1},{"tool_choice","required"},
+                   {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        CHECK(g_last_response["__status"]==200);
+        CHECK(g_last_response["choices"][0]["finish_reason"]=="length");
+        CHECK(g_last_response["choices"][0]["message"]["content"]=="not a tool call");
+        CHECK(!g_last_response["choices"][0]["message"].contains("tool_calls"));
+    }
+
+    // ---- Test 16: forced SSE truncation terminates with length, not error. ----
+    {
+        FakeTok tok;
+        tok.pieces={"<eos>","not a tool call"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1};
+        std::atomic<long> rc{0};
+        json body={{"stream",true},{"max_tokens",1},{"tool_choice","required"},
+                   {"tools",json::array({{{"type","function"},{"function",{{"name","safe"},{"parameters",json::object()}}}}})},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",true,false,true,100000,100000,rc,cache,slots,body,true);
+        bool saw_error=false,saw_length=false,saw_partial=false;
+        for(const auto& ev:g_sse_events) {
+            if(ev.contains("error")) saw_error=true;
+            if(!ev.contains("choices") || ev["choices"].empty()) continue;
+            const auto& choice=ev["choices"][0];
+            if(choice["finish_reason"]=="length") saw_length=true;
+            if(choice.contains("delta") && choice["delta"].contains("content") &&
+               choice["delta"]["content"]=="not a tool call") saw_partial=true;
+        }
+        CHECK(!saw_error);
+        CHECK(saw_length);
+        CHECK(saw_partial);
+    }
+
+    // ---- Test 16b: a forced request that re-enters THINK and exhausts its
+    // reasoning budget is a truncated response, not a missing-tool error. ----
+    for(bool stream:{false,true}) {
+        FakeTok tok;
+        tok.pieces={"<eos>","</tool_call><think>","unreachable reasoning"};
+        std::vector<std::string> vb=tok.pieces;
+        auto cache=fresh_cache(vb);
+        auto slots=fresh_slots();
+        slots[0].eng->script={1,2};
+        std::atomic<long> rc{0};
+        json body={{"stream",stream},{"max_tokens",2},
+                   {"enable_thinking",true},{"thinking_token_budget",0},
+                   {"tool_choice","required"},
+                   {"tools",json::array({{{"type","function"},{"function",{
+                       {"name","safe"},{"parameters",json::object()}}}}})},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})}};
+        run_request(tok,"q27-test",false,false,true,100000,100000,rc,cache,slots,
+                    body,true);
+        if(!stream) {
+            CHECK(g_last_response["__status"]==200);
+            CHECK(g_last_response["choices"][0]["finish_reason"]=="length");
+        } else {
+            bool saw_error=false,saw_length=false;
+            for(const auto& ev:g_sse_events) {
+                if(ev.contains("error")) saw_error=true;
+                if(!ev.contains("choices") || ev["choices"].empty()) continue;
+                if(ev["choices"][0]["finish_reason"]=="length") saw_length=true;
+            }
+            CHECK(!saw_error);
+            CHECK(saw_length);
+        }
+    }
+
+    // ---- Test 17: count_tokens and live Anthropic requests share the exact
+    // tool filtering, thinking, and forced-opener prompt construction. ----
+    {
+        json tools=json::array({
+            {{"name","alpha"},{"description","first"},
+             {"input_schema",{{"type","object"},{"properties",json::object()}}}},
+            {{"name","beta"},{"description","second"},
+             {"input_schema",{{"type","object"},{"properties",json::object()}}}},
+        });
+        json body={{"system","stable"},{"tools",tools},
+                   {"messages",json::array({{{"role","user"},{"content","run"}}})},
+                   {"tool_choice",{{"type","none"}}}};
+        auto none=prepare_anthropic_prompt_for_test(body,false);
+        CHECK(none.tools.empty());
+        CHECK(none.tool_names.empty());
+        CHECK(none.thinking);
+        const json none_unavailable=q27::anthropic_tools_json(body);
+        CHECK(none.rendered==q27::chatml_prompt(
+            q27::anthropic_msgs(body),none.tools,none.thinking,nullptr,nullptr,
+            q27::anthropic_tool_choice_instruction(none.tchoice),&none_unavailable));
+        CHECK(none.rendered.find("# Tools")==std::string::npos);
+        CHECK(none.rendered.find("<unavailable_tools>")!=std::string::npos);
+
+        body["tool_choice"]={{"type","tool"},{"name","alpha"}};
+        auto forced=prepare_anthropic_prompt_for_test(body,false);
+        CHECK(forced.tchoice.mode==q27::ToolChoice::FORCED);
+        CHECK(!forced.thinking);
+        CHECK(forced.tool_names==std::vector<std::string>({"alpha"}));
+        CHECK(forced.tools.size()==1);
+        CHECK(forced.tools[0]["function"]["name"]=="alpha");
+        const json all_forced_tools=q27::anthropic_tools_json(body);
+        const json forced_unavailable=json::array({all_forced_tools[1]});
+        CHECK(forced.rendered==q27::chatml_prompt(
+            q27::anthropic_msgs(body),forced.tools,false,nullptr,nullptr,
+            q27::anthropic_tool_choice_instruction(forced.tchoice),
+            &forced_unavailable)+"<tool_call>\n");
+        CHECK(forced.rendered.find("# Tools")!=std::string::npos);
+        CHECK(forced.rendered.find("<unavailable_tools>")!=std::string::npos);
+        CHECK(forced.rendered.find("stable")<forced.rendered.find("You must call only"));
+
+        bool thinking_threw=false;
+        body["thinking"]={{"type","enabled"},{"budget_tokens",1024}};
+        try { (void)prepare_anthropic_prompt_for_test(body,false); }
+        catch(const std::invalid_argument&) { thinking_threw=true; }
+        CHECK(thinking_threw);
+        body.erase("thinking");
+
+        bool invalid_threw=false;
+        body["tool_choice"]={{"type","tool"},{"name","missing"}};
+        try { (void)prepare_anthropic_prompt_for_test(body,false); }
+        catch(const std::runtime_error&) { invalid_threw=true; }
+        CHECK(invalid_threw);
     }
 
     fprintf(stderr, failures ? "%d FAILURE(S)\n" : "all integration tests passed\n", failures);

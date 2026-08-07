@@ -7,8 +7,8 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
              -gencode arch=compute_89,code=sm_89 \
              -gencode arch=compute_120,code=sm_120 -Xcompiler -Wall
 
-.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical
-all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_depthctl build/test_toolconstrain
+.PHONY: all clean test-inspect test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
+all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
 
 build/q27: src/engine.cu src/engine.cuh src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h | build
@@ -30,11 +30,30 @@ test-inspect: build/inspect build/test_loader_contracts
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
-build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/toolgram.h | build
+build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
-build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h | build
+build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_stream_split.cpp -o $@
+
+build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
+
+build/test_chat_completions_integration: tools/test_chat_completions_integration.cpp src/server.cu src/api_common.h src/toolconstrain.h src/toolgram.h src/stream_split.h src/markdown_lex.h src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_chat_completions_integration.cpp -o $@
+
+build/test_auth: tools/test_auth.cpp src/api_common.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_auth.cpp -o $@
+
+build/test_auth_integration: tools/test_auth_integration.cpp src/api_common.h third_party/httplib.h | build
+	$(CXX) $(CXXFLAGS) -I src -I third_party -pthread tools/test_auth_integration.cpp -o $@
+
+check-chat-extract: tools/extract_check.sh src/server.cu tools/test_chat_completions_integration.cpp
+	./tools/extract_check.sh
+
+SERVER ?= build/q27-server
+check-responses-integration: $(SERVER) tools/test_responses_integration.py
+	python3 tools/test_responses_integration.py --server "$(SERVER)" --model "$(MODEL)" --tokenizer "$(TOKENIZER)"
 
 build/test_depthctl: tools/test_depthctl.cpp src/depthctl.h | build
 	$(CXX) $(CXXFLAGS) tools/test_depthctl.cpp -o $@
@@ -63,7 +82,7 @@ build/test_argmax_tie: tools/test_argmax_tie.cu src/blocks.cu src/blocks.cuh | b
 
 
 build/q27-server: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -108,7 +127,7 @@ build/turbo5_test: tools/turbo5_test.cu src/turbo5.cuh src/turbo3.cuh | build
 # graph zoo so the fixed stack fits beside the weights (the default W12
 # build OOMs at graph instantiation on 24GB). Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -133,7 +152,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/conductor.h src/prefi
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \

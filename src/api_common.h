@@ -12,11 +12,14 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "../third_party/json.hpp"
+#include "markdown_lex.h"
+
 #include "stream_split.h"
 
 namespace q27 {
@@ -59,6 +62,9 @@ inline std::string jstr(const json& b, const char* key,
     if (!b.is_object()) return dflt;
     const auto it = b.find(key);
     return (it != b.end() && it->is_string()) ? it->get<std::string>() : dflt;
+}
+inline std::string json_dump_replace(const json& value) {
+    return value.dump(-1,' ',false,json::error_handler_t::replace);
 }
 
 // Incremental UTF-8 boundary gate for streaming token pieces. BPE token
@@ -250,6 +256,15 @@ inline std::string tools_preamble(const json& tools) {
     return s;
 }
 
+inline std::string unavailable_tools_preamble(const json& tools) {
+    std::string s = "# Unavailable tools\n\nThe following tool declarations are included "
+                    "for request accounting only. They are not callable in this response:\n\n"
+                    "<unavailable_tools>";
+    for (const auto& tool : tools) s += "\n" + strip_ctrl(tool.dump());
+    s += "\n</unavailable_tools>";
+    return s;
+}
+
 // Build the full ChatML prompt string. If tools are present they are merged
 // into the (first) system message per the template's merged_system behavior.
 // think=false appends the empty think block (enable_thinking=false
@@ -265,7 +280,9 @@ inline std::string tools_preamble(const json& tools) {
 // split-invariance argument applies.
 inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools,
                                  bool think = true, size_t* stable_off = nullptr,
-                                 size_t* sys_off = nullptr) {
+                                 size_t* sys_off = nullptr,
+                                 const std::string& tool_instruction = {},
+                                 const json* unavailable_tools = nullptr) {
     std::string p;
     size_t start = 0;
     std::string sys;
@@ -279,12 +296,24 @@ inline std::string chatml_prompt(const std::vector<Msg>& msgs, const json& tools
     // zero reasoning cost (real Claude Code always sends a system prompt, so
     // this never fires there). Q27_BARE=1 restores the no-default behavior.
     if (sys.empty() && !getenv("Q27_BARE")) sys = "You are a helpful assistant.";
-    if (tools.is_array() && !tools.empty()) {
-        p += "<|im_start|>system\n" + tools_preamble(tools);
-        if (!sys.empty()) p += "\n\n" + sys;
+    const bool has_tools=tools.is_array() && !tools.empty();
+    const bool has_unavailable=unavailable_tools && unavailable_tools->is_array() &&
+                               !unavailable_tools->empty();
+    if (has_tools || has_unavailable || !sys.empty() || !tool_instruction.empty()) {
+        p += "<|im_start|>system\n";
+        bool need_separator=false;
+        auto append_system_part=[&](const std::string& part) {
+            if (part.empty()) return;
+            if (need_separator) p += "\n\n";
+            p += part;
+            need_separator=true;
+        };
+        if (has_tools) append_system_part(tools_preamble(tools));
+        if (has_unavailable)
+            append_system_part(unavailable_tools_preamble(*unavailable_tools));
+        append_system_part(sys);
+        append_system_part(strip_ctrl(tool_instruction));
         p += "<|im_end|>\n";
-    } else if (!sys.empty()) {
-        p += "<|im_start|>system\n" + sys + "<|im_end|>\n";
     }
     if (sys_off) *sys_off = p.size();  // 0 when no system block was emitted
     for (size_t i = start; i < msgs.size(); i++)
@@ -556,6 +585,771 @@ struct ThinkBudgetState {
 // Anthropic error envelope, exactly the real API's shape: the SDK inside
 // Claude Code reads error.message from it, and CC's compact-vs-retry
 // decision substring-matches that message.
+// Minimal JSON structural context for mode-10 quote repair. A colon can
+// terminate a quoted OBJECT KEY, but inside a string VALUE it is ordinary
+// content (for example the raw shell fragment `echo "key": value`).
+struct JsonQuoteContext {
+    struct Frame { char kind; bool expect_key; };
+    std::vector<Frame> stack;
+    bool opening_string_is_key() const {
+        return !stack.empty() && stack.back().kind=='{' && stack.back().expect_key;
+    }
+    void structural(char c) {
+        if(c=='{') stack.push_back({'{',true});
+        else if(c=='[') stack.push_back({'[',false});
+        else if(c=='}') { if(!stack.empty() && stack.back().kind=='{') stack.pop_back(); }
+        else if(c==']') { if(!stack.empty() && stack.back().kind=='[') stack.pop_back(); }
+        else if(c==':' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=false;
+        else if(c==',' && !stack.empty() && stack.back().kind=='{') stack.back().expect_key=true;
+    }
+};
+
+inline std::string escape_json_interior(const std::string& s);
+
+inline void append_json_escaped_byte(std::string& out, unsigned char c) {
+    switch(c) {
+        case '"': out+="\\\""; return;
+        case '\\': out+="\\\\"; return;
+        case '\b': out+="\\b"; return;
+        case '\f': out+="\\f"; return;
+        case '\n': out+="\\n"; return;
+        case '\r': out+="\\r"; return;
+        case '\t': out+="\\t"; return;
+        default:
+            if(c<0x20) {
+                static constexpr char hex[]="0123456789abcdef";
+                out+="\\u00";
+                out+=hex[c>>4];
+                out+=hex[c&15];
+            } else out+=(char)c;
+    }
+}
+
+// Incremental tool-call argument streamer. Shares the
+// mode-5/10 drift semantics of JsonSanitizerStepper but deliberately keeps
+// its OWN loop: it is STREAMING (no full-call buffer for
+// quote_terminates_string lookahead) and adds mode-3 <content>-tag capture,
+// neither of which fits the stepper's buffer+index contract. Keep the
+// escape/repair RULES in lockstep with the stepper; mechanics differ.
+//
+// Feeds the splitter's TOOL-channel bytes as they decode; once the call head
+// parses ({"name": "X", "arguments": { — tolerating mode 9's missing
+// opening quote on the arguments key), object fields stream out sanitized.
+// A quoted `content` field is the one deliberate holdback: until its closing
+// bytes arrive, valid JSON is indistinguishable from mode 3's raw
+// `"content":"RAW</content>` drift. That value is released at finalization
+// if valid, or escaped when the tag appears; other fields remain incremental.
+// Heads that deviate (mode 6/7/8 shapes) or exceed the bound never stream:
+// raw bytes stay exact for the buffered recovery path. A streamed call whose
+// body ends unbalanced reaches the client unbalanced (production semantics —
+// the model's bytes are the model's bytes); repair applies only where bytes
+// have not already reached the wire.
+struct ToolCallStreamer {
+    enum State { HEAD, ARGS, DONE, INVALID_DONE, FALLBACK };
+    State state = HEAD;
+    std::string raw;      // entire body verbatim (fallback + logging)
+    std::string name;     // valid once opened
+    bool opened = false;  // head parsed; an opener chunk belongs on the wire
+
+    bool active() const { return !raw.empty(); }
+    bool invalid() const { return invalid_done_; }
+    void reset() { *this = ToolCallStreamer(); }
+
+    // Feed body bytes; returns the sanitized argument fragment to stream
+    // (often empty). *opened_now fires on the feed that completes the head.
+    std::string feed(const std::string& t, bool* opened_now) {
+        if (opened_now) *opened_now = false;
+        raw += t;
+        if (state == DONE || state == INVALID_DONE) { add_trail(t); return ""; }
+        if (state == FALLBACK) return "";
+        std::string out;
+        if (state == HEAD) {
+            head_ += t;
+            size_t consumed = 0;
+            int m = match_head(head_, name, consumed);
+            if (m == 0) {
+                if (head_.size() > 512) state = FALLBACK;
+                return "";
+            }
+            if (m < 0) { state = FALLBACK; return ""; }
+            state = ARGS;
+            opened = true;
+            if (opened_now) *opened_now = true;
+            std::string rest = head_.substr(consumed);
+            head_.clear();
+            scan(rest, out);
+            sanitized_ += out;
+            validate_done();
+            return out;
+        }
+        scan(t, out);
+        sanitized_ += out;
+        validate_done();
+        return out;
+    }
+
+    // Wrapper closed (or turn flushed). True = the args object completed
+    // cleanly (DONE). Mid-ARGS: resolves a pending quote per the EOF rule
+    // (terminator), appends the final bytes to *tail, returns false — the
+    // handler closes the call as-is. HEAD/FALLBACK: false, nothing streamed.
+    bool finalize(std::string* tail,bool allow_repair=true) {
+        if (state == DONE) return true;
+        if (!allow_repair) return false;
+        if (state == ARGS) {
+            if (defer_raw_tail_) {
+                const std::string pending = raw_tail_;
+                const bool array_value = !json_ctx_.stack.empty() &&
+                    json_ctx_.stack.back().kind == '[';
+                if (!raw_replay_work_) raw_replay_work_ = std::make_shared<size_t>(0);
+                bool have_fallback = false;
+                ToolCallStreamer fallback;
+                std::string fallback_output;
+                bool fallback_starts_call = false;
+                bool have_incomplete = false;
+                ToolCallStreamer incomplete;
+                std::string incomplete_output;
+                for (size_t terminal = pending.find("</content>");
+                     terminal != std::string::npos;
+                     terminal = pending.find("</content>", terminal + 1)) {
+                    size_t after = terminal + 10;
+                    while (after < pending.size() && is_ws(pending[after])) after++;
+                    bool structural = false;
+                    if (after == pending.size()) structural = true;
+                    else if (pending[after] == '}' || pending[after] == ']') structural = true;
+                    else if (pending[after] == ',') {
+                        size_t next = after + 1;
+                        while (next < pending.size() && is_ws(pending[next])) next++;
+                        if (array_value) {
+                            if (next < pending.size()) {
+                                const char n = pending[next];
+                                structural = n == '<' || n == '"' || n == '{' || n == '[' ||
+                                    n == '-' || (n >= '0' && n <= '9') || n == 't' ||
+                                    n == 'f' || n == 'n';
+                            }
+                        } else if (next < pending.size() && pending[next] == '"') {
+                            bool key_escape = false;
+                            size_t close = next + 1;
+                            for (; close < pending.size(); close++) {
+                                if (key_escape) { key_escape = false; continue; }
+                                if (pending[close] == '\\') { key_escape = true; continue; }
+                                if (pending[close] == '"') break;
+                            }
+                            size_t colon = close < pending.size() ? close + 1 : close;
+                            while (colon < pending.size() && is_ws(pending[colon])) colon++;
+                            structural = colon < pending.size() && pending[colon] == ':';
+                        }
+                    }
+                    if (!structural) continue;
+                    ToolCallStreamer replay = *this;
+                    constexpr size_t max_raw_replay_work = 4u * 1024u * 1024u;
+                    if (pending.size() > max_raw_replay_work -
+                        std::min(*raw_replay_work_, max_raw_replay_work)) break;
+                    *raw_replay_work_ += pending.size();
+                    replay.raw.clear();
+                    replay.defer_raw_tail_ = false;
+                    replay.raw_tail_.clear();
+                    replay.raw_tail_depth_ = raw_tail_depth_ + 1;
+                    replay.defer_raw_tails_enabled_ = replay.raw_tail_depth_ < 8;
+                    replay.tag_raw_ = false;
+                    const std::string escaped = escape_json_interior(pending.substr(0, terminal));
+                    replay.sanitized_ += escaped;
+                    std::string scanned;
+                    replay.scan("\"" + pending.substr(terminal + 10), scanned);
+                    replay.sanitized_ += scanned;
+                    replay.validate_done();
+                    std::string replay_tail;
+                    const bool complete = replay.finalize(&replay_tail);
+                    const size_t trail_begin = replay.trail_.find_first_not_of(" \t\r\n");
+                    bool clean_trail = trail_begin == std::string::npos;
+                    if (!clean_trail) {
+                        std::string remaining = replay.trail_.substr(trail_begin);
+                        clean_trail = true;
+                        int packed_count = 0;
+                        while (!remaining.empty() && packed_count++ < 64) {
+                            ToolCallStreamer packed;
+                            packed.raw_replay_work_ = raw_replay_work_;
+                            packed.raw_tail_depth_ = raw_tail_depth_ + 1;
+                            bool packed_opened = false;
+                            (void)packed.feed(remaining, &packed_opened);
+                            std::string packed_tail;
+                            if (!packed_opened || !packed.finalize(&packed_tail)) {
+                                clean_trail = false;
+                                break;
+                            }
+                            remaining = packed.trail_;
+                            const size_t next = remaining.find_first_not_of(" \t\r\n");
+                            if (next == std::string::npos) remaining.clear();
+                            else if (next > 0) remaining.erase(0, next);
+                        }
+                        if (!remaining.empty()) clean_trail = false;
+                    }
+                    if (complete && clean_trail) {
+                        *tail += escaped + scanned + replay_tail;
+                        state = replay.state;
+                        invalid_done_ = replay.invalid_done_;
+                        trail_ = std::move(replay.trail_);
+                        outer_seen_ = replay.outer_seen_;
+                        defer_raw_tail_ = false;
+                        raw_tail_.clear();
+                        return true;
+                    }
+                    if (complete && !have_fallback) {
+                        have_fallback = true;
+                        fallback = std::move(replay);
+                        fallback_output = escaped + scanned + replay_tail;
+                        const size_t fallback_begin = fallback.trail_.find_first_not_of(" \t\r\n");
+                        if (fallback_begin != std::string::npos) {
+                            std::string packed_name;
+                            size_t packed_args = 0;
+                            fallback_starts_call =
+                                match_head(fallback.trail_.substr(fallback_begin),
+                                           packed_name, packed_args) == 1;
+                        }
+                    }
+                    if (!complete && replay.state == ARGS && replay.trail_.empty()) {
+                        have_incomplete = true;
+                        incomplete = std::move(replay);
+                        incomplete_output = escaped + scanned + replay_tail;
+                    }
+                }
+                if (have_fallback && fallback_starts_call) {
+                    *tail += fallback_output;
+                    state = fallback.state;
+                    invalid_done_ = fallback.invalid_done_;
+                    trail_ = std::move(fallback.trail_);
+                    outer_seen_ = fallback.outer_seen_;
+                    defer_raw_tail_ = false;
+                    raw_tail_.clear();
+                    return true;
+                }
+                if (have_incomplete) {
+                    *tail += incomplete_output;
+                    state = incomplete.state;
+                    invalid_done_ = incomplete.invalid_done_;
+                    trail_ = std::move(incomplete.trail_);
+                    outer_seen_ = incomplete.outer_seen_;
+                    defer_raw_tail_ = false;
+                    raw_tail_.clear();
+                    return false;
+                }
+                if (have_fallback) {
+                    *tail += fallback_output;
+                    state = fallback.state;
+                    invalid_done_ = fallback.invalid_done_;
+                    trail_ = std::move(fallback.trail_);
+                    outer_seen_ = fallback.outer_seen_;
+                    defer_raw_tail_ = false;
+                    raw_tail_.clear();
+                    return true;
+                }
+                *tail += escape_json_interior(pending);
+                *tail += '"';
+                defer_raw_tail_ = false;
+                raw_tail_.clear();
+                tag_raw_ = false;
+                return false;
+            }
+            if (defer_content_) {
+                const std::string pending = deferred_;
+                const std::string complete_text = sanitized_ + pending;
+                auto balanced_end = [](const std::string& text) {
+                    int depth = 0;
+                    bool in_string = false, escaped = false, started = false;
+                    for (size_t i = 0; i < text.size(); i++) {
+                        const char c = text[i];
+                        if (escaped) { escaped = false; continue; }
+                        if (in_string) {
+                            if (c == '\\') escaped = true;
+                            else if (c == '"') in_string = false;
+                            continue;
+                        }
+                        if (c == '"') in_string = true;
+                        else if (c == '{') { depth++; started = true; }
+                        else if (c == '}' && started && --depth == 0) return i;
+                    }
+                    return std::string::npos;
+                };
+                const size_t exact_end = balanced_end(complete_text);
+                if (exact_end != std::string::npos && exact_end + 1 >= sanitized_.size()) {
+                    try {
+                        const json exact = json::parse(complete_text.substr(0, exact_end + 1));
+                        if (exact.is_object()) {
+                            const std::string emitted = complete_text.substr(
+                                sanitized_.size(), exact_end + 1 - sanitized_.size());
+                            *tail += emitted;
+                            sanitized_ += emitted;
+                            state = DONE;
+                            defer_content_ = false;
+                            deferred_.clear();
+                            add_trail(complete_text.substr(exact_end + 1));
+                            return true;
+                        }
+                    } catch (...) {}
+                }
+
+                auto prepare = [&](ToolCallStreamer& replay) {
+                    replay.defer_content_ = false;
+                    replay.deferred_.clear();
+                    replay.defer_content_keys_ = false;
+                };
+                auto finish = [&](ToolCallStreamer& replay, const std::string& bytes,
+                                  const std::string& prefix, std::string& emitted) {
+                    emitted = prefix;
+                    std::string scanned;
+                    replay.scan(bytes, scanned);
+                    replay.sanitized_ += scanned;
+                    replay.validate_done();
+                    emitted += scanned;
+                    std::string replay_tail;
+                    const bool complete = replay.finalize(&replay_tail);
+                    emitted += replay_tail;
+                    return complete;
+                };
+                auto adopt = [&](ToolCallStreamer& replay) {
+                    state = replay.state;
+                    invalid_done_ = replay.invalid_done_;
+                    trail_ = std::move(replay.trail_);
+                    outer_seen_ = replay.outer_seen_;
+                    defer_content_ = false;
+                    deferred_.clear();
+                };
+
+                // Find a provable closing quote for THIS content value. Raw
+                // controls and lone backslashes are tolerated for ownership,
+                // but unescaped inner quotes remain invalid; this distinguishes
+                // `a\nb", "body":...` from raw `{"a":"b"}</content>`.
+                const size_t any_tag = pending.find("</content>");
+                size_t tag = std::string::npos;
+                for (size_t search = any_tag; search != std::string::npos;
+                     search = pending.find("</content>", search + 1)) {
+                    size_t after = search + 10;
+                    while (after < pending.size() && is_ws(pending[after])) after++;
+                    if (after == pending.size() || pending[after] == ',' ||
+                        pending[after] == '}' || pending[after] == ']') {
+                        tag = search;
+                        break;
+                    }
+                }
+                size_t first_close_quote = std::string::npos;
+                if (any_tag != std::string::npos) {
+                    bool escaped = false;
+                    size_t quote = std::string::npos;
+                    char quote_delimiter = 0;
+                    for (size_t i = 0; i < pending.size(); i++) {
+                        if (escaped) { escaped = false; continue; }
+                        if (pending[i] == '\\') { escaped = true; continue; }
+                        if (pending[i] != '"') continue;
+                        size_t next = i + 1;
+                        while (next < pending.size() && is_ws(pending[next])) next++;
+                        if (next < pending.size() &&
+                            (pending[next] == ',' || pending[next] == '}' || pending[next] == ']')) {
+                            quote = i;
+                            quote_delimiter = pending[next];
+                            break;
+                        }
+                    }
+                    if (quote != std::string::npos) {
+                        if (quote_delimiter == ',') {
+                            ToolCallStreamer boundary = *this;
+                            prepare(boundary);
+                            boundary.recognize_tags_ = false;
+                            std::string first_part;
+                            boundary.scan(pending.substr(0, quote + 1), first_part);
+                            boundary.sanitized_ += first_part;
+                            boundary.validate_done();
+                            boundary.recognize_tags_ = true;
+                            std::string rest;
+                            const bool boundary_complete = finish(
+                                boundary, pending.substr(quote + 1), "", rest);
+                            const size_t trail_start = boundary.trail_.find_first_not_of(" \t\r\n");
+                            const bool packed = trail_start != std::string::npos &&
+                                boundary.trail_[trail_start] == '{';
+                            const bool stranded = boundary.trail_.find("</content>") !=
+                                std::string::npos && !packed;
+                            if (boundary_complete && !stranded) first_close_quote = quote;
+                        } else {
+                            std::vector<char> stack;
+                            bool in_string = false, prefix_escape = false;
+                            for (size_t i = 0; i + 1 < sanitized_.size(); i++) {
+                                const char c = sanitized_[i];
+                                if (prefix_escape) { prefix_escape = false; continue; }
+                                if (in_string) {
+                                    if (c == '\\') prefix_escape = true;
+                                    else if (c == '"') in_string = false;
+                                } else if (c == '"') in_string = true;
+                                else if (c == '{' || c == '[') stack.push_back(c);
+                                else if ((c == '}' || c == ']') && !stack.empty()) stack.pop_back();
+                            }
+                            std::string body;
+                            body.reserve(quote + 8);
+                            for (size_t i = 0; i < quote; i++) {
+                                const unsigned char c = (unsigned char)pending[i];
+                                if (c == '\\') {
+                                    if (i + 1 < quote) {
+                                        const char n = pending[i + 1];
+                                        if (n == '"' || n == '\\' || n == '/' || n == 'b' || n == 'f' ||
+                                            n == 'n' || n == 'r' || n == 't' || n == 'u') {
+                                            body += '\\'; body += n; i++; continue;
+                                        }
+                                    }
+                                    body += "\\\\";
+                                } else if (c == '\n') body += "\\n";
+                                else if (c == '\r') body += "\\r";
+                                else if (c == '\t') body += "\\t";
+                                else if (c < 0x20) {
+                                    char hex[8];
+                                    snprintf(hex, sizeof hex, "\\u%04x", c);
+                                    body += hex;
+                                } else body += (char)c;
+                            }
+                            std::string probe = sanitized_ + body + "\"";
+                            for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+                                probe += *it == '{' ? '}' : ']';
+                            try {
+                                if (json::parse(probe).is_object()) first_close_quote = quote;
+                            } catch (...) {}
+                        }
+                    }
+                }
+                if (tag != std::string::npos && first_close_quote == std::string::npos) {
+                    ToolCallStreamer tagged = *this;
+                    prepare(tagged);
+                    const std::string escaped = escape_json_interior(pending.substr(0, tag));
+                    tagged.sanitized_ += escaped;
+                    std::string tagged_out;
+                    if (finish(tagged, "\"" + pending.substr(tag + 10), escaped, tagged_out)) {
+                        *tail += tagged_out;
+                        adopt(tagged);
+                        return true;
+                    }
+                }
+
+                // No sentinel reconstruction completed. Preserve the prior
+                // tolerant quote/control repair path without recursive
+                // content deferral or duplicate raw buffering.
+                ToolCallStreamer ordinary = *this;
+                prepare(ordinary);
+                std::string ordinary_out;
+                bool complete = false;
+                if (first_close_quote != std::string::npos) {
+                    ordinary.recognize_tags_ = false;
+                    std::string first_value;
+                    ordinary.scan(pending.substr(0, first_close_quote + 1), first_value);
+                    ordinary.sanitized_ += first_value;
+                    ordinary.validate_done();
+                    ordinary_out += first_value;
+                    ordinary.recognize_tags_ = true;
+                    std::string remainder;
+                    complete = finish(ordinary, pending.substr(first_close_quote + 1), "", remainder);
+                    ordinary_out += remainder;
+                } else {
+                    ordinary.recognize_tags_ = any_tag == std::string::npos || tag != std::string::npos;
+                    complete = finish(ordinary, pending, "", ordinary_out);
+                }
+                *tail += ordinary_out;
+                adopt(ordinary);
+                return complete;
+            }
+            if (!tag_.empty()) { *tail += tag_; tag_.clear(); }
+            if (pend_q_ || pend_tag_) {
+                *tail += '"';
+                *tail += pend_ws_;
+                pend_q_ = pend_tag_ = false;
+            }
+        }
+        return false;
+    }
+
+    // Bytes seen after the streamed call's arguments object closed. A
+    // wrapper can pack more than one call; these are NOT framing — the
+    // handler runs them through the bare-call recovery chain (review
+    // 2026-07-17: the DONE-state byte drop silently lost every call after
+    // the first, a regression vs the buffered path).
+    const std::string& trail() const { return trail_; }
+
+  private:
+    std::string head_;
+    std::string trail_;
+    std::string sanitized_;
+    bool invalid_done_ = false;
+    int depth_ = 0;
+    int raw_tail_depth_ = 0;
+    std::shared_ptr<size_t> raw_replay_work_;
+    bool in_str_ = false, esc_ = false, string_is_key_ = false;
+    bool tag_raw_ = false;   // <content> opened a raw value; escape until its close tag
+    bool defer_raw_tail_ = false;
+    std::string raw_tail_;
+    bool defer_raw_tails_enabled_ = true;
+    bool content_value_ = false;
+    std::string current_key_;
+    bool defer_content_keys_ = true;
+    bool next_content_value_ = false;
+    // A quoted `content` value is ambiguous until finalization can prefer a
+    // valid literal-tag interpretation over the malformed mode-3 sentinel.
+    bool defer_content_ = false;
+    std::string deferred_;
+    bool recognize_tags_ = true;
+    JsonQuoteContext json_ctx_;
+    bool pend_q_ = false;   // in-string quote awaiting one-byte lookahead
+    bool pend_tag_ = false; // full </content> matched, awaiting the same lookahead
+    bool outer_seen_ = false; // the call object's OWN closing } consumed from the trail
+    std::string pend_ws_;   // whitespace held behind the pending quote/tag
+    std::string tag_;       // partial <content>/</content> capture (mode 3)
+
+    // Post-DONE bytes: the head consumed the call object's opening { without
+    // counting it, so exactly one closing } after the args object is the
+    // call's own framing — swallow it once; everything else is trail.
+    void add_trail(const std::string& s) {
+        size_t k = 0;
+        if (!outer_seen_) {
+            while (k < s.size() && is_ws(s[k])) k++;
+            if (k == s.size()) return;      // only ws so far: keep waiting
+            outer_seen_ = true;
+            if (s[k] == '}') k++;
+        }
+        trail_ += s.substr(k);
+    }
+
+    static bool is_content_key(const std::string& raw) {
+        static constexpr char expected[] = "content";
+        size_t out = 0;
+        for (size_t i = 0; i < raw.size();) {
+            unsigned value = static_cast<unsigned char>(raw[i++]);
+            if (value == '\\') {
+                if (i == raw.size()) return false;
+                const char escape = raw[i++];
+                if (escape == 'u') {
+                    if (raw.size() - i < 4) return false;
+                    value = 0;
+                    for (int digit = 0; digit < 4; digit++) {
+                        const char h = raw[i++];
+                        unsigned nibble;
+                        if (h >= '0' && h <= '9') nibble = static_cast<unsigned>(h - '0');
+                        else if (h >= 'a' && h <= 'f') nibble = static_cast<unsigned>(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') nibble = static_cast<unsigned>(h - 'A' + 10);
+                        else return false;
+                        value = (value << 4) | nibble;
+                    }
+                } else {
+                    switch (escape) {
+                        case '"': value = '"'; break;
+                        case '\\': value = '\\'; break;
+                        case '/': value = '/'; break;
+                        case 'b': value = '\b'; break;
+                        case 'f': value = '\f'; break;
+                        case 'n': value = '\n'; break;
+                        case 'r': value = '\r'; break;
+                        case 't': value = '\t'; break;
+                        default: return false;
+                    }
+                }
+            }
+            if (out >= sizeof(expected) - 1 || value != static_cast<unsigned char>(expected[out]))
+                return false;
+            out++;
+        }
+        return out == sizeof(expected) - 1;
+    }
+
+    static bool is_ws(char c) { return c==' '||c=='\t'||c=='\r'||c=='\n'; }
+
+    void validate_done() {
+        if(state!=DONE) return;
+        try {
+            json parsed=json::parse(sanitized_);
+            if(!parsed.is_object()) throw std::runtime_error("tool arguments are not an object");
+        } catch(...) {
+            invalid_done_=true;
+            // The opener is already on wire, so this is not an ordinary
+            // buffered fallback. Preserve all later feeds as recovery trail
+            // for packed calls that start in a subsequent token.
+            state=INVALID_DONE;
+        }
+    }
+
+    void scan(const std::string& in, std::string& out) {
+        for (size_t i = 0; i < in.size() && state == ARGS; ) {
+            const char c = in[i];
+            if (defer_raw_tail_) {
+                raw_tail_ += c;
+                i++;
+                continue;
+            }
+            if (defer_content_) {
+                deferred_ += c;
+                i++;
+                continue;
+            }
+            if (!tag_.empty()) {
+                const char* want = in_str_ ? "</content>" : "<content>";
+                const size_t wl = in_str_ ? 10 : 9;
+                if (c == want[tag_.size()]) {
+                    tag_ += c; i++;
+                    if (tag_.size() == wl) {
+                        if (in_str_ && tag_raw_ && defer_raw_tails_enabled_) {
+                            defer_raw_tail_ = true;
+                            raw_tail_ = tag_;
+                            tag_.clear();
+                        } else {
+                            tag_.clear();
+                            if (in_str_) pend_tag_ = true;
+                            else {
+                                out += '"';
+                                in_str_ = true;
+                                string_is_key_ = false;
+                                tag_raw_ = true;
+                                content_value_ = false;
+                                next_content_value_ = false;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                out += tag_;
+                tag_.clear();
+                continue;
+            }
+            if (pend_q_ || pend_tag_) {
+                if (is_ws(c)) { pend_ws_ += c; i++; continue; }
+                const bool terminates = string_is_key_ ? c == ':'
+                    : (c == ',' || c == '}' || c == ']');
+                if (terminates) {
+                    out += '"'; out += pend_ws_;
+                    in_str_ = false;
+                    content_value_ = false;
+                    tag_raw_ = false;
+                    if (string_is_key_)
+                        next_content_value_ = is_content_key(current_key_);
+                } else {
+                    out += pend_tag_ ? "</content>" : "\\\"";
+                    for (char w : pend_ws_)
+                        out += w=='\n' ? "\\n" : w=='\r' ? "\\r"
+                             : w=='\t' ? "\\t" : std::string(1, w);
+                }
+                pend_ws_.clear();
+                pend_q_ = pend_tag_ = false;
+            }
+            if (esc_) {
+                esc_ = false;
+                if (string_is_key_) current_key_ += c;
+                out += c; i++; continue;
+            }
+            if (in_str_) {
+                if (tag_raw_) {
+                    if (recognize_tags_ && c == '<') { tag_ += c; i++; continue; }
+                    append_json_escaped_byte(out,(unsigned char)c);
+                    i++;
+                    continue;
+                }
+                if (c == '\\') {
+                    if (string_is_key_) current_key_ += c;
+                    esc_ = true; out += c; i++; continue;
+                }
+                if (c == '"') { pend_q_ = true; i++; continue; }
+                if (recognize_tags_ && content_value_ && c == '<') { tag_ += c; i++; continue; }
+                if (string_is_key_) current_key_ += c;
+                append_json_escaped_byte(out,(unsigned char)c);
+                i++;
+                continue;
+            }
+            if (next_content_value_ && !is_ws(c) && c != ':' && c != '"' && c != '<')
+                next_content_value_ = false;
+            if (recognize_tags_ && c == '<') { tag_ += c; i++; continue; }
+            out += c; i++;
+            if (c == '"') {
+                string_is_key_ = json_ctx_.opening_string_is_key();
+                in_str_ = true;
+                if (string_is_key_) current_key_.clear();
+                else {
+                    content_value_ = next_content_value_;
+                    defer_content_ = defer_content_keys_ && content_value_;
+                    next_content_value_ = false;
+                    deferred_.clear();
+                }
+            } else {
+                json_ctx_.structural(c);
+                if (c == '{') depth_++;
+                else if (c == '}' && --depth_ == 0) {
+                    state = DONE;
+                    add_trail(in.substr(i));
+                }
+            }
+        }
+    }
+
+    // 1 = matched (name_out set, consumed = index OF the args '{'),
+    // 0 = undecided (need more bytes), -1 = not this shape (fallback).
+    static int match_head(const std::string& b, std::string& name_out,
+                          size_t& consumed) {
+        size_t i = 0;
+        auto skip = [&]() { while (i < b.size() && is_ws(b[i])) i++; return i < b.size(); };
+        auto lit = [&](const char* s) -> int {
+            for (size_t k = 0; s[k]; k++, i++) {
+                if (i >= b.size()) return 0;
+                if (b[i] != s[k]) return -1;
+            }
+            return 1;
+        };
+        int r;
+        if (!skip()) return 0;
+        if ((r = lit("{")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"name\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit("\"")) <= 0) return r;
+        std::string nm;
+        for (;; i++) {
+            if (i >= b.size()) return 0;
+            if (b[i] == '\\') return -1;   // escaped names: buffered path
+            if (b[i] == '"') { i++; break; }
+            nm += b[i];
+        }
+        if (nm.empty()) return -1;
+        if (!skip()) return 0;
+        if ((r = lit(",")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] == '"') i++;              // mode-9: opening quote optional
+        if ((r = lit("arguments\"")) <= 0) return r;
+        if (!skip()) return 0;
+        if ((r = lit(":")) <= 0) return r;
+        if (!skip()) return 0;
+        if (b[i] != '{') return -1;        // non-object args: buffered path
+        name_out = nm;
+        consumed = i;
+        return 1;
+    }
+};
+
+// Experimental harness-prefix prewarming accepts only an initial request:
+// zero or more merged system messages followed by exactly one live user
+// message. Return the closed static prompt and optionally the complete
+// ordinary generation prompt. Token-level callers still verify that encoding
+// the former is an exact prefix of encoding the latter before any side effect.
+inline std::string initial_harness_prefix(const std::vector<Msg>& messages,
+                                          const json& tools, bool think,
+                                          std::string* full_prompt = nullptr,
+                                          const std::string& tool_instruction = {},
+                                          const json* unavailable_tools = nullptr) {
+    if (messages.empty() || messages.back().role != "user")
+        throw std::runtime_error(
+            "prewarm requires an initial request ending in one user message");
+    std::vector<Msg> prefix_messages(messages.begin(), messages.end() - 1);
+    for (const auto& message : prefix_messages)
+        if (message.role != "system")
+            throw std::runtime_error(
+                "prewarm accepts initial requests only (system plus final user)");
+    if (full_prompt) *full_prompt=chatml_prompt(
+        messages,tools,think,nullptr,nullptr,tool_instruction,unavailable_tools);
+    size_t stable_bytes = 0;
+    std::string prefix=chatml_prompt(
+        prefix_messages,tools,think,&stable_bytes,nullptr,tool_instruction,
+        unavailable_tools);
+    prefix.resize(stable_bytes);
+    return prefix;
+}
+
 inline std::string anthropic_error_json(const std::string& err_type,
                                         const std::string& message) {
     json e = {{"type", "error"},
@@ -577,13 +1371,19 @@ inline json anthropic_tools_json(const json& body) {
     json out = json::array();
     if (body.contains("tools") && body["tools"].is_array())
         for (auto& t : body["tools"]) {
-            if (!t.is_object() || !t.contains("name")) continue;
+            if (!t.is_object() || !t.contains("name") || !t["name"].is_string()) continue;
+            const std::string& name=t["name"].get_ref<const std::string&>();
+            if(name.empty()) continue;
+            const std::string description=
+                t.contains("description") && t["description"].is_string()
+                    ? t["description"].get<std::string>() : "";
+            const json parameters=
+                t.contains("input_schema") && t["input_schema"].is_object()
+                    ? t["input_schema"] : json::object();
             out.push_back({{"type", "function"},
-                           {"function", {{"name", t["name"]},
-                                         {"description", t.value("description", "")},
-                                         {"parameters", t.contains("input_schema")
-                                                            ? t["input_schema"]
-                                                            : json::object()}}}});
+                           {"function", {{"name", name},
+                                         {"description", description},
+                                         {"parameters", parameters}}}});
         }
     return out;
 }
@@ -660,14 +1460,19 @@ inline std::vector<Msg> anthropic_msgs(const json& body) {
 inline json openai_tools_json(const json& body) {
     json out = json::array();
     if (body.contains("tools") && body["tools"].is_array())
-        for (auto& t : body["tools"]) {
-            if (!t.is_object() || t.value("type", "") != "function") continue;
+        for (const auto& t : body["tools"]) {
+            if (!t.is_object() || !t.contains("type") || !t["type"].is_string() ||
+                t["type"] != "function") continue;
             if (!t.contains("function") || !t["function"].is_object()) continue;
             const json& fn = t["function"];
-            if (!fn.contains("name") || !fn["name"].is_string()) continue;
+            if (!fn.contains("name") || !fn["name"].is_string() ||
+                fn["name"].get_ref<const std::string&>().empty()) continue;
+            if (fn.contains("description") && !fn["description"].is_string()) continue;
+            if (fn.contains("parameters") && !fn["parameters"].is_object()) continue;
             out.push_back({{"type", "function"},
                            {"function", {{"name", fn["name"]},
-                                         {"description", fn.value("description", "")},
+                                         {"description", fn.contains("description")
+                                                             ? fn["description"] : json("")},
                                          {"parameters", fn.contains("parameters")
                                                             ? fn["parameters"]
                                                             : json::object()}}}});
@@ -735,19 +1540,58 @@ inline std::vector<Msg> openai_msgs(const json& body) {
     return msgs;
 }
 
-// tool_choice (OpenAI shape): "auto"/absent -> AUTO (unchanged behavior);
-// "none" -> NONE (tools stripped from the prompt entirely -- the model gets
-// no tool definitions and cannot call anything this turn); "required" or a
-// named {"type":"function","function":{"name":...}} -> FORCED. FORCED is a
-// soft force (prompt-injected <tool_call> opener + pre-seeded stream router,
-// see server.cu) -- it is NOT combined with --constrain-tools grammar
-// masking (documented limitation: the grammar's engage trigger scans
-// GENERATED text for the <tool_call> marker, which never appears in the
-// output when it was injected into the PROMPT instead).
+// tool_choice (OpenAI shape): "auto"/absent -> AUTO; "none" -> NONE;
+// "required", a named function, or allowed_tools mode:"required" -> FORCED.
+// allowed_tools mode:"auto" keeps AUTO while narrowing the eligible registry.
 struct ToolChoice {
     enum Mode { AUTO, NONE, FORCED } mode = AUTO;
-    std::string forced_name; // empty = any registered tool eligible
+    std::string forced_name; // non-empty only for a named function choice
+    std::vector<std::string> allowed_names; // empty = every declared tool
+    bool disable_parallel_tool_use = false;
+    bool invalid = false;
 };
+
+inline bool forced_tool_choice_missing_is_error(const ToolChoice& choice,
+                                                bool has_eligible_call,
+                                                bool generation_truncated) {
+    return choice.mode == ToolChoice::FORCED && !has_eligible_call &&
+           !generation_truncated;
+}
+
+inline const char* openai_tool_finish_reason(bool has_eligible_call,
+                                             bool final_tool_incomplete,
+                                             bool generation_truncated) {
+    if(has_eligible_call && !final_tool_incomplete) return "tool_calls";
+    return generation_truncated ? "length" : "stop";
+}
+
+inline const char* anthropic_tool_stop_reason(bool has_eligible_call,
+                                               bool final_tool_incomplete,
+                                               bool generation_truncated) {
+    if(has_eligible_call && !final_tool_incomplete) return "tool_use";
+    return generation_truncated ? "max_tokens" : "end_turn";
+}
+
+// OpenAI's top-level parallel_tool_calls=false has the same output
+// multiplicity contract as Anthropic's disable_parallel_tool_use=true.
+// Keep it on ToolChoice so wrapped, recovered, streaming, and non-streaming
+// calls all pass through one eligibility rule.
+inline void apply_openai_parallel_tool_calls(const json& body,ToolChoice& choice) {
+    if(!body.contains("parallel_tool_calls")) return;
+    if(!body["parallel_tool_calls"].is_boolean()) {
+        choice.invalid=true;
+        return;
+    }
+    choice.disable_parallel_tool_use=!body["parallel_tool_calls"].get<bool>();
+}
+
+template<class NameSet>
+inline bool tool_choice_allows_call(const ToolChoice& choice,const NameSet& allowed,
+                                    const std::string& name,size_t accepted_calls) {
+    return choice.mode != ToolChoice::NONE && allowed.count(name) &&
+        (choice.forced_name.empty() || name == choice.forced_name) &&
+        (!choice.disable_parallel_tool_use || accepted_calls == 0);
+}
 inline ToolChoice parse_tool_choice(const json& body) {
     ToolChoice tc;
     if (!body.contains("tool_choice")) return tc;
@@ -756,12 +1600,375 @@ inline ToolChoice parse_tool_choice(const json& body) {
         if (v == "none") tc.mode = ToolChoice::NONE;
         else if (v == "required") tc.mode = ToolChoice::FORCED;
         // "auto" or any other/unknown string: default AUTO
-    } else if (v.is_object() && v.value("type", "") == "function" && v.contains("function") &&
-               v["function"].is_object()) {
-        tc.mode = ToolChoice::FORCED;
-        tc.forced_name = v["function"].value("name", std::string());
+        return tc;
     }
+    if (v.is_null()) return tc;
+    if (!v.is_object() || !v.contains("type") || !v["type"].is_string()) {
+        tc.invalid = true;
+        return tc;
+    }
+    if (v["type"] == "function") {
+        if (!v.contains("function") || !v["function"].is_object() ||
+            !v["function"].contains("name") || !v["function"]["name"].is_string() ||
+            v["function"]["name"].get_ref<const std::string&>().empty()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["function"]["name"].get<std::string>();
+        tc.allowed_names.push_back(tc.forced_name);
+        return tc;
+    }
+    if (v["type"] == "allowed_tools") {
+        if (!v.contains("allowed_tools") || !v["allowed_tools"].is_object()) {
+            tc.invalid = true;
+            return tc;
+        }
+        const json& allowed = v["allowed_tools"];
+        if (!allowed.contains("mode") || !allowed["mode"].is_string() ||
+            (allowed["mode"] != "auto" && allowed["mode"] != "required") ||
+            !allowed.contains("tools") || !allowed["tools"].is_array()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = allowed["mode"] == "required" ? ToolChoice::FORCED : ToolChoice::AUTO;
+        for (const auto& tool : allowed["tools"]) {
+            if (!tool.is_object() || !tool.contains("type") || !tool["type"].is_string() ||
+                tool["type"] != "function" || !tool.contains("function") ||
+                !tool["function"].is_object() || !tool["function"].contains("name") ||
+                !tool["function"]["name"].is_string() ||
+                tool["function"]["name"].get_ref<const std::string&>().empty()) {
+                tc.invalid = true;
+                return tc;
+            }
+            const std::string name=tool["function"]["name"].get<std::string>();
+            if (std::find(tc.allowed_names.begin(),tc.allowed_names.end(),name)==tc.allowed_names.end())
+                tc.allowed_names.push_back(name);
+        }
+        if (tc.allowed_names.empty()) tc.invalid = true;
+        return tc;
+    }
+    tc.invalid = true;
     return tc;
+}
+
+// Anthropic tool_choice: absent/auto -> AUTO, none -> NONE, any -> FORCED
+// across the declared registry, and tool{name} -> FORCED for that one tool.
+inline ToolChoice parse_anthropic_tool_choice(const json& body) {
+    ToolChoice tc;
+    if (!body.contains("tool_choice") || body["tool_choice"].is_null()) return tc;
+    const json& v = body["tool_choice"];
+    if (!v.is_object() || !v.contains("type") || !v["type"].is_string()) {
+        tc.invalid = true;
+        return tc;
+    }
+    if (v.contains("disable_parallel_tool_use")) {
+        if (!v["disable_parallel_tool_use"].is_boolean()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.disable_parallel_tool_use = v["disable_parallel_tool_use"].get<bool>();
+    }
+    const std::string type = v["type"].get<std::string>();
+    if (type == "auto") return tc;
+    if (type == "none") {
+        tc.mode = ToolChoice::NONE;
+        return tc;
+    }
+    if (type == "any") {
+        tc.mode = ToolChoice::FORCED;
+        return tc;
+    }
+    if (type == "tool") {
+        if (!v.contains("name") || !v["name"].is_string() ||
+            v["name"].get_ref<const std::string&>().empty()) {
+            tc.invalid = true;
+            return tc;
+        }
+        tc.mode = ToolChoice::FORCED;
+        tc.forced_name = v["name"].get<std::string>();
+        tc.allowed_names.push_back(tc.forced_name);
+        return tc;
+    }
+    tc.invalid = true;
+    return tc;
+}
+
+// Anthropic's incompatibility is request-scoped: an explicit thinking block
+// cannot coexist with forced tool_choice. A server-side --think default is a
+// local fallback, so forced choice may override it when the request is silent.
+inline void validate_anthropic_tool_choice_thinking(
+        const ToolChoice& choice, const ThinkCfg& thinking) {
+    if (choice.mode == ToolChoice::FORCED && thinking.enabled && thinking.enabled_set)
+        throw std::invalid_argument(
+            "thinking.type: enabled is incompatible with forced tool_choice");
+}
+
+inline std::string anthropic_tool_choice_instruction(const ToolChoice& choice) {
+    if (choice.mode == ToolChoice::NONE)
+        return "Tool use is disabled for this response. Do not call any tool.";
+    if (choice.mode != ToolChoice::FORCED) return {};
+    if (choice.forced_name.empty())
+        return "You must call at least one of the available tools before ending the response.";
+    return "You must call only the tool named " + json(choice.forced_name).dump() +
+           " before ending the response.";
+}
+
+inline void validate_responses_tool_fields(const json& body) {
+    if(!body.contains("tools") || !body["tools"].is_array()) return;
+    for(const auto& tool:body["tools"]) {
+        if(!tool.is_object()) continue;
+        auto require_string=[&](const char* field) {
+            const auto it=tool.find(field);
+            if(it!=tool.end() && !it->is_string())
+                throw std::invalid_argument(
+                    std::string("tools[].")+field+" must be a string");
+        };
+        require_string("type");
+        const std::string type=jstr(tool,"type");
+        if(type=="function" || type=="custom") {
+            require_string("name");
+            require_string("description");
+        }
+    }
+}
+
+// Legacy Codex clients can advertise their locally executed shell capability
+// as the hosted Responses type `shell`, while still consuming ordinary
+// function_call items. Translate that compatibility form into the two
+// model-facing functions the client executes; true hosted execution remains
+// the client's responsibility, not this inference server's.
+inline json responses_shell_prompt_tools() {
+    return json::array({
+        {{"type","function"},{"function",{
+            {"name","exec_command"},
+            {"description","Runs a shell command and returns output or a session ID for ongoing interaction."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"cmd",{{"type","string"},{"description","Shell command to execute."}}},
+                {"workdir",{{"type","string"},{"description","Working directory for the command."}}},
+                {"tty",{{"type","boolean"},{"description","Whether to allocate a PTY."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}},
+                {"shell",{{"type","string"},{"description","Shell binary to launch."}}}
+            }},{"required",json::array({"cmd"})},{"additionalProperties",false}}}
+        }}},
+        {{"type","function"},{"function",{
+            {"name","write_stdin"},
+            {"description","Writes characters to an existing command session and returns recent output."},
+            {"parameters",{{"type","object"},{"properties",{
+                {"session_id",{{"type","number"},{"description","Identifier of the running command session."}}},
+                {"chars",{{"type","string"},{"description","Bytes to write; empty polls without writing."}}},
+                {"yield_time_ms",{{"type","number"},{"description","Wait before yielding output."}}},
+                {"max_output_tokens",{{"type","number"},{"description","Output token budget."}}}
+            }},{"required",json::array({"session_id"})},{"additionalProperties",false}}}
+        }}}
+    });
+}
+
+template<class NameSet>
+inline void add_responses_hosted_call_names(NameSet& names,
+                                            const std::string& hosted_type) {
+    if (hosted_type != "shell") return;
+    names.insert("exec_command");
+    names.insert("write_stdin");
+}
+
+inline bool responses_tool_names_ambiguous(
+    const std::set<std::string>& function_names,
+    const std::set<std::string>& custom_names,
+    const std::set<std::string>& hosted_tool_types) {
+    std::set<std::string> hosted_call_names;
+    for (const auto& type : hosted_tool_types)
+        add_responses_hosted_call_names(hosted_call_names, type);
+    for (const auto& name : function_names)
+        if (custom_names.count(name) || hosted_tool_types.count(name) ||
+            hosted_call_names.count(name))
+            return true;
+    for (const auto& name : custom_names)
+        if (hosted_tool_types.count(name) || hosted_call_names.count(name))
+            return true;
+    return false;
+}
+inline void validate_responses_tool_choice_declarations(
+    const json& body,
+    const std::set<std::string>& function_names,
+    const std::set<std::string>& custom_names,
+    const std::set<std::string>& hosted_tool_types) {
+    auto validate_tool = [&](const json& tool) {
+        if (!tool.is_object()) return;
+        const std::string type = jstr(tool, "type");
+        if (type == "function" || type == "custom") {
+            const std::string name = jstr(tool, "name");
+            if (name.empty()) return;
+            const bool declared = type == "function" ? function_names.count(name)
+                                                       : custom_names.count(name);
+            if (!declared)
+                throw std::runtime_error("tool_choice kind/name not present in tools");
+        } else if (!type.empty() && type != "allowed_tools" && type != "mcp" &&
+                   !hosted_tool_types.count(type)) {
+            throw std::runtime_error("tool_choice hosted type not present in tools");
+        }
+    };
+    if (!body.contains("tool_choice") || !body["tool_choice"].is_object()) return;
+    const json& source = body["tool_choice"];
+    if (jstr(source, "type") != "allowed_tools") {
+        validate_tool(source);
+        return;
+    }
+    const json* allowed = &source;
+    if (source.contains("allowed_tools") && source["allowed_tools"].is_object())
+        allowed = &source["allowed_tools"];
+    if (allowed->contains("tools") && (*allowed)["tools"].is_array())
+        for (const auto& tool : (*allowed)["tools"]) validate_tool(tool);
+}
+
+inline ToolChoice responses_registered_tool_choice(
+    const ToolChoice& choice, const std::set<std::string>& hosted_tool_types) {
+    ToolChoice registered = choice;
+    auto mapped_names = [](const std::string& type) {
+        std::set<std::string> names;
+        add_responses_hosted_call_names(names, type);
+        return names;
+    };
+    if (!registered.forced_name.empty() &&
+        hosted_tool_types.count(registered.forced_name)) {
+        auto mapped = mapped_names(registered.forced_name);
+        registered.forced_name.clear();
+        registered.allowed_names.assign(mapped.begin(), mapped.end());
+        if (registered.allowed_names.empty()) registered.mode = ToolChoice::NONE;
+    } else if (!registered.allowed_names.empty()) {
+        std::set<std::string> expanded;
+        for (const auto& name : registered.allowed_names) {
+            if (hosted_tool_types.count(name)) {
+                auto mapped = mapped_names(name);
+                expanded.insert(mapped.begin(), mapped.end());
+            } else {
+                expanded.insert(name);
+            }
+        }
+        registered.allowed_names.assign(expanded.begin(), expanded.end());
+        if (registered.allowed_names.empty()) registered.mode = ToolChoice::NONE;
+    }
+    return registered;
+}
+
+
+// Responses API names function/custom tools directly in object-form
+// tool_choice, unlike Chat Completions' nested `function.name` shape.
+// Normalize that wire form into ToolChoice so both APIs share selection and
+// output-validation semantics.
+inline ToolChoice parse_responses_tool_choice(const json& body) {
+    if (body.contains("tool_choice") && body["tool_choice"].is_string() &&
+        body["tool_choice"] != "auto" && body["tool_choice"] != "none" &&
+        body["tool_choice"] != "required") {
+        ToolChoice invalid;
+        invalid.invalid = true;
+        return invalid;
+    }
+    if (!body.contains("tool_choice") || !body["tool_choice"].is_object())
+        return parse_tool_choice(body);
+    json normalized = body;
+    const json& source = body["tool_choice"];
+    const std::string type = source.value("type", std::string());
+    if ((type == "function" || type == "custom") && source.contains("name")) {
+        normalized["tool_choice"] = {{"type","function"},
+                                     {"function",{{"name",source["name"]}}}};
+    } else if (type == "shell") {
+        normalized["tool_choice"] = {{"type","function"},
+                                     {"function",{{"name",type}}}};
+    } else if (type == "allowed_tools") {
+        json allowed;
+        if (source.contains("allowed_tools") && source["allowed_tools"].is_object())
+            allowed=source["allowed_tools"];
+        else {
+            if (source.contains("mode")) allowed["mode"]=source["mode"];
+            if (source.contains("tools")) allowed["tools"]=source["tools"];
+        }
+        bool skipped_unavailable=false;
+        if (allowed.contains("tools") && allowed["tools"].is_array()) {
+            json tools = json::array();
+            const bool optional=allowed.value("mode",std::string())=="auto";
+            for (const auto& tool : allowed["tools"]) {
+                const std::string tool_type = tool.is_object()
+                    ? tool.value("type",std::string()) : std::string();
+                if (tool.is_object() && tool.contains("name") &&
+                    (tool_type == "function" || tool_type == "custom"))
+                    tools.push_back({{"type","function"},
+                                     {"function",{{"name",tool["name"]}}}});
+                else if (tool_type == "shell")
+                    tools.push_back({{"type","function"},
+                                     {"function",{{"name",tool_type}}}});
+                else if(optional && !tool_type.empty())
+                    skipped_unavailable=true;
+                else tools.push_back(tool);
+            }
+            if(skipped_unavailable && tools.empty()) {
+                ToolChoice unavailable;
+                unavailable.mode=ToolChoice::NONE;
+                return unavailable;
+            }
+            allowed["tools"] = std::move(tools);
+        }
+        normalized["tool_choice"] = {{"type","allowed_tools"},
+                                     {"allowed_tools",std::move(allowed)}};
+    }
+    return parse_tool_choice(normalized);
+}
+
+inline bool openai_stream_includes_usage(const json& body) {
+    if (!jbool(body,"stream",false) || !body.contains("stream_options") ||
+        !body["stream_options"].is_object()) return false;
+    const json& options=body["stream_options"];
+    return options.contains("include_usage") && options["include_usage"].is_boolean() &&
+           options["include_usage"].get<bool>();
+}
+
+struct OpenAIToolSelection {
+    json tools=json::array();
+    std::vector<std::string> names;
+};
+
+// Normalize the declared registry once, then apply tool_choice's eligible
+// subset. Both backends use this helper so prompt injection, grammar names,
+// fallback parsing, and output validation all share the same registry.
+inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice& choice) {
+    if (choice.invalid) throw std::runtime_error("invalid tool_choice or parallel_tool_calls");
+    OpenAIToolSelection selected;
+    if (choice.mode == ToolChoice::NONE) return selected;
+    selected.tools=openai_tools_json(body);
+    for (const auto& tool : selected.tools)
+        selected.names.push_back(tool["function"]["name"].get<std::string>());
+    if (!choice.allowed_names.empty()) {
+        const std::set<std::string> declared(selected.names.begin(),selected.names.end());
+        for (const auto& name : choice.allowed_names)
+            if (!declared.count(name))
+                throw std::runtime_error("tool_choice names a function not present in tools");
+        const std::set<std::string> allowed(choice.allowed_names.begin(),choice.allowed_names.end());
+        json filtered=json::array();
+        for (auto& tool : selected.tools)
+            if (allowed.count(tool["function"]["name"].get<std::string>()))
+                filtered.push_back(std::move(tool));
+        selected.tools=std::move(filtered);
+        selected.names=choice.allowed_names;
+    }
+    if (choice.mode == ToolChoice::FORCED && selected.names.empty())
+        throw std::runtime_error("tool_choice requires at least one valid function tool");
+    return selected;
+}
+
+// Anthropic counts every declaration even when tool_choice narrows eligibility.
+// The inactive block keeps that accounting while leaving only selected schemas
+// in the callable interface. This choice-specific system prompt is intentional:
+// Anthropic documents that changing tool_choice invalidates message-block cache
+// entries (tool definitions are a separate hosted cache boundary).
+inline json unselected_openai_tools(const json& all_tools,
+                                    const OpenAIToolSelection& selected) {
+    const std::set<std::string> active(selected.names.begin(),selected.names.end());
+    json unavailable=json::array();
+    for (const auto& tool : all_tools)
+        if (!active.count(tool["function"]["name"].get<std::string>()))
+            unavailable.push_back(tool);
+    return unavailable;
 }
 
 // Parsed model tool call. `ok` false if the JSON was malformed (raw kept).
@@ -770,7 +1977,51 @@ struct ToolCall {
     std::string name;
     json arguments;
     std::string raw;
+    size_t source_begin=std::string::npos;
+    size_t source_end=std::string::npos;
+    size_t rewritten_begin=std::string::npos;
+    size_t rewritten_end=std::string::npos;
 };
+
+template<class NameSet>
+inline bool tool_choice_allows_all_calls(const ToolChoice& choice,
+                                         const NameSet& allowed,
+                                         const std::vector<ToolCall>& calls,
+                                         size_t accepted_calls=0) {
+    if (calls.empty()) return false;
+    for (const auto& call : calls) {
+        if (!call.ok || !tool_choice_allows_call(
+                choice, allowed, call.name, accepted_calls))
+            return false;
+        accepted_calls++;
+    }
+    return true;
+}
+template<class NameSet>
+inline bool responses_tool_tail_after_bare_calls(
+    bool current_tool_tail, const std::string& text,
+    const std::vector<ToolCall>& calls, const ToolChoice& choice,
+    const NameSet& allowed, size_t accepted_calls=0) {
+    if (calls.empty())
+        return current_tool_tail &&
+               text.find_first_not_of(" \t\r\n") == std::string::npos;
+    bool tool_tail = false;
+    size_t tail_begin = 0;
+    for (const auto& call : calls) {
+        if (call.ok && tool_choice_allows_call(
+                           choice, allowed, call.name, accepted_calls)) {
+            tool_tail = true;
+            accepted_calls++;
+        } else {
+            tool_tail = false;
+        }
+        if (call.source_end != std::string::npos && call.source_end <= text.size())
+            tail_begin = call.source_end;
+    }
+    if (text.find_first_not_of(" \t\r\n", tail_begin) != std::string::npos)
+        tool_tail = false;
+    return tool_tail;
+}
 
 inline std::string escape_content_tags(const std::string& text);
 
@@ -796,8 +2047,11 @@ inline ToolCall parse_tool_call(const std::string& seg) {
             json j = json::parse(seg);
             tc.name = j.value("name", std::string());
             tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
-            if (tc.arguments.is_string()) {
-                fprintf(stderr, "[q27-strict] rejected double-encoded arguments (tool=%s)\n",
+            if (!tc.arguments.is_object()) {
+                fprintf(stderr,
+                        tc.arguments.is_string()
+                            ? "[q27-strict] rejected double-encoded arguments (tool=%s)\n"
+                            : "[q27-strict] rejected non-object arguments (tool=%s)\n",
                         tc.name.c_str());
                 tc.ok = false;
                 return tc;
@@ -817,7 +2071,7 @@ inline ToolCall parse_tool_call(const std::string& seg) {
         tc.arguments = j.contains("arguments") ? j["arguments"] : json::object();
         if (tc.arguments.is_string()) // some models double-encode
             tc.arguments = json::parse(tc.arguments.get<std::string>());
-        tc.ok = !tc.name.empty();
+        tc.ok = !tc.name.empty() && tc.arguments.is_object();
     } catch (...) { tc.ok = false; }
     return tc;
 }
@@ -827,6 +2081,412 @@ inline std::string strip_ws2(const std::string& s) {
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+
+// Streaming Responses must withhold a possible wrapper-less call until it is
+// classified, but arbitrary Markdown/JSON must keep flowing. Limit holdback
+// to object prefixes whose first key can identify a supported call shape.
+inline bool plausible_bare_tool_prefix_range(
+    const std::string& text,size_t begin,size_t end) {
+    end=std::min(end,text.size());
+    if(begin>=end || text[begin]!='{') return false;
+    size_t p=begin+1;
+    while(p<end && (text[p]==' ' || text[p]=='\t' ||
+                    text[p]=='\r' || text[p]=='\n')) p++;
+    if(p==end) return true;
+    static const char* keys[]={
+        "\"name\"","\"arguments\"","\"function\"",
+        "\"tool\"","\"tool_name\"","\"tool_call\""};
+    const size_t available=end-p;
+    for(const char* key:keys) {
+        const size_t key_size=std::char_traits<char>::length(key);
+        const size_t compared=std::min(available,key_size);
+        if(text.compare(p,compared,key,compared)==0) return true;
+    }
+    return false;
+}
+
+inline bool plausible_bare_tool_prefix(const std::string& text) {
+    return plausible_bare_tool_prefix_range(text,0,text.size());
+}
+
+
+inline void consume_bare_text_context(JsonStringLexState& string_state,
+                                      MarkdownFenceLexState& fence_state,
+                                      char ch) {
+    consume_display_text_context(string_state,fence_state,ch);
+}
+
+inline void consume_bare_text_context(JsonStringLexState& string_state,
+                                      MarkdownFenceLexState& fence_state,
+                                      const std::string& text,
+                                      size_t count=std::string::npos) {
+    consume_display_text_context(string_state,fence_state,text,count);
+}
+
+inline bool bare_markdown_context_is_displayed(
+    const std::string& text,size_t position,
+    MarkdownFenceLexState& fence_state,bool end_is_final) {
+    return markdown_context_is_displayed(
+        text,position,fence_state,end_is_final);
+}
+
+
+inline bool bare_context_is_executable(
+    const std::string& text,size_t position,
+    JsonStringLexState& string_state,MarkdownFenceLexState& fence_state,
+    bool end_is_final) {
+    if(position<text.size()) string_state.settle_pending(text[position]);
+    if(string_state.in_inert_container() ||
+       !display_text_context_is_executable(
+           text,position,string_state,fence_state,end_is_final)) return false;
+    string_state.discard_pending_containers();
+    return true;
+}
+
+inline bool bare_text_position_is_executable(
+    const std::string& text,size_t position,
+    JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={},bool end_is_final=true) {
+    consume_bare_text_context(string_state,fence_state,text,position);
+    return bare_context_is_executable(
+        text,position,string_state,fence_state,end_is_final);
+}
+
+inline bool bare_position_is_displayed(const std::string& text,size_t position) {
+    JsonStringLexState string_state;
+    MarkdownFenceLexState fence_state;
+    consume_bare_text_context(string_state,fence_state,text,position);
+    return bare_markdown_context_is_displayed(
+        text,position,fence_state,/*end_is_final=*/true);
+}
+
+inline size_t bare_object_position(const std::string& text,
+                                   JsonStringLexState string_state={},
+                                   MarkdownFenceLexState fence_state={},
+                                   bool end_is_final=true) {
+    for(size_t i=0;i<text.size();i++) {
+        if(text[i]=='{' && bare_context_is_executable(
+               text,i,string_state,fence_state,end_is_final)) return i;
+        consume_bare_text_context(string_state,fence_state,text[i]);
+    }
+    return std::string::npos;
+}
+
+inline size_t bare_unresolved_inline_probe_start(
+    const std::string& text,JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={}) {
+    consume_bare_text_context(string_state,fence_state,text);
+    fence_state.settle_before_non_backtick();
+    return fence_state.fence_length==0 && fence_state.inline_ticks!=0
+        ?0:std::string::npos;
+}
+
+// Return the byte after the first balanced top-level object, or npos while
+// the candidate is incomplete. Braces inside JSON strings do not count.
+struct IncrementalBareJsonEnd {
+    size_t cursor=0;
+    int depth=0;
+    bool in_string=false;
+    bool escaped=false;
+
+    void begin(bool dropped_opener,size_t start=0) {
+        cursor=start;
+        depth=dropped_opener?1:0;
+        // Mode 10 starts after a synthesized {"name":" prefix.
+        in_string=dropped_opener;
+        escaped=false;
+    }
+
+    size_t advance(const std::string& text) {
+        while(cursor<text.size()) {
+            const char ch=text[cursor++];
+            if(escaped) { escaped=false; continue; }
+            if(in_string) {
+                if(ch=='\\') escaped=true;
+                else if(ch=='"') in_string=false;
+                continue;
+            }
+            if(ch=='"') in_string=true;
+            else if(ch=='{') depth++;
+            else if(ch=='}') {
+                if(depth<=0) return std::string::npos;
+                if(--depth==0) return cursor;
+            }
+        }
+        return std::string::npos;
+    }
+};
+
+inline size_t balanced_json_object_prefix_end(const std::string& text) {
+    if(text.empty() || text[0]!='{') return std::string::npos;
+    IncrementalBareJsonEnd scan;
+    scan.begin(false);
+    return scan.advance(text);
+}
+
+template<class NameSet>
+inline size_t bare_mode10_signature_position(
+    const std::string& text,const NameSet& names,
+    JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={},bool end_is_final=true) {
+    size_t first=std::string::npos;
+    for(const auto& name:names) {
+        if(name.empty()) continue;
+        const std::string signature=name+"\", \"";
+        for(size_t p=text.find(signature);p!=std::string::npos;
+            p=text.find(signature,p+1)) {
+            if(!bare_text_position_is_executable(
+                   text,p,string_state,fence_state,end_is_final)) continue;
+            first=std::min(first,p);
+            break;
+        }
+    }
+    return first;
+}
+
+// Start of the longest suffix that can still become a dropped-opener
+// signature. Quoted and fenced suffixes are ordinary displayed content.
+template<class NameSet>
+inline size_t bare_mode10_probe_start(
+    const std::string& text,const NameSet& names,
+    JsonStringLexState string_state={},
+    MarkdownFenceLexState fence_state={},bool end_is_final=true) {
+    size_t best=std::string::npos;
+    for(const auto& name:names) {
+        if(name.empty()) continue;
+        const std::string signature=name+"\", \"";
+        const size_t cap=std::min(text.size(),signature.size()-1);
+        for(size_t len=cap;len;--len) {
+            const size_t start=text.size()-len;
+            if(text.compare(start,len,signature,0,len)!=0) continue;
+            if(!bare_text_position_is_executable(
+                   text,start,string_state,fence_state,end_is_final)) break;
+            best=best==std::string::npos?start:std::min(best,start);
+            break;
+        }
+    }
+    return best;
+}
+
+template<class NameSet>
+inline bool bare_candidate_repair_eligible(
+    const std::string& text,const NameSet& names,bool mode10) {
+    // A mode-10 probe already contains a registered-name signature.  The
+    // balanced-object path is deferred only for the exact mode-11 shape;
+    // ordinary {"name":...} JSON must continue streaming immediately.
+    if(mode10) return true;
+    if(text.compare(0,7,"{\"name\"")!=0) return false;
+    const size_t colon=text.find(':',7);
+    if(colon==std::string::npos) return false;
+    size_t q1=colon+1;
+    while(q1<text.size() && (text[q1]==' ' || text[q1]=='\t' ||
+                             text[q1]=='\r' || text[q1]=='\n')) q1++;
+    if(q1==text.size() || text[q1]!='\"') return false;
+    const size_t q2=text.find('\"',q1+1);
+    if(q2==std::string::npos) return false;
+    const std::string name=text.substr(q1+1,q2-q1-1);
+    if(std::find(names.begin(),names.end(),name)==names.end()) return false;
+    const size_t arguments=text.find("\"arguments\"",q2+1);
+    if(arguments==std::string::npos) return false;
+    const size_t arguments_colon=text.find(':',arguments+11);
+    if(arguments_colon==std::string::npos) return false;
+    size_t object=arguments_colon+1;
+    while(object<text.size() && (text[object]==' ' || text[object]=='\t' ||
+                                 text[object]=='\r' || text[object]=='\n')) object++;
+    return object<text.size() && text[object]=='{';
+}
+
+// Streaming handlers cannot retract text after it reaches the wire. Hold only
+// plausible wrapper-less call prefixes, classify complete strict candidates,
+// and defer a balanced-but-malformed candidate until final tolerant recovery.
+// EmitCandidate receives a callback that preserves Markdown/string context for
+// visible bytes and reports parsing and policy acceptance separately.
+struct BareToolCandidateResult {
+    bool parsed=false;
+    bool accepted=false;
+    explicit operator bool() const { return parsed; }
+};
+
+struct BareToolTextHoldback {
+    std::string pending;
+    std::string probe;
+    std::string deferred;
+    std::string deferred_trailing;
+    bool deferred_mode10=false;
+    bool holding=false;
+    bool mode10=false;
+    bool input_final=false;
+    bool input_allow_repair=false;
+    bool ordinary_call_seen=false;
+    IncrementalBareJsonEnd scan;
+    JsonStringLexState string_state;
+    MarkdownFenceLexState fence_state;
+
+    template<class EmitText>
+    void emit_visible(const std::string& text,EmitText&& emit_text) {
+        consume_bare_text_context(string_state,fence_state,text);
+        if(!text.empty()) emit_text(text);
+    }
+
+    template<class EmitText,class EmitCandidate>
+    bool flush_candidate(bool allow_repair,EmitText&& emit_text,
+                         EmitCandidate&& emit_candidate,
+                         bool defer_failure=false) {
+        if(!holding) return false;
+        const bool candidate_mode10=mode10;
+        auto visible=[&](const std::string& text) {
+            emit_visible(text,emit_text);
+        };
+        const BareToolCandidateResult result=
+            emit_candidate(pending,allow_repair,visible);
+        if(!result.parsed) {
+            if(defer_failure) {
+                deferred=std::move(pending);
+                deferred_mode10=candidate_mode10;
+            } else visible(pending);
+        }
+        if(!candidate_mode10 && result.accepted) ordinary_call_seen=true;
+        pending.clear();
+        holding=false;
+        mode10=false;
+        string_state.reset();
+        return !result.parsed && defer_failure;
+    }
+
+    template<class NameSet,class EmitText,class EmitCandidate>
+    void route(const std::string& value,const NameSet& names,
+               EmitText&& emit_text,EmitCandidate&& emit_candidate) {
+        if(!deferred.empty()) {
+            deferred_trailing+=value;
+            return;
+        }
+        std::string remaining=std::move(probe);
+        probe.clear();
+        remaining+=value;
+        while(!remaining.empty()) {
+            if(holding) {
+                pending+=remaining;
+                remaining.clear();
+            } else {
+                const size_t object_pos=bare_object_position(
+                    remaining,string_state,fence_state,input_final);
+                const size_t mode10_pos=ordinary_call_seen?std::string::npos:
+                    bare_mode10_signature_position(
+                        remaining,names,string_state,fence_state,input_final);
+                const size_t opener=object_pos==std::string::npos?mode10_pos:
+                    mode10_pos==std::string::npos?object_pos:
+                    std::min(object_pos,mode10_pos);
+                if(opener==std::string::npos) {
+                    size_t keep=input_final || ordinary_call_seen?std::string::npos:
+                        bare_mode10_probe_start(
+                            remaining,names,string_state,fence_state,false);
+                    if(!input_final) {
+                        const size_t inline_keep=bare_unresolved_inline_probe_start(
+                            remaining,string_state,fence_state);
+                        if(inline_keep!=std::string::npos)
+                            keep=keep==std::string::npos?inline_keep:
+                                 std::min(keep,inline_keep);
+                    }
+                    if(keep==std::string::npos) emit_visible(remaining,emit_text);
+                    else {
+                        emit_visible(remaining.substr(0,keep),emit_text);
+                        probe=remaining.substr(keep);
+                    }
+                    return;
+                }
+                if(opener) emit_visible(remaining.substr(0,opener),emit_text);
+                pending=remaining.substr(opener);
+                holding=true;
+                mode10=mode10_pos==opener;
+                scan.begin(mode10);
+                remaining.clear();
+            }
+            if(!mode10 && !plausible_bare_tool_prefix(pending)) {
+                std::string retry=std::move(pending);
+                pending.clear();
+                holding=false;
+                emit_visible(retry.substr(0,1),emit_text);
+                remaining=retry.substr(1);
+                continue;
+            }
+            const size_t end=scan.advance(pending);
+            if(end==std::string::npos) return;
+            std::string trailing=pending.substr(end);
+            pending.resize(end);
+            const bool defer_failure=!input_final &&
+                bare_candidate_repair_eligible(pending,names,mode10);
+            if(flush_candidate(input_final && input_allow_repair,
+                               emit_text,emit_candidate,defer_failure)) {
+                deferred_trailing=std::move(trailing);
+                return;
+            }
+            remaining=std::move(trailing);
+        }
+    }
+
+    template<class NameSet,class EmitText,class EmitCandidate>
+    void finish(bool allow_repair,const NameSet& names,
+                EmitText&& emit_text,EmitCandidate&& emit_candidate) {
+        if(!probe.empty()) {
+            input_final=true;
+            input_allow_repair=allow_repair;
+            std::string final_probe=std::move(probe);
+            probe.clear();
+            route(final_probe,names,emit_text,emit_candidate);
+            input_final=false;
+            input_allow_repair=false;
+        }
+        std::string trailing;
+        if(!deferred.empty()) {
+            pending=std::move(deferred);
+            trailing=std::move(deferred_trailing);
+            holding=true;
+            mode10=deferred_mode10;
+            deferred_mode10=false;
+            flush_candidate(allow_repair,emit_text,emit_candidate);
+        }
+        if(!trailing.empty()) {
+            input_final=true;
+            input_allow_repair=allow_repair;
+            route(trailing,names,emit_text,emit_candidate);
+            input_final=false;
+            input_allow_repair=false;
+        }
+        flush_candidate(allow_repair,emit_text,emit_candidate);
+    }
+
+    void reset_context() {
+        string_state.reset();
+        fence_state.reset();
+        ordinary_call_seen=false;
+    }
+};
+
+template<class EmitText,class EmitCall>
+inline size_t route_bare_tool_sequence(
+    const std::string& source,const std::vector<ToolCall>& calls,
+    EmitText&& emit_text,EmitCall&& emit_call) {
+    size_t cursor=0;
+    for(const auto& call:calls) {
+        if(call.source_begin<cursor || call.source_end<call.source_begin ||
+           call.source_end>source.size()) {
+            emit_text(source);
+            return 0;
+        }
+        cursor=call.source_end;
+    }
+    cursor=0;
+    size_t emitted=0;
+    for(const auto& call:calls) {
+        emit_text(source.substr(cursor,call.source_begin-cursor));
+        cursor=call.source_end;
+        if(emit_call(call)) emitted++;
+        else emit_text(source.substr(
+            call.source_begin,call.source_end-call.source_begin));
+    }
+    emit_text(source.substr(cursor));
+    return emitted;
 }
 
 // Fallback for models that drop the <tool_call> wrapper and emit the call
@@ -841,16 +2501,7 @@ inline std::string strip_ws2(const std::string& s) {
 // strings so the call parses. Returns the input unchanged if no tag pair.
 inline std::string escape_json_interior(const std::string& s) {
     std::string esc;
-    for (char c : s) {
-        switch (c) {
-            case '"': esc += "\\\""; break;
-            case '\\': esc += "\\\\"; break;
-            case '\n': esc += "\\n"; break;
-            case '\r': esc += "\\r"; break;
-            case '\t': esc += "\\t"; break;
-            default: esc += c;
-        }
-    }
+    for (unsigned char c : s) append_json_escaped_byte(esc,c);
     return esc;
 }
 
@@ -1031,7 +2682,18 @@ inline void scan_namedropped(const std::string& text, const json* tools,
                              std::vector<ToolCall>& out, size_t* first) {
     if (!tools) return;
     size_t p = 0;
+    JsonStringLexState string_state;
+    MarkdownFenceLexState fence_state;
+    size_t context_cursor=0;
     while ((p = text.find("{\"name\":", p)) != std::string::npos) {
+        for(size_t cursor=context_cursor;cursor<p;cursor++)
+            consume_bare_text_context(string_state,fence_state,text[cursor]);
+        context_cursor=p;
+        if(!bare_context_is_executable(
+               text,p,string_state,fence_state,/*end_is_final=*/true)) {
+            p+=8;
+            continue;
+        }
         size_t q = p + 8;
         while (q < text.size() && (text[q]==' '||text[q]=='\t'||text[q]=='\r'||text[q]=='\n')) q++;
         if (q >= text.size() || text[q] != '{') { p += 8; continue; }
@@ -1060,6 +2722,9 @@ inline void scan_namedropped(const std::string& text, const json* tools,
                 std::string nm = infer_tool_name_unwrapped(*tools, args);
                 if (!nm.empty()) {
                     ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(args);
+                    tc.raw=text.substr(p,e-p+1);
+                    tc.rewritten_begin=p;
+                    tc.rewritten_end=e+1;
                     if (*first == std::string::npos) *first = p;
                     out.push_back(std::move(tc));
                 }
@@ -1161,25 +2826,12 @@ inline std::string first_balanced_object(const std::string& s) {
     return "";
 }
 
-// True if `pos` sits inside an open ```...``` fenced code block (an odd number
-// of ``` precede it). A tool call the model INTENDS to emit is never markdown-
-// fenced; a call shown as an example, or echoed from an injected file/page, is.
-// We look ONLY before `pos`, so a write whose VALUE contains fences (its ``` are
-// after the call's opener) is not mistaken for a fenced call.
-inline bool inside_fence(const std::string& s, size_t pos) {
-    size_t f = 0, count = 0;
-    while ((f = s.find("```", f)) != std::string::npos && f < pos) {
-        count++;
-        f += 3;
-    }
-    return (count & 1) != 0;
-}
 
 inline bool recover_raw_value_call(const std::string& text, const json& tools,
                                    std::vector<ToolCall>& out) {
     size_t mo = text.rfind("{\"name\"");
     if (mo == std::string::npos) return false;
-    if (inside_fence(text, mo)) return false; // fenced example, not a real call
+    if (!bare_text_position_is_executable(text, mo)) return false;
     size_t colon = text.find(':', mo + 6);
     if (colon == std::string::npos) return false;
     size_t q1 = text.find('"', colon + 1);
@@ -1209,8 +2861,8 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
     // parse the reconstructed object. The FIRST candidate that parses is the
     // real terminator -- inner quotes leave the tail as un-parseable raw code,
     // and a scalar arg after the value forces the correct earlier terminator
-    // (making that arg a valid sibling). Ordering-independent. The call must
-    // be at the end of the model output, which is the UN-RESCUED reality.
+    // (making that arg a valid sibling). Ordering-independent; map the
+    // reconstructed suffix back to the source so following prose is preserved.
     for (const auto& k : strkeys) {
         size_t kp = text.find("\"" + k + "\"", mo);
         if (kp == std::string::npos) continue;
@@ -1233,10 +2885,17 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
             json args = obj.contains("arguments") && obj["arguments"].is_object()
                             ? obj["arguments"]
                             : json::object();
+            const size_t suffix_offset=(opener-mo)+body.size()+2;
+            if(recon.size()<suffix_offset) continue;
+            const size_t source_end=cand+1+(recon.size()-suffix_offset);
+            if(source_end>text.size()) continue;
             ToolCall tc;
             tc.ok = true;
             tc.name = nm;
+            tc.rewritten_begin=mo;
+            tc.rewritten_end=source_end;
             tc.arguments = std::move(args);
+            tc.raw=text.substr(mo,source_end-mo);
             fprintf(stderr, "[drift] mode-11 raw-value rescue: %s.%s (%zu bytes)\n", nm.c_str(),
                     k.c_str(), cand - opener - 1);
             out.push_back(std::move(tc));
@@ -1249,13 +2908,16 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
-                                                   bool allow_o10 = true) {
+                                                   bool allow_o10 = true,
+                                                   bool allow_eof_repair = true,
+                                                   std::string* remaining_text = nullptr) {
     std::vector<ToolCall> out;
     if (tool_strict()) {
         // strict-parser A/B: the wrapper-less recovery chain (drift modes 1-6)
         // is OFF. Log when the text plausibly contained an intended call so the
         // campaign can count suppressed rescues against the tolerant leg.
         if (prefix) *prefix = "";
+        if (remaining_text) *remaining_text = text_in;
         if (text_in.find("{\"name\"") != std::string::npos ||
             text_in.find("{\"tool_call\"") != std::string::npos ||
             text_in.find("</content>") != std::string::npos)
@@ -1264,18 +2926,70 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         return out;
     }
     bool m2 = false, m5 = false, m6 = false, m8 = false; // drift-mode flags (exit-gate catalog)
+    struct SourceMappedText {
+        std::string value;
+        std::vector<size_t> boundaries;
+
+        explicit SourceMappedText(const std::string& source):value(source) {}
+
+        void ensure_boundaries() {
+            if(!boundaries.empty()) return;
+            boundaries.reserve(value.size()+1);
+            for(size_t i=0;i<=value.size();i++) boundaries.push_back(i);
+        }
+
+        size_t source_boundary(size_t position) const {
+            return boundaries.empty()?position:boundaries.at(position);
+        }
+
+        void insert(size_t position,const std::string& added) {
+            ensure_boundaries();
+            const size_t source=boundaries.at(position);
+            value.insert(position,added);
+            boundaries.insert(boundaries.begin()+position+1,added.size(),source);
+        }
+
+        void replace_with(const std::string& replacement) {
+            if(replacement==value) return;
+            ensure_boundaries();
+            size_t prefix=0;
+            while(prefix<value.size() && prefix<replacement.size() &&
+                  value[prefix]==replacement[prefix]) prefix++;
+            size_t old_suffix=value.size(),new_suffix=replacement.size();
+            while(old_suffix>prefix && new_suffix>prefix &&
+                  value[old_suffix-1]==replacement[new_suffix-1]) {
+                old_suffix--;
+                new_suffix--;
+            }
+            const size_t source_begin=boundaries[prefix];
+            const size_t source_end=boundaries[old_suffix];
+            std::vector<size_t> next;
+            next.reserve(replacement.size()+1);
+            next.insert(next.end(),boundaries.begin(),boundaries.begin()+prefix+1);
+            const size_t replacement_size=new_suffix-prefix;
+            if(replacement_size==0) next.back()=source_end;
+            else for(size_t i=0;i<replacement_size;i++)
+                next.push_back(i+1==replacement_size?source_end:source_begin);
+            next.insert(next.end(),boundaries.begin()+old_suffix+1,boundaries.end());
+            value=replacement;
+            boundaries=std::move(next);
+        }
+    };
+    SourceMappedText rewritten(text_in);
+    rewritten.replace_with(escape_content_tags(rewritten.value));
     // drift mode 9 (2026-07-11, codex-harnessed traffic): the model drops the
     // OPENING quote of the "arguments" key ({"name":"X",\narguments":{...}}).
     // "arguments" is the tool-call schema key, so quoting a bare `arguments":`
     // is unambiguous inside these segments. Applied before segmentation so
     // both the whole-object and truncated-tail parse paths see valid JSON.
-    auto fix_arg_quote = [](std::string s) {
+    auto fix_arg_quote = [](SourceMappedText& text) {
         size_t p = 0;
-        while ((p = s.find("arguments\"", p)) != std::string::npos) {
-            if (p == 0 || s[p - 1] != '"') { s.insert(p, "\""); p += 11; }
-            else p += 10;
+        while ((p = text.value.find("arguments\"", p)) != std::string::npos) {
+            if (p == 0 || text.value[p - 1] != '"') {
+                text.insert(p,"\"");
+                p += 11;
+            } else p += 10;
         }
-        return s;
     };
     // drift mode 12 (2026-07-19, club-3090 cli-40 agent): the model drops the
     // QUOTES around the tool-NAME value -- {"name": bash, "arguments": {...}}.
@@ -1284,20 +2998,22 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     // name is quoted the object parses on the normal path. SAFE because we only
     // quote a bareword that EXACTLY matches a registered tool name -- prose,
     // non-tool JSON, null/numbers, and unknown names are left untouched.
-    auto fix_unquoted_name = [](std::string s, const json* tools) {
-        if (!tools || !tools->is_array()) return s;
+    auto fix_unquoted_name = [](SourceMappedText& text, const json* tools) {
+        if (!tools || !tools->is_array()) return;
         size_t p = 0;
-        while ((p = s.find("\"name\":", p)) != std::string::npos) {
+        while ((p = text.value.find("\"name\":", p)) != std::string::npos) {
             size_t c = p + 7;
-            while (c < s.size() && (s[c] == ' ' || s[c] == '\t' || s[c] == '\n' || s[c] == '\r'))
-                c++;
-            if (c < s.size() && s[c] != '"' &&
-                (isalpha((unsigned char)s[c]) || s[c] == '_')) {
+            while (c < text.value.size() &&
+                   (text.value[c] == ' ' || text.value[c] == '\t' ||
+                    text.value[c] == '\n' || text.value[c] == '\r')) c++;
+            if (c < text.value.size() && text.value[c] != '"' &&
+                (isalpha((unsigned char)text.value[c]) || text.value[c] == '_')) {
                 size_t e = c;
-                while (e < s.size() && (isalnum((unsigned char)s[e]) || s[e] == '_' ||
-                                        s[e] == '-' || s[e] == '.'))
-                    e++;
-                const std::string word = s.substr(c, e - c);
+                while (e < text.value.size() &&
+                       (isalnum((unsigned char)text.value[e]) ||
+                        text.value[e] == '_' || text.value[e] == '-' ||
+                        text.value[e] == '.')) e++;
+                const std::string word = text.value.substr(c, e - c);
                 bool match = false;
                 for (const auto& t : *tools)
                     if (t.contains("function") &&
@@ -1309,26 +3025,37 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     // Add the closing quote only if one isn't already there:
                     // {"name": bash,   -> both quotes; {"name": read"  (dropped
                     // OPENING quote, stray close) -> opening only (thunderdome).
-                    if (!(e < s.size() && s[e] == '"')) s.insert(e, "\"");
-                    s.insert(c, "\"");
+                    if (!(e < text.value.size() && text.value[e] == '"'))
+                        text.insert(e,"\"");
+                    text.insert(c,"\"");
                     p = e + 2;
                     continue;
                 }
             }
             p = c;
         }
-        return s;
     };
-    const std::string text =
-        fix_unquoted_name(fix_arg_quote(escape_content_tags(text_in)), tools);
+    fix_arg_quote(rewritten);
+    fix_unquoted_name(rewritten,tools);
+    const std::string& text=rewritten.value;
     const bool m3 = (text != text_in);              // mode 3: <content>-tagged value rewritten
     const bool m4 = text.find("{\"tool_call\":") != std::string::npos; // mode 4: JSON-keyed opener
     size_t first = std::string::npos;
     size_t i = text.find('{');
+    JsonStringLexState candidate_string_state;
+    MarkdownFenceLexState candidate_fence_state;
+    size_t candidate_context_cursor=0;
     while (i != std::string::npos) {
-        // A {...} sitting inside a ```fenced``` block is a displayed example /
-        // echoed injection, not a call the model is making -- don't recover it.
-        if (inside_fence(text, i)) {
+        // Displayed Markdown is an example or echoed input, not a call the
+        // model is making.  Malformed earlier call text must not poison a
+        // later executable candidate's independent recovery.
+        for(size_t cursor=candidate_context_cursor;cursor<i;cursor++)
+            consume_bare_text_context(
+                candidate_string_state,candidate_fence_state,text[cursor]);
+        candidate_context_cursor=i;
+        if(!bare_context_is_executable(
+               text,i,candidate_string_state,candidate_fence_state,
+               /*end_is_final=*/true)) {
             i = text.find('{', i + 1);
             continue;
         }
@@ -1355,6 +3082,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             else if (ch == '}' && --depth == 0) { end = j; break; }
         }
         if (end == std::string::npos) {
+            if (!allow_eof_repair) break;
             // unbalanced to EOF: repair only a {"name" candidate (truncated
             // final call); otherwise keep scanning inner objects. `san` holds
             // the sanitized remainder (scan ran to EOF).
@@ -1411,6 +3139,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             bool recovered_here = false;
             if (shaped) {
                 ToolCall tc = parse_tool_call(r);
+                tc.raw=text.substr(i);
+                tc.rewritten_begin=i;
+                tc.rewritten_end=text.size();
                 if (tc.ok) {
                     if (first == std::string::npos) first = i;
                     out.push_back(tc);
@@ -1426,11 +3157,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             i = text.find('{', i + 1);
             continue;
         }
+        const std::string raw_seg=text.substr(i,end-i+1);
         const std::string& seg = san;
         bool shaped = false, m6cand = false, m8cand = false;
+        bool valid_json=false;
         json j6, j8;
         try {
             json j = json::parse(seg);
+            valid_json=true;
             shaped = j.is_object() && j.contains("name") && j.contains("arguments");
             if (!shaped && j.is_object() && j.contains("name") &&
                 j["name"].is_object() && !j.contains("arguments")) {
@@ -1441,6 +3175,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         } catch (...) {}
         if (shaped) {
             ToolCall tc = parse_tool_call(seg);
+            tc.raw=raw_seg;
+            tc.rewritten_begin=i;
+            tc.rewritten_end=end+1;
             if (tc.ok) {
                 if (first == std::string::npos) first = i;
                 out.push_back(tc);
@@ -1455,6 +3192,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             std::string nm = infer_tool_name_unwrapped(*tools, m6args);
             if (!nm.empty()) {
                 ToolCall tc; tc.ok = true; tc.name = nm; tc.arguments = std::move(m6args);
+                tc.raw=raw_seg;
+                tc.rewritten_begin=i;
+                tc.rewritten_end=end+1;
                 if (first == std::string::npos) first = i;
                 out.push_back(std::move(tc));
                 m6 = true;
@@ -1479,6 +3219,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                     for (auto it = j8.begin(); it != j8.end(); ++it)
                         if (it.key() != "name") args[it.key()] = it.value();
                     ToolCall tc; tc.ok = true; tc.name = cand; tc.arguments = std::move(args);
+                    tc.raw=raw_seg;
+                    tc.rewritten_begin=i;
+                    tc.rewritten_end=end+1;
                     if (first == std::string::npos) first = i;
                     out.push_back(std::move(tc));
                     m8 = true;
@@ -1492,6 +3235,9 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             json aa;
             if (resolve_aliased_call(*tools, j8, an, aa)) {
                 ToolCall tc; tc.ok = true; tc.name = std::move(an); tc.arguments = std::move(aa);
+                tc.raw=raw_seg;
+                tc.rewritten_begin=i;
+                tc.rewritten_end=end+1;
                 if (first == std::string::npos) first = i;
                 out.push_back(std::move(tc));
                 m8 = true;
@@ -1499,11 +3245,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 continue;
             }
         }
-        i = text.find('{', i + 1);
+        i = text.find('{', valid_json ? end + 1 : i + 1);
     }
     // Fallback: name-dropped mode-6 BATCH (the main scan can't segment it). Only when the
     // standard scan found nothing, so normal calls are never double-counted.
-    if (out.empty() && tools && text.find("{\"name\":") != std::string::npos) {
+    if (out.empty() && allow_eof_repair && tools &&
+        text.find("{\"name\":") != std::string::npos) {
         scan_namedropped(text, tools, out, &first);
         if (!out.empty()) m6 = true;
     }
@@ -1526,25 +3273,182 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     // false in the recursion so a still-broken splice cannot loop). This is
     // the deterministic early-quit the n=3 seal caught: a missed first call
     // ends the agent turn with a leaked-JSON text response.
-    if (out.empty() && allow_o10 && tools && tools->is_array()) {
+    if (allow_o10 && tools && tools->is_array()) {
+        struct O10Candidate { size_t source,end; std::string name; };
+        std::vector<O10Candidate> candidates;
         for (const auto& t : *tools) {
-            std::string nm = t.contains("function")
-                                 ? t["function"].value("name", std::string())
-                                 : std::string();
-            if (nm.empty()) continue;
-            const std::string sig = nm + "\", \"";
-            size_t p = text.find(sig);
-            if (p == std::string::npos) continue;
-            if (p > 0 && text[p - 1] == '"') continue; // already `"name": "NAME"`
-            std::string synth = text.substr(0, p) + "{\"name\": \"" + text.substr(p);
-            if (synth.find('}') == std::string::npos) synth += "}";
-            std::string pre2;
-            auto rec = parse_bare_tool_calls(synth, &pre2, tools, /*allow_o10=*/false);
-            if (!rec.empty()) {
-                out = std::move(rec);
-                if (prefix) *prefix = pre2;
-                fprintf(stderr, "[drift] mode-10 dropped-opener rescue: %s\n", nm.c_str());
-                break;
+            const std::string nm=t.contains("function")
+                ?t["function"].value("name",std::string()):std::string();
+            if(nm.empty()) continue;
+            const std::string sig=nm+"\", \"";
+            for(size_t p=text.find(sig);p!=std::string::npos;p=text.find(sig,p+1)) {
+                // Quoted-string filtering runs after source-order sorting so
+                // an accepted dropped-opener call can restore lexical state
+                // before a later call in the same batch.
+                // Once the ordinary scanner has found a call, a matching
+                // signature after it is prose, not another executable item.
+                // Mode 10 only repairs dropped openers that precede the first
+                // already-classified call (or the whole turn when none exist).
+                if(first!=std::string::npos && p>=first) continue;
+                candidates.push_back({p,p+sig.size(),nm});
+            }
+        }
+        std::sort(candidates.begin(),candidates.end(),
+                  [](const O10Candidate& a,const O10Candidate& b) {
+                      if(a.source!=b.source) return a.source<b.source;
+                      return a.end>b.end; // same start: keep the longest name
+                  });
+        std::vector<O10Candidate> nonoverlapping;
+        for(auto& candidate:candidates)
+            if(nonoverlapping.empty() || candidate.source>=nonoverlapping.back().end)
+                nonoverlapping.push_back(std::move(candidate));
+        candidates=std::move(nonoverlapping);
+        JsonStringLexState lexical;
+        MarkdownFenceLexState fence;
+        size_t lexical_cursor=0,repaired_until=0,invalid_until=0;
+        const std::string mode10_opener="{\"name\": \"";
+        struct InvalidO10Context { size_t source,end; };
+        std::vector<InvalidO10Context> invalid_contexts;
+        constexpr size_t max_invalid_contexts=8;
+        auto add_invalid_context=[&](size_t source,size_t end) {
+            if(invalid_contexts.size()>=max_invalid_contexts) return false;
+            invalid_contexts.push_back({source,end});
+            return true;
+        };
+        std::vector<O10Candidate> safe_candidates;
+        auto consume_mode10_context=[&](size_t begin,size_t end) {
+            end=std::min(end,text.size());
+            for(size_t i=std::min(begin,end);i<end;i++)
+                consume_bare_text_context(lexical,fence,text[i]);
+        };
+        for(auto& candidate:candidates) {
+            if(candidate.source<repaired_until) continue;
+            if(candidate.source<invalid_until) {
+                const bool nested=std::any_of(
+                    invalid_contexts.begin(),invalid_contexts.end(),
+                    [&](const InvalidO10Context& context) {
+                        return candidate.source>context.source &&
+                               candidate.source<context.end;
+                    });
+                if(nested) continue;
+                lexical.reset();
+                fence.reset();
+                lexical_cursor=candidate.source;
+            } else if(lexical_cursor<invalid_until) {
+                lexical.reset();
+                fence.reset();
+                lexical_cursor=invalid_until;
+            }
+            consume_mode10_context(lexical_cursor,candidate.source);
+            lexical_cursor=candidate.source;
+            if(!bare_context_is_executable(
+                   text,candidate.source,lexical,fence,true)) continue;
+            IncrementalBareJsonEnd completion;
+            completion.begin(true,candidate.source);
+            const size_t call_end=completion.advance(text);
+            const size_t context_end=call_end==std::string::npos
+                ?text.size():call_end;
+            std::string probe=mode10_opener;
+            probe.append(text,candidate.source,context_end-candidate.source);
+            if(call_end==std::string::npos && allow_eof_repair) probe+='}';
+            if(call_end==std::string::npos && !allow_eof_repair) {
+                invalid_until=text.size();
+                if(!add_invalid_context(candidate.source,context_end)) break;
+                lexical.reset();
+                fence.reset();
+                lexical_cursor=candidate.end;
+                continue;
+            }
+            std::string probe_prefix,probe_remaining;
+            const auto parsed_candidate=parse_bare_tool_calls(
+                probe,&probe_prefix,tools,/*allow_o10=*/false,
+                allow_eof_repair,&probe_remaining);
+            const bool validated=std::any_of(
+                parsed_candidate.begin(),parsed_candidate.end(),
+                [&](const ToolCall& call) {
+                    return call.ok && call.name==candidate.name &&
+                           call.source_begin==0;
+                });
+            if(!validated) {
+                invalid_until=std::max(
+                    invalid_until,
+                    call_end==std::string::npos?text.size():call_end);
+                if(!add_invalid_context(candidate.source,context_end)) break;
+                lexical.reset();
+                fence.reset();
+                lexical_cursor=candidate.end;
+                continue;
+            }
+            safe_candidates.push_back(candidate);
+            repaired_until=call_end==std::string::npos?text.size():call_end;
+            lexical_cursor=repaired_until;
+            lexical.reset();
+            fence.reset();
+        }
+        candidates=std::move(safe_candidates);
+        if(!candidates.empty()) {
+            struct O10Insertion { size_t begin,end,source; };
+            // A validated candidate may follow malformed same-line call text
+            // with an unmatched quote. The synthetic newline is removed by
+            // source mapping and prevents that discarded prefix from poisoning
+            // the independently validated repaired object.
+            const std::string opener="\n{\"name\": \"";
+            std::vector<O10Insertion> insertions;
+            std::string synth;
+            size_t cursor=0;
+            for(const auto& candidate:candidates) {
+                synth.append(text,cursor,candidate.source-cursor);
+                const size_t begin=synth.size();
+                synth+=opener;
+                insertions.push_back({begin,synth.size(),candidate.source});
+                cursor=candidate.source;
+            }
+            synth.append(text,cursor,std::string::npos);
+            if(synth.find('}')==std::string::npos && allow_eof_repair) {
+                const size_t begin=synth.size();
+                synth+='}';
+                insertions.push_back({begin,synth.size(),text.size()});
+            }
+            std::string pre2,rec_remaining;
+            auto rec=parse_bare_tool_calls(synth,&pre2,tools,
+                                           /*allow_o10=*/false,allow_eof_repair,
+                                           &rec_remaining);
+            if(!rec.empty()) {
+                auto source_boundary=[&](size_t boundary) {
+                    size_t removed=0;
+                    for(const auto& insertion:insertions) {
+                        if(boundary<=insertion.begin) break;
+                        if(boundary<=insertion.end) return insertion.source;
+                        removed+=insertion.end-insertion.begin;
+                    }
+                    return boundary-removed;
+                };
+                bool mapped=true;
+                for(auto& call:rec) {
+                    if(call.source_begin==std::string::npos ||
+                       call.source_end==std::string::npos) {
+                        mapped=false;
+                        break;
+                    }
+                    const size_t begin=source_boundary(call.source_begin);
+                    const size_t end=source_boundary(call.source_end);
+                    if(end<begin || end>text.size()) {
+                        mapped=false;
+                        break;
+                    }
+                    call.source_begin=begin;
+                    call.source_end=end;
+                    call.rewritten_begin=begin;
+                    call.rewritten_end=end;
+                    call.raw=text.substr(begin,end-begin);
+                }
+                if(mapped) {
+                    out=std::move(rec);
+                    first=out.front().source_begin;
+                    if(prefix) *prefix=strip_ws2(text.substr(0,first));
+                    fprintf(stderr,"[drift] mode-10 dropped-opener rescue: %s (%zu calls)\n",
+                            candidates.front().name.c_str(),out.size());
+                }
             }
         }
     }
@@ -1552,10 +3456,51 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     // Last resort -- runs only when everything above failed. Sets the prefix
     // to the text before the call object so a preamble ("Let me write...")
     // still streams as text.
-    if (out.empty() && tools && tools->is_array() &&
-        recover_raw_value_call(text, *tools, out) && prefix) {
+    if (out.empty() && allow_eof_repair && tools && tools->is_array() &&
+        recover_raw_value_call(text, *tools, out)) {
         size_t mo = text.rfind("{\"name\"");
-        *prefix = mo != std::string::npos ? strip_ws2(text.substr(0, mo)) : std::string();
+        const std::string before = mo != std::string::npos
+            ? strip_ws2(text.substr(0, mo)) : std::string();
+        if (prefix) *prefix = before;
+        if (remaining_text) *remaining_text = before;
+    }
+    bool exact_source_spans=true;
+    size_t source_cursor=0;
+    for(auto& call:out) {
+        if(call.rewritten_begin==std::string::npos ||
+           call.rewritten_end==std::string::npos ||
+           call.rewritten_begin>call.rewritten_end ||
+           call.rewritten_end>rewritten.value.size()) {
+            exact_source_spans=false;
+            break;
+        }
+        const size_t begin=rewritten.source_boundary(call.rewritten_begin);
+        const size_t end=rewritten.source_boundary(call.rewritten_end);
+        if(begin<source_cursor || end<begin || end>text_in.size()) {
+            exact_source_spans=false;
+            break;
+        }
+        call.source_begin=begin;
+        call.source_end=end;
+        call.raw=text_in.substr(begin,end-begin);
+        source_cursor=end;
+    }
+    if(!exact_source_spans) out.clear();
+    if(remaining_text) {
+        if(out.empty()) {
+            *remaining_text=text_in;
+        } else {
+            std::string remainder;
+            remainder.reserve(text_in.size());
+            source_cursor=0;
+            for(const auto& call:out) {
+                remainder.append(text_in,source_cursor,
+                                 call.source_begin-source_cursor);
+                source_cursor=call.source_end;
+            }
+            remainder.append(text_in,source_cursor,std::string::npos);
+            *remaining_text=std::move(remainder);
+        }
     }
     // Drift catalog (exit gate, docs/sampling-exit-gate.md): tag which tool-format
     // drift mode(s) the fallback chain rescued, or flag an intended call it could
@@ -1595,6 +3540,131 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     return out;
 }
 
+struct OrderedToolPart {
+    enum class Kind { Text, Call };
+    Kind kind=Kind::Text;
+    size_t text_begin=0;
+    size_t text_end=0;
+    size_t call_index=0;
+};
+
+struct OrderedToolOutput {
+    std::string text;
+    std::string reasoning;
+    std::vector<ToolCall> calls;
+    std::vector<OrderedToolPart> parts;
+    size_t recovered = 0;
+
+    void append_visible_text(const std::string& raw) {
+        if(raw.empty()) return;
+        const size_t begin=text.size();
+        text+=raw;
+        if(!parts.empty() && parts.back().kind==OrderedToolPart::Kind::Text &&
+           parts.back().text_end==begin) {
+            parts.back().text_end=text.size();
+            return;
+        }
+        OrderedToolPart part;
+        part.kind=OrderedToolPart::Kind::Text;
+        part.text_begin=begin;
+        part.text_end=text.size();
+        parts.push_back(part);
+    }
+
+    void append_tool_call(ToolCall call) {
+        OrderedToolPart part;
+        part.kind=OrderedToolPart::Kind::Call;
+        part.call_index=calls.size();
+        calls.push_back(std::move(call));
+        parts.push_back(part);
+    }
+};
+
+inline std::string take_unclosed_final_tool_segment(
+    std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
+    bool wrapper_incomplete) {
+    if(!wrapper_incomplete || segments.empty() ||
+       segments.back().first!=StreamSplitter::TOOL) return {};
+    std::string raw=std::move(segments.back().second);
+    segments.pop_back();
+    return raw;
+}
+
+// Resolve generated text and wrapped calls in generation order. This matters
+// when parallel calls are disabled: a bare call emitted before a later wrapped
+// call must win, and rejected or malformed bytes must remain visible as text.
+template<class Eligible>
+inline OrderedToolOutput resolve_ordered_tool_segments(
+
+    const std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
+    const json* tools,bool allow_eof_repair,Eligible eligible) {
+    OrderedToolOutput out;
+    auto append_text=[&](const std::string& raw,bool repair_eof) {
+        if(!tools) { out.append_visible_text(raw); return; }
+        if(raw.empty()) return;
+        std::string pre,residual;
+        auto calls=parse_bare_tool_calls(raw,&pre,tools,true,
+                                         repair_eof,&residual);
+        if(calls.empty()) { out.append_visible_text(raw); return; }
+        size_t cursor=0;
+        for(auto& call:calls) {
+            out.append_visible_text(raw.substr(cursor,call.source_begin-cursor));
+            cursor=call.source_end;
+            if(eligible(call.name,out.calls.size())) {
+                out.recovered++;
+                out.append_tool_call(std::move(call));
+            } else {
+                out.append_visible_text(raw.substr(
+                    call.source_begin,call.source_end-call.source_begin));
+            }
+        }
+        out.append_visible_text(raw.substr(cursor));
+    };
+    std::string pending_text;
+    auto flush_pending_text=[&](bool final_segment) {
+        if(pending_text.empty()) return;
+        append_text(pending_text,final_segment && allow_eof_repair);
+        pending_text.clear();
+    };
+    for(const auto& segment:segments) {
+        if(segment.first==StreamSplitter::TEXT) {
+            pending_text+=segment.second;
+            continue;
+        }
+        flush_pending_text(false);
+        if(segment.first==StreamSplitter::THINK) {
+            out.reasoning+=segment.second;
+            continue;
+        }
+        ToolCall call=parse_tool_call(strip_ws2(segment.second));
+        if(call.ok && eligible(call.name,out.calls.size()))
+            out.append_tool_call(std::move(call));
+        else out.append_visible_text(call.raw);
+    }
+    flush_pending_text(true);
+    return out;
+}
+
+template<class ToolBlock>
+inline size_t append_anthropic_ordered_content(
+    json& content,const OrderedToolOutput& out,ToolBlock tool_block) {
+    size_t emitted=0;
+    size_t call_number=0;
+    for(const auto& part:out.parts) {
+        if(part.kind==OrderedToolPart::Kind::Call) {
+            content.push_back(tool_block(out.calls.at(part.call_index),call_number++));
+            emitted++;
+            continue;
+        }
+        if(part.text_begin>=part.text_end) continue;
+        content.push_back({{"type","text"},
+                           {"text",out.text.substr(
+                               part.text_begin,part.text_end-part.text_begin)}});
+        emitted++;
+    }
+    return emitted;
+}
+
 // Single-call convenience wrapper (first recovered call). suffix retained for
 // callers that trim trailing junk; multi-call callers use the vector form.
 inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* prefix,
@@ -1613,7 +3683,7 @@ inline ToolCall parse_bare_tool_call(const std::string& text_in, std::string* pr
 
 inline json openai_tool_call_json(const std::string& id, const ToolCall& c) {
     return {{"id", id}, {"type", "function"},
-            {"function", {{"name", c.name}, {"arguments", c.arguments.dump()}}}};
+            {"function", {{"name", c.name}, {"arguments", json_dump_replace(c.arguments)}}}};
 }
 
 // Non-streaming choices[0].message. content is null ONLY when there is at
@@ -1670,10 +3740,26 @@ struct ResponsesTerminalState {
     const char* event;
 };
 inline ResponsesTerminalState responses_terminal_state(
+    bool limit_reached) {
+    return {limit_reached, limit_reached ? "incomplete" : "completed",
+            limit_reached ? "response.incomplete" : "response.completed"};
+}
+inline ResponsesTerminalState responses_terminal_state(
     int produced, int limit, bool budget_truncated) {
-    const bool incomplete = produced >= limit || budget_truncated;
-    return {incomplete, incomplete ? "incomplete" : "completed",
-            incomplete ? "response.incomplete" : "response.completed"};
+    return responses_terminal_state(produced >= limit || budget_truncated);
+}
+
+inline bool unfinished_tool_wrapper(
+    int produced,int limit,bool budget_truncated,
+    StreamSplitter::Chan final_channel) {
+    return (produced>=limit || budget_truncated) &&
+           final_channel==StreamSplitter::TOOL;
+}
+
+inline std::string take_responses_output_text(std::string& text) {
+    std::string output=std::move(text);
+    text.clear();
+    return output;
 }
 
 // One streamed tool_calls[] delta entry. Whole-shot (id+name+full arguments
@@ -1686,7 +3772,7 @@ inline json openai_tool_call_delta(int index, const std::string& id, const ToolC
                                          {"id", id},
                                          {"type", "function"},
                                          {"function", {{"name", c.name},
-                                                       {"arguments", c.arguments.dump()}}}}})}};
+                                                       {"arguments", json_dump_replace(c.arguments)}}}}})}};
 }
 
 // ---- API key authentication -----------------------------------------------
@@ -1724,10 +3810,21 @@ inline bool secure_compare(const std::string& a, const std::string& b) {
 inline std::string extract_api_key(const std::string& authorization_header,
                                    const std::string& x_api_key_header) {
     if (!x_api_key_header.empty()) return x_api_key_header;
-    static const std::string prefix = "Bearer ";
-    if (authorization_header.size() > prefix.size() &&
-        authorization_header.compare(0, prefix.size(), prefix) == 0)
-        return authorization_header.substr(prefix.size());
+    static constexpr char bearer[]="bearer";
+    constexpr size_t scheme_size=sizeof(bearer)-1;
+    if(authorization_header.size()<=scheme_size) return "";
+    for(size_t i=0;i<scheme_size;i++) {
+        char ch=authorization_header[i];
+        if(ch>='A' && ch<='Z') ch=(char)(ch-'A'+'a');
+        if(ch!=bearer[i]) return "";
+    }
+    size_t token=scheme_size;
+    if(authorization_header[token]!=' ' && authorization_header[token]!='\t')
+        return "";
+    while(token<authorization_header.size() &&
+          (authorization_header[token]==' ' || authorization_header[token]=='\t'))
+        token++;
+    if(token<authorization_header.size()) return authorization_header.substr(token);
     return "";
 }
 
