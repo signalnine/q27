@@ -2190,6 +2190,13 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         // `</parameter>` before the first real `<parameter=` is ignored by the
         // scan below, which searches forward for the opener.
         size_t ns = b + 6;
+        // Tolerate the name on the NEXT line after `<name>` -- a real
+        // emission (and this harness's mangled tool transport) can open
+        // `<name>` and drop the identifier on the following line. The old
+        // code read "up to the first newline", yielding an EMPTY name and
+        // refusing the whole call. Mirror parse_function_opener's leading-
+        // whitespace skip so `<name>\nbash\n<parameter=...>` -> name="bash".
+        while (ns < seg.size() && isspace((unsigned char)seg[ns])) ns++;
         size_t ne = seg.find('\n', ns);
         if (ne == std::string::npos) ne = seg.size();
         tc.name = seg.substr(ns, ne - ns);

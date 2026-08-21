@@ -504,6 +504,19 @@ static void test_mode18_bare_name_opener() {
            t4.name == "Read" &&
            t4.arguments.value("file_path", std::string()) == "/x/y.py",
        "mode18: bare <name> without the stray closer");
+    // Mode-18 gap (found via pi's mangled tool transport): the name opens
+    // `<name>` but lands on the NEXT line. Pre-fix this read an empty name
+    // and refused the whole call. Corroborating <parameter= present, so this
+    // must rescue -- and must NOT swallow an identical opener with no dialect.
+    q27::ToolCall t5;
+    ok(q27::parse_native_xml_call("<name>\nbash\n</parameter>\n"
+                                  "<parameter=command>\nls /code\n</parameter>\n", t5) &&
+           t5.ok && t5.name == "bash" &&
+           t5.arguments.value("command", std::string()) == "ls /code",
+       "mode18-FIX: name on the line after <name> is still recognized");
+    q27::ToolCall t6;
+    ok(!q27::parse_native_xml_call("<name>\njust prose, no dialect follows", t6),
+       "mode18-FIX: name-on-next-line with no dialect is NOT a call");
 }
 
 static void test_mode14_tool_name_xml_dialect() {
