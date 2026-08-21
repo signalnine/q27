@@ -270,10 +270,13 @@ inline bool tool_dialect_xml() {
     if (d) return !strcmp(d, "xml");
     return tool_dialect_xml_default();
 }
-// Q27_TOOL_DIALECT=xml swaps the calling instruction for the dialect the
-// checkpoint was trained on (see parse_native_xml_call above). Default stays
-// JSON: 3.6 complied with it well, and the A/B that would justify flipping the
-// default is exactly what this knob exists to run.
+// Q27_TOOL_DIALECT=xml|json overrides either direction. The DEFAULT is now
+// auto-selected from the artifact's general.name (see
+// set_tool_dialect_for_model above): 3.8-family checkpoints boot as XML
+// (their trained format -- the 08-14 A/B showed zero drift rescues under
+// XML vs four under JSON), and 3.6-family boot as JSON (3.6 demonstrably
+// complies with JSON). The knob exists for A/Bs and for fine-tunes whose
+// general.name normalization misses the "qwen38" substring.
 
 // Reasoning-effort instruction (Qwen3.8 chat_template.jinja): with thinking
 // enabled the trained template injects this line at the HEAD of the system
@@ -2042,6 +2045,57 @@ inline OpenAIToolSelection select_openai_tools(const json& body,const ToolChoice
     return selected;
 }
 
+// Per-tool parameter-key extraction, aligned with OpenAIToolSelection::names.
+// Used by the XML-dialect toolgram (--constrain-tools on Qwen3.8) to build
+// its schema-aware parameter-key allowlist: only declared property names are
+// legal as <parameter=...> keys, which is what stops the model from
+// emitting undeclared keys in its XML tool body. Returns one vector per tool,
+// in the same order as `selected.names`; tools whose parameters block is
+// missing/malformed get an empty list (the grammar then accepts any key for
+// that tool -- a permissive fallback for malformed schemas rather than a
+// silent rejection of the whole request).
+inline std::vector<std::vector<std::string>>
+tool_param_keys_per_name(const OpenAIToolSelection& selected) {
+    std::vector<std::vector<std::string>> out;
+    out.reserve(selected.tools.size());
+    for (const auto& t : selected.tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("properties") &&
+            t["function"]["parameters"]["properties"].is_object()) {
+            for (auto it = t["function"]["parameters"]["properties"].begin();
+                 it != t["function"]["parameters"]["properties"].end(); ++it) {
+                keys.push_back(it.key());
+            }
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+
+// json-array overload (for callers that already moved `tools` out of the
+// selection; the two backends' selected-tools arrays are both aligned with
+// tool_names_v).
+inline std::vector<std::vector<std::string>>
+tool_param_keys_per_name(const json& tools) {
+    std::vector<std::vector<std::string>> out;
+    if (!tools.is_array()) return out;
+    out.reserve(tools.size());
+    for (const auto& t : tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("properties") &&
+            t["function"]["parameters"]["properties"].is_object()) {
+            for (auto it = t["function"]["parameters"]["properties"].begin();
+                 it != t["function"]["parameters"]["properties"].end(); ++it) {
+                keys.push_back(it.key());
+            }
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+
 // Anthropic counts every declaration even when tool_choice narrows eligibility.
 // The inactive block keeps that accounting while leaving only selected schemas
 // in the callable interface. This choice-specific system prompt is intentional:
@@ -2190,6 +2244,13 @@ inline bool parse_native_xml_call(const std::string& seg, ToolCall& tc) {
         // `</parameter>` before the first real `<parameter=` is ignored by the
         // scan below, which searches forward for the opener.
         size_t ns = b + 6;
+        // Tolerate the name on the NEXT line after `<name>` -- a real
+        // emission (and this harness's mangled tool transport) can open
+        // `<name>` and drop the identifier on the following line. The old
+        // code read "up to the first newline", yielding an EMPTY name and
+        // refusing the whole call. Mirror parse_function_opener's leading-
+        // whitespace skip so `<name>\nbash\n<parameter=...>` -> name="bash".
+        while (ns < seg.size() && isspace((unsigned char)seg[ns])) ns++;
         size_t ne = seg.find('\n', ns);
         if (ne == std::string::npos) ne = seg.size();
         tc.name = seg.substr(ns, ne - ns);
@@ -3172,6 +3233,72 @@ inline bool looks_like_intended_tool_call(const std::string& text_in) {
            text_in.find("<tool_name>") != std::string::npos;
 }
 
+// HALLUCINATED-RESULT RULE (2026-08-21, unified).
+//
+// Qwen3.8 does not only degrade its tool-call wrapper -- it also invents tool
+// RESULTS wearing the very same tags:
+//
+//   <tool_calls>\n<result>\n<name>Read</name>\n<output>\nfile contents\n</output>
+//   \n<tool_name>\n<parameter=file_path>\n/w/x\n</parameter>\n</function>
+//
+// Promoting that to a call feeds the model's own fiction back as though a tool
+// had produced it, so every dialect recovery has to refuse it. The original
+// guard was a WHOLE-STRING `find("<result>")` over the entire segment, which
+// is both too weak and too strong:
+//
+//   too strong -- a legitimate call preceded by an unrelated, already-CLOSED
+//   `<output>make: up to date</output>` (a quoted result from a prior step,
+//   ordinary prose in an agent transcript) was thrown away wholesale. That is
+//   the production leak behind "sometimes I still see <parameter= / </function>
+//   in the output": the real call was sitting right there and the guard
+//   vetoed the whole recovery chain.
+//
+//   too weak -- it says nothing about WHERE the tags sit, so it cannot
+//   distinguish the two cases at all; it just refuses both.
+//
+// The discriminator is STRUCTURAL, not lexical: does the result element
+// *contain* the candidate call?
+//
+//   (a) a <result>/<output> tag INSIDE the span  -> invented output is being
+//       passed off as a parameter value; refuse.
+//   (b) the span begins INSIDE an unclosed <result>/<output> element -> the
+//       "call" is part of the invented result block; refuse.
+//   otherwise -> every result block is closed before the call starts, so it is
+//       prior context, not a wrapper around this call; ACCEPT.
+//
+// (b) is what catches the real hallucinated shapes above: the model opens
+// <result> and never closes it, so the <tool_name>/<parameter= span it later
+// emits is enclosed by it. (a) catches the inverse -- a well-formed-looking
+// call whose parameter VALUE is a fabricated <result>.
+//
+// Nesting is handled by depth counting rather than a last-open scan, so a
+// closed block followed by an open one still reads as enclosed.
+inline bool hallucinated_result_around(const std::string& s, size_t begin, size_t end) {
+    if (begin == std::string::npos) return false;
+    if (end == std::string::npos || end > s.size()) end = s.size();
+    static const char* const kTags[2][2] = {{"<result>", "</result>"},
+                                            {"<output>", "</output>"}};
+    for (const auto& tg : kTags) {
+        const std::string open = tg[0], close = tg[1];
+        // (a) either tag of the pair occurring within [begin, end)
+        for (const std::string& t : {open, close}) {
+            size_t p = s.find(t, begin);
+            if (p != std::string::npos && p < end) return true;
+        }
+        // (b) unbalanced open before begin == the span is enclosed by it
+        long depth = 0;
+        size_t i = 0;
+        while (i < begin) {
+            size_t o = s.find(open, i), c = s.find(close, i);
+            if (o >= begin && c >= begin) break; // (npos included)
+            if (o < c) { depth++; i = o + open.size(); }
+            else { if (depth > 0) depth--; i = c + close.size(); }
+        }
+        if (depth > 0) return true;
+    }
+    return false;
+}
+
 inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    std::string* prefix,
                                                    const json* tools = nullptr,
@@ -3379,8 +3506,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         static const std::string FN_OPEN = "<function>";
         size_t p = text_in.find(FN_OPEN);
         if (p != std::string::npos && tools && tools->is_array() &&
-            text_in.find("<result>") == std::string::npos &&
-            text_in.find("<output>") == std::string::npos) {
+            !hallucinated_result_around(text_in, p, text_in.size())) {
             size_t ob = text_in.find('{', p + FN_OPEN.size());
             if (ob != std::string::npos) {
                 std::string body = text_in.substr(ob);
@@ -3428,11 +3554,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
     //         {"name": "Write",\n<parameter=file_path>\n/x\n</parameter>\n<parameter=content>\n...
     // (a) reuses parse_native_xml_call on the spanned substring. (b) extracts
     // the name from the JSON head and hands the rest to the XML parameter
-    // walk. Both engage only on a declared name; anything carrying <result> or
-    // <output> stays text (the hallucinated-result rule).
-    if (tools && tools->is_array() &&
-        text_in.find("<result>") == std::string::npos &&
-        text_in.find("<output>") == std::string::npos) {
+    // walk. Both engage only on a declared name.
+    //
+    // Hallucinated-result protection (2026-08-21): the outer whole-string
+    // find for <result>/<output> that used to gate this entire block is gone;
+    // each mode below now applies hallucinated_result_around() to its OWN
+    // candidate span. See that helper for why enclosure -- not mere presence
+    // -- is the correct test.
+    if (tools && tools->is_array()) {
         auto declared = [&](const std::string& nm) {
             for (const auto& t : *tools)
                 if (t.contains("function") &&
@@ -3455,10 +3584,11 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             std::string span = text_in.substr(fb);
             size_t fe = span.find("</function>");
             if (fe != std::string::npos) span = span.substr(0, fe + 11);
-            if (parse_native_xml_call(span, tc) && declared(tc.name)) {
+            const size_t fb_end = fe != std::string::npos ? fb + fe + 11 : text_in.size();
+            if (!hallucinated_result_around(text_in, fb, fb_end) &&
+                parse_native_xml_call(span, tc) && declared(tc.name)) {
                 tc.source_begin = fb;
-                tc.source_end = fe != std::string::npos ? fb + fe + 11
-                                                        : text_in.size();
+                tc.source_end = fb_end;
                 if (prefix) *prefix = text_in.substr(0, fb);
                 if (remaining_text) *remaining_text = "";
                 fprintf(stderr, "[q27] bare native-dialect call recovered: %s\n", tc.name.c_str());
@@ -3475,7 +3605,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 size_t q2 = q1 == std::string::npos ? q1 : text_in.find('"', q1 + 1);
                 if (q2 != std::string::npos && q2 < pp) {
                     const std::string nm = text_in.substr(q1 + 1, q2 - q1 - 1);
-                    if (declared(nm)) {
+                    if (declared(nm) &&
+                        !hallucinated_result_around(text_in, jb, text_in.size())) {
                         // reuse the XML walk by synthesizing a well-formed span;
                         // a missing final </parameter> is tolerated by closing at EOF
                         std::string span = "<function=" + nm + ">\n" + text_in.substr(pp);
@@ -3510,15 +3641,18 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
         // for JSON mode 6, including its refuse-on-tie rule. A wrong tool is
         // worse than an un-rescued one, so inference failure leaves it as text.
         //
-        // The <result>/<output> guard above is what keeps this off the
+        // hallucinated_result_around() is what keeps this off the
         // HALLUCINATED-RESULT shape (<tool_calls><result><name>X</name>
-        // <output>...), which mode 16 pins with a negative fixture: those are
-        // invented tool OUTPUT, and promoting them to calls would feed the
-        // model's own fiction back as if a tool had produced it.
+        // <output>...<tool_name><parameter=...), which mode 16 pins with a
+        // negative fixture: those are invented tool OUTPUT, and promoting them
+        // to calls would feed the model's own fiction back as if a tool had
+        // produced it. That shape leaves <result> UNCLOSED, so the per-call
+        // span below reads as enclosed by it and is refused -- while a batch
+        // that merely follows a closed <output> block still recovers.
         {
             static const std::string TN = "<tool_name>";
             std::vector<ToolCall> batch;
-            size_t scan = 0, first_begin = std::string::npos;
+            size_t scan = 0;
             while (true) {
                 size_t tn = text_in.find(TN, scan);
                 if (tn == std::string::npos) break;
@@ -3538,20 +3672,36 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                    text_in.substr(after, end - after);
                 if (span.find("</function>") == std::string::npos) span += "\n</function>";
                 ToolCall tc;
+                if (hallucinated_result_around(text_in, tn, end)) {
+                    fprintf(stderr, "[q27] drift mode 20: hallucinated <result>/<output> "
+                                    "block encloses the call, refusing\n");
+                    continue;
+                }
                 if (!parse_native_xml_call(span, tc) || tc.arguments.empty()) continue;
                 const std::string nm = infer_tool_name(*tools, tc.arguments);
                 if (nm.empty() || !declared(nm)) continue;
                 tc.name = nm;
                 tc.ok = true;
-                if (first_begin == std::string::npos) first_begin = tn;
+                // STAMP PER-CALL spans (review 2026-08-20): the prior code
+                // only set batch.front().source_begin and batch.back().source_end,
+                // leaving middle calls with source_begin == npos. The unclosed-tail
+                // recovery (recover_unclosed_tool_tail) and the closed-wrapper
+                // resolver (resolve_ordered_tool_segments) both compute
+                // `raw.substr(cursor, c.source_begin - cursor)`; an npos middle
+                // call underflows to SIZE_MAX and substr throws out_of_range
+                // inside the request handler. Stamp every call so the gaps
+                // between calls and the trailing text after the last call are
+                // represented correctly.
+                tc.source_begin = tn;
+                tc.source_end = end;
                 batch.push_back(std::move(tc));
                 scan = end;
             }
             if (!batch.empty()) {
-                batch.front().source_begin = first_begin;
-                batch.back().source_end = text_in.size();
-                if (prefix) *prefix = text_in.substr(0, first_begin);
-                if (remaining_text) *remaining_text = "";
+                if (prefix) *prefix = text_in.substr(0, batch.front().source_begin);
+                // trailing text after the last call's region stays visible as
+                // text (the prior override glued it to the last call's source_end)
+                if (remaining_text) *remaining_text = text_in.substr(batch.back().source_end);
                 fprintf(stderr, "[q27] drift mode 20: recovered %zu nameless <tool_name> call(s)\n",
                         batch.size());
                 return batch;
@@ -3583,6 +3733,20 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
             size_t fe = ps == std::string::npos ? std::string::npos
                                                 : text_in.find("</function>", ps);
             if (fe != std::string::npos) {
+                // Scoped hallucinated-result guard (2026-08-21). The span is
+                // [ps, fe+11) -- the parameter list itself. A <result>/<output>
+                // tag inside it, or an unclosed one enclosing it, is invented
+                // output and refused; one that opened AND closed before ps is
+                // prior context and must not veto this call. (The first attempt
+                // at this scoped it only at the END, so a closed block earlier
+                // in the tail still killed the call -- the very leak it meant
+                // to fix.)
+                const size_t span_end = fe + 11;
+                if (hallucinated_result_around(text_in, ps, span_end)) {
+                    fprintf(stderr,
+                            "[q27] drift mode 21: hallucinated <result>/<output> "
+                            "block in the parameter span, refusing\n");
+                } else {
                 std::string span =
                     "<function=q27_unnamed>\n" + text_in.substr(ps, fe + 11 - ps);
                 ToolCall tc;
@@ -3600,6 +3764,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                 nm.c_str());
                         return std::vector<ToolCall>{std::move(tc)};
                     }
+                }
                 }
             }
         }
@@ -3648,6 +3813,12 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                 ToolCall tc;
                 const std::string span =
                     "<function=" + nm + ">\n" + text_in.substr(nxt, fe + FC.size() - nxt);
+                if (hallucinated_result_around(text_in, ps, fe + FC.size())) {
+                    fprintf(stderr, "[q27] drift mode 22: hallucinated <result>/<output> "
+                                    "block encloses the call, refusing\n");
+                    cur = fe + FC.size();
+                    continue;
+                }
                 if (parse_native_xml_call(span, tc) && !tc.arguments.empty()) {
                     tc.name = nm;
                     tc.ok = true;
@@ -4332,6 +4503,58 @@ inline std::string take_unclosed_final_tool_segment(
     return raw;
 }
 
+// Route an UNCLOSED-<tool_call> tail (wrapper stripped, generation truncated)
+// through the drift chain. Complements bb60661, which routed a CLOSED-wrapped
+// TOOL segment through parse_bare_tool_calls but deliberately left the unclosed
+// one as raw text. Same safety bar that commit documented:
+//
+//   "no EOF repair, because a closed wrapper means drift rather than
+//    truncation, and an unclosed one is removed upstream by
+//    take_unclosed_final_tool_segment. Executing half a Write stays refused."
+//
+// allow_eof_repair=false inside means only bytes the parser accepts as a
+// well-formed call execute: an inner call whose JSON/XML is COMPLETE (its
+// </tool_call> merely never arrived because the generation was cut) recovers on
+// mode 1 / the native dialect, while a value genuinely cut mid-parse (a
+// partial Write) is rejected and shown as text. That is the same refusal
+// boundary that protects the closed-wrapper path, just reached from the tail.
+//
+// emit_call returns true when the call was accepted (recovered++), false to
+// leave its bytes as text (ineligible / refused -- never re-runs the chain, so
+// tool_choice / disable_parallel_tool_use rejections can't be resurrected).
+// Returns the number of accepted calls.
+template<class EmitText, class EmitCall>
+inline size_t recover_unclosed_tool_tail(const std::string& raw,
+    const json* tools, EmitText emit_text, EmitCall emit_call) {
+    if(raw.empty()) return 0;
+    if(!tools || !tools->is_array() || tools->empty()){
+        emit_text(raw); return 0;
+    }
+    std::string pre; // parse_bare_tool_calls writes here; we use cursor/source_begin instead (see comment above)
+    auto calls=parse_bare_tool_calls(raw,&pre,tools,true,false,nullptr);
+    if(calls.empty()){ emit_text(raw); return 0; }
+    size_t cursor=0,recovered=0;
+    for(auto& c:calls){
+        // defense-in-depth (review 2026-08-20): mode 20 now stamps per-call
+        // spans, but if any future drift mode returns a batch with a missing
+        // source_begin (npos) or a span that overlaps the cursor we've already
+        // emitted, raw.substr(cursor, c.source_begin-cursor) would underflow
+        // to SIZE_MAX and throw out_of_range inside the request handler.
+        // Refuse to emit such a call -- dump the remaining tail as text and
+        // stop -- rather than crash.
+        if (c.source_begin == std::string::npos || c.source_begin < cursor) {
+            emit_text(raw.substr(cursor));
+            break;
+        }
+        emit_text(raw.substr(cursor,c.source_begin-cursor));
+        cursor=c.source_end;
+        if(emit_call(c)) recovered++;
+        else emit_text(c.raw);
+    }
+    emit_text(raw.substr(cursor));
+    return recovered;
+}
+
 // Resolve generated text and wrapped calls in generation order. This matters
 // when parallel calls are disabled: a bare call emitted before a later wrapped
 // call must win, and rejected or malformed bytes must remain visible as text.
@@ -4350,6 +4573,14 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         if(calls.empty()) { out.append_visible_text(raw); return; }
         size_t cursor=0;
         for(auto& call:calls) {
+            // defense-in-depth (review 2026-08-20): see recover_unclosed_tool_tail.
+            // If any drift mode hands us a call with an unset source_begin
+            // (npos) or an overlapping span, substr() would throw; dump the
+            // remaining tail as visible text and stop.
+            if (call.source_begin == std::string::npos || call.source_begin < cursor) {
+                out.append_visible_text(raw.substr(cursor));
+                break;
+            }
             out.append_visible_text(raw.substr(cursor,call.source_begin-cursor));
             cursor=call.source_end;
             if(eligible(call.name,out.calls.size())) {

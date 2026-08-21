@@ -664,7 +664,7 @@ struct Runtime {
     // default for speed). --think flips the profile to prefilling an open
     // think tag. Either way, per-request fields override (resolve_think).
     std::vector<std::string> vocab_bytes_v;
-    q27::ToolMaskCache mask_cache;
+    q27::ToolMaskCache<q27::ToolGrammar> mask_cache;
     DiskSnapshotStore snapstore{&snap_peek_adapter,&snap_hash_sha1};
     TraceLog trace;
     std::string model_name,model_sha1_cache,boot_id,server_sha1,tokenizer_name,tokenizer_sha1;
@@ -1710,6 +1710,24 @@ struct Runtime {
         tc.enabled=q27::metal_tool_constraint_enabled(
             constrain_tools,!tool_names.empty(),sampling.temperature==0.0f,
             effective_speculation_width(sampling,bounded_reasoning),forced_tool_choice);
+        // Metal is still on the 1-arg tc.begin (JSON grammar only) -- it has
+        // no parallel cache_xml and the filtered tools JSON isn't threaded
+        // through to this site. If the model is XML-trained (Qwen3.8) and
+        // --constrain-tools is on, the JSON grammar dead-states on the first
+        // body byte ('<', where JSON expects '{') and the constraint drops
+        // cleanly. No crash, but the feature silently no-ops. Warn once so
+        // it's visible (review 2026-08-20).
+        if (tc.enabled && q27::tool_dialect_xml()) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr,
+                        "[metal] WARNING: --constrain-tools + XML-dialect model "
+                        "(Qwen3.8) is not wired on Metal -- constraint will "
+                        "disengage on the first body byte. CUDA path uses "
+                        "ToolGrammarXml and works correctly; Metal is JSON-only.\n");
+            }
+        }
         {
             auto gpu=lease_now();
             tc.begin(tool_names);

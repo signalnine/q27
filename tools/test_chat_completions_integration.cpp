@@ -439,7 +439,7 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
 static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv,
                         bool constrain_tools, bool sampled_on, int max_prompt,
                         int max_slot_ctx, std::atomic<long>& req_counter,
-                        q27::ToolMaskCache& tool_mask_cache, std::vector<Slot>& slots,
+                        q27::ToolMaskCache<q27::ToolGrammar>& tool_mask_cache, std::vector<Slot>& slots,
                         const json& body, bool chat, bool batch = false,
                         int budget_flag = 0) {
     const int EOS = tok.eos();
@@ -1256,8 +1256,8 @@ static std::vector<Slot> fresh_slots() {
     return slots;
 }
 
-static q27::ToolMaskCache fresh_cache(std::vector<std::string>& vocab_bytes) {
-    q27::ToolMaskCache c;
+static q27::ToolMaskCache<q27::ToolGrammar> fresh_cache(std::vector<std::string>& vocab_bytes) {
+    q27::ToolMaskCache<q27::ToolGrammar> c;
     c.init(&vocab_bytes, -1); // </tool_call> id unused (constrain_tools off in these tests)
     return c;
 }

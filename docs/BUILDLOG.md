@@ -14025,3 +14025,166 @@ both channels can reach it.
 
 Both backends green: `make test-tools` under gcc on haight and clang on the M4,
 `q27-metal-server` links clean under `-Werror`.
+
+## 2026-08-21: the hallucinated-result guard was vetoing REAL calls -- presence is not enclosure
+
+Follow-on to (d). The report was the same sentence as always -- "sometimes I
+still see `<parameter=` / `</function>` in the output" -- but this time the
+bytes recovered cleanly when replayed in isolation and died in the session. The
+difference was the CONTEXT they arrived in, not the call.
+
+**The shape.** A perfectly recoverable mode-21 openerless call, in a tail that
+also quoted an earlier step's output:
+
+```
+Here is what the build printed:
+<output>make: all targets up to date</output>
+
+Now I'll fix the import.
+<parameter=filePath>
+/code/fileaction.go
+</parameter>
+<parameter=newString>
+import "bytes"
+</parameter>
+</function>
+```
+
+The hallucinated-result guard was a **whole-string** `find("<result>")` /
+`find("<output>")` gating the ENTIRE mode 17/20/21/22 block. One quoted
+`<output>` anywhere in the segment -- prose, a fenced transcript, a prior
+step's result -- and every recovery below it was skipped. The call was sitting
+right there, fully formed, and the guard threw the chain away.
+
+Worth recording precisely because 2026-08-20 (b) **ruled this guard out as a
+hypothesis**: "the hallucinated-result guard (no `<result>`/`<output>` in any
+capture)". That was true of those captures and false as a general claim. The
+instrument was a corpus of failures that had already been collected; a failure
+mode whose trigger is *the presence of a tag none of the captures contained*
+cannot appear in it. Third variant of the same lesson from (b), (c) and (d):
+**absence of evidence in a catalogue built from past failures is not evidence
+of absence.**
+
+### The obvious repair does not work, and it is worth saying why
+
+The first instinct is "scope the guard to the call span", and the first
+implementation of that scopes the wrong end: search for a complete
+`<output>...</output>` from **position 0** up to `span_end`. That bounds the END
+of the window and leaves the START at the beginning of the segment, so a closed
+block *before* the call is still inside the window and still vetoes it --
+precisely the bug, unchanged. Worse, dropping the coarse outer guard while
+replacing it with a span check that only covers mode 21 leaves modes 20 and 22
+(and the wrapped variant) with no protection at all, so three previously-pinned
+negatives start promoting invented output to calls.
+
+Recorded because the half-fix is more dangerous than the bug: it trades a
+dropped call for an EXECUTED hallucination, and it looks like progress.
+
+### The rule: enclosure, not presence
+
+Lexical presence cannot separate the two cases, because both have a complete
+`<output>...</output>` block before the call span. The discriminator is
+structural -- does the result element *contain* the candidate call?
+
+```
+(a) a <result>/<output> tag INSIDE the span      -> invented output posing as a
+                                                    parameter value; refuse
+(b) the span begins inside an UNCLOSED such tag  -> the "call" is part of the
+                                                    invented result block; refuse
+otherwise (every block closed before the span)   -> prior context; ACCEPT
+```
+
+(b) is what catches the genuine hallucinated shapes: the model opens `<result>`
+and never closes it, so the `<tool_name>`/`<parameter=` span it emits afterwards
+is enclosed by it. That is why the real negatives keep refusing while the quoted
+`<output>` case now recovers -- the two differ by exactly one closing tag.
+Depth counting rather than a last-open scan, so `closed, then reopened` still
+reads as enclosed.
+
+Extracted as `hallucinated_result_around(s, begin, end)` and applied to every
+mode that promotes dialect to a call -- 16, 17a, 17b, 20, 21, 22 -- each against
+its OWN span, instead of one coarse veto over all of them. Mode 16 was carrying
+a second copy of the whole-string guard and had the identical latent bug; it is
+on the shared helper now.
+
+### Measured
+
+`test_tool_drift` 124 -> 151 assertions, the new ones red before the change.
+They pin the rule directly (closed-before-span is context, unclosed-before-span
+and in-span are not, closed-then-reopened is enclosed, fully-closed nesting is
+context) plus the mode-16 loosening in BOTH directions: a closed `<output>`
+before a `<function>`-wrapped call no longer kills it, an unclosed `<result>`
+enclosing one still refuses.
+
+Full `make test-tools` green under gcc: drift (tolerant and strict), corpus,
+openai bridge, chat-completions integration, think-resolve, stream-split,
+toolconstrain.
+
+**No live-generation A/B is claimed for this change.** The fixtures are the
+reported bytes, and the fix is a pure parser predicate, but the survey harness
+needs a GPU host this work was not done on -- so the live tables in (b)/(c)/(d)
+have no counterpart here. Anyone with the survey running should expect the
+UNPARSED column to fall on transcripts that quote tool output, and nothing else
+to move.
+
+### Also on this branch
+
+**Unclosed-`<tool_call>` tail recovery.** `bb60661` routed a CLOSED wrapped
+TOOL segment through the drift chain but left the unclosed one as raw text.
+`recover_unclosed_tool_tail()` now routes that tail too, with
+`allow_eof_repair=false` -- an inner call whose JSON/XML is COMPLETE and merely
+lost its `</tool_call>` to truncation recovers, while a value cut mid-parse
+stays text. Executing half a Write is still refused. Wired at all six handler
+sites (chat, chat-stream, messages, messages-stream, responses,
+responses-stream). Defence-in-depth: both this and
+`resolve_ordered_tool_segments` now refuse a call whose `source_begin` is npos
+or overlaps the emitted cursor, because `substr(cursor, begin - cursor)` would
+underflow to SIZE_MAX and throw inside the request handler. Mode 20 also stamps
+per-call spans now instead of only first/last, which is what made middle calls
+npos in the first place.
+
+**XML-dialect toolgram.** `--constrain-tools` only ever spoke the 3.6 JSON body
+format, so on an XML-trained 3.8 the grammar fought the model's own trained
+emission. `ToolGrammarXml` constrains the body to
+`<function=NAME><parameter=KEY>VALUE</parameter></function>` instead, schema-
+aware: the parameter-key allowlist switches to that tool's declared parameters
+once the name completes. `<` inside a value is legal ONLY as the start of
+`</parameter>` or `</function>`, so a model reaching for `<result>` or a nested
+`<function=` hits a dead state and the decoder masks it out -- **the chimera
+from (d) is prevented at the source rather than refused after the fact.**
+`ToolMaskCache` is templated on the grammar so both dialects share the caching
+and the allowlist-in-cache-key isolation (R1) unchanged. Metal stays JSON-only
+and warns once when it would matter, rather than silently no-opping.
+
+**Vendored cpp-httplib 0.18.3 -> 0.53.1.** 0.53.1 renames `DataSink::is_alive`
+-> `is_writable`; the four Metal call sites follow. The two cannot ship apart --
+the vendor bump alone leaves `q27-metal-server` uncompilable.
+
+### Metal does not currently compile on master, and no suite can tell you
+
+Separable from everything above, found while rebasing onto it: `a317bc8`
+vendored cpp-httplib 0.53.1, which renames `DataSink::is_alive` to
+`is_writable`, but `src/metal/metal_server.cpp` still calls `sink.is_alive()` at
+four sites. `q27-metal-server` does not build on the current tip. Sent
+separately as a four-line change, since it stands on its own and should not
+queue behind a parser review.
+
+What IS here is the other half of the same file: `ToolMaskCache` is templated on
+the grammar now (below), so Metal's `q27::ToolMaskCache mask_cache;` needs its
+template argument or that backend stops compiling for a second, unrelated
+reason.
+
+The reason it went unnoticed is the part worth keeping: **every CPU suite and
+the CUDA build are blind to that file.** `make test-tools` is fully green on a
+tree where one of the two backends cannot build at all, so the vendor bump
+looked clean by every gate that runs by default. Same failure shape as (b), (c)
+and (d) one more time -- the instrument cannot see the thing, so the thing reads
+as absent. A per-backend compile gate is cheaper than the next occurrence;
+`make test-tools` covers the tree it can build, not the tree.
+
+**Not verified here:** neither backend was compiled for this entry -- no CUDA
+and no Apple-silicon host was available. The `is_alive` -> `is_writable` break
+is a source-level fact about the vendored header's API, and the CUDA-side
+changes are header-only C++ exercised by the CPU suites, but
+`build/q27-server` and `q27-metal-server` both still want a real compile before
+anyone leans on this.

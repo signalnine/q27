@@ -125,6 +125,64 @@ static void test_mode16_and_15_variants() {
         "</result>\n</tool_calls>";
     auto v3 = q27::parse_bare_tool_calls(halluc, &pre, &tools);
     ok(v3.empty(), "hallucinated <result>/<output> block is NOT rescued as a call");
+
+    // ...but the rule is ENCLOSURE, not mere presence (2026-08-21). A result
+    // block that opened AND closed before the call is prior context -- a
+    // quoted result from an earlier step -- and must not veto the real call
+    // that follows it. The old whole-string guard threw this away.
+    std::string after_closed_output =
+        "The last command printed:\n<output>total 0</output>\n\nNow listing again.\n\n"
+        "<function>\n{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls -la\"}}";
+    auto v4 = q27::parse_bare_tool_calls(after_closed_output, &pre, &tools);
+    ok(v4.size() == 1 && v4[0].name == "Bash" &&
+           v4[0].arguments.value("command", std::string()) == "ls -la",
+       "mode16: a CLOSED <output> block before the wrapper does not kill the call");
+    ok(pre.find("total 0") != std::string::npos,
+       "mode16: the quoted result stays in the visible prefix");
+
+    // and the converse: an UNCLOSED <result> enclosing the wrapper is an
+    // invented result block, so the JSON inside it stays text.
+    std::string enclosed =
+        "<result>\n<function>\n{\"name\": \"Bash\", \"arguments\": {\"command\": \"ls\"}}";
+    auto v5 = q27::parse_bare_tool_calls(enclosed, &pre, &tools);
+    ok(v5.empty(), "mode16: an unclosed <result> enclosing the wrapper refuses");
+}
+
+// The enclosure rule itself (hallucinated_result_around), independent of any
+// one drift mode: closed-before-span is context, unclosed-before-span or
+// in-span is invented output.
+static void test_hallucinated_result_enclosure_rule() {
+    using q27::hallucinated_result_around;
+    const std::string closed_before = "<output>x</output>\nCALL";
+    ok(!hallucinated_result_around(closed_before, closed_before.find("CALL"),
+                                   closed_before.size()),
+       "enclosure: closed block before the span is prior context");
+
+    const std::string open_before = "<result>\nCALL";
+    ok(hallucinated_result_around(open_before, open_before.find("CALL"),
+                                  open_before.size()),
+       "enclosure: unclosed block before the span encloses it");
+
+    const std::string in_span = "CALL <result>fake</result>";
+    ok(hallucinated_result_around(in_span, 0, in_span.size()),
+       "enclosure: a block inside the span is invented output");
+
+    // closed, then reopened: still enclosed (depth counting, not last-open)
+    const std::string reopened = "<output>a</output>\n<output>\nCALL";
+    ok(hallucinated_result_around(reopened, reopened.rfind("CALL"), reopened.size()),
+       "enclosure: closed-then-reopened still reads as enclosed");
+
+    // nested same-tag pairs fully closed before the span
+    const std::string nested_closed = "<result><result>a</result></result>CALL";
+    ok(!hallucinated_result_around(nested_closed, nested_closed.find("CALL"),
+                                   nested_closed.size()),
+       "enclosure: fully-closed nested pairs before the span are context");
+
+    // no tags at all, and the npos guard
+    ok(!hallucinated_result_around("plain text", 0, 10),
+       "enclosure: text with no result tags is clean");
+    ok(!hallucinated_result_around("<result>x", std::string::npos, std::string::npos),
+       "enclosure: npos span begin is not flagged");
 }
 
 // Native XML dialect (2026-08-14): the format Qwen3.8's chat template trains.
@@ -238,6 +296,23 @@ static void test_dialect_default_keying() {
     ok(q27::tool_dialect_xml(), "dialect: env xml overrides a 3.6 model");
     unsetenv("Q27_TOOL_DIALECT");
     q27::tool_dialect_xml_default() = false;   // leave global state clean
+}
+
+static void test_preamble_swaps_with_dialect() {
+    unsetenv("Q27_TOOL_DIALECT");
+    q27::tool_dialect_xml_default() = true;
+    json tools = json::array({tool("bash", {{"command", true}})});
+    std::string pre = q27::tools_preamble(tools);
+    ok(pre.find("<tool_call>") != std::string::npos &&
+       pre.find("<function=") != std::string::npos,
+       "preamble: xml dialect emits XML-format instructions");
+    q27::tool_dialect_xml_default() = false;
+    pre = q27::tools_preamble(tools);
+    ok(pre.find("{\"name\":") != std::string::npos &&
+       pre.find("<function=") == std::string::npos,
+       "preamble: json dialect emits JSON-format instructions");
+    q27::tool_dialect_xml_default() = false;   // clean up
+    unsetenv("Q27_TOOL_DIALECT");
 }
 
 static void test_reasoning_effort_line() {
@@ -475,6 +550,59 @@ static void test_mode21_openerless_params() {
        "mode21: an explicit <function= opener still resolves to Bash");
 }
 
+// Regression (2026-08-21): the <result>/<output> hallucinated-result guard is a
+// WHOLE-STRING find, but it gates the entire mode 17/20/21 recovery block. So an
+// openerless <parameter=...> + </function> call (mode 21) in a tail that ALSO
+// contains an unrelated <output> or <result> anywhere -- a quoted command result,
+// a prior hallucinated block in the same segment -- bails the whole chain and the
+// real call leaks through as plain text. This is the "sometimes I still see
+// <parameter= / </function>" report. The guard must be scoped to the parameter
+// span, not the whole tail.
+static void test_mode21_guard_scoped_to_span() {
+    json tools = json::array({tool("FileAction", {{"filePath", true}, {"newString", false}}),
+                              tool("Bash", {{"command", true}, {"description", false}})});
+
+    // 1. The leak: a real openerless call, with an unrelated <output> block
+    //    EARLIER in the same tail (e.g. a quoted result from a prior step).
+    //    Today the whole-string guard sees <output> and skips mode 21 entirely.
+    {
+        const std::string raw =
+            "Here is what the build printed:\n"
+            "<output>make: all targets up to date</output>\n\n"
+            "Now I'll fix the import.\n"
+            "<parameter=filePath>\n/code/fileaction.go\n</parameter>\n"
+            "<parameter=newString>\nimport \"bytes\"\n</parameter>\n</function>";
+        std::string pre;
+        auto v = q27::parse_bare_tool_calls(raw, &pre, &tools);
+        ok(v.size() == 1 && v[0].name == "FileAction" &&
+               v[0].arguments.value("filePath", std::string()) == "/code/fileaction.go",
+           "mode21: an unrelated <output> earlier in the tail must not kill the call");
+    }
+
+    // 2. Same, with <result> as the contaminant.
+    {
+        const std::string raw =
+            "<result>previous step output</result>\n"
+            "<parameter=filePath>\n/code/x.go\n</parameter>\n</function>";
+        std::string pre;
+        auto v = q27::parse_bare_tool_calls(raw, &pre, &tools);
+        ok(v.size() == 1 && v[0].name == "FileAction",
+           "mode21: an unrelated <result> earlier in the tail must not kill the call");
+    }
+
+    // 3. The guard must STILL bite where it belongs: a hallucinated tool RESULT
+    //    inside the span (<parameter> wrapping <result>/<output>) is invented
+    //    output, not a call. This is the behavior the guard exists to protect.
+    {
+        const std::string raw =
+            "<parameter=filePath>\n<result>fake</result>\n</parameter>\n</function>";
+        std::string pre;
+        auto v = q27::parse_bare_tool_calls(raw, &pre, &tools);
+        ok(v.empty(),
+           "mode21: <result> INSIDE the parameter span still refuses (hallucinated result)");
+    }
+}
+
 static void test_mode18_bare_name_opener() {
     q27::ToolCall tc;
     ok(q27::parse_native_xml_call(
@@ -504,6 +632,19 @@ static void test_mode18_bare_name_opener() {
            t4.name == "Read" &&
            t4.arguments.value("file_path", std::string()) == "/x/y.py",
        "mode18: bare <name> without the stray closer");
+    // Mode-18 gap (found via pi's mangled tool transport): the name opens
+    // `<name>` but lands on the NEXT line. Pre-fix this read an empty name
+    // and refused the whole call. Corroborating <parameter= present, so this
+    // must rescue -- and must NOT swallow an identical opener with no dialect.
+    q27::ToolCall t5;
+    ok(q27::parse_native_xml_call("<name>\nbash\n</parameter>\n"
+                                  "<parameter=command>\nls /code\n</parameter>\n", t5) &&
+           t5.ok && t5.name == "bash" &&
+           t5.arguments.value("command", std::string()) == "ls /code",
+       "mode18-FIX: name on the line after <name> is still recognized");
+    q27::ToolCall t6;
+    ok(!q27::parse_native_xml_call("<name>\njust prose, no dialect follows", t6),
+       "mode18-FIX: name-on-next-line with no dialect is NOT a call");
 }
 
 static void test_mode14_tool_name_xml_dialect() {
@@ -1150,6 +1291,166 @@ static void test_intended_tool_call_detector() {
        "detector: ordinary prose is NOT flagged");
 }
 
+// Unclosed-<tool_call> tail recovery (completes bb60661). When the generation
+// is cut INSIDE <tool_call>...</tool_call>, the splitter stays on the TOOL
+// channel; the server pulls that last segment off with
+// take_unclosed_final_tool_segment and used to dump it to visible text raw, so
+// a call whose inner JSON was COMPLETE (only the </tool_call> never arrived)
+// was lost. recover_unclosed_tool_tail routes it through the drift chain with
+// allow_eof_repair=false: COMPLETE inner calls recover, a value genuinely cut
+// mid-parse (a partial Write) stays text.
+static void test_unclosed_tool_tail_recovery() {
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Write", {{"content", true}, {"file_path", true}})});
+
+    // The server's own flow: split the raw bytes, and when the trailing
+    // channel is TOOL (wrapper unclosed) pull the tail off and recover it.
+    auto server_flow = [&](const std::string& raw, bool has_tools,
+                           bool (*accept)(const q27::ToolCall&) = nullptr) {
+        q27::StreamSplitter sp;
+        std::vector<std::pair<q27::StreamSplitter::Chan, std::string>> segments;
+        auto route = [&](q27::StreamSplitter::Chan ch, const std::string& t) {
+            if (t.empty()) {
+                if (ch != q27::StreamSplitter::TOOL && !segments.empty() &&
+                    segments.back().first == q27::StreamSplitter::TOOL)
+                    segments.emplace_back(ch, std::string());
+                return;
+            }
+            if (!segments.empty() && segments.back().first == ch) segments.back().second += t;
+            else segments.emplace_back(ch, t);
+        };
+        for (auto& p : sp.feed(raw)) route(p.first, p.second);
+        for (auto& p : sp.flush()) route(p.first, p.second);
+        const bool tail_unclosed =
+            !segments.empty() && segments.back().first == q27::StreamSplitter::TOOL;
+        std::string unclosed =
+            q27::take_unclosed_final_tool_segment(segments, tail_unclosed);
+        q27::OrderedToolOutput out;
+        size_t rec = q27::recover_unclosed_tool_tail(
+            unclosed, has_tools ? &tools : nullptr,
+            [&](const std::string& t) { out.append_visible_text(t); },
+            [&](q27::ToolCall c) {
+                if (accept && !accept(c)) return false;
+                out.append_tool_call(std::move(c));
+                return true;
+            });
+        return std::make_pair(rec, out);
+    };
+
+    // 1. COMPLETE inner JSON, </tool_call> never arrived -> recovered (mode 1).
+    {
+        auto [rec, out] = server_flow(
+            "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/x\"}}\n",
+            true);
+        ok(rec == 1 && out.calls.size() == 1 && out.calls[0].name == "Read",
+           "unclosed: complete inner JSON recovers from the unclosed tail");
+    }
+
+    // 2. Truncated mid-value (a partial Write) -> NOT recovered, stays text.
+    //    mode 2/12 EOF repair is disabled here: this is the safety bar.
+    {
+        auto [rec, out] = server_flow(
+            "<tool_call>\n{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/x\",\"content\":\"trun",
+            true);
+        ok(rec == 0 && out.calls.empty() &&
+               out.text.find("content\":\"trun") != std::string::npos,
+           "unclosed: partial Write stays text (no half-execution)");
+    }
+
+    // 3. No tools configured -> stays text, nothing recovered.
+    {
+        auto [rec, out] = server_flow(
+            "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/x\"}}\n",
+            false);
+        ok(rec == 0 && out.calls.empty(), "unclosed: no tools -> stays text");
+    }
+
+    // 4. Rejected call (caller refuses it) stays text, not re-run.
+    {
+        auto [rec, out] = server_flow(
+            "<tool_call>\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/x\"}}\n",
+            true, [](const q27::ToolCall&) { return false; });
+        ok(rec == 0 && out.calls.empty() &&
+               out.text.find("\"name\":\"Read\"") != std::string::npos,
+           "unclosed: a refused call stays text and is not resurrected");
+    }
+
+    // 5. Native-dialect inner (model omitted the final </parameter>, the exact
+    //    shape that broke vLLM's regex parser) -> recovers even unclosed.
+    {
+        json t2 = json::array({tool("get_weather", {{"location", true}, {"unit", true}})});
+        std::string raw = "<tool_call>\n<function=get_weather>\n<parameter=location>\nTokyo\n";
+        raw += "</parameter>\n<parameter=unit>\ncelsius\n";
+        q27::StreamSplitter sp;
+        std::vector<std::pair<q27::StreamSplitter::Chan, std::string>> segments;
+        for (auto& p : sp.feed(raw)) segments.push_back(p);
+        for (auto& p : sp.flush()) segments.push_back(p);
+        std::string unclosed = q27::take_unclosed_final_tool_segment(
+            segments, !segments.empty() &&
+                           segments.back().first == q27::StreamSplitter::TOOL);
+        q27::OrderedToolOutput out;
+        size_t rec = q27::recover_unclosed_tool_tail(
+            unclosed, &t2,
+            [&](const std::string& t) { out.append_visible_text(t); },
+            [&](q27::ToolCall c) { out.append_tool_call(std::move(c)); return true; });
+        ok(rec == 1 && out.calls.size() == 1 &&
+               out.calls[0].arguments.value("unit", std::string()) == "celsius",
+           "unclosed: native-dialect omitted-</parameter> recovers (vLLM shape)");
+    }
+}
+
+// Regression for the mode-20 npos underflow (review 2026-08-20): mode 20
+// (nameless <tool_name> batch) used to only stamp batch.front().source_begin
+// and batch.back().source_end, so middle calls carried npos and the
+// unclosed-tail / closed-wrapper resolvers' `raw.substr(cursor,
+// c.source_begin-cursor)` underflowed to SIZE_MAX and threw out_of_range
+// inside the request handler. After stamping per-call spans, every call has
+// a usable source range and the recovery loop slices cleanly. This test
+// would CRASH before the fix.
+static void test_mode20_multicall_span_stamping() {
+    json tools = json::array({tool("Read", {{"file_path", true}}),
+                              tool("Write", {{"content", true}, {"file_path", true}})});
+    // two nameless <tool_name> calls in one batch (mode 20 path)
+    std::string raw =
+        "<tool_calls>\n<tool_name>\n<parameter=file_path>/a</parameter>\n</function>"
+        "\n<tool>\n<tool_name>\n<parameter=content>x</parameter>\n"
+        "<parameter=file_path>/b</parameter>\n</function>";
+    std::string pre, residual;
+    auto calls = q27::parse_bare_tool_calls(raw, &pre, &tools);
+    ok(calls.size() == 2,
+       "mode20: two nameless <tool_name> calls parse into two ToolCalls");
+    if (calls.size() == 2) {
+        ok(calls[0].source_begin != std::string::npos &&
+           calls[0].source_end != std::string::npos &&
+           calls[1].source_begin != std::string::npos &&
+           calls[1].source_end != std::string::npos,
+           "mode20: per-call source spans are stamped (not npos middle)");
+        ok(calls[0].source_end <= calls[1].source_begin,
+           "mode20: call spans are ordered and non-overlapping");
+    }
+    // recover_unclosed_tool_tail must not throw on the middle call.
+    bool threw = false;
+    std::string threw_what;
+    q27::OrderedToolOutput out;
+    try {
+        q27::recover_unclosed_tool_tail(
+            raw, &tools,
+            [&](const std::string& t) { out.append_visible_text(t); },
+            [&](q27::ToolCall c) { out.append_tool_call(std::move(c)); return true; });
+    } catch (const std::exception& e) {
+        threw = true; threw_what = e.what();
+    }
+    ok(!threw,
+       "mode20: recover_unclosed_tool_tail does not throw on the stamped spans");
+    if (threw) printf("    threw: %s\n", threw_what.c_str());
+    // Trailing text after the last call's region becomes visible as text
+    // (the prior override glued it into back().source_end; the stamping fix
+    // exposes it as remaining_text via append_visible_text).
+    ok(out.text.find("/b") != std::string::npos ||
+       out.calls.size() == 2,
+       "mode20: trailing gap is either emitted as text or absorbed by the calls");
+}
+
 // N7. tool_strict() is a process-lifetime memo, so the strict leg cannot share
 // a run with the tests above; main() dispatches on the env var and `make
 // test-tools` invokes the binary a second time with Q27_TOOL_STRICT=1.
@@ -1176,20 +1477,25 @@ int main() {
     test_json_fused_opener_shapes();
     test_mode22_parameter_as_opener();
     test_intended_tool_call_detector();
+    test_unclosed_tool_tail_recovery();
+    test_mode20_multicall_span_stamping();
     test_mode13_truncated_mid_escape();
     test_function_arguments_unterminated();
     test_think_mode_drift();
     test_dialect_default_keying();
+    test_preamble_swaps_with_dialect();
     test_reasoning_effort_line();
     test_native_xml_dialect();
     test_mode18_bare_name_opener();
     test_mode19_attribute_opener();
     test_mode20_nameless_tool_name();
     test_mode21_openerless_params();
+    test_mode21_guard_scoped_to_span();
     test_quoted_name_normalization();
     test_mode14_tool_name_xml_dialect();
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();
+    test_hallucinated_result_enclosure_rule();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

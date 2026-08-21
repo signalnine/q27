@@ -720,7 +720,7 @@ int main(int argc, char** argv) {
                                           "abc", "\n",  "}",    " ",      "</tool_call>",
                                           ""};
         const int CLOSER = 9, CTRL = 10;
-        q27::ToolMaskCache mc;
+        q27::ToolMaskCache<q27::ToolGrammar> mc;
         mc.init(&vocab, CLOSER);
         q27::ToolGrammar g;
         g.reset({"write", "view"});
@@ -749,7 +749,7 @@ int main(int argc, char** argv) {
     {
         auto vb = tok.vocab_bytes();
         int closer = tok.token_id("</tool_call>");
-        q27::ToolMaskCache mc;
+        q27::ToolMaskCache<q27::ToolGrammar> mc;
         mc.init(&vb, closer);
         q27::ToolGrammar g;
         g.reset({"write", "view", "ls", "bash", "grep", "glob", "edit"});

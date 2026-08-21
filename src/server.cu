@@ -1154,8 +1154,14 @@ int main(int argc, char** argv) {
     // P7 shared mask cache (mutated only from generation callbacks, which
     // run while holding the GPU gate; pool ids are per-slot)
     std::vector<std::string> vocab_bytes_v = tok.vocab_bytes();
-    q27::ToolMaskCache tool_mask_cache;
+    q27::ToolMaskCache<q27::ToolGrammar> tool_mask_cache;
     tool_mask_cache.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
+    // Parallel cache for the XML-dialect toolgram (3.8 trained format);
+    // --constrain-tools routes the body through whichever matches the
+    // model's dialect (tool_dialect_xml). Same vocabulary / closer; distinct
+    // masks (different grammar signatures).
+    q27::ToolMaskCache<q27::ToolGrammarXml> tool_mask_cache_xml;
+    tool_mask_cache_xml.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
     if (constrain_tools)
         fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
                 tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
@@ -2047,7 +2053,7 @@ int main(int argc, char** argv) {
                 else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
-            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
             tc.host2dev = &sl.tool_mask_host2dev;
             // FORCED requests are prompt-injected past the <tool_call> marker
             // (above) -- scan_round's engage trigger scans GENERATED text for
@@ -2056,7 +2062,8 @@ int main(int argc, char** argv) {
             // comment); AUTO (the default) and NONE are unaffected.
             tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                         eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            auto params_per_name = q27::tool_param_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
             // FORCED: the opener was injected into the PROMPT, not generated,
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
@@ -2123,7 +2130,21 @@ int main(int argc, char** argv) {
                     return q27::tool_choice_allows_call(
                         tchoice, allowed_tool_names, name, accepted);
                 });
-            ordered.text+=unclosed_tool;
+            // unclosed-<tool_call> tail: recover COMPLETE inner calls the same
+            // way bb60661 recovers closed ones, without EOF repair (see the
+            // helper). Only finished inner JSON executes; a partial Write stays
+            // text.
+            ordered.recovered += q27::recover_unclosed_tool_tail(
+                unclosed_tool, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                [&](const std::string& t) { ordered.append_visible_text(t); },
+                [&](q27::ToolCall c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                            tchoice, allowed_tool_names, c.name,
+                            ordered.calls.size()))
+                        return false;
+                    ordered.append_tool_call(std::move(c));
+                    return true;
+                });
             std::string tx = ordered.text;
             std::vector<q27::ToolCall> eligible_calls = std::move(ordered.calls);
             if (ordered.recovered)
@@ -2257,11 +2278,12 @@ int main(int argc, char** argv) {
                 // mechanical twin of the /v1/messages SSE handler above.
                 const std::string cid = "chatcmpl-q27-" + std::to_string(rid);
                 ToolConstrainer tc;
-                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                auto params_per_name = q27::tool_param_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
                 StreamSplitter sp;
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
@@ -2395,8 +2417,16 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) {
                     if (final_tool_incomplete) {
-                        emit_text(tool_buf);
+                        // recover COMPLETE inner calls from the truncated
+                        // wrapper; no EOF repair, so a partial Write stays text.
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, has_tools ? &tools : nullptr,
+                            emit_text, emit_call);
                         tool_buf.clear();
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (oai-stream truncated wrapper)\n",
+                                    rec);
                     } else emit_tool();
                 }
                 if (!final_tool_incomplete)
@@ -2631,11 +2661,12 @@ int main(int argc, char** argv) {
                 else segments.emplace_back(ch, t);
             };
             ToolConstrainer tc;
-            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+            tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
             tc.host2dev = &sl.tool_mask_host2dev;
             tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                          eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-            tc.begin(tool_names_v);
+            auto params_per_name = q27::tool_param_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             eng.on_round = [&](const int* em, int nr) {
@@ -2697,7 +2728,19 @@ int main(int argc, char** argv) {
                     return q27::tool_choice_allows_call(
                         tchoice,allowed_tool_names,name,accepted);
                 });
-            ordered.append_visible_text(unclosed_tool);
+            // unclosed-<tool_call> tail: recover COMPLETE inner calls (bb60661
+            // style), no EOF repair -- a partial Write stays text.
+            ordered.recovered += q27::recover_unclosed_tool_tail(
+                unclosed_tool, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                [&](const std::string& t) { ordered.append_visible_text(t); },
+                [&](q27::ToolCall c) {
+                    if (!c.ok || !q27::tool_choice_allows_call(
+                            tchoice,allowed_tool_names,c.name,
+                            ordered.calls.size()))
+                        return false;
+                    ordered.append_tool_call(std::move(c));
+                    return true;
+                });
             json content = json::array();
             std::string th = q27::strip_ws2(ordered.reasoning);
             if (!th.empty())
@@ -2763,11 +2806,12 @@ int main(int argc, char** argv) {
                 const int nm = limits.n_max;
                 const int think_budget = limits.budget;
                 ToolConstrainer tc;
-                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache;
+                tc.eng = &eng; tc.tok = &tok; tc.cache = &tool_mask_cache; tc.cache_xml = &tool_mask_cache_xml;
                 tc.host2dev = &sl.tool_mask_host2dev;
                 tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                              eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
-                tc.begin(tool_names_v);
+                auto params_per_name = q27::tool_param_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 bool alive = true; // cleared when a write fails (client disconnected)
@@ -2938,8 +2982,14 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) emit_seg(ch, t);
                 if (!tool_buf.empty()) {
                     if (final_tool_incomplete) {
-                        emit_text(tool_buf);
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, has_tools ? &tools : nullptr,
+                            emit_text, emit_call);
                         tool_buf.clear();
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (stream truncated wrapper)\n",
+                                    rec);
                     } else emit_tool();
                 }
                 if(!final_tool_incomplete)
@@ -3424,9 +3474,26 @@ int main(int argc, char** argv) {
             for (auto& [ch, t] : sp.flush()) route(ch, t);
             if (!ctx->tool_buf.empty()) {
                 if (unfinished_tool_wrapper) {
-                    push_text(ctx->tool_buf,true);
+                    // recover COMPLETE inner calls from the truncated wrapper
+                    // (bb60661 for the unclosed tail); no EOF repair, so a
+                    // partial Write stays text. Residual is incomplete text.
+                    const size_t rec = q27::recover_unclosed_tool_tail(
+                        ctx->tool_buf, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                        [&](const std::string& t) { push_text(t, true); },
+                        [&](q27::ToolCall c) -> bool {
+                            if (!c.ok || !q27::tool_choice_allows_call(
+                                    response_choice, eligible_call_names,
+                                    c.name, tool_counter))
+                                return false;
+                            emit_tool(std::move(c));
+                            return true;
+                        });
                     ctx->tool_buf.clear();
-                    ctx->tool_tail=false;
+                    ctx->tool_tail = rec != 0;
+                    if (rec)
+                        fprintf(stderr,
+                                "[tool-fallback] %zu drifted call(s) recovered (responses truncated wrapper)\n",
+                                rec);
                 } else flush_tool();
             }
             flush_think();
@@ -3857,9 +3924,18 @@ int main(int argc, char** argv) {
                 for (auto& [ch, t] : sp.flush()) route(ch, t);
                 if (!tool_buf.empty()) {
                     if (unfinished_tool_wrapper) {
-                        append_text(tool_buf);
+                        // recover COMPLETE inner calls (bb60661 for the
+                        // unclosed tail); no EOF repair -- partial Write stays
+                        // text.
+                        const size_t rec = q27::recover_unclosed_tool_tail(
+                            tool_buf, tools.is_array() && !tools.empty() ? &tools : nullptr,
+                            append_text, emit_call);
                         tool_buf.clear();
-                        output_tool_tail=false;
+                        output_tool_tail = rec != 0;
+                        if (rec)
+                            fprintf(stderr,
+                                    "[tool-fallback] %zu drifted call(s) recovered (responses-stream truncated wrapper)\n",
+                                    rec);
                     } else flush_tool();
                 }
                 flush_think();

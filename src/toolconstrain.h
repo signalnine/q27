@@ -28,13 +28,18 @@ template <class EngineT, class TokT>
 struct BasicToolConstrainer {
     EngineT* eng = nullptr;
     const TokT* tok = nullptr;
-    ToolMaskCache* cache = nullptr;
+    ToolMaskCache<ToolGrammar>* cache = nullptr;
+    ToolMaskCache<ToolGrammarXml>* cache_xml = nullptr; // parallel cache for the XML dialect
     std::vector<int>* host2dev = nullptr;
     bool enabled = false, active = false;
     bool pool_dead = false; // sticky: mask pool filled up this request
     ToolGrammar tg;
     ToolGrammar staged_state; // grammar state whose mask is in verify slot 0
+    ToolGrammarXml staged_state_xml; // parallel for the XML dialect (P11 on_drafts)
+    ToolGrammarXml tg_xml;     // XML-dialect sibling (3.8 trained format)
     std::vector<std::string> names;
+    std::vector<std::vector<std::string>> params_per_name; // per-tool param-key allowlists (XML)
+    bool dialect_xml = false;  // select XML grammar (ToolGrammarXml) vs JSON (ToolGrammar)
     std::string tail; // rolling decoded-text window for the opener trigger
     int skip_feed = 0; // round tokens already consumed by scan_round
     long engaged = 0, disengaged = 0, pool_drops = 0, rebinds = 0;
@@ -45,6 +50,22 @@ struct BasicToolConstrainer {
         skip_feed = 0;
         tail.clear();
         names = std::move(n);
+        dialect_xml = false;
+        params_per_name.clear();
+    }
+    // Schema + dialect aware begin: pass params_per_name aligned with `n` and
+    // dialect_xml=true to constrain the body with ToolGrammarXml (the 3.8
+    // trained format); dialect_xml=false (default) keeps the JSON body
+    // grammar. The XML grammar switches its parameter-key allowlist when the
+    // tool name completes (reset's params_per_name), so callers MUST supply
+    // the schema for the prevention to bite.
+    void begin(std::vector<std::string> n,
+               std::vector<std::vector<std::string>> pp,
+               bool dialect_xml_) {
+        begin(std::move(n));
+        dialect_xml = dialect_xml_;
+        params_per_name = std::move(pp);
+        if (dialect_xml_) tg_xml.reset(names, params_per_name);
     }
     // pool id for grammar state g's legal-token mask (-1 if pool full)
     int mask_id(const ToolGrammar& g) {
@@ -71,6 +92,37 @@ struct BasicToolConstrainer {
         if (slot < 0) slot = eng->mask_pool_add(cache->mask(ci).data());
         return slot;
     }
+    // XML-dialect twin of mask_id (mirrors the same host2dev / split-brain
+    // machinery, but against the parallel ToolMaskCache<ToolGrammarXml>).
+    // Guard (review 2026-08-20): if cache_xml is null (caller forgot to wire
+    // it -- the 3-arg begin does NOT check this), bail with pool-dead so the
+    // constrainer disengages cleanly instead of crashing on a null deref. The
+    // intended production wiring sets tc.cache_xml alongside tc.cache in
+    // server.cu (and metal_server.cpp); this guard makes that wiring
+    // mandatory rather than load-bearing.
+    int mask_id(const ToolGrammarXml& g) {
+        if (!cache_xml) {
+            if (!active) {
+                fprintf(stderr, "[toolgram-xml] mask_id called with cache_xml=null "
+                                "-- 3-arg begin(names, params, /*dialect_xml=*/true) "
+                                "requires tc.cache_xml to be assigned (see server.cu)\n");
+            }
+            pool_drops++;
+            pool_dead = true;
+            return -1;
+        }
+        int ci = cache_xml->get(g);
+        if ((int)host2dev->size() <= ci) host2dev->resize(ci + 1, -2);
+        int& slot = (*host2dev)[ci];
+        if (slot >= 0 && slot >= eng->mask_pool_used) {
+            fprintf(stderr, "[toolgram-xml] stale mask id %d >= pool %d -- re-uploading\n", slot,
+                    eng->mask_pool_used);
+            rebinds++;
+            slot = -2;
+        }
+        if (slot < 0) slot = eng->mask_pool_add(cache_xml->mask(ci).data());
+        return slot;
+    }
     void apply(const ToolGrammar& g) {
         int slot = mask_id(g);
         if (slot < 0) {
@@ -82,12 +134,25 @@ struct BasicToolConstrainer {
         staged_state = g; // P11: on_drafts advances from here for lanes 1-4
         eng->set_tool_constraint(slot);
     }
+    // XML-dialect twin of apply.
+    void apply(const ToolGrammarXml& g) {
+        int slot = mask_id(g);
+        if (slot < 0) {
+            pool_drops++;
+            pool_dead = true;
+            drop("mask pool full (constraint off for the rest of this request)");
+            return;
+        }
+        staged_state_xml = g;
+        eng->set_tool_constraint(slot);
+    }
     // P11: mid-round, given the 4 draft tokens, stage per-lane masks. Lane 0 =
     // staged_state (the pending position, legal set already correct); lane k =
     // that state advanced over drafts d1..dk. If a draft is grammar-illegal,
     // remaining lanes reuse the last legal mask -- moot, since acceptance
     // breaks at that lane anyway (its verify argmax is legal != the draft).
     void on_drafts(const int* dr) {
+        if (dialect_xml) { on_drafts_xml(dr); return; }
         int ids[5];
         ToolGrammar c = staged_state;
         ids[0] = mask_id(c);
@@ -102,13 +167,37 @@ struct BasicToolConstrainer {
         if (ids[0] < 0) return; // pool exhausted; verify keeps prior masks
         eng->set_tool_masks5(ids);
     }
+    // XML twin of on_drafts (same semantics, ToolGrammarXml).
+    void on_drafts_xml(const int* dr) {
+        int ids[5];
+        ToolGrammarXml c = staged_state_xml;
+        ids[0] = mask_id(c);
+        bool alive = true;
+        for (int k = 1; k <= 4; k++) {
+            if (alive)
+                for (char ch : tok->decode_one(dr[k - 1]))
+                    if (!c.advance(ch)) { alive = false; break; }
+            ids[k] = alive ? mask_id(c) : ids[k - 1];
+            if (ids[k] < 0) ids[k] = ids[k - 1] < 0 ? ids[0] : ids[k - 1];
+        }
+        if (ids[0] < 0) return;
+        eng->set_tool_masks5(ids);
+    }
     // Stage next round's slot-0 mask: the constrained lane decides the token
     // AFTER the pending one, so simulate the pending token on a copy first.
     void on_pending(int id) {
         if (!enabled || !active || id < 0) return;
+        if (dialect_xml) { on_pending_xml(id); return; }
         ToolGrammar peek = tg;
         for (char c : tok->decode_one(id))
             if (!peek.advance(c)) return; // entry-race pending; on_id will drop
+        if (peek.closed()) { eng->set_tool_constraint(-1); return; }
+        apply(peek);
+    }
+    void on_pending_xml(int id) {
+        ToolGrammarXml peek = tg_xml;
+        for (char c : tok->decode_one(id))
+            if (!peek.advance(c)) return;
         if (peek.closed()) { eng->set_tool_constraint(-1); return; }
         apply(peek);
     }
@@ -140,10 +229,12 @@ struct BasicToolConstrainer {
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
             std::string rem = tail.substr(pos + 11);
-            tg.reset(names);
+            if (dialect_xml) tg_xml.reset(names, params_per_name);
+            else tg.reset(names);
             active = true;
             engaged++;
-            fprintf(stderr, "[toolgram] engaged (rem=%zu)\n", rem.size());
+            fprintf(stderr, "[toolgram] engaged (rem=%zu, dialect=%s)\n",
+                    rem.size(), dialect_xml ? "xml" : "json");
             if (getenv("Q27_TG_TRACE")) {
                 std::string t2 = tail;
                 for (auto& ch : t2)
@@ -152,7 +243,7 @@ struct BasicToolConstrainer {
             }
             bool rem_ok = true;
             for (char c : rem)
-                if (!tg.advance(c)) {
+                if ((dialect_xml ? tg_xml.advance(c) : tg.advance(c)) == false) {
                     char why[64];
                     snprintf(why, sizeof why, "entry byte 0x%02x rejected", (unsigned char)c);
                     drop(why);
@@ -160,15 +251,13 @@ struct BasicToolConstrainer {
                     break;
                 }
             if (!rem_ok) continue; // keep scanning; a later marker may engage
-            if (tg.closed()) {
-                // the whole call completed inside this token's remainder --
-                // nothing left to constrain (and a closed-state mask must
-                // never be staged). Post-call text continues unconstrained.
+            if (dialect_xml ? tg_xml.closed() : tg.closed()) {
                 active = false;
                 fprintf(stderr, "[toolgram] call closed within entry token\n");
                 continue;
             }
-            apply(tg);
+            if (dialect_xml) apply(tg_xml);
+            else apply(tg);
             if (!active) {
                 // pool-full drop inside apply: stickiness must hold from this
                 // token on -- a later marker whose entry mask happens to be
@@ -195,13 +284,13 @@ struct BasicToolConstrainer {
             fprintf(stderr, "[tg-trace] feed: %s\n", t2.c_str());
         }
         for (char c : bytes)
-            if (!tg.advance(c)) {
+            if (!(dialect_xml ? tg_xml.advance(c) : tg.advance(c))) {
                 char why[64];
                 snprintf(why, sizeof why, "byte 0x%02x rejected", (unsigned char)c);
                 drop(why);
                 return;
             }
-        if (tg.closed()) {
+        if (dialect_xml ? tg_xml.closed() : tg.closed()) {
             eng->set_tool_constraint(-1);
             active = false;
             tail.clear();

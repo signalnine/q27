@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::string> vocab = tok.vocab_bytes();
-    q27::ToolMaskCache cache;
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
     cache.init(&vocab, tok.token_id("</tool_call>"));
     std::vector<int> host2dev;
     q27::BasicToolConstrainer<Engine, q27::Tokenizer> tc;
