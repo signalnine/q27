@@ -3273,6 +3273,23 @@ inline bool plausible_bare_tool_prefix_range(
         const size_t compared=std::min(available,key_size);
         if(text.compare(p,compared,key,compared)==0) return true;
     }
+    // Args-only object (issue #38 round 6): the model emits the ARGUMENTS
+    // object bare -- {"command": ...} -- with no name key at all. Any quoted
+    // identifier first key is plausible; classification decides whether a
+    // call comes out (an ordinary JSON object is re-emitted untouched), so
+    // the cost of holding is latency, not bytes.
+    if(text[p]=='"') {
+        size_t q=p+1;
+        if(q==end) return true;
+        if(!(isalpha((unsigned char)text[q]) || text[q]=='_')) return false;
+        while(q<end && (isalnum((unsigned char)text[q]) || text[q]=='_' ||
+                        text[q]=='-')) q++;
+        if(q==end) return true;
+        if(text[q]!='"') return false;
+        q++;
+        while(q<end && (text[q]==' '||text[q]=='\t')) q++;
+        return q==end || text[q]==':';
+    }
     return false;
 }
 
@@ -3647,6 +3664,15 @@ inline bool bare_candidate_repair_eligible(
     // balanced-object path is deferred only for the exact mode-11 shape;
     // ordinary {"name":...} JSON must continue streaming immediately.
     if(mode10) return true;
+    // Args-only object (round 6): a balanced-but-malformed {"ident": ...}
+    // defers to final tolerant recovery, where the trailing XML closers the
+    // deferral captured decide whether mode 23 fires.
+    if(!text.empty() && text[0]=='{' && text.compare(0,7,"{\"name\"")!=0) {
+        size_t p=1;
+        while(p<text.size() && isspace((unsigned char)text[p])) p++;
+        if(p<text.size() && text[p]=='"' && p+1<text.size() &&
+           (isalpha((unsigned char)text[p+1]) || text[p+1]=='_')) return true;
+    }
     if(text.compare(0,7,"{\"name\"")!=0) return false;
     const size_t colon=text.find(':',7);
     if(colon==std::string::npos) return false;
@@ -3993,6 +4019,23 @@ struct BareToolTextHoldback {
         if(!deferred.empty()) {
             pending=std::move(deferred);
             trailing=std::move(deferred_trailing);
+            // Round 6: XML closers that followed a deferred args-only object
+            // are its intent evidence -- move them into the candidate so the
+            // repair-time classify sees them (a bare object with no closers
+            // stays an ordinary object and is re-emitted).
+            size_t adv=0;
+            for(;;) {
+                size_t w=adv;
+                while(w<trailing.size() && isspace((unsigned char)trailing[w])) w++;
+                static const char* const closers[]={"</parameter>","</function>","</tool_call>"};
+                bool moved=false;
+                for(const char* c:closers) {
+                    const size_t n=std::char_traits<char>::length(c);
+                    if(trailing.compare(w,n,c)==0) { adv=w+n; moved=true; break; }
+                }
+                if(!moved) break;
+            }
+            if(adv>0) { pending+=trailing.substr(0,adv); trailing.erase(0,adv); }
             holding=true;
             mode10=deferred_mode10;
             deferred_mode10=false;
@@ -4632,6 +4675,123 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
         }
     }
     return false;
+}
+
+// DRIFT MODE 23 (2026-09-01, issue #38 round 6, cosmicnag): the model emits
+// the ARGUMENTS object bare -- {"command": "..."} with no name, no wrapper,
+// no opener -- then closes with XML dialect closers (</parameter>
+// </function>). The inverse chimera of mode 17, with mode-11-class escaping
+// damage inside the value (mixed \" and raw ", literal newlines). The XML
+// closers are the intent evidence: a bare JSON object in prose does NOT
+// fire (nothing but whitespace/closers may follow the object). The value
+// repair is the mode-11 terminator scan, tried per declared tool (its
+// string params are the scan keys); the call fires only when exactly ONE
+// tool yields a parse whose keys fit it.
+inline bool recover_args_object_call(const std::string& text, const json& tools,
+                                     std::vector<ToolCall>& out) {
+    // The object start: the LAST bare '{' opening a quoted-identifier key.
+    size_t mo=std::string::npos;
+    for(size_t i=text.rfind('{');i!=std::string::npos;
+        i=i?text.rfind('{',i-1):std::string::npos) {
+        size_t p=i+1;
+        while(p<text.size() && isspace((unsigned char)text[p])) p++;
+        if(p<text.size() && text[p]=='"' && p+1<text.size() &&
+           (isalpha((unsigned char)text[p+1])||text[p+1]=='_') &&
+           text.compare(i,7,"{\"name\"")!=0 &&
+           bare_text_position_is_executable(text,i)) { mo=i; break; }
+        if(!i) break;
+    }
+    if(mo==std::string::npos) return false;
+    // Closer evidence: the text after the object's last "} must be only
+    // whitespace and XML closers, with at least one </function> or
+    // </parameter> present.
+    const size_t vend=text.rfind("\"}");
+    if(vend==std::string::npos || vend<mo) return false;
+    size_t q=vend+2; bool saw_closer=false;
+    while(q<text.size()) {
+        if(isspace((unsigned char)text[q])) { q++; continue; }
+        bool moved=false;
+        static const char* const closers[]={"</parameter>","</function>","</tool_call>"};
+        for(const char* c:closers) {
+            const size_t n=std::char_traits<char>::length(c);
+            if(text.compare(q,n,c)==0) { q+=n; moved=true; saw_closer=true; break; }
+        }
+        if(!moved) return false;  // real content after the object: not a call
+    }
+    if(!saw_closer) return false;
+    const std::string obj=text.substr(mo,vend+2-mo);
+    // Per-tool trial of the mode-11 terminator-scan repair.
+    std::string hit_name; json hit_args; int hits=0;
+    for(const auto& t:tools) {
+        if(!t.contains("function")) continue;
+        const json& fn=t["function"];
+        const std::string nm=fn.value("name",std::string());
+        if(nm.empty()) continue;
+        std::vector<std::string> strkeys; json props;
+        if(fn.contains("parameters") && fn["parameters"].is_object() &&
+           fn["parameters"].contains("properties") &&
+           fn["parameters"]["properties"].is_object()) {
+            props=fn["parameters"]["properties"];
+            for(auto it=props.begin();it!=props.end();++it)
+                if(it.value().is_object() &&
+                   it.value().value("type",std::string())=="string")
+                    strkeys.push_back(it.key());
+        }
+        json parsed;
+        bool ok=false;
+        try { parsed=json::parse(obj); ok=parsed.is_object(); } catch(...) {}
+        if(!ok) {
+            for(const auto& k:strkeys) {
+                size_t kp=obj.find("\""+k+"\"");
+                if(kp==std::string::npos) continue;
+                size_t kc=obj.find(':',kp+k.size()+2);
+                if(kc==std::string::npos) continue;
+                size_t opener=obj.find('"',kc+1);
+                if(opener==std::string::npos) continue;
+                for(size_t cand=obj.find('"',opener+1);cand!=std::string::npos;
+                    cand=obj.find('"',cand+1)) {
+                    const std::string body=minimal_escape_body(
+                        obj.substr(opener+1,cand-opener-1));
+                    const std::string recon=first_balanced_object(
+                        obj.substr(0,opener)+"\""+body+"\""+obj.substr(cand+1));
+                    if(recon.empty()) continue;
+                    try {
+                        json o2=json::parse(recon);
+                        if(o2.is_object()) { parsed=std::move(o2); ok=true; }
+                    } catch(...) { continue; }
+                    if(ok) break;
+                }
+                if(ok) break;
+            }
+        }
+        if(!ok || !parsed.is_object() || parsed.empty()) continue;
+        // Fit: every key known to this tool, every required key present.
+        bool fits=true;
+        for(auto it=parsed.begin();it!=parsed.end();++it)
+            if(!props.is_object() || !props.contains(it.key())) { fits=false; break; }
+        if(fits && fn.contains("parameters") &&
+           fn["parameters"].contains("required") &&
+           fn["parameters"]["required"].is_array())
+            for(const auto& r:fn["parameters"]["required"])
+                if(r.is_string() && !parsed.contains(r.get<std::string>())) { fits=false; break; }
+        if(!fits) continue;
+        hits++;
+        if(hits>1) return false;  // ambiguous: refuse rather than guess
+        hit_name=nm; hit_args=std::move(parsed);
+    }
+    if(hits!=1) return false;
+    ToolCall tc;
+    tc.ok=true;
+    tc.name=hit_name;
+    tc.arguments=std::move(hit_args);
+    // Offsets are in the rewritten buffer; the span validator maps them back
+    // to source and fills source_begin/source_end/raw (same as mode 11).
+    tc.rewritten_begin=mo;
+    tc.rewritten_end=q;
+    fprintf(stderr,"[drift] mode 23: args-only object + XML closers -> %s\n",
+            hit_name.c_str());
+    out.push_back(std::move(tc));
+    return true;
 }
 
 inline bool only_dialect_control_bytes(const std::string& s) {
@@ -6328,6 +6488,15 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
         size_t mo = text.rfind("{\"name\"");
         const std::string before = mo != std::string::npos
             ? strip_ws2(text.substr(0, mo)) : std::string();
+        if (prefix) *prefix = before;
+        if (remaining_text) *remaining_text = before;
+    }
+    // mode 23: args-only object + XML closers (round 6). Same last-resort
+    // tier as mode 11; the closer-evidence gate keeps prose JSON as text.
+    if (out.empty() && allow_eof_repair && tools && tools->is_array() &&
+        recover_args_object_call(text, *tools, out)) {
+        drift_mode_hint = "23";
+        const std::string before = strip_ws2(text.substr(0, out.front().source_begin));
         if (prefix) *prefix = before;
         if (remaining_text) *remaining_text = before;
     }

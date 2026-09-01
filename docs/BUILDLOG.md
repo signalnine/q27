@@ -15553,3 +15553,38 @@ requests are never preempted; dashboards should treat 0 as healthy. Design
 reference: `docs/metrics-endpoint.md`. Security posture of the new
 auth-exempt route dispositioned in the SECURITY-MODEL addendum of the same
 date.
+
+## 2026-09-01 (a): drift mode 23 -- the args-only object (issue #38 round 6)
+
+cosmicnag's sixth distinct shape: the model emits the ARGUMENTS object bare
+-- `{"command": "..."}`, no name, no wrapper, no opener -- then closes with
+XML dialect closers, and the value carries mode-11-class escaping damage
+(mixed `\"` and raw `"`, literal newlines mid-string). The inverse chimera
+of mode 17. Non-stream recovered nothing; streaming leaked the whole object
+as text and the agent halted.
+
+`recover_args_object_call`, last-resort tier next to mode 11. The XML
+closers are the intent evidence -- nothing but whitespace and closers may
+follow the object, so a bare JSON object in prose stays text. The value
+repair is mode 11's terminator scan (minimal-escape the span, first
+reconstruction that parses wins), tried per declared tool with that tool's
+string params as scan keys; the call fires only when exactly ONE tool
+yields a parse whose keys fit (all keys known, required present) --
+ambiguity refuses rather than guesses. Fidelity on the report's bytes: the
+1187-byte command survives with both the raw-quote region and the escaped
+tail intact.
+
+Streaming needed three touchpoints: `plausible_bare_tool_prefix` widened to
+any quoted-identifier first key (an ordinary object is held, classified,
+and re-emitted untouched -- the old bounds test asserting refusal is
+updated); args-only objects defer on strict failure so final tolerant
+recovery sees them; and the holdback's finish() absorbs trailing closers
+from `deferred_trailing` into the candidate, since the deferral machinery
+already captures late-arriving bytes. One implementation gotcha for the
+next recovery fn: the impl operates on the REWRITTEN buffer -- set
+rewritten_begin/rewritten_end, not source_*, or the span validator clears
+the whole result.
+
+Tracked tests both directions (the recovery at chunk sizes to 1 byte; a
+prose object without closers re-emitting byte-intact). test-tools green,
+corpus-check 159/159 unchanged, fuzz 250k clean, server.cu under nvcc.

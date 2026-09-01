@@ -1636,7 +1636,10 @@ static void test_bare_tool_stream_holdback_bounds() {
     CHECK(q27::plausible_bare_tool_prefix("{  \n\"na"));
     CHECK(q27::plausible_bare_tool_prefix("{\"arguments\":{"));
     CHECK(q27::plausible_bare_tool_prefix("{\"tool_name\":\"read\"}"));
-    CHECK(!q27::plausible_bare_tool_prefix("{\"title\":\"ordinary\"}"));
+    // Round 6 (mode 23) inverted this: an ordinary-keyed object IS plausible
+    // now -- it is held, classified, and re-emitted untouched when it is not
+    // a call (see test_stream_router_bare_object_without_closers_stays_text).
+    CHECK(q27::plausible_bare_tool_prefix("{\"title\":\"ordinary\"}"));
     CHECK(!q27::plausible_bare_tool_prefix("{code block"));
     const std::string complete="{\"name\":\"read\",\"arguments\":{\"text\":\"} kept\"}} tail";
     CHECK(q27::balanced_json_object_prefix_end(complete)==complete.size()-5);
@@ -3101,6 +3104,49 @@ static json mode21_stream_tools() {
       {"type":"function","function":{"name":"read","parameters":{"type":"object",
         "properties":{"path":{"type":"string"}},"required":["path"]}}}])");
 }
+// issue #38 round 6 (2026-09-01, cosmicnag): the ARGUMENTS object emitted
+// bare -- {"command": "..."} with no name, no wrapper, no opener -- closed by
+// XML dialect closers, with mode-11-class escaping damage inside the value
+// (mixed \\" and raw ", literal newlines). The XML closers are the intent
+// evidence; the repair is the mode-11 terminator scan tried per declared
+// tool, firing only on a unique fit (mode 23).
+static void test_stream_router_args_only_object_with_closers() {
+    const json tools = mode21_stream_tools();
+    // representative reduction of the report's bytes: escaped \\n, then a RAW
+    // unescaped quote + literal newline mid-value, then escaped \\" later,
+    // terminated "} + closers.
+    const std::string gen =
+        "This is the deciding evidence.\n Let me look.\n\n "
+        "{\"command\":\"D=/tmp/x\\necho \"===\n inner raw quote region\\ngrep -i \\\"pat\\\" f | head -c 600\"}\n\n"
+        " </parameter>\n </function>";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.size() == 1);
+        if (!r.calls.empty()) {
+            CHECK(r.calls[0].name == "Bash");
+            const std::string cmd = r.calls[0].arguments.value("command", std::string());
+            CHECK(cmd.find("echo \"===") != std::string::npos);      // raw quote survived
+            CHECK(cmd.find("head -c 600") != std::string::npos);      // tail survived
+        }
+        CHECK(r.text.find("{\"command\"") == std::string::npos);      // no leak
+        CHECK(r.text.find("deciding evidence.") != std::string::npos); // prose kept
+    }
+}
+
+// The evidence gate both ways: a bare JSON object in prose WITHOUT closers is
+// an ordinary object and must come back out as text; with closers but an
+// AMBIGUOUS registry fit, refuse rather than guess.
+static void test_stream_router_bare_object_without_closers_stays_text() {
+    const json tools = mode21_stream_tools();
+    const std::string gen = "the config is {\"command\":\"ls -la\"} as requested, done.";
+    for (size_t chunk : {size_t(1), size_t(7), size_t(64)}) {
+        auto r = stream_turn_tools(tools, gen, false, chunk);
+        CHECK(r.calls.empty());
+        CHECK(r.text.find("{\"command\":\"ls -la\"}") != std::string::npos);
+        CHECK(r.text.find("done.") != std::string::npos);
+    }
+}
+
 static void test_stream_router_openerless_html_attr_params() {
     const json tools = mode21_stream_tools();
     const std::string gen =
@@ -3259,6 +3305,8 @@ int main() {
     test_stream_router_bare_mode22_in_reasoning();
     test_stream_router_bare_mode22_standalone_zero_arg();
     test_stream_router_parameter_tag_that_is_not_a_call();
+    test_stream_router_args_only_object_with_closers();
+    test_stream_router_bare_object_without_closers_stays_text();
     test_stream_router_openerless_html_attr_params();
     test_stream_router_quoted_parameter_pair_stays_text();
     test_dialect_residue_is_not_text();
