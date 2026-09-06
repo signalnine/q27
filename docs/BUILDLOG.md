@@ -15680,3 +15680,32 @@ all byte-identical to the matched fp8 plain at K=7.
 Commit chain: c725ca1 (P0) b1e4cf0 (P1a) 2307465 (P1b) bd300e4 (P1c) 80e4447 (P2)
 9ca6e90 (P3). Pack: qwen38-dflash2-q4.d2w (canonical), qwen38-dflash2-q8.d2w
 (fallback). `--dflash2 <pack> [--k N]`.
+
+## 2026-09-06 (d): DFlash2 Phase 5 -- verify graph, wins on all four; the width-8 wall
+
+Phase-4's "drafter 12 ms" was a smoke artifact: dflash2_smoke uses the fp16 PACK
+head (no engine), so 10.4 ms of it was one gemv_f16_3 head/round. Real E2E
+(engine Q8 head) profile: no hot kernel; the round is eager drafter (~2 ms) +
+eager 64-layer width-8 verify (~18-20 ms). Verify was the lever.
+
+Captured spec_verify_forward(with taps)+spec_verify_tail as a graph (fixed
+launch seq, init-fixed buffers, per-round inputs are device buffers written
+before the round) and replay per round; Q27_D2_NOGRAPH=1 keeps eager. Graph is
+byte-identical to eager and deterministic run-to-run.
+
+Result -- dflash2 wins t/s on ALL four at K=7, byte-identical to plain greedy
+(fp8, engine head): code-write 164/154 (+6%), prose 130/124 (+4%), code-edit
+226/189 (+20%), echo 361/252 (+43%). +10-15% over the Phase-4 eager verify;
+round ~20 ms (drafter ~2 + graphed verify ~18).
+
+Width-8 wall: identity-vs-K on prose shows K<=7 (w<=8) byte-identical, K>=8
+(w>=9) diverges at the same token regardless of K -- a hard width boundary at
+8, = the ladder's structural max (D_MAX_MTP=7 -> gate_maxd+1=8). Widths 9..12
+are reached only by suffix rounds via captured graphs; the eager verify/GDN/fold
+at width>8 has a latent, pre-existing engine bug. K=7 is the default (Phase-0
+balanced point; wins echo +43% without the wider block). K>7 gains are gated on
+that engine-core fix, tracked separately.
+
+Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
+composition A/B; and the ~2 ms eager drafter tail (graphing needs a
+device-indexed embedding). Commit chain adds fbb19b6 (P4).

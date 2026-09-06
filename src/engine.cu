@@ -236,6 +236,26 @@ int main(int argc, char** argv) {
         // accepting n > 5 folds unrecorded rows and corrupts committed GDN
         // state. No graphs exist in this mode, so setting it is safe.
         e.set_round_width(d2_w);
+        // Phase 5: the width-d2_w verify (forward with tap capture + tail) is a
+        // fixed launch sequence over init-fixed buffers -- capture it ONCE and
+        // replay per round, dropping the eager 64-layer launch overhead. Every
+        // per-round input (staged drafts, positions, d_token, d_P) is a device
+        // buffer written by prep_round/the draft stage BEFORE the replay, so the
+        // graph reads current state. Q27_D2_NOGRAPH=1 keeps the eager path.
+        const bool d2_graph = !getenv("Q27_D2_NOGRAPH");
+        cudaGraphExec_t verify_exec = nullptr;
+        if (d2_graph) {
+            auto v = e.solo_view();
+            v.vw = d2_w;
+            cudaGraph_t g;
+            CUDA_CHECK(cudaStreamBeginCapture(e.stm, cudaStreamCaptureModeGlobal));
+            e.spec_verify_forward(v, d_vtaps);
+            e.spec_verify_tail(v);
+            CUDA_CHECK(cudaStreamEndCapture(e.stm, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&verify_exec, g, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(g));
+            fprintf(stderr, "dflash2: verify graph captured (width %d)\n", d2_w);
+        }
         cudaEvent_t t0, t1;
         CUDA_CHECK(cudaEventCreate(&t0));
         CUDA_CHECK(cudaEventCreate(&t1));
@@ -249,10 +269,14 @@ int main(int argc, char** argv) {
             for (int k = 0; k < d2_k; k++)
                 CUDA_CHECK(cudaMemcpyAsync(e.d_draft_L[k], d2.d_prop + k, 4,
                                            cudaMemcpyDeviceToDevice, e.stm));
-            auto v = e.solo_view();
-            v.vw = d2_w;
-            e.spec_verify_forward(v, d_vtaps);
-            e.spec_verify_tail(v);
+            if (verify_exec) {
+                CUDA_CHECK(cudaGraphLaunch(verify_exec, e.stm));
+            } else {
+                auto v = e.solo_view();
+                v.vw = d2_w;
+                e.spec_verify_forward(v, d_vtaps);
+                e.spec_verify_tail(v);
+            }
             int oc[OUTCOME_INTS];
             CUDA_CHECK(cudaMemcpyAsync(oc, e.d_outcome, OUTCOME_INTS * 4,
                                        cudaMemcpyDeviceToHost, e.stm));

@@ -1,12 +1,12 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phases 0-4 EXECUTED 2026-09-06 (results sections below). Phase 4
-Q4 repack DONE: numerics gate PASSED (K=7 byte-identical, tok/round within
--3.6%), drafter 26 -> 12 ms/round, dflash2 now WINS t/s on echo (+30%) and
-code-edit (+9%) at K=7, ~parity on code-write/prose. Remaining: the drafter
-is still eager (12 ms, launch-bound) -- CUDA-graph capture is the next lever
-to reach the projected ~13 ms round and win everywhere; and a width-10
-(K=9) identity edge case to fix before K>7 ships. Supersedes
+Status: Phases 0-5 EXECUTED 2026-09-06. **DONE: dflash2 wins t/s on all
+four traffic types at K=7, byte-identical to plain greedy.** Phase 5 added a
+captured verify graph (+10-15%): code-write 164/154, prose 130/124,
+code-edit 226/189 (+20%), echo 361/252 (+43%). Remaining, both optional:
+wire dflash2 into the server for a live-CC trial, and the small eager-drafter
+tail (~2 ms/round, needs a device-indexed embedding to graph). K>7 is capped
+by a pre-existing engine width>8 verify bug (see Phase 5). Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -471,6 +471,57 @@ tokens. Always compare a drafter run against a plain run at the SAME KV
 setting -- the first "divergence" here was a stale fp16-KV baseline, not a
 bug (plain greedy is deterministic run-to-run, and Q4/Q8/fp16 drafters are
 all byte-identical to the matched fp8 plain).
+
+## Phase 5 (2026-09-06, same day): verify graph -> wins everywhere; the width-8 wall
+
+**The Phase-4 "drafter is 12 ms" number was a smoke artifact.** The
+`dflash2_smoke` tool uses the fp16 PACK head (it has no engine), so 10.4 of
+its 12 ms was one `gemv_f16_3` head call per round. Profiling the real E2E
+(engine Q8 head) showed no pathological kernel: the round is the eager sum of
+a small drafter (~2 ms) and the eager 64-layer width-8 verify (~18-20 ms).
+The verify was the lever, not the drafter.
+
+**Verify graph.** `spec_verify_forward` (with tap capture) + `spec_verify_tail`
+is a fixed launch sequence over init-fixed buffers; every per-round input
+(staged drafts, positions, d_token, d_P) is a device buffer written before
+the round. So it captures once and replays -- exactly how the ladder graphs
+its own verify, now with the tap D2D copies inside the capture (the tap
+buffer is init-fixed). `Q27_D2_NOGRAPH=1` keeps the eager path; the two are
+byte-identical and the graph is deterministic run-to-run.
+
+**Result -- dflash2 wins t/s on all four at K=7, byte-identical to plain
+greedy (fp8 KV, engine head):**
+
+| traffic    | ladder | dflash2 K=7 | delta |
+|------------|-------:|------------:|------:|
+| code-write |    154 |         164 |   +6% |
+| prose      |    124 |         130 |   +4% |
+| code-edit  |    189 |         226 |  +20% |
+| echo       |    252 |         361 |  +43% |
+
+The graph added +10-15% over the Phase-4 eager verify and flipped code-write
+and prose from parity to wins. Round is now ~20 ms (drafter ~2 ms eager +
+graphed verify ~18 ms).
+
+**The width-8 wall (why K stays at 7).** Mapping identity vs K on prose:
+K<=7 (width<=8) byte-identical, K>=8 (width>=9) diverges -- and always at the
+same token regardless of K, i.e. a hard width boundary at 8, not a
+drafter-quality effect. Width 8 is exactly the ladder's structural max
+(D_MAX_MTP=7 -> gate_maxd+1=8); widths 9..12 are reached only by suffix
+rounds through *captured* graphs, and the eager verify/GDN/fold at width>8
+has a latent bug the ladder never exercises. It is pre-existing engine-core
+code, not the drafter integration, and K=7 is the right default anyway (the
+Phase-0 balanced point, and it already wins echo by +43% without needing the
+wider block). Fixing width>8 would unlock the K=9 echo/code-edit gains but is
+its own engine task, tracked separately.
+
+**Remaining, both optional.** (1) Wire dflash2 behind a server flag
+(`Q27_DFLASH2`) for the live-CC trial and the suffix-composition A/B -- the
+CLI single-turn wins are clean, but real agentic traffic (long context, echo
+bursts) is the last validation before a default flip. (2) The ~2 ms eager
+drafter tail: graphing it needs a device-indexed embedding lookup (the anchor
+token currently bakes into a launch arg); ~1 ms/round, low priority now that
+every traffic type already wins.
 
 ## Prior art
 
