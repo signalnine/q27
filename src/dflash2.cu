@@ -390,10 +390,11 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
             }
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
             q27k::gemv_f16_3(f16(nm), mkCP3(s_ct, D2_H, n), kr, D2_KVD, D2_H, st, n);
+            // ring rows for this chunk are contiguous [n][KVD] from base+ctx_n+c0;
+            // norm all n rows' heads in one launch.
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
-            for (int t = 0; t < n; t++)
-                q27k::rmsnorm_heads(kr.p[t], f32(nm), kr.p[t], D2_NKV, D2_HD, D2_HD, D2_EPS,
-                                    st);
+            q27k::rmsnorm_heads(kr.p[0], f32(nm), kr.p[0], n * D2_NKV, D2_HD, D2_HD, D2_EPS,
+                                st);
             {
                 IP3 ip{};
                 for (int i = 0; i < 16; i++) ip.p[i] = d_ing_pos + c0 + (i < n ? i : 0);
@@ -449,14 +450,13 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
         q27k::gemv_f16_3(f16(nm), y0C, mkP3(nk, D2_KVD, W), D2_KVD, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
         q27k::gemv_f16_3(f16(nm), y0C, mkP3(nv, D2_KVD, W), D2_KVD, D2_H, st, W);
+        // nq/nk are [W][*D] contiguous and each head is exactly head_dim with
+        // stride head_dim, so all W rows' heads norm in ONE launch (W*NH and
+        // W*NKV heads) -- bit-identical to the per-row loop, W-1 fewer launches.
         snprintf(nm, sizeof nm, "layers.%d.self_attn.q_norm.weight", l);
-        for (int r = 0; r < W; r++)
-            q27k::rmsnorm_heads(nq + (size_t)r * D2_QD, f32(nm), nq + (size_t)r * D2_QD, D2_NH,
-                                D2_HD, D2_HD, D2_EPS, st);
+        q27k::rmsnorm_heads(nq, f32(nm), nq, W * D2_NH, D2_HD, D2_HD, D2_EPS, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
-        for (int r = 0; r < W; r++)
-            q27k::rmsnorm_heads(nk + (size_t)r * D2_KVD, f32(nm), nk + (size_t)r * D2_KVD,
-                                D2_NKV, D2_HD, D2_HD, D2_EPS, st);
+        q27k::rmsnorm_heads(nk, f32(nm), nk, W * D2_NKV, D2_HD, D2_HD, D2_EPS, st);
         q27k::rope3(mkP3(nq, D2_QD, W), D2_NH, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
         q27k::rope3(mkP3(nk, D2_KVD, W), D2_NKV, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
         {

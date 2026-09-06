@@ -15588,3 +15588,64 @@ the whole result.
 Tracked tests both directions (the recovery at chunk sizes to 1 byte; a
 prose object without closers re-emitting byte-intact). test-tools green,
 corpus-check 159/159 unchanged, fuzz 250k clean, server.cu under nvcc.
+
+## 2026-09-06 (b): DFlash2 drafter integration, Phases 0-3 -- GO conditional on a Q4 repack
+
+Full arc in docs/plans/2026-09-06-dflash2-integration.md; this is the ledger
+summary. Triggered by the ninfer re-bench (bench/crossengine/NINFER-REBENCH.md):
+their DFlash2 integration beat their own MTP3 by +40-50% on our instrument,
+first working DFlash-family win on this box.
+
+**Phase 0 (measurement, zero engine risk).** z-lab's torch package run over
+q27-captured taps. Drafter beats the ladder on tok/round on think/code, and
+the composition thesis INVERTED vs the parked v1 design: both drafters feast
+on echo (correlated), so dflash2's real margin is prose/code, not the
+echo-stacking the old doc assumed.
+
+**Phase 1.** (a) Quant-tap kill gate PASSED: controlled same-token-stream
+comparison, q27 5.25-bpw taps vs BF16 taps = +2/+4/+9/0% (self-consistent
+live taps edge out off-policy BF16). (b) CUDA runtime src/dflash2.cu, parity
+vs torch (91.7% token match, AL within 2%). (c) In-engine `q27 --dflash2`:
+suffix-round pattern + eager width-8 verify with tap capture, BYTE-IDENTICAL
+to plain greedy on all four traffic types. Landmine: gdn_mix + the record
+arena run at the MEMBER vw (the LaneView vw only drives the attn/FFN sweep) --
+a width-8 round accepting n>=6 folded unrecorded GDN rows and corrupted state;
+fix set_round_width(W) (legal only off the graph paths).
+
+**Phase 2.** On-device top-16 + selector walk (no per-round D2H); engine
+quantized-head reuse for drafter logits = +37% throughput, tok/round
+byte-identical (Q8 head numerics don't shift acceptance); K runtime-selectable
+1..11; fp8 KV byte-identical to plain-fp8. K sweep: echo scales to the width-12
+ceiling, code-write peaks K=9.
+
+**Phase 3 -- the verdict. GO, conditional on a Phase-4 Q4 drafter repack.**
+Same binary/prompts/fp8, tok/round (fair) and t/s (wall):
+
+| traffic | ladder t/r/(t/s) | dflash2 K=7 | dflash2 K=9 |
+|---|---|---|---|
+| code-write | 2.76 / 154 | 3.25 / 89 | 3.25 / 81 |
+| prose | 2.21 / 124 | 2.68 / 74 | 2.97 / 74 |
+| code-edit | 3.43 / 189 | 4.51 / 122 | 4.73 / 116 |
+| echo | 4.64 / 252 | 7.65 / 199 | 9.05 / 213 |
+
+dflash2 wins tok/round on all four (+18% to +95%) -- the drafter is better,
+proven on our quant/engine/traffic. It loses on t/s TODAY, for exactly one
+reason: the verify is free (--p0b: width-2..12 forward 20.1->21.3 ms,
+bandwidth-bound), but the eager fp16 drafter is 26 ms/round because
+`k_gemv_f16_3` grids (rows, ntok) and re-reads the full weight row per verify
+column -- the drafter reads its 3.85 GB of fp16 weights ONCE PER COLUMN
+(~30 GB/round at W=8). The verify's `gemv_q4_n` reads each weight once and
+shares it across columns (~10 us/call, same shapes). The drafter is on the
+wrong kernel. Suffix never fires on single-turn prompts (needs agentic echo),
+so ladder==ladder+suffix here; the composition A/B defers to the live-CC trial
+and is lower-priority since dflash2's K knob already reaches echo's ceiling.
+
+Projection: verify+fold ~10 ms; drafter on gemv_q4_n at the ~0.6-2 ms design
+floor -> round ~12-13 ms -> code-write ~250 t/s (vs 154), echo K=9 ~450+ t/s
+(vs 252). **Phase 4 = the Q4-g64 drafter repack onto gemv_q4_n, with a numerics
+gate (Q4-drafter acceptance vs bf16, kill if >5-10% tok/round loss).** Nothing
+upstream of the repack is speculative -- every stage is byte-identity-gated.
+
+Commits: c725ca1 (P0), b1e4cf0 (P1a), 2307465 (P1b), bd300e4 (P1c),
+80e4447 (P2). Rig: bench/dflash2/, tools/dflash2_pack.py, tools/dflash2_smoke,
+src/dflash2.{h,cu}, `--dflash2 <pack.d2w> [--k N]`.

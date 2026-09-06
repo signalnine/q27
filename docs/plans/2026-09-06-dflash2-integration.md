@@ -1,12 +1,12 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phases 0, 1, 2 EXECUTED 2026-09-06 (results sections below).
-Kill gates all passed; in-engine E2E BYTE-IDENTICAL to plain greedy at
-K=7 with fp16 head, engine head (+37%, still byte-identical), and fp8 KV;
-on-device selector; K sweep measured. Next: Phase 3 same-harness verdict
-(ladder+suffix vs dflash2 vs dflash2+suffix on the cctx replay + live CC)
-and, if the wall needs it, the two profiled perf levers (Q4 drafter
-repack, drafter graph). Supersedes
+Status: Phases 0-3 EXECUTED 2026-09-06 (results sections below).
+VERDICT: **GO, conditional on the Phase-4 drafter Q4 repack.** The drafter
+wins tok/round on every traffic type (+18% to +95% vs the ladder); the
+verify is free (bandwidth-bound, flat in width); the only thing keeping
+dflash2 from a t/s win is that the fp16 drafter re-reads its weights once
+per verify column, which the Q4/gemv_q4_n path fixes. Phase 4 = that repack
++ its numerics gate. Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -358,6 +358,61 @@ verdict says whether the wall is even the thing to fix.
 **Not done, deliberately:** suffix stacking (dflash2's 8 columns + suffix
 lanes 9..11 in one verify) is the composition A/B -- it IS Phase 3's
 three-way comparison, so it lives there, not here.
+
+## Phase 3 (2026-09-06, same day): same-harness verdict
+
+Same binary, same four prompts, fp8 KV (serving config), greedy. `--spec`
+is the ladder; `--dflash2` is this drafter. Two numbers per cell:
+tok/round (the fair, graph-independent measure) and t/s (wall).
+
+| traffic    | ladder t/r / t/s | dflash2 K=7 t/r / t/s | dflash2 K=9 t/r / t/s |
+|------------|-----------------:|----------------------:|----------------------:|
+| code-write |  2.76 / 154      |  3.25 / 89            |  3.25 / 81            |
+| prose      |  2.21 / 124      |  2.68 / 74            |  2.97 / 74            |
+| code-edit  |  3.43 / 189      |  4.51 / 122           |  4.73 / 116           |
+| echo       |  4.64 / 252      |  7.65 / 199           |  9.05 / 213           |
+
+**Two things this settles.**
+
+1. **The drafter is clearly better.** dflash2 wins tok/round on all four,
+   by +18% (code-write) to +95% (echo). That is the drafter's whole reason
+   to exist and it is proven on our quant, our engine, our traffic.
+2. **It loses on t/s today, and exactly one thing is why.** The verify is
+   free: `--p0b` shows the width-2..12 verify forward is 20.1 -> 21.3 ms,
+   i.e. width-8 costs 0.7 ms more than width-2 (weight-bandwidth-bound, the
+   premise of batched verify). The drafter, measured alone on the 5090
+   (`dflash2_smoke`, drafter+ingest), is 26 ms/round -- and `k_gemv_f16_3`
+   is 98% of it, one call maxing at 10.4 ms. Root cause, confirmed at the
+   kernel: `k_gemv_f16_3` grids `(rows, ntok)` and each `(row, token)`
+   block re-reads the full weight row, so the drafter reads its 3.85 GB of
+   fp16 weights ONCE PER VERIFY COLUMN -- ~30 GB/round at W=8. The verify's
+   own `gemv_q4_n` reads each weight once and shares it across all columns
+   (~10 us/call for the same shapes). The drafter is on the wrong kernel.
+
+**Suffix note.** On these single-turn prompts the suffix drafter never
+fires (needs >=12-token committed echo), so `--spec` and `Q27_SUFFIX=1
+--spec` are identical here -- the Phase-0 suffix wins were real agentic
+echo. The composition A/B (dflash2 + suffix lanes 9..11) is therefore not
+measurable on this corpus and is deferred to the live-CC trial. It is also
+now lower-priority: dflash2's own K knob already reaches echo's ceiling
+(K=9 gives 9.05 tok/round on echo, beating ladder+suffix's live ~6.86),
+so the drafter may not need suffix stacking at all.
+
+**Projection (the GO case).** Round = drafter + verify. Verify+fold ~10 ms
+(the 36.5 ms eager round minus the 26 ms drafter). Put the drafter on the
+`gemv_q4_n` path (weight read once, shared across columns, int4): the
+design's ~0.6-2 ms floor. Round -> ~12-13 ms, and at the measured
+tok/round: code-write ~3.25/13 ms = ~250 t/s (vs ladder 154), echo K=9
+~9.05/13 ms = ~450+ t/s (vs 252). dflash2 wins t/s across the board once
+the drafter is quantized, most decisively exactly where the tok/round lead
+is largest.
+
+**Verdict: GO**, conditional on Phase 4 (drafter Q4-g64 repack onto
+`gemv_q4_n`, with a numerics gate: Q4-drafter acceptance vs the bf16
+drafter, kill if >5-10% tok/round loss). Everything upstream of the repack
+is done and byte-identity-gated; the repack is the one remaining piece
+between a proven-better drafter and a shipped t/s win. Suffix stacking and
+CUDA-graph capture fold into the live-CC trial after the repack lands.
 
 ## Prior art
 

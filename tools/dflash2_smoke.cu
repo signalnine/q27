@@ -50,6 +50,11 @@ int main(int argc, char** argv) {
 
     int F = P, rounds = 0, produced_sum = 0;
     std::map<int, int> hist;
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaDeviceSynchronize();
+    cudaEventRecord(t0);
     while (F + 1 < M) {
         int prop[q27d2::D2_WMAX - 1];
         d2.draft(toks[F], F, K, 0, prop);
@@ -71,8 +76,12 @@ int main(int argc, char** argv) {
         produced_sum += produced;
         hist[produced]++;
     }
-    printf("[smoke] %d tok, %d rounds, %.2f tok/round, hist={", produced_sum, rounds,
-           (double)produced_sum / rounds);
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, t0, t1);
+    printf("[smoke] %d tok, %d rounds, %.2f tok/round, %.2f ms/round (drafter+ingest), hist={",
+           produced_sum, rounds, (double)produced_sum / rounds, ms / rounds);
     bool first = true;
     for (auto& kv : hist) {
         printf("%s%d: %d", first ? "" : ", ", kv.first, kv.second);
