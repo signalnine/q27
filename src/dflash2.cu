@@ -292,7 +292,7 @@ void Dflash2::load(const char* path) {
     if (fread(pack.data(), 1, sz, f) != (size_t)sz) abort();
     fclose(f);
     const char* p = pack.data();
-    assert(!memcmp(p, "D2W1", 4));
+    assert(!memcmp(p, "D2W2", 4));
     int n;
     memcpy(&n, p + 4, 4);
     size_t off = 8;
@@ -314,18 +314,61 @@ void Dflash2::load(const char* path) {
         memcpy(&nbytes, p + off, 8);
         off += 8;
         off += (64 - (off % 64)) % 64;
-        t.host = p + off;
+        D2CHECK(cudaMalloc(&t.dev, nbytes));
+        D2CHECK(cudaMemcpy(t.dev, p + off, nbytes, cudaMemcpyHostToDevice));
+        off += nbytes;
         t.rows = dims[0];
         t.cols = ndim > 1 ? dims[1] : 1;
         for (int d = 2; d < ndim; d++) t.cols *= dims[d];
         t.n = t.rows * t.cols;
-        D2CHECK(cudaMalloc(&t.dev, nbytes));
-        D2CHECK(cudaMemcpy(t.dev, t.host, nbytes, cudaMemcpyHostToDevice));
-        off += nbytes;
+        if (t.dtype == 2 || t.dtype == 3) { // q4_g64 / q8_g128: scales blob follows
+            int64_t sbytes;
+            memcpy(&sbytes, p + off, 8);
+            off += 8;
+            off += (64 - (off % 64)) % 64;
+            D2CHECK(cudaMalloc(&t.dscales, sbytes));
+            D2CHECK(cudaMemcpy(t.dscales, p + off, sbytes, cudaMemcpyHostToDevice));
+            off += sbytes;
+        } else {
+            t.host = p + off - nbytes; // codebooks read host-side by the walk
+        }
         w[name] = t;
     }
     assert(T("fc.weight").rows == D2_H && T("fc.weight").cols == D2_TAPD);
     assert(T("candidate_selector.predecessor_codebook").rows == D2_V);
+}
+
+// Quantized matmul mirroring the engine's qx5+mm5: quantize the W-column
+// activation once (g32, eo/isum), then gemv_q4_n/q8_n reads each weight ONCE
+// and shares it across all W columns. act is [W][cols] contiguous.
+void Dflash2::mmq(const std::string& name, const float* act, float* out, int W,
+                  cudaStream_t st) {
+    const D2Tensor& t = T(name);
+    const int cols = (int)t.cols, rows = (int)t.rows;
+    q27k::XQ3 xq{};
+    for (int i = 0; i < 16; i++) xq.q[i] = dxq[i < W ? i : 0];
+    q27k::quantize3(mkCP3(act, cols, W), cols, xq, st, W);
+    if (W == 1) { // batched kernels need nbatch >= 2; single column (n=1 ingest)
+        if (t.dtype == 2)
+            q27k::gemv_q4((const uint8_t*)t.dev, (const __half*)t.dscales, dxq[0], out, rows,
+                          cols, st);
+        else
+            q27k::gemv_q8((const int8_t*)t.dev, (const __half*)t.dscales, dxq[0], out, rows,
+                          cols, st);
+        return;
+    }
+    q27k::XQuant qs[16];
+    float* ysa[16];
+    for (int i = 0; i < 16; i++) {
+        qs[i] = dxq[i < W ? i : 0];
+        ysa[i] = out + (size_t)(i < W ? i : 0) * rows;
+    }
+    if (t.dtype == 2)
+        q27k::gemv_q4_n((const uint8_t*)t.dev, (const __half*)t.dscales, qs, W, ysa, rows,
+                        cols, st);
+    else
+        q27k::gemv_q8_n((const int8_t*)t.dev, (const __half*)t.dscales, qs, W, ysa, rows, cols,
+                        st);
 }
 
 void Dflash2::alloc(int cap) {
@@ -362,6 +405,9 @@ void Dflash2::alloc(int cap) {
     // device scalar mirror of ctx_n for the attention kernel (graph-stable)
     D2CHECK(cudaMalloc(&d_ctx_n, 4));
     for (int i = 0; i < D2_WMAX - 1; i++) hxq[i] = q27k::xquant_alloc(D2_H);
+    // drafter activation-quant scratch, sized to the widest activation (the
+    // fc input = concatenated taps, TAPD=25600)
+    for (int i = 0; i < D2_WMAX; i++) dxq[i] = q27k::xquant_alloc(D2_TAPD);
     // cache the mask-token embedding once
     k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
                               D2_H);
@@ -376,32 +422,27 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
     D2CHECK(cudaMemcpyAsync(d_ring_pos + ctx_n, h_pos, T * 4, cudaMemcpyHostToDevice, st));
     for (int c0 = 0; c0 < T; c0 += D2_WMAX) {
         const int n = std::min(D2_WMAX, T - c0);
-        q27k::gemv_f16_3(f16("fc.weight"), mkCP3(d_taps + (size_t)c0 * D2_TAPD, D2_TAPD, n),
-                         mkP3(s_fc, D2_H, n), D2_H, D2_TAPD, st, n);
+        mmq("fc.weight", d_taps + (size_t)c0 * D2_TAPD, s_fc, n, st);
         q27k::rmsnorm3(mkCP3(s_fc, D2_H, n), f32("hidden_norm.weight"), mkP3(s_ct, D2_H, n),
                        D2_H, D2_EPS, st, n);
         for (int l = 0; l < D2_LAYERS; l++) {
             char nm[64];
-            P3 kr{}, vr{};
-            for (int i = 0; i < 16; i++) {
-                int t = i < n ? i : 0;
-                kr.p[i] = ringK[l] + (size_t)(ctx_n + c0 + t) * D2_KVD;
-                vr.p[i] = ringV[l] + (size_t)(ctx_n + c0 + t) * D2_KVD;
-            }
+            // ring rows for this chunk are contiguous [n][KVD] from base+ctx_n+c0
+            float* kr0 = ringK[l] + (size_t)(ctx_n + c0) * D2_KVD;
+            float* vr0 = ringV[l] + (size_t)(ctx_n + c0) * D2_KVD;
+            P3 kr{};
+            for (int i = 0; i < 16; i++) kr.p[i] = kr0 + (size_t)(i < n ? i : 0) * D2_KVD;
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-            q27k::gemv_f16_3(f16(nm), mkCP3(s_ct, D2_H, n), kr, D2_KVD, D2_H, st, n);
-            // ring rows for this chunk are contiguous [n][KVD] from base+ctx_n+c0;
-            // norm all n rows' heads in one launch.
+            mmq(nm, s_ct, kr0, n, st);
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
-            q27k::rmsnorm_heads(kr.p[0], f32(nm), kr.p[0], n * D2_NKV, D2_HD, D2_HD, D2_EPS,
-                                st);
+            q27k::rmsnorm_heads(kr0, f32(nm), kr0, n * D2_NKV, D2_HD, D2_HD, D2_EPS, st);
             {
                 IP3 ip{};
                 for (int i = 0; i < 16; i++) ip.p[i] = d_ing_pos + c0 + (i < n ? i : 0);
                 q27k::rope3(kr, D2_NKV, D2_HD, D2_HD, D2_HD, ip, D2_THETA, st, n);
             }
             snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-            q27k::gemv_f16_3(f16(nm), mkCP3(s_ct, D2_H, n), vr, D2_KVD, D2_H, st, n);
+            mmq(nm, s_ct, vr0, n, st);
         }
     }
     ctx_n += T;
@@ -429,10 +470,7 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
     P3 xP = mkP3(nx, D2_H, W);
     CP3 xC = mkCP3(nx, D2_H, W);
     P3 h1P = mkP3(nh1, D2_H, W);
-    CP3 h1C = mkCP3(nh1, D2_H, W);
     CP3 y0C = mkCP3(ny0, D2_H, W);
-    P3 dynP = mkP3(ndyn, 2 * D2_CONVK * D2_CONVG, W);
-    P3 oP = mkP3(no, D2_H, W);
     dim3 cgrid(20, W);
 
     for (int l = 0; l < D2_LAYERS; l++) {
@@ -440,16 +478,16 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
         snprintf(nm, sizeof nm, "layers.%d.input_layernorm.weight", l);
         q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, W);
         snprintf(nm, sizeof nm, "layers.%d.attention_conv.kernel_projection.weight", l);
-        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, W);
+        mmq(nm, nh1, ndyn, W, st);
         snprintf(nm, sizeof nm, "layers.%d.attention_conv.base_kernel", l);
         const float* baseA = f32(nm);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseA, ny0, W, 0);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.q_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nq, D2_QD, W), D2_QD, D2_H, st, W);
+        mmq(nm, ny0, nq, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nk, D2_KVD, W), D2_KVD, D2_H, st, W);
+        mmq(nm, ny0, nk, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nv, D2_KVD, W), D2_KVD, D2_H, st, W);
+        mmq(nm, ny0, nv, W, st);
         // nq/nk are [W][*D] contiguous and each head is exactly head_dim with
         // stride head_dim, so all W rows' heads norm in ONE launch (W*NH and
         // W*NKV heads) -- bit-identical to the per-row loop, W-1 fewer launches.
@@ -466,24 +504,24 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
                                                nv, d_posW, natt, W);
         }
         snprintf(nm, sizeof nm, "layers.%d.self_attn.o_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), mkCP3(natt, D2_QD, W), oP, D2_H, D2_QD, st, W);
+        mmq(nm, natt, no, W, st);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseA + D2_CONVK * D2_H, ny0, W, 1);
         q27k::add3(xP, y0C, D2_H, st, W);
         // -- mlp half --
         snprintf(nm, sizeof nm, "layers.%d.post_attention_layernorm.weight", l);
         q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp_conv.kernel_projection.weight", l);
-        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, W);
+        mmq(nm, nh1, ndyn, W, st);
         snprintf(nm, sizeof nm, "layers.%d.mlp_conv.base_kernel", l);
         const float* baseM = f32(nm);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseM, ny0, W, 0);
         snprintf(nm, sizeof nm, "layers.%d.mlp.gate_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(ngate, D2_I, W), D2_I, D2_H, st, W);
+        mmq(nm, ny0, ngate, W, st);
         snprintf(nm, sizeof nm, "layers.%d.mlp.up_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nup, D2_I, W), D2_I, D2_H, st, W);
+        mmq(nm, ny0, nup, W, st);
         q27k::silu_mul3(mkP3(ngate, D2_I, W), mkCP3(nup, D2_I, W), D2_I, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp.down_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), mkCP3(ngate, D2_I, W), oP, D2_H, D2_I, st, W);
+        mmq(nm, ngate, no, W, st);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseM + D2_CONVK * D2_H, ny0, W, 1);
         q27k::add3(xP, y0C, D2_H, st, W);
     }
@@ -508,8 +546,7 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
         q27k::gemv_f16_3(f16("target.head.weight"), mkCP3(nhf, D2_H, K),
                          mkP3(nlogits, D2_V, K), D2_V, D2_H, st, K);
     }
-    q27k::gemv_f16_3(f16("candidate_selector.hidden_projection.weight"), mkCP3(nhf, D2_H, K),
-                     mkP3(nhp, D2_RANK, K), D2_RANK, D2_H, st, K);
+    mmq("candidate_selector.hidden_projection.weight", nhf, nhp, K, st);
     // on-device top-16 (two-stage) + selector walk; proposals land in d_prop
     {
         dim3 g1(K, D2_T16B);

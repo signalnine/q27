@@ -1,12 +1,12 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phases 0-3 EXECUTED 2026-09-06 (results sections below).
-VERDICT: **GO, conditional on the Phase-4 drafter Q4 repack.** The drafter
-wins tok/round on every traffic type (+18% to +95% vs the ladder); the
-verify is free (bandwidth-bound, flat in width); the only thing keeping
-dflash2 from a t/s win is that the fp16 drafter re-reads its weights once
-per verify column, which the Q4/gemv_q4_n path fixes. Phase 4 = that repack
-+ its numerics gate. Supersedes
+Status: Phases 0-4 EXECUTED 2026-09-06 (results sections below). Phase 4
+Q4 repack DONE: numerics gate PASSED (K=7 byte-identical, tok/round within
+-3.6%), drafter 26 -> 12 ms/round, dflash2 now WINS t/s on echo (+30%) and
+code-edit (+9%) at K=7, ~parity on code-write/prose. Remaining: the drafter
+is still eager (12 ms, launch-bound) -- CUDA-graph capture is the next lever
+to reach the projected ~13 ms round and win everywhere; and a width-10
+(K=9) identity edge case to fix before K>7 ships. Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -413,6 +413,64 @@ drafter, kill if >5-10% tok/round loss). Everything upstream of the repack
 is done and byte-identity-gated; the repack is the one remaining piece
 between a proven-better drafter and a shipped t/s win. Suffix stacking and
 CUDA-graph capture fold into the live-CC trial after the repack lands.
+
+## Phase 4 (2026-09-06, same day): the Q4 drafter repack
+
+The Phase-3 root cause was that `gemv_f16_3` re-reads the weight per verify
+column. Fix: pack the drafter's 47 matmul weights as Q4-g64
+(tools/dflash2_pack.py `quant_q4`, identical to the engine's own format) and
+route them through `gemv_q4_n` (`Dflash2::mmq`: quantize the activation once,
+then the weight is read ONCE and shared across all W columns). Norm weights
+and conv base kernels stay fp32; codebooks and the target embedding stay
+fp16. Pack is `qwen38-dflash2-q4.d2w`; `--q8` builds a Q8 sibling as the
+numerics fallback.
+
+**Numerics gate: PASSED.** Q4-drafter tok/round vs the fp16 drafter, same
+q27 taps: code-write 3.24 vs 3.29 (-1.5%), prose 2.42 vs 2.51 (-3.6%),
+code-edit 4.24 vs 4.34 (-2.3%), echo 7.64 vs 7.64 (0%). All inside the
+5-10% kill line; Q8 came back byte-identical to fp16 as expected. And
+crucially the E2E output stays BYTE-IDENTICAL to plain greedy at K=7 on all
+four (verify-decided), so the drafter's small acceptance loss costs nothing
+in correctness.
+
+**Cost.** Drafter+ingest on the 5090: 26.1 -> 12.2 ms/round (2.1x) -- the
+weight-reread is gone. E2E round ~22 ms (drafter 12 + verify ~10).
+
+**E2E throughput, K=7, fp8 KV, engine head (byte-identical to plain):**
+
+| traffic    | ladder t/s | dflash2 Q4 t/s | delta |
+|------------|-----------:|---------------:|------:|
+| code-write |        154 |            148 |   -4% |
+| prose      |        124 |            117 |   -6% |
+| code-edit  |        189 |            205 |   +9% |
+| echo       |        252 |            328 |  +30% |
+
+dflash2 now wins where its tok/round lead is largest (echo, code-edit) and
+sits at ~parity where it is smallest (code-write, prose). That is the
+expected shape: round = ~12 ms drafter + ~10 ms verify, and the extra
+tokens pay for the wider round only when acceptance is high.
+
+**Two things between here and winning everywhere.**
+
+1. **The drafter is still eager (12 ms, launch-bound), not the ~2 ms
+   bandwidth floor.** 47 `gemv_q4_n` + attention/dconv/norm launches per
+   round, each with a `quantize3`, all eager. CUDA-graph capture of the
+   drafter forward (fixed shape per K, all pointers init-fixed) is the next
+   lever; projected round ~13 ms -> code-write ~250 t/s, prose ~180, i.e. a
+   win on all four. This is Phase 5.
+2. **K=9 (width-10) has an identity edge case** -- code-write and prose
+   diverge late (token 188 / 61) at K=9 while code-edit/echo hold; K=7
+   (width-8) is byte-identical everywhere. The ladder captures verify
+   graphs only for widths 2..8, and width-10 is a path exercised only by
+   this mode; the fold/verify interaction above width 8 needs a look before
+   K>7 ships. K=7 is the default and the shipped-safe point.
+
+Baseline hygiene note (cost a detour): the Phase-1/2 plain baselines were
+fp16-KV; the Phase-3/4 runs are fp8-KV, and fp8 vs fp16 KV changes greedy
+tokens. Always compare a drafter run against a plain run at the SAME KV
+setting -- the first "divergence" here was a stale fp16-KV baseline, not a
+bug (plain greedy is deterministic run-to-run, and Q4/Q8/fp16 drafters are
+all byte-identical to the matched fp8 plain).
 
 ## Prior art
 

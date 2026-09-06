@@ -32,9 +32,10 @@ constexpr int D2_RANK = 256, D2_TOPK = 16;
 constexpr float D2_EPS = 1e-6f, D2_THETA = 1e7f;
 
 struct D2Tensor {
-    void* dev = nullptr;     // device copy
+    void* dev = nullptr;        // device copy (packed data)
+    void* dscales = nullptr;    // device group scales (Q4/Q8; nullptr otherwise)
     const void* host = nullptr; // pointer into the pack's host buffer
-    int dtype = 0;           // 0 = f16, 1 = f32
+    int dtype = 0;              // 0 = f16, 1 = f32, 2 = q4_g64, 3 = q8_g128
     int64_t rows = 0, cols = 0, n = 0;
 };
 
@@ -46,6 +47,12 @@ struct Dflash2 {
     const D2Tensor& T(const std::string& name) const { return w.at(name); }
     const __half* f16(const std::string& n) const { return (const __half*)T(n).dev; }
     const float* f32(const std::string& n) const { return (const float*)T(n).dev; }
+    // Quantized matmul: quantize the W-column activation once, then the
+    // engine's weight-shared int4/int8 gemv (weight read ONCE across columns,
+    // vs gemv_f16_3's per-column re-read). act is [W][cols] contiguous, out is
+    // [W][rows] contiguous (cols/rows from the tensor shape).
+    void mmq(const std::string& name, const float* act, float* out, int W, cudaStream_t st);
+    q27k::XQuant dxq[D2_WMAX] = {}; // activation-quant scratch (sized to TAPD)
 
     // ---- context ring (bring-up: append-only, capacity-capped, no wrap) ----
     int ctx_cap = 0, ctx_n = 0;

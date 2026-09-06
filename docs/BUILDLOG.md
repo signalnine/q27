@@ -15649,3 +15649,34 @@ upstream of the repack is speculative -- every stage is byte-identity-gated.
 Commits: c725ca1 (P0), b1e4cf0 (P1a), 2307465 (P1b), bd300e4 (P1c),
 80e4447 (P2). Rig: bench/dflash2/, tools/dflash2_pack.py, tools/dflash2_smoke,
 src/dflash2.{h,cu}, `--dflash2 <pack.d2w> [--k N]`.
+
+## 2026-09-06 (c): DFlash2 Phase 4 -- the Q4 drafter repack, gate passed, first t/s wins
+
+Phase-3 root cause: gemv_f16_3 re-reads the weight per verify column, so the
+fp16 drafter read its 3.85 GB once per column (~30 GB/round). Fix: pack the 47
+drafter matmuls as Q4-g64 (tools/dflash2_pack.py quant_q4, the engine's own
+format) and route through gemv_q4_n via Dflash2::mmq (activation quantized once,
+weight read once and shared across columns). Norms/base_kernel stay fp32,
+codebooks/embed fp16. --q8 builds a Q8 fallback.
+
+Numerics gate PASSED: Q4 vs fp16 tok/round -1.5/-3.6/-2.3/0% (cw/prose/ce/echo),
+inside the 5-10% kill line; Q8 byte-identical to fp16. E2E stays BYTE-IDENTICAL
+to plain greedy at K=7 on all four (verify-decided). Drafter 26.1 -> 12.2 ms/round
+(2.1x). E2E K=7 fp8 t/s vs ladder: code-write 148/154, prose 117/124, code-edit
+205/189 (+9%), echo 328/252 (+30%) -- dflash2 wins where its tok/round lead is
+largest, ~parity where smallest.
+
+Open: (1) drafter still eager (12 ms, launch-bound, not the ~2 ms floor) -- a
+CUDA-graph capture is Phase 5, projects to a win on all four; (2) K=9 (width-10)
+diverges late on cw/prose (token 188/61) while ce/echo hold -- width>8 is a
+mode-only path (ladder graphs 2..8), needs a look before K>7 ships. K=7
+(width-8) is the byte-identical default.
+
+Detour worth recording: the first "divergences" were a stale fp16-KV plain
+baseline vs fp8-KV drafter runs. fp8 vs fp16 KV changes greedy tokens; always
+compare same-KV. Plain greedy is deterministic run-to-run; Q4/Q8/fp16 drafters
+all byte-identical to the matched fp8 plain at K=7.
+
+Commit chain: c725ca1 (P0) b1e4cf0 (P1a) 2307465 (P1b) bd300e4 (P1c) 80e4447 (P2)
+9ca6e90 (P3). Pack: qwen38-dflash2-q4.d2w (canonical), qwen38-dflash2-q8.d2w
+(fallback). `--dflash2 <pack> [--k N]`.
