@@ -1,11 +1,12 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phases 0 AND 1 EXECUTED 2026-09-06 (results sections below).
-Quant-tap kill gate PASSED; drafter runtime parity-validated vs the torch
-reference; in-engine E2E (`q27 --dflash2`) BYTE-IDENTICAL to plain greedy
-on all four traffic types with tok/round matching the offline replay.
-Next: Phase 2 (graphs, on-device selector, engine head/embed reuse, K
-sweep, suffix stacking). Supersedes
+Status: Phases 0, 1, 2 EXECUTED 2026-09-06 (results sections below).
+Kill gates all passed; in-engine E2E BYTE-IDENTICAL to plain greedy at
+K=7 with fp16 head, engine head (+37%, still byte-identical), and fp8 KV;
+on-device selector; K sweep measured. Next: Phase 3 same-harness verdict
+(ladder+suffix vs dflash2 vs dflash2+suffix on the cctx replay + live CC)
+and, if the wall needs it, the two profiled perf levers (Q4 drafter
+repack, drafter graph). Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -302,6 +303,61 @@ on-device top-16 + selector walk, reuse the engine head/int8 embeddings
 (measure the int8-embed delta then), tap-enabled verify graph captures
 (the tap buffer is init-fixed, so capture is legal), K sweep 5/7/9/11,
 suffix stacking at widths 9..12.
+
+## Phase 2 (2026-09-06, same day): perf + K sweep
+
+Four things landed; the wall analysis pointed at the two that were worth
+doing and away from the two that weren't.
+
+**On-device selector.** Per-round top-16 + selector walk moved off the host
+(`k_d2_top16a/b` two-stage over the whole grid; `k_d2_walk` one block).
+Proposals stay on device and reach the engine's `d_draft_L` by D2D copy --
+no host sync in the round. The first cut (one iterative top-16 block) cost
+4 ms/round; the two-stage version is negligible. tok/round unchanged
+(3.29/2.51/4.34/7.64 on the smoke, exact vs the Phase-1 host walk -- tie
+semantics preserved by ordering stage 2 on value-desc then id-asc).
+
+**Engine quantized head reuse (the win).** The drafter's logits ran through
+the pack's fp16 `target.head` (2.5 GB, 10.4 ms/round at DDR-limited fp16
+bandwidth). Routing them through the engine's own Q8/Q4 output head instead
+(`set_engine_head`, opt-out `Q27_D2_FP16HEAD=1`): **+37% throughput** --
+code-write 64.4 -> 88.2 t/s, echo 147 -> 196 t/s -- and tok/round stayed
+byte-identical (3.25/2.49/4.43/7.65). The Q8-vs-fp16 head numerics did not
+shift acceptance, and E2E output is verify-decided so it stays identical to
+plain greedy regardless.
+
+**K sweep (offline, on the q27 taps).** tok/round by K:
+
+| traffic    | K=5  | K=7  | K=9  | K=11 |
+|------------|-----:|-----:|-----:|-----:|
+| code-write | 2.94 | 3.29 | 3.47 | 3.35 |
+| echo       | 5.79 | 7.64 | 9.10 | 10.61 |
+
+Echo scales with K to the width-12 ceiling; code-write peaks at K=9 then
+falls (deeper masks propose worse). K=7 is the balanced default; K=9 is the
+echo-favoring point and the natural DFlash2 width when suffix is off. The
+verify wall grows with width, so the throughput-optimal K is a Phase-3
+tok/ms question, not a tok/round one.
+
+**fp8 KV.** E2E under `Q27_KV=fp8` (the serving config) is byte-identical
+to plain-fp8 at the same tok/round -- the drafter taps read the fp32
+residual stream before the KV store, so KV quant never reaches drafter
+acceptance. code-write 89.2 t/s, echo 200.2 t/s under fp8.
+
+**Wall breakdown (nsys, decode phase, K=7).** Round ~37 ms. Split: width-8
+verify through the 27B (`k_gemv_q4_n<8>` + tails) ~40%, the eager fp16
+drafter forward + batched ingest (`k_gemv_f16_3`) ~35%, GDN/attn/norms the
+rest. GPU-busy tracks wall -- the round is compute/bandwidth-bound, not
+launch-bound, so CUDA-graph capture buys ~10-15%, not a multiple. The one
+lever that would move the drafter third materially is a Q4 repack of the
+drafter weights (3.85 GB fp16 -> ~1.1 GB, the design's ~0.6 ms floor), but
+that shifts drafter numerics and deserves its own acceptance gate rather
+than riding in on a perf commit. Both are deferred to after the Phase-3
+verdict says whether the wall is even the thing to fix.
+
+**Not done, deliberately:** suffix stacking (dflash2's 8 columns + suffix
+lanes 9..11 in one verify) is the composition A/B -- it IS Phase 3's
+three-way comparison, so it lives there, not here.
 
 ## Prior art
 

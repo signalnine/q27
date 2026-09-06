@@ -2,7 +2,7 @@
 // src/dflash2.cu runtime and report tokens/round -- the parity gate against
 // bench/dflash2/p1_qtap_al.py mode q27 (same dump, torch reference).
 //
-// usage: dflash2_smoke <pack.d2w> <taps.bin> <prompt_len> [--proposals]
+// usage: dflash2_smoke <pack.d2w> <taps.bin> <prompt_len> [K] [--proposals]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,10 +13,11 @@
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s pack.d2w taps.bin prompt_len [--proposals]\n", argv[0]);
+        fprintf(stderr, "usage: %s pack.d2w taps.bin prompt_len [K] [--proposals]\n", argv[0]);
         return 1;
     }
-    bool show = argc > 4 && !strcmp(argv[4], "--proposals");
+    int K = argc > 4 && argv[4][0] != '-' ? atoi(argv[4]) : q27d2::D2_K;
+    bool show = !strcmp(argv[argc - 1], "--proposals");
     const int NT = q27d2::D2_TAPD;
     FILE* f = fopen(argv[2], "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[2]); return 1; }
@@ -50,15 +51,15 @@ int main(int argc, char** argv) {
     int F = P, rounds = 0, produced_sum = 0;
     std::map<int, int> hist;
     while (F + 1 < M) {
-        int prop[q27d2::D2_K];
-        d2.draft(toks[F], F, prop, 0);
+        int prop[q27d2::D2_WMAX - 1];
+        d2.draft(toks[F], F, K, 0, prop);
         if (show) {
             printf("round F=%d anchor=%d prop:", F, toks[F]);
-            for (int j = 0; j < q27d2::D2_K; j++) printf(" %d", prop[j]);
+            for (int j = 0; j < K; j++) printf(" %d", prop[j]);
             printf("\n");
         }
         int al = 0;
-        for (int j = 0; j < q27d2::D2_K && F + 1 + j < M; j++) {
+        for (int j = 0; j < K && F + 1 + j < M; j++) {
             if (prop[j] == toks[F + 1 + j]) al++;
             else break;
         }

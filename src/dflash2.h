@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "kernels.cuh" // XQuant (engine-head reuse)
+
 namespace q27d2 {
 
 // geometry (z-lab/Qwen3.8-27B-DFlash2 checkpoint; asserts at load)
@@ -21,6 +23,9 @@ constexpr int D2_H = 5120, D2_TAPS = 5, D2_TAPD = 25600;
 constexpr int D2_NH = 32, D2_NKV = 8, D2_HD = 128;
 constexpr int D2_QD = D2_NH * D2_HD, D2_KVD = D2_NKV * D2_HD;
 constexpr int D2_I = 17408, D2_V = 248320, D2_LAYERS = 5;
+// K is a runtime choice 1..D2_WMAX-1 (checkpoint masks reach 15; the engine
+// verify caps width at W_MAX=12). D2_W/D2_K are the recommended defaults.
+constexpr int D2_WMAX = 12;
 constexpr int D2_W = 8, D2_K = 7, D2_MASK = 248070;
 constexpr int D2_WINDOW = 2048, D2_CONVK = 2, D2_CONVG = 320; // groups = H/16
 constexpr int D2_RANK = 256, D2_TOPK = 16;
@@ -46,28 +51,53 @@ struct Dflash2 {
     int ctx_cap = 0, ctx_n = 0;
     float *ringK[D2_LAYERS] = {}, *ringV[D2_LAYERS] = {}; // [cap][KVD] fp32
     int* d_ring_pos = nullptr;                            // [cap]
-    // scratch
-    float *s_fc = nullptr, *s_ct = nullptr;
-    float *nx = nullptr, *nh1 = nullptr, *ny0 = nullptr; // [8][H]
-    float *ndyn = nullptr;                               // [8][2*CONVK*CONVG]
-    float *nq = nullptr, *nk = nullptr, *nv = nullptr;   // [8][QD/KVD]
-    float *natt = nullptr, *no = nullptr;                // [8][QD], [8][H]
-    float *ngate = nullptr, *nup = nullptr;              // [8][I]
-    float *nhf = nullptr;                                // [7][H] final-normed mask rows
-    float *nlogits = nullptr;                            // [7][V]
-    float *nhp = nullptr;                                // [7][RANK]
+    // scratch (sized for the widest block, D2_WMAX rows)
+    float *s_fc = nullptr, *s_ct = nullptr;              // [WMAX][H] ingest rows
+    float *nx = nullptr, *nh1 = nullptr, *ny0 = nullptr; // [WMAX][H]
+    float *ndyn = nullptr;                               // [WMAX][2*CONVK*CONVG]
+    float *nq = nullptr, *nk = nullptr, *nv = nullptr;   // [WMAX][QD/KVD]
+    float *natt = nullptr, *no = nullptr;                // [WMAX][QD], [WMAX][H]
+    float *ngate = nullptr, *nup = nullptr;              // [WMAX][I]
+    float *nhf = nullptr;                                // [WMAX-1][H] final-normed mask rows
+    float *nlogits = nullptr;                            // [WMAX-1][V]
+    float *nhp = nullptr;                                // [WMAX-1][RANK]
     float* maskrow = nullptr;                            // cached mask-token embedding
-    int* d_pos8 = nullptr;                               // noise positions
+    int* d_posW = nullptr;                               // noise positions [WMAX]
     int* d_ing_pos = nullptr;                            // ingest positions (chunk)
+    // Phase 2 on-device selector: per-position top-16 (values+ids) and the
+    // walked path. Proposals stay on device -- the CLI stages them into the
+    // engine's d_draft_L slots with D2D copies, no host sync in the round.
+    int* d_cand = nullptr;   // [WMAX-1][TOPK]
+    float* d_cval = nullptr; // [WMAX-1][TOPK]
+    int* d_prop = nullptr;   // [WMAX-1] the walked draft tokens
+    int* d_ctx_n = nullptr;  // device mirror of ctx_n (graph-stable attn)
+    float* d_c1v = nullptr;  // top-16 stage-1 candidates [WMAX-1][512*16]
+    int* d_c1i = nullptr;
+    // Phase 2: engine quantized-head reuse for drafter logits (replaces the
+    // 2.5 GB fp16 target.head gemv, ~10.4 -> ~1 ms/round). Numerics shift
+    // (Q4/Q8 head vs fp16) -- acceptance impact measured E2E; output tokens
+    // are verify-decided and unaffected. Cleared = fp16 pack head.
+    const void* ehead_data = nullptr;
+    const __half* ehead_scales = nullptr;
+    bool ehead_q4 = false;
+    q27k::XQuant hxq[D2_WMAX - 1] = {};
+    void set_engine_head(const void* data, const __half* scales, bool q4) {
+        ehead_data = data;
+        ehead_scales = scales;
+        ehead_q4 = q4;
+    }
     void alloc(int cap);
 
     // append T committed-token context rows. taps: device [T][TAPD] fp32,
-    // positions: host absolute positions (uploaded internally).
+    // positions: host absolute positions (uploaded internally). Batched: the
+    // fc weight (131 MB fp16) is read ONCE for all T rows.
     void ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st);
 
-    // one draft block: anchor (pending) token at anchor_pos; writes the K=7
-    // proposed tokens to out. Eager; syncs the stream.
-    void draft(int anchor_token, int anchor_pos, int* out, cudaStream_t st);
+    // one draft block of K proposals (width K+1): anchor (pending) token at
+    // anchor_pos. Fully device-side; proposals land in d_prop[0..K-1]. No
+    // stream sync. out_host (optional): also D2H the proposals (syncs).
+    void draft(int anchor_token, int anchor_pos, int K, cudaStream_t st,
+               int* out_host = nullptr);
 };
 
 } // namespace q27d2

@@ -1,6 +1,8 @@
-// DFlash2 drafter runtime -- see src/dflash2.h. Eager bring-up: the forward
-// mirrors z-lab dflash/model.py operation for operation (the parity gate is
-// tools/dflash2_smoke.cu vs bench/dflash2/p1_qtap_al.py on the same dump).
+// DFlash2 drafter runtime -- see src/dflash2.h. The forward mirrors z-lab
+// dflash/model.py operation for operation (parity gates: tools/dflash2_smoke
+// vs bench/dflash2/p1_qtap_al.py, and the --dflash2 byte-identity matrix).
+// Phase 2: batched ingest (fc read once per round), on-device top-16 +
+// selector walk (no per-round D2H), width runtime-selectable to D2_WMAX.
 #include "dflash2.h"
 
 #include <cassert>
@@ -11,7 +13,7 @@
 
 #include "blocks.cuh"  // rmsnorm_heads, rope_neox_partial
 #include "kernels.cuh" // gemv_f16, rmsnorm, P3/CP3, gemv_f16_3, rmsnorm3, add3, silu_mul3
-#include "spec3.cuh"   // IP3, rope3, gemv_f16_3 batched decls
+#include "spec3.cuh"   // IP3, rope3, batched decls
 
 #define D2CHECK(x)                                                                             \
     do {                                                                                       \
@@ -71,16 +73,20 @@ __global__ void k_d2_dconv(const float* __restrict__ in, const float* __restrict
     }
 }
 
-// Bidirectional sliding-window attention: 8 noise queries vs [ctx ring + 8
-// noise] keys. Block = (query row, q head); two-pass softmax in smem. GQA:
-// q head h reads kv head h/4. Bring-up kernel -- clarity over speed.
+// Bidirectional sliding-window attention: nrows noise queries vs [ctx ring +
+// nrows noise] keys. Block = (query row, q head); two-pass softmax in smem.
+// GQA: q head h reads kv head h/4. ctx_n is read through a device pointer so
+// a future graph capture stays shape-stable. Bring-up kernel -- clarity over
+// speed.
 __global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__ ringK,
                           const float* __restrict__ ringV, const int* __restrict__ ring_pos,
-                          int ctx_n, const float* __restrict__ nk, const float* __restrict__ nv,
-                          const int* __restrict__ npos, float* __restrict__ out, int nrows) {
+                          const int* __restrict__ d_ctx_n, const float* __restrict__ nk,
+                          const float* __restrict__ nv, const int* __restrict__ npos,
+                          float* __restrict__ out, int nrows) {
     extern __shared__ float sc[]; // scores [ctx_n + nrows]
     const int r = blockIdx.x, h = blockIdx.y, kh = h / (D2_NH / D2_NKV);
     if (r >= nrows) return;
+    const int ctx_n = *d_ctx_n;
     const float scale = rsqrtf((float)D2_HD);
     const float* qv = q + (size_t)r * D2_QD + (size_t)h * D2_HD;
     const int qpos = npos[r], total = ctx_n + nrows;
@@ -100,7 +106,6 @@ __global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__
         sc[j] = vis ? d * scale : -INFINITY;
     }
     __syncthreads();
-    // softmax (thread 0 reduction: total <= a few thousand, bring-up only)
     __shared__ float s_max, s_sum;
     if (threadIdx.x == 0) {
         float m = -INFINITY;
@@ -122,6 +127,156 @@ __global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__
             acc += sc[j] * vv[c];
         }
         out[(size_t)r * D2_QD + (size_t)h * D2_HD + c] = acc;
+    }
+}
+
+// Per-row top-16 over the vocab, two stages so the whole grid participates
+// (the one-block iterative version measured 4 ms/round). Tie semantics = the
+// host scan's (equal values: lowest vocab id ranks first) -- stage 2 orders
+// by (value desc, id asc), and any global top-16 element is necessarily in
+// its slice's local top-16, so the result is exact.
+constexpr int D2_T16B = 512; // stage-1 blocks per row
+
+__global__ void k_d2_top16a(const float* __restrict__ logits, float* __restrict__ c1v,
+                            int* __restrict__ c1i, int rows) {
+    const int r = blockIdx.x, b = blockIdx.y;
+    if (r >= rows) return;
+    const int slice = (D2_V + D2_T16B - 1) / D2_T16B;
+    const int v0 = b * slice, v1 = min(v0 + slice, D2_V);
+    const float* lg = logits + (size_t)r * D2_V;
+    __shared__ float sv[128];
+    __shared__ int si[128];
+    __shared__ int picked[D2_TOPK];
+    for (int it = 0; it < D2_TOPK; it++) {
+        float best = -INFINITY;
+        int besti = -1;
+        for (int v = v0 + threadIdx.x; v < v1; v += blockDim.x) {
+            bool skip = false;
+            for (int p = 0; p < it; p++) skip |= (picked[p] == v);
+            if (skip) continue;
+            float x = lg[v];
+            if (x > best || (x == best && v < besti)) { best = x; besti = v; }
+        }
+        sv[threadIdx.x] = best;
+        si[threadIdx.x] = besti;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float xo = sv[threadIdx.x + s];
+                int io = si[threadIdx.x + s];
+                if (xo > sv[threadIdx.x] ||
+                    (xo == sv[threadIdx.x] && io != -1 &&
+                     (si[threadIdx.x] == -1 || io < si[threadIdx.x]))) {
+                    sv[threadIdx.x] = xo;
+                    si[threadIdx.x] = io;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            picked[it] = si[0];
+            c1v[((size_t)r * D2_T16B + b) * D2_TOPK + it] = sv[0];
+            c1i[((size_t)r * D2_T16B + b) * D2_TOPK + it] = si[0];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_d2_top16b(const float* __restrict__ c1v, const int* __restrict__ c1i,
+                            int* __restrict__ cand, float* __restrict__ cval, int rows) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int N = D2_T16B * D2_TOPK;
+    const float* cv = c1v + (size_t)r * N;
+    const int* ci = c1i + (size_t)r * N;
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    __shared__ int picked[D2_TOPK]; // candidate-array slots already taken
+    for (int it = 0; it < D2_TOPK; it++) {
+        float best = -INFINITY;
+        int besti = -1; // slot in the candidate array
+        for (int j = threadIdx.x; j < N; j += blockDim.x) {
+            bool skip = false;
+            for (int p = 0; p < it; p++) skip |= (picked[p] == j);
+            if (skip) continue;
+            float x = cv[j];
+            if (x > best ||
+                (x == best && besti != -1 && ci[j] < ci[besti]) ||
+                (x == best && besti == -1)) {
+                best = x;
+                besti = j;
+            }
+        }
+        sv[threadIdx.x] = best;
+        si[threadIdx.x] = besti;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float xo = sv[threadIdx.x + s];
+                int io = si[threadIdx.x + s];
+                bool take = false;
+                if (io != -1) {
+                    if (si[threadIdx.x] == -1) take = xo > -INFINITY || true;
+                    else if (xo > sv[threadIdx.x]) take = true;
+                    else if (xo == sv[threadIdx.x] && ci[io] < ci[si[threadIdx.x]]) take = true;
+                }
+                if (take) {
+                    sv[threadIdx.x] = xo;
+                    si[threadIdx.x] = io;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            picked[it] = si[0];
+            cand[(size_t)r * D2_TOPK + it] = ci[si[0]];
+            cval[(size_t)r * D2_TOPK + it] = sv[0];
+        }
+        __syncthreads();
+    }
+}
+
+// Selector path walk (z-lab CandidateSelector.select, greedy): one block,
+// K sequential positions. score(c) = unary logit + dot(pred_row(prev) *
+// hp_row, succ_row(c)); argmax with ties to the lower candidate slot (the
+// host walk's strict-> semantics). prev chains; out[pos] = the pick.
+__global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict__ cval,
+                          const float* __restrict__ hp, const __half* __restrict__ pred,
+                          const __half* __restrict__ succ, int anchor, int K,
+                          int* __restrict__ out) {
+    __shared__ float ph[D2_RANK];
+    __shared__ float sc[D2_TOPK][256 / 32]; // per-warp partials per candidate
+    __shared__ int s_prev;
+    if (threadIdx.x == 0) s_prev = anchor;
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int pos = 0; pos < K; pos++) {
+        const int prev = s_prev;
+        for (int i = threadIdx.x; i < D2_RANK; i += blockDim.x)
+            ph[i] = __half2float(pred[(size_t)prev * D2_RANK + i]) *
+                    hp[(size_t)pos * D2_RANK + i];
+        __syncthreads();
+        // 8 warps x 16 candidates: warp w handles candidates w, w+8
+        for (int i = warp; i < D2_TOPK; i += blockDim.x / 32) {
+            const __half* sr = succ + (size_t)cand[(size_t)pos * D2_TOPK + i] * D2_RANK;
+            float acc = 0.f;
+            for (int j = lane; j < D2_RANK; j += 32) acc += ph[j] * __half2float(sr[j]);
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_down_sync(0xffffffff, acc, off);
+            if (lane == 0) sc[i][0] = acc;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float best = -INFINITY;
+            int besti = 0;
+            for (int i = 0; i < D2_TOPK; i++) {
+                float s = cval[(size_t)pos * D2_TOPK + i] + sc[i][0];
+                if (s > best) { best = s; besti = i; }
+            }
+            s_prev = cand[(size_t)pos * D2_TOPK + besti];
+            out[pos] = s_prev;
+        }
+        __syncthreads();
     }
 }
 
@@ -180,184 +335,195 @@ void Dflash2::alloc(int cap) {
         D2CHECK(cudaMalloc(&ringV[l], (size_t)cap * D2_KVD * 4));
     }
     D2CHECK(cudaMalloc(&d_ring_pos, cap * 4));
-    D2CHECK(cudaMalloc(&s_fc, D2_H * 4));
-    D2CHECK(cudaMalloc(&s_ct, D2_H * 4));
-    D2CHECK(cudaMalloc(&nx, (size_t)D2_W * D2_H * 4));
-    D2CHECK(cudaMalloc(&nh1, (size_t)D2_W * D2_H * 4));
-    D2CHECK(cudaMalloc(&ny0, (size_t)D2_W * D2_H * 4));
-    D2CHECK(cudaMalloc(&ndyn, (size_t)D2_W * 2 * D2_CONVK * D2_CONVG * 4));
-    D2CHECK(cudaMalloc(&nq, (size_t)D2_W * D2_QD * 4));
-    D2CHECK(cudaMalloc(&nk, (size_t)D2_W * D2_KVD * 4));
-    D2CHECK(cudaMalloc(&nv, (size_t)D2_W * D2_KVD * 4));
-    D2CHECK(cudaMalloc(&natt, (size_t)D2_W * D2_QD * 4));
-    D2CHECK(cudaMalloc(&no, (size_t)D2_W * D2_H * 4));
-    D2CHECK(cudaMalloc(&ngate, (size_t)D2_W * D2_I * 4));
-    D2CHECK(cudaMalloc(&nup, (size_t)D2_W * D2_I * 4));
-    D2CHECK(cudaMalloc(&nhf, (size_t)D2_K * D2_H * 4));
-    D2CHECK(cudaMalloc(&nlogits, (size_t)D2_K * D2_V * 4));
-    D2CHECK(cudaMalloc(&nhp, (size_t)D2_K * D2_RANK * 4));
+    D2CHECK(cudaMalloc(&s_fc, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&s_ct, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&nx, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&nh1, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&ny0, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&ndyn, (size_t)D2_WMAX * 2 * D2_CONVK * D2_CONVG * 4));
+    D2CHECK(cudaMalloc(&nq, (size_t)D2_WMAX * D2_QD * 4));
+    D2CHECK(cudaMalloc(&nk, (size_t)D2_WMAX * D2_KVD * 4));
+    D2CHECK(cudaMalloc(&nv, (size_t)D2_WMAX * D2_KVD * 4));
+    D2CHECK(cudaMalloc(&natt, (size_t)D2_WMAX * D2_QD * 4));
+    D2CHECK(cudaMalloc(&no, (size_t)D2_WMAX * D2_H * 4));
+    D2CHECK(cudaMalloc(&ngate, (size_t)D2_WMAX * D2_I * 4));
+    D2CHECK(cudaMalloc(&nup, (size_t)D2_WMAX * D2_I * 4));
+    D2CHECK(cudaMalloc(&nhf, (size_t)(D2_WMAX - 1) * D2_H * 4));
+    D2CHECK(cudaMalloc(&nlogits, (size_t)(D2_WMAX - 1) * D2_V * 4));
+    D2CHECK(cudaMalloc(&nhp, (size_t)(D2_WMAX - 1) * D2_RANK * 4));
     D2CHECK(cudaMalloc(&maskrow, D2_H * 4));
-    D2CHECK(cudaMalloc(&d_pos8, D2_W * 4));
+    D2CHECK(cudaMalloc(&d_posW, D2_WMAX * 4));
     D2CHECK(cudaMalloc(&d_ing_pos, 4096 * 4));
+    D2CHECK(cudaMalloc(&d_cand, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
+    D2CHECK(cudaMalloc(&d_cval, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
+    D2CHECK(cudaMalloc(&d_prop, (size_t)(D2_WMAX - 1) * 4));
+    D2CHECK(cudaMalloc(&d_c1v, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
+    D2CHECK(cudaMalloc(&d_c1i, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
+    // device scalar mirror of ctx_n for the attention kernel (graph-stable)
+    D2CHECK(cudaMalloc(&d_ctx_n, 4));
+    for (int i = 0; i < D2_WMAX - 1; i++) hxq[i] = q27k::xquant_alloc(D2_H);
     // cache the mask-token embedding once
     k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
                               D2_H);
     D2CHECK(cudaDeviceSynchronize());
 }
 
-// ---- context ingest -----------------------------------------------------
+// ---- context ingest (batched: fc weight read once for all T rows) -------
 
 void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st) {
     assert(ctx_n + T <= ctx_cap && T <= 4096);
     D2CHECK(cudaMemcpyAsync(d_ing_pos, h_pos, T * 4, cudaMemcpyHostToDevice, st));
     D2CHECK(cudaMemcpyAsync(d_ring_pos + ctx_n, h_pos, T * 4, cudaMemcpyHostToDevice, st));
-    for (int t = 0; t < T; t++) {
-        q27k::gemv_f16(f16("fc.weight"), d_taps + (size_t)t * D2_TAPD, s_fc, D2_H, D2_TAPD, st);
-        q27k::rmsnorm(s_fc, f32("hidden_norm.weight"), s_ct, D2_H, D2_EPS, st);
+    for (int c0 = 0; c0 < T; c0 += D2_WMAX) {
+        const int n = std::min(D2_WMAX, T - c0);
+        q27k::gemv_f16_3(f16("fc.weight"), mkCP3(d_taps + (size_t)c0 * D2_TAPD, D2_TAPD, n),
+                         mkP3(s_fc, D2_H, n), D2_H, D2_TAPD, st, n);
+        q27k::rmsnorm3(mkCP3(s_fc, D2_H, n), f32("hidden_norm.weight"), mkP3(s_ct, D2_H, n),
+                       D2_H, D2_EPS, st, n);
         for (int l = 0; l < D2_LAYERS; l++) {
             char nm[64];
-            float* krow = ringK[l] + (size_t)(ctx_n + t) * D2_KVD;
-            float* vrow = ringV[l] + (size_t)(ctx_n + t) * D2_KVD;
+            P3 kr{}, vr{};
+            for (int i = 0; i < 16; i++) {
+                int t = i < n ? i : 0;
+                kr.p[i] = ringK[l] + (size_t)(ctx_n + c0 + t) * D2_KVD;
+                vr.p[i] = ringV[l] + (size_t)(ctx_n + c0 + t) * D2_KVD;
+            }
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-            q27k::gemv_f16(f16(nm), s_ct, krow, D2_KVD, D2_H, st);
+            q27k::gemv_f16_3(f16(nm), mkCP3(s_ct, D2_H, n), kr, D2_KVD, D2_H, st, n);
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
-            q27k::rmsnorm_heads(krow, f32(nm), krow, D2_NKV, D2_HD, D2_HD, D2_EPS, st);
-            q27k::rope_neox_partial(krow, D2_NKV, D2_HD, D2_HD, D2_HD, d_ing_pos + t, D2_THETA,
+            for (int t = 0; t < n; t++)
+                q27k::rmsnorm_heads(kr.p[t], f32(nm), kr.p[t], D2_NKV, D2_HD, D2_HD, D2_EPS,
                                     st);
+            {
+                IP3 ip{};
+                for (int i = 0; i < 16; i++) ip.p[i] = d_ing_pos + c0 + (i < n ? i : 0);
+                q27k::rope3(kr, D2_NKV, D2_HD, D2_HD, D2_HD, ip, D2_THETA, st, n);
+            }
             snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-            q27k::gemv_f16(f16(nm), s_ct, vrow, D2_KVD, D2_H, st);
+            q27k::gemv_f16_3(f16(nm), mkCP3(s_ct, D2_H, n), vr, D2_KVD, D2_H, st, n);
         }
     }
     ctx_n += T;
+    D2CHECK(cudaMemcpyAsync(d_ctx_n, &ctx_n, 4, cudaMemcpyHostToDevice, st));
 }
 
 // ---- draft block --------------------------------------------------------
 
-void Dflash2::draft(int anchor_token, int anchor_pos, int* out, cudaStream_t st) {
+void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, int* out_host) {
+    assert(K >= 1 && K < D2_WMAX);
+    const int W = K + 1;
     char nm[64];
-    // noise rows: anchor embedding + 7 mask embeddings
+    // noise rows: anchor embedding + K mask embeddings
     k_d2_rowcast<<<40, 256, 0, st>>>(
         f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
-    for (int r = 1; r < D2_W; r++)
+    for (int r = 1; r < W; r++)
         D2CHECK(cudaMemcpyAsync(nx + (size_t)r * D2_H, maskrow, D2_H * 4,
                                 cudaMemcpyDeviceToDevice, st));
-    int hpos[D2_W];
-    for (int i = 0; i < D2_W; i++) hpos[i] = anchor_pos + i;
-    D2CHECK(cudaMemcpyAsync(d_pos8, hpos, D2_W * 4, cudaMemcpyHostToDevice, st));
-    IP3 pos8{};
-    for (int i = 0; i < 16; i++) pos8.p[i] = d_pos8 + (i < D2_W ? i : 0);
+    int hpos[D2_WMAX];
+    for (int i = 0; i < W; i++) hpos[i] = anchor_pos + i;
+    D2CHECK(cudaMemcpyAsync(d_posW, hpos, W * 4, cudaMemcpyHostToDevice, st));
+    IP3 posW{};
+    for (int i = 0; i < 16; i++) posW.p[i] = d_posW + (i < W ? i : 0);
 
-    P3 xP = mkP3(nx, D2_H, D2_W);
-    CP3 xC = mkCP3(nx, D2_H, D2_W);
-    P3 h1P = mkP3(nh1, D2_H, D2_W);
-    CP3 h1C = mkCP3(nh1, D2_H, D2_W);
-    P3 y0P = mkP3(ny0, D2_H, D2_W);
-    CP3 y0C = mkCP3(ny0, D2_H, D2_W);
-    P3 dynP = mkP3(ndyn, 2 * D2_CONVK * D2_CONVG, D2_W);
-    P3 oP = mkP3(no, D2_H, D2_W);
-    CP3 oC = mkCP3(no, D2_H, D2_W);
-    dim3 cgrid(20, D2_W);
+    P3 xP = mkP3(nx, D2_H, W);
+    CP3 xC = mkCP3(nx, D2_H, W);
+    P3 h1P = mkP3(nh1, D2_H, W);
+    CP3 h1C = mkCP3(nh1, D2_H, W);
+    CP3 y0C = mkCP3(ny0, D2_H, W);
+    P3 dynP = mkP3(ndyn, 2 * D2_CONVK * D2_CONVG, W);
+    P3 oP = mkP3(no, D2_H, W);
+    dim3 cgrid(20, W);
 
     for (int l = 0; l < D2_LAYERS; l++) {
         // -- attention half --
         snprintf(nm, sizeof nm, "layers.%d.input_layernorm.weight", l);
-        q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, D2_W);
+        q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, W);
         snprintf(nm, sizeof nm, "layers.%d.attention_conv.kernel_projection.weight", l);
-        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.attention_conv.base_kernel", l);
         const float* baseA = f32(nm);
-        k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseA, ny0, D2_W, 0);
+        k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseA, ny0, W, 0);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.q_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nq, D2_QD, D2_W), D2_QD, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nq, D2_QD, W), D2_QD, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nk, D2_KVD, D2_W), D2_KVD, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nk, D2_KVD, W), D2_KVD, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nv, D2_KVD, D2_W), D2_KVD, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nv, D2_KVD, W), D2_KVD, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.q_norm.weight", l);
-        for (int r = 0; r < D2_W; r++)
+        for (int r = 0; r < W; r++)
             q27k::rmsnorm_heads(nq + (size_t)r * D2_QD, f32(nm), nq + (size_t)r * D2_QD, D2_NH,
                                 D2_HD, D2_HD, D2_EPS, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
-        for (int r = 0; r < D2_W; r++)
+        for (int r = 0; r < W; r++)
             q27k::rmsnorm_heads(nk + (size_t)r * D2_KVD, f32(nm), nk + (size_t)r * D2_KVD,
                                 D2_NKV, D2_HD, D2_HD, D2_EPS, st);
-        q27k::rope3(mkP3(nq, D2_QD, D2_W), D2_NH, D2_HD, D2_HD, D2_HD, pos8, D2_THETA, st,
-                    D2_W);
-        q27k::rope3(mkP3(nk, D2_KVD, D2_W), D2_NKV, D2_HD, D2_HD, D2_HD, pos8, D2_THETA, st,
-                    D2_W);
+        q27k::rope3(mkP3(nq, D2_QD, W), D2_NH, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
+        q27k::rope3(mkP3(nk, D2_KVD, W), D2_NKV, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
         {
-            dim3 grid(D2_W, D2_NH);
-            size_t smem = (size_t)(ctx_n + D2_W) * 4;
-            k_d2_attn<<<grid, 128, smem, st>>>(nq, ringK[l], ringV[l], d_ring_pos, ctx_n, nk,
-                                               nv, d_pos8, natt, D2_W);
+            dim3 grid(W, D2_NH);
+            size_t smem = (size_t)(ctx_n + W) * 4;
+            k_d2_attn<<<grid, 128, smem, st>>>(nq, ringK[l], ringV[l], d_ring_pos, d_ctx_n, nk,
+                                               nv, d_posW, natt, W);
         }
         snprintf(nm, sizeof nm, "layers.%d.self_attn.o_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), mkCP3(natt, D2_QD, D2_W), oP, D2_H, D2_QD, st, D2_W);
-        k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseA + D2_CONVK * D2_H, ny0, D2_W, 1);
-        q27k::add3(xP, y0C, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), mkCP3(natt, D2_QD, W), oP, D2_H, D2_QD, st, W);
+        k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseA + D2_CONVK * D2_H, ny0, W, 1);
+        q27k::add3(xP, y0C, D2_H, st, W);
         // -- mlp half --
         snprintf(nm, sizeof nm, "layers.%d.post_attention_layernorm.weight", l);
-        q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, D2_W);
+        q27k::rmsnorm3(xC, f32(nm), h1P, D2_H, D2_EPS, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp_conv.kernel_projection.weight", l);
-        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), h1C, dynP, 2 * D2_CONVK * D2_CONVG, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp_conv.base_kernel", l);
         const float* baseM = f32(nm);
-        k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseM, ny0, D2_W, 0);
+        k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseM, ny0, W, 0);
         snprintf(nm, sizeof nm, "layers.%d.mlp.gate_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(ngate, D2_I, D2_W), D2_I, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), y0C, mkP3(ngate, D2_I, W), D2_I, D2_H, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp.up_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nup, D2_I, D2_W), D2_I, D2_H, st, D2_W);
-        q27k::silu_mul3(mkP3(ngate, D2_I, D2_W), mkCP3(nup, D2_I, D2_W), D2_I, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), y0C, mkP3(nup, D2_I, W), D2_I, D2_H, st, W);
+        q27k::silu_mul3(mkP3(ngate, D2_I, W), mkCP3(nup, D2_I, W), D2_I, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp.down_proj.weight", l);
-        q27k::gemv_f16_3(f16(nm), mkCP3(ngate, D2_I, D2_W), oP, D2_H, D2_I, st, D2_W);
-        k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseM + D2_CONVK * D2_H, ny0, D2_W, 1);
-        q27k::add3(xP, y0C, D2_H, st, D2_W);
+        q27k::gemv_f16_3(f16(nm), mkCP3(ngate, D2_I, W), oP, D2_H, D2_I, st, W);
+        k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseM + D2_CONVK * D2_H, ny0, W, 1);
+        q27k::add3(xP, y0C, D2_H, st, W);
     }
-    // final norm on the 7 mask rows, head + selector projection
-    q27k::rmsnorm3(mkCP3(nx + D2_H, D2_H, D2_K), f32("norm.weight"), mkP3(nhf, D2_H, D2_K),
-                   D2_H, D2_EPS, st, D2_K);
-    q27k::gemv_f16_3(f16("target.head.weight"), mkCP3(nhf, D2_H, D2_K),
-                     mkP3(nlogits, D2_V, D2_K), D2_V, D2_H, st, D2_K);
-    q27k::gemv_f16_3(f16("candidate_selector.hidden_projection.weight"),
-                     mkCP3(nhf, D2_H, D2_K), mkP3(nhp, D2_RANK, D2_K), D2_RANK, D2_H, st,
-                     D2_K);
-    // host: top-16 per row + selector walk
-    static std::vector<float> hlog, hhp;
-    hlog.resize((size_t)D2_K * D2_V);
-    hhp.resize((size_t)D2_K * D2_RANK);
-    D2CHECK(cudaMemcpyAsync(hlog.data(), nlogits, hlog.size() * 4, cudaMemcpyDeviceToHost, st));
-    D2CHECK(cudaMemcpyAsync(hhp.data(), nhp, hhp.size() * 4, cudaMemcpyDeviceToHost, st));
-    D2CHECK(cudaStreamSynchronize(st));
-    const __half* pred = (const __half*)T("candidate_selector.predecessor_codebook").host;
-    const __half* succ = (const __half*)T("candidate_selector.successor_codebook").host;
-    int prev = anchor_token;
-    for (int posn = 0; posn < D2_K; posn++) {
-        const float* lg = hlog.data() + (size_t)posn * D2_V;
-        int cand[D2_TOPK];
-        float cval[D2_TOPK];
-        for (int i = 0; i < D2_TOPK; i++) { cand[i] = -1; cval[i] = -INFINITY; }
-        for (int v = 0; v < D2_V; v++) {
-            float x = lg[v];
-            if (x <= cval[D2_TOPK - 1]) continue;
-            int i = D2_TOPK - 1;
-            while (i > 0 && cval[i - 1] < x) { cval[i] = cval[i - 1]; cand[i] = cand[i - 1]; i--; }
-            cval[i] = x;
-            cand[i] = v;
-        }
-        const float* hp = hhp.data() + (size_t)posn * D2_RANK;
-        float ph[D2_RANK];
-        for (int r = 0; r < D2_RANK; r++)
-            ph[r] = __half2float(pred[(size_t)prev * D2_RANK + r]) * hp[r];
-        float best = -INFINITY;
-        int besti = 0;
-        for (int i = 0; i < D2_TOPK; i++) {
-            const __half* sr = succ + (size_t)cand[i] * D2_RANK;
-            float s = cval[i];
-            for (int r = 0; r < D2_RANK; r++) s += ph[r] * __half2float(sr[r]);
-            if (s > best) { best = s; besti = i; }
-        }
-        prev = cand[besti];
-        out[posn] = prev;
+    // final norm on the K mask rows, head + selector projection
+    q27k::rmsnorm3(mkCP3(nx + D2_H, D2_H, K), f32("norm.weight"), mkP3(nhf, D2_H, K), D2_H,
+                   D2_EPS, st, K);
+    if (ehead_data) {
+        q27k::XQ3 xq{};
+        for (int i = 0; i < 16; i++) xq.q[i] = hxq[i < K ? i : 0];
+        q27k::quantize3(mkCP3(nhf, D2_H, K), D2_H, xq, st, K);
+        float* ys[16];
+        for (int i = 0; i < 16; i++) ys[i] = nlogits + (size_t)(i < K ? i : 0) * D2_V;
+        q27k::XQuant qs[16];
+        for (int i = 0; i < 16; i++) qs[i] = hxq[i < K ? i : 0];
+        if (ehead_q4)
+            q27k::gemv_q4_n((const uint8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
+                            st);
+        else
+            q27k::gemv_q8_n((const int8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
+                            st);
+    } else {
+        q27k::gemv_f16_3(f16("target.head.weight"), mkCP3(nhf, D2_H, K),
+                         mkP3(nlogits, D2_V, K), D2_V, D2_H, st, K);
+    }
+    q27k::gemv_f16_3(f16("candidate_selector.hidden_projection.weight"), mkCP3(nhf, D2_H, K),
+                     mkP3(nhp, D2_RANK, K), D2_RANK, D2_H, st, K);
+    // on-device top-16 (two-stage) + selector walk; proposals land in d_prop
+    {
+        dim3 g1(K, D2_T16B);
+        k_d2_top16a<<<g1, 128, 0, st>>>(nlogits, d_c1v, d_c1i, K);
+        k_d2_top16b<<<K, 256, 0, st>>>(d_c1v, d_c1i, d_cand, d_cval, K);
+    }
+    k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, nhp,
+                                 (const __half*)T("candidate_selector.predecessor_codebook").dev,
+                                 (const __half*)T("candidate_selector.successor_codebook").dev,
+                                 anchor_token, K, d_prop);
+    D2CHECK(cudaGetLastError());
+    if (out_host) {
+        D2CHECK(cudaMemcpyAsync(out_host, d_prop, K * 4, cudaMemcpyDeviceToHost, st));
+        D2CHECK(cudaStreamSynchronize(st));
     }
 }
 

@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
     bool nll_serial = false, verify_weights = false;
     std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
     std::string d2_pack;   // DFlash2 P1c E2E decode (--dflash2 <pack.d2w>)
+    int d2_k = q27d2::D2_K; // DFlash2 draft depth (--k, verify width K+1)
     bool p0b = false;      // DFlash P0b S=16 verify-cost bench
     // Sampling (roadmap #2). temp>0 routes the --spec loop to the sampled spec
     // path (Phase 2); Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B.
@@ -95,6 +96,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
         if (!strcmp(argv[i], "--dump-taps") && i + 1 < argc) taps_path = argv[++i];
         if (!strcmp(argv[i], "--dflash2") && i + 1 < argc) d2_pack = argv[++i];
+        if (!strcmp(argv[i], "--k") && i + 1 < argc) d2_k = atoi(argv[++i]);
         if (!strcmp(argv[i], "--p0b")) p0b = true;
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
@@ -194,9 +196,26 @@ int main(int argc, char** argv) {
                     ctx);
             return 1;
         }
+        const int d2_w = d2_k + 1; // verify width
+        if (d2_k < 1 || d2_w > W_MAX) {
+            fprintf(stderr, "--dflash2: --k %d out of range (1..%d)\n", d2_k, W_MAX - 1);
+            return 1;
+        }
         q27d2::Dflash2 d2;
         d2.load(d2_pack.c_str());
         d2.alloc(NP + n_gen + 64);
+        // Phase 2: drafter logits through the engine's quantized head (the
+        // fp16 pack head measured 10.4 ms/round at 240 GB/s). Opt-out for
+        // the numerics A/B: Q27_D2_FP16HEAD=1.
+        if (!getenv("Q27_D2_FP16HEAD")) {
+            const char* vh = (e.fast_head && e.dm.model_has("output_q4.weight"))
+                                 ? "output_q4.weight"
+                                 : "output.weight";
+            const DevTensor& hw = e.dm.get(vh);
+            d2.set_engine_head(hw.data, (const __half*)hw.scales,
+                               hw.dtype == DType::Q4_G64);
+            fprintf(stderr, "dflash2: engine head (%s)\n", vh);
+        }
         float* d_vtaps;
         CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
         // prompt: eager tapped steps, ingest each committed position
@@ -216,7 +235,7 @@ int main(int argc, char** argv) {
         // only drives the attention/FFN sweep) -- without this, a round
         // accepting n > 5 folds unrecorded rows and corrupts committed GDN
         // state. No graphs exist in this mode, so setting it is safe.
-        e.set_round_width(q27d2::D2_W);
+        e.set_round_width(d2_w);
         cudaEvent_t t0, t1;
         CUDA_CHECK(cudaEventCreate(&t0));
         CUDA_CHECK(cudaEventCreate(&t1));
@@ -224,15 +243,14 @@ int main(int argc, char** argv) {
         int rounds = 0, hist[W_MAX] = {0};
         CUDA_CHECK(cudaEventRecord(t0, e.stm));
         while ((int)out.size() < n_gen && P + 2 * W_MAX < ctx) {
-            int prop[q27d2::D2_K];
-            d2.draft(pending, P + 1, prop, e.stm);
+            d2.draft(pending, P + 1, d2_k, e.stm); // proposals stay on device
             q27k::prep_round(e.d_P, e.d_token, e.lane_pos(), e.mtp_pos(), W_MAX, D_MAX_MTP,
                              e.d_outcome, e.stm);
-            for (int k = 0; k < q27d2::D2_K; k++)
-                CUDA_CHECK(cudaMemcpyAsync(e.d_draft_L[k], &prop[k], 4,
-                                           cudaMemcpyHostToDevice, e.stm));
+            for (int k = 0; k < d2_k; k++)
+                CUDA_CHECK(cudaMemcpyAsync(e.d_draft_L[k], d2.d_prop + k, 4,
+                                           cudaMemcpyDeviceToDevice, e.stm));
             auto v = e.solo_view();
-            v.vw = q27d2::D2_W;
+            v.vw = d2_w;
             e.spec_verify_forward(v, d_vtaps);
             e.spec_verify_tail(v);
             int oc[OUTCOME_INTS];
@@ -261,10 +279,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "\n");
         printf("generated:");
         for (int i = 0; i < n_gen && i < (int)out.size(); i++) printf(" %d", out[i]);
-        printf("\ndflash2 decode: %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round over %d "
-               "rounds)\n",
-               (int)out.size(), msf, out.size() * 1000.0f / msf, (double)out.size() / rounds,
-               rounds);
+        printf("\ndflash2 decode (K=%d): %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round "
+               "over %d rounds)\n",
+               d2_k, (int)out.size(), msf, out.size() * 1000.0f / msf,
+               (double)out.size() / rounds, rounds);
         return 0;
     }
 
