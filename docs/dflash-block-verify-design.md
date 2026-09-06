@@ -1,8 +1,11 @@
 # DFlash block-drafter + batched S=16 verify -- design (2026-07-09)
 
-Status: DESIGN, pre-measurement. Nothing built. Phase-0 gates below decide
-GO/NO-GO before any engine work (maxd6/fd3 discipline: measure the economics
-first, kill cheaply).
+Status: SUPERSEDED 2026-09-06 by
+`docs/plans/2026-09-06-dflash2-integration.md` (the v2 drafter changed the
+verify plan and dissolved the GDN partial-accept problem; the Phase-0
+discipline below carries forward there). Kept for the motivation analysis
+and the v1 drafter contract. Original status: DESIGN, pre-measurement,
+nothing built.
 
 ## Motivation
 
