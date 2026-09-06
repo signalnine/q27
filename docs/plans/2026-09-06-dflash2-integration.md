@@ -1,8 +1,11 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phase 0 EXECUTED 2026-09-06 (results section below); Phase 1
-quant-tap kill gate PASSED same day (see "Phase 1: quant-tap gate") --
-drafter runtime bring-up in progress. Supersedes
+Status: Phases 0 AND 1 EXECUTED 2026-09-06 (results sections below).
+Quant-tap kill gate PASSED; drafter runtime parity-validated vs the torch
+reference; in-engine E2E (`q27 --dflash2`) BYTE-IDENTICAL to plain greedy
+on all four traffic types with tok/round matching the offline replay.
+Next: Phase 2 (graphs, on-device selector, engine head/embed reuse, K
+sweep, suffix stacking). Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -254,6 +257,51 @@ trajectory content variance, not tap quality -- the controlled table is the
 comparison that counts.) The int8 embedding rows feeding the noise columns
 remain a small untested delta; they are high-fidelity (q8 + fp16 row
 scales) and get covered by the bring-up parity test.
+
+## Phase 1 complete (2026-09-06, same day): runtime + in-engine E2E
+
+**Runtime (src/dflash2.cu + tools/dflash2_pack.py).** Eager bring-up module:
+flat fp16/fp32 pack, context ingest (fc + context_norm + per-layer K/V with
+k_norm/rope into an append ring), draft block (new grouped-dynamic-conv and
+bidirectional-window-attention kernels; gemv/rmsnorm/rope3 reuse; host-side
+top-16 + selector walk). Parity vs the z-lab torch reference on the same
+dumps: 46/57 rounds propose the identical 7 tokens, 91.7% token match
+(divergences are fp16-vs-bf16 tie cascades), AL equal within 2%.
+
+**In-engine E2E (`q27 --dflash2 <pack.d2w>`).** The suffix-round pattern
+with the DFlash2 drafter: host proposals staged into `d_draft_L[0..6]`,
+`prep_round`, EAGER width-8 `spec_verify_forward` (new defaulted `taps`
+arg retains each lane's five residual streams -- host branch, graphs and
+the fused mirror byte-identical) + `spec_verify_tail`, fold, ingest the
+accepted lanes' taps. Gate matrix, 192 tokens per prompt:
+
+| traffic    | vs plain greedy | E2E tok/round | offline replay |
+|------------|-----------------|--------------:|---------------:|
+| code-write | IDENTICAL       |          3.25 |           3.24 |
+| prose      | IDENTICAL       |          2.49 |           2.55 |
+| code-edit  | IDENTICAL       |          4.43 |           4.44 |
+| echo       | IDENTICAL       |          7.65 |           7.64 |
+
+`--spec` on the same binary stayed byte-identical to plain (the shared
+verify path is untouched; the taps param defaults to nullptr everywhere
+else). Echo already runs 153.8 t/s fully eager.
+
+**The one real bug of the bring-up, worth remembering:** `gdn_mix` and the
+record arena run at the MEMBER `vw` (the LaneView's `vw` only drives the
+attention/FFN sweep). The member defaults to 5, so a width-8 eager round
+recorded only 4 speculative GDN rows -- any round accepting n >= 6 folded
+unrecorded garbage into committed state and corrupted the stream (caught
+by the byte-identity gate at token 6). Fix: `set_round_width(D2_W)` before
+the loop, legal here because this mode captures no graphs.
+
+**Eager round wall: ~47-50 ms** (vs ~18 ms for the graphed ladder round) --
+drafter gemvs eagerly submitted, 7 MB logits D2H + host top-16/walk per
+round, fp16 target head instead of the engine's quantized head, no graphs.
+That cost order is Phase 2's whole job: drafter under its own graph,
+on-device top-16 + selector walk, reuse the engine head/int8 embeddings
+(measure the int8-embed delta then), tap-enabled verify graph captures
+(the tap buffer is init-fixed, so capture is legal), K sweep 5/7/9/11,
+suffix stacking at widths 9..12.
 
 ## Prior art
 

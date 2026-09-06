@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <tuple>
+#include "dflash2.h"
 #include "engine.cuh"
 
 int main(int argc, char** argv) {
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
     int nll_chunk = 512, nll_long = 0, nll_max = 0, kvstats_n = 0;
     bool nll_serial = false, verify_weights = false;
     std::string taps_path; // DFlash P0a tap capture (--dump-taps <file>)
+    std::string d2_pack;   // DFlash2 P1c E2E decode (--dflash2 <pack.d2w>)
     bool p0b = false;      // DFlash P0b S=16 verify-cost bench
     // Sampling (roadmap #2). temp>0 routes the --spec loop to the sampled spec
     // path (Phase 2); Q27_SAMPLE_PLAIN=1 forces the plain sampler for the A/B.
@@ -92,6 +94,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 10);
         if (!strcmp(argv[i], "--dump-taps") && i + 1 < argc) taps_path = argv[++i];
+        if (!strcmp(argv[i], "--dflash2") && i + 1 < argc) d2_pack = argv[++i];
         if (!strcmp(argv[i], "--p0b")) p0b = true;
     }
     if (toks.empty() && nll_path.empty()) { fprintf(stderr, "need --tokens\n"); return 1; }
@@ -174,6 +177,94 @@ int main(int argc, char** argv) {
         fclose(tf);
         fprintf(stderr, "taps: %d steps (%d prompt-tail + %d gen) -> %s\n",
                 NP - base + n_gen, NP - base, n_gen, taps_path.c_str());
+        return 0;
+    }
+
+    if (!d2_pack.empty()) {
+        // DFlash2 P1c bring-up E2E (docs/plans/2026-09-06-dflash2-integration.md):
+        // eager serial-tap prefill, then the suffix-round pattern with the
+        // DFlash2 drafter -- host proposals staged into d_draft_L, EAGER
+        // width-8 verify (spec_verify_forward with tap capture + tail), fold,
+        // ingest the accepted lanes' taps. No graphs, no tuning. Emitted
+        // tokens are greedy-identical to the plain path by the verify-tail
+        // equality chain (gate: diff vs a plain run of the same prompt).
+        int NP = (int)toks.size();
+        if (NP + n_gen + W_MAX > ctx) {
+            fprintf(stderr, "--dflash2: prompt %d + n %d > --ctx %d -- refusing\n", NP, n_gen,
+                    ctx);
+            return 1;
+        }
+        q27d2::Dflash2 d2;
+        d2.load(d2_pack.c_str());
+        d2.alloc(NP + n_gen + 64);
+        float* d_vtaps;
+        CUDA_CHECK(cudaMalloc((void**)&d_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
+        // prompt: eager tapped steps, ingest each committed position
+        for (int i = 0; i < NP; i++) {
+            e.step_taps(toks[i]);
+            d2.ingest(e.d_taps, &i, 1, e.stm);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        // bootstrap, mirroring the --spec loop
+        CUDA_CHECK(cudaMemcpyAsync(e.h_next, e.x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
+                                   e.stm));
+        int P = NP - 1;
+        CUDA_CHECK(cudaMemcpyAsync(e.d_P, &P, 4, cudaMemcpyHostToDevice, e.stm));
+        int pending;
+        CUDA_CHECK(cudaMemcpy(&pending, e.d_token, 4, cudaMemcpyDeviceToHost));
+        // gdn_mix and the record arena run at the MEMBER width (the view's vw
+        // only drives the attention/FFN sweep) -- without this, a round
+        // accepting n > 5 folds unrecorded rows and corrupts committed GDN
+        // state. No graphs exist in this mode, so setting it is safe.
+        e.set_round_width(q27d2::D2_W);
+        cudaEvent_t t0, t1;
+        CUDA_CHECK(cudaEventCreate(&t0));
+        CUDA_CHECK(cudaEventCreate(&t1));
+        std::vector<int> out;
+        int rounds = 0, hist[W_MAX] = {0};
+        CUDA_CHECK(cudaEventRecord(t0, e.stm));
+        while ((int)out.size() < n_gen && P + 2 * W_MAX < ctx) {
+            int prop[q27d2::D2_K];
+            d2.draft(pending, P + 1, prop, e.stm);
+            q27k::prep_round(e.d_P, e.d_token, e.lane_pos(), e.mtp_pos(), W_MAX, D_MAX_MTP,
+                             e.d_outcome, e.stm);
+            for (int k = 0; k < q27d2::D2_K; k++)
+                CUDA_CHECK(cudaMemcpyAsync(e.d_draft_L[k], &prop[k], 4,
+                                           cudaMemcpyHostToDevice, e.stm));
+            auto v = e.solo_view();
+            v.vw = q27d2::D2_W;
+            e.spec_verify_forward(v, d_vtaps);
+            e.spec_verify_tail(v);
+            int oc[OUTCOME_INTS];
+            CUDA_CHECK(cudaMemcpyAsync(oc, e.d_outcome, OUTCOME_INTS * 4,
+                                       cudaMemcpyDeviceToHost, e.stm));
+            CUDA_CHECK(cudaStreamSynchronize(e.stm));
+            int n = oc[0];
+            e.fold_pending = n - 1;
+            e.flush_fold(e.stm);
+            std::vector<int> ipos(n);
+            for (int k = 0; k < n; k++) ipos[k] = P + 1 + k;
+            d2.ingest(d_vtaps, ipos.data(), n, e.stm);
+            for (int k = 0; k < n; k++) out.push_back(oc[1 + k]);
+            pending = oc[OUTCOME_INTS - 1];
+            P += n;
+            rounds++;
+            hist[n - 1]++;
+        }
+        CUDA_CHECK(cudaEventRecord(t1, e.stm));
+        CUDA_CHECK(cudaStreamSynchronize(e.stm));
+        float msf = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&msf, t0, t1));
+        fprintf(stderr, "round outcomes:");
+        for (int k = 0; k < W_MAX; k++)
+            fprintf(stderr, "%s %d-tok %d", k ? "," : "", k + 1, hist[k]);
+        fprintf(stderr, "\n");
+        printf("generated:");
+        for (int i = 0; i < n_gen && i < (int)out.size(); i++) printf(" %d", out[i]);
+        printf("\ndflash2 decode: %d tokens in %.1f ms = %.2f t/s (%.2f tokens/round over %d "
+               "rounds)\n",
+               (int)out.size(), msf, out.size() * 1000.0f / msf, (double)out.size() / rounds,
+               rounds);
         return 0;
     }
 

@@ -10,9 +10,9 @@ NVCCFLAGS ?= -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 \
 
 .PHONY: all clean test-inspect test-repack test-repack-canonical test-metal-backend metal-engine test-metal-contracts test-metal test-metal-canonical check-chat-extract check-responses-integration
 all: build/inspect build/test_sampling build/test_kernels build/test_argmax_tie build/q27 build/q27-server build/test_tokenizer build/test_stream_split build/test_tool_drift build/test_tool_drift_corpus build/test_think_resolve build/test_openai_bridge build/test_chat_completions_integration build/test_depthctl build/test_toolconstrain
-build/q27: src/engine.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
+build/q27: src/engine.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/kv_pool.h src/prefill_arena.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp \
            src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/device_model.h src/loader.h src/cuda_common.h src/depthctl.h src/prefix_cache.h src/prefix_ram.h build/pf4.o | build
-	$(NVCC) $(NVCCFLAGS) src/engine.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
+	$(NVCC) $(NVCCFLAGS) src/engine.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 build:
 	mkdir -p build

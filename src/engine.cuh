@@ -2252,7 +2252,11 @@ struct Engine {
         for (int k = 0; k + 1 < W_PLUMB; k++) t.p[k + 1] = d_draft_L[k];
         return t;
     }
-    void spec_verify_forward(const LaneView& v) {
+    // taps (DFlash2 P1c, default nullptr): retain each lane's residual stream
+    // after the DFLASH_TAPS layers into taps[lane][5][N_EMBD] -- host-side
+    // branch only, same pattern as token_launches, so every graph capture
+    // (taps == nullptr) and the conductor's fused mirror are byte-identical.
+    void spec_verify_forward(const LaneView& v, float* taps = nullptr) {
         // P0 batching: the CALLER builds the view (solo: solo_view() -- a
         // vw/stm snapshot taken exactly when the members were read before),
         // so the P1 fused round can hand this same forward a union view.
@@ -2270,6 +2274,7 @@ struct Engine {
             Yc LANESV(v, y);
         q27k::P3 Hm LANESV(v, h),
             X1m LANESV(v, x1);
+        int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
             q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
@@ -2280,6 +2285,13 @@ struct Engine {
             q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
             ffn_pair(il, v);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
+            if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
+                for (int t = 0; t < v.vw; t++)
+                    CUDA_CHECK(cudaMemcpyAsync(taps + ((size_t)t * 5 + tap_k) * N_EMBD,
+                                               v.h[t], (size_t)N_EMBD * 4,
+                                               cudaMemcpyDeviceToDevice, v.stm));
+                tap_k++;
+            }
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
         q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
