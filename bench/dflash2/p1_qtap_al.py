@@ -26,6 +26,8 @@ from dflash.model import DFlash2DraftModel
 TARGET = '/mnt/ai/models/qwen38-27b-hf'
 DRAFT = '/mnt/ai/models/qwen38-27b-dflash2-bf16'
 H, NTAP, WINDOW = 5120, 5, 2048
+import os
+PRINT_PROPOSALS = os.environ.get('D2_PROPOSALS') == '1'
 
 
 def load_drafter():
@@ -65,6 +67,8 @@ def replay(tokens, taps, prompt_len, model, embed_w, head):
         hid = model(target_hidden=th, noise_embedding=noise, position_ids=pos,
                     past_key_values=None, use_cache=False)[:, -K:, :]
         prop = model.propose(hid, noise_ids[:, 0], head, 0.0)[0][0].tolist()
+        if PRINT_PROPOSALS:
+            print(f'round F={F} anchor={tokens[F]} prop:', ' '.join(map(str, prop)), flush=True)
         al = 0
         for j in range(min(K, M - 1 - F)):
             if prop[j] == tokens[F + 1 + j]:

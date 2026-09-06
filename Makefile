@@ -470,3 +470,6 @@ test-metal:
 test-metal-canonical:
 	@echo "test-metal-canonical requires macOS" >&2; exit 1
 endif
+
+build/dflash2_smoke: tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp | build
+	$(NVCC) $(NVCCFLAGS) tools/dflash2_smoke.cu src/dflash2.cu src/kernels.cu src/spec3.cu src/vgemm.cu src/blocks.cu src/prefill.cu src/device_model.cu src/loader.cpp -o $@
