@@ -1,12 +1,13 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phases 0-5 EXECUTED 2026-09-06. **DONE: dflash2 wins t/s on all
-four traffic types at K=7, byte-identical to plain greedy.** Phase 5 added a
-captured verify graph (+10-15%): code-write 164/154, prose 130/124,
-code-edit 226/189 (+20%), echo 361/252 (+43%). Remaining, both optional:
-wire dflash2 into the server for a live-CC trial, and the small eager-drafter
-tail (~2 ms/round, needs a device-indexed embedding to graph). K>7 is capped
-by a pre-existing engine width>8 verify bug (see Phase 5). Supersedes
+Status: Phases 0-6 EXECUTED 2026-09-06. dflash2 wins single-turn CLI t/s
+on all four traffic types at K=7, byte-identical to plain greedy (Phase 5:
+code-write 164/154, code-edit 226/189, echo 361/252). **But the Phase-6
+live-CC trial says NOT a serving win yet: -7% vs the ladder on real agentic
+traffic, because the drafter ring cold-starts each turn (no prefill tap
+capture).** Verdict: promising, correct, wired -- but gated on prefill tap
+capture before it beats the always-warm MTP ladder on serving. K>7 is
+separately capped by a pre-existing engine width>8 verify bug. Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -522,6 +523,58 @@ bursts) is the last validation before a default flip. (2) The ~2 ms eager
 drafter tail: graphing it needs a device-indexed embedding lookup (the anchor
 token currently bakes into a launch arg); ~1 ms/round, low priority now that
 every traffic type already wins.
+
+## Phase 6 (2026-09-06, same day): server wiring + the live-CC verdict
+
+Wired the drafter into the serving path (`Q27_DFLASH2=<pack>`, single-slot /
+`Q27_BATCH=0`): a per-engine `Dflash2` with a sliding context ring,
+`dflash2_round` hooked into `decode_step` in place of `spec_round`, the
+verify graph captured once in `d2_setup`, and the drafter reusing the
+engine's own Q8 head AND Q8 embedding (the serving pack drops the fp16
+head+embed -> 1.2 GB, and the KV pool reserves ~2 GB for it up front, or it
+OOMs since the pool otherwise eats all free VRAM). The ring cold-resets each
+turn -- warm turns restore the target's state but NOT the drafter's prefix
+taps, a deliberate first-cut limitation.
+
+**It works and it is correct.** Real Claude Code sessions (SWE-bench flask +
+requests, via the agentic harness) ran to completion, edited the right
+files, and hit prefix-cache warm turns (rid=3 prompt 23979, computed 176).
+Output is verify-decided, so correct regardless of drafter quality.
+
+**But it LOSES on live agentic traffic** (same two instances, same
+single-slot config, only the drafter differs):
+
+| | agg decode t/s | tok/round | reqs |
+|---|--:|--:|--:|
+| dflash2 (cold-start) | 164.6 | 3.17 | 27 |
+| ladder + suffix      | 177.5 | 3.43 | 28 |
+| delta                | **-7.2%** | | |
+
+The single-turn CLI wins do NOT transfer. The reason is cold-start: agentic
+CC is many short turns, the drafter ring resets each turn, and its attention
+has no prefix context for the first stretch of every turn -- while the
+ladder's MTP head drafts from the target's hidden state, which always
+carries context through the KV cache. The CLI benchmarks each had one
+prefill + one long decode, so the ring warmed once and stayed warm; live
+traffic never gives that. (The suffix drafter accepted zero tokens on these
+instances, so the incumbent here is pure MTP.)
+
+**What this means.** The drafter is genuinely better token-for-token when it
+has context (Phases 0-5), but on this box, in this engine, the MTP ladder's
+always-warm context beats DFlash2's cold-per-turn ring on real agentic
+traffic. Two things would close it, and both are real work, not tuning:
+
+1. **Prefill tap capture** -- get the last ~2048 prompt tokens' taps into
+   the ring during the batched prefill (`prefill_chunk`), so the drafter
+   starts each turn warm. This is the single highest-value follow-up; the
+   cold-start penalty is the whole -7%.
+2. **Composition with the ladder** -- keep the MTP/suffix drafts for the
+   cold rounds and let DFlash2 ride once the ring warms. More invasive
+   (fused verify), lower priority than (1).
+
+Until (1) lands, DFlash2 stays a CLI/warm-context win and NOT a serving
+default. That is the honest state, and it is exactly what a live-CC trial
+is for: the single-turn numbers were real but not representative.
 
 ## Prior art
 

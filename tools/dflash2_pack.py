@@ -100,8 +100,16 @@ def main():
     extra = []
     if hf:
         idx = json.load(open(f'{hf}/model.safetensors.index.json'))['weight_map']
-        for src, dst in (('model.language_model.embed_tokens.weight', 'target.embed.weight'),
-                         ('lm_head.weight', 'target.head.weight')):
+        # The fp16 head is the engine-head fallback (Q27_D2_FP16HEAD); the fp16
+        # embed is the drafter's anchor/mask lookup. Serving reuses the engine's
+        # own Q8 head AND Q8 embed, so --no-head / --no-embed drop these 2.5 GB
+        # each for the serving pack (~1.2 GB total).
+        srcs = []
+        if '--no-embed' not in sys.argv:
+            srcs.append(('model.language_model.embed_tokens.weight', 'target.embed.weight'))
+        if '--no-head' not in sys.argv:
+            srcs.append(('lm_head.weight', 'target.head.weight'))
+        for src, dst in srcs:
             with safe_open(f'{hf}/{idx[src]}', 'pt') as f:
                 tensors[dst] = f.get_tensor(src)
             extra.append(dst)

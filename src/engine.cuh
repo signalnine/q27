@@ -22,6 +22,7 @@
 #include "prefill.cuh"
 #include "cuda_common.h"
 #include "depthctl.h"
+#include "dflash2.h"
 #include "suffixdraft.h"
 #include "device_model.h"
 #include "kernels.cuh"
@@ -2743,10 +2744,95 @@ struct Engine {
                                               : " (auto: floats 4..5)")
                           : "",
                 dexit_on ? 1 : 0);
+        d2_setup(); // DFlash2 serving (Q27_DFLASH2): after the zoo is captured
     }
 
     // one speculative round; returns tokens emitted (1..gate_maxd+1).
     // All position math + acceptance runs on device; host reads 36 bytes.
+    // ---- DFlash2 serving (Q27_DFLASH2=<pack.d2w>, single-slot only) ----
+    // A per-engine drafter with a sliding context ring. Wired into decode_step
+    // in place of spec_round. Cold-start per turn (the ring is reset at
+    // prefill; warm turns restore target state but not the drafter's prefix
+    // taps -- a known first-trial limitation). Output stays verify-decided, so
+    // byte-identical to the ladder's greedy regardless of drafter quality.
+    q27d2::Dflash2* d2 = nullptr;
+    float* d2_vtaps = nullptr;
+    cudaGraphExec_t d2_verify_exec = nullptr;
+    bool d2_on = false;
+    int d2_k = 7;
+    int d2_pending = 0, d2_pos = 0;
+    void d2_setup() {
+        const char* pk = getenv("Q27_DFLASH2");
+        if (!pk) return;
+        if (const char* k = getenv("Q27_DFLASH2_K")) d2_k = atoi(k);
+        const int d2_w = d2_k + 1;
+        if (d2_k < 1 || d2_w > W_MAX) {
+            fprintf(stderr, "Q27_DFLASH2_K=%d out of range (1..%d)\n", d2_k, W_MAX - 1);
+            exit(1);
+        }
+        d2 = new q27d2::Dflash2();
+        d2->load(pk);
+        const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
+                                                                         : "output.weight";
+        const DevTensor& hw = dm.get(vh);
+        d2->set_engine_head(hw.data, (const __half*)hw.scales, hw.dtype == DType::Q4_G64);
+        // reuse the engine's Q8 token embedding for the drafter's anchor/mask
+        // rows (the serving pack ships no fp16 target.embed). MUST precede
+        // alloc(), which caches the mask-token embedding.
+        const DevTensor& ew = dm.get("token_embd.weight");
+        d2->set_engine_embed((const int8_t*)ew.data, (const __half*)ew.scales);
+        d2->alloc(4096); // sliding ring (window 2048 + headroom)
+        set_round_width(d2_w);
+        CUDA_CHECK(cudaMalloc((void**)&d2_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
+        LaneView v = solo_view();
+        v.vw = d2_w;
+        cudaGraph_t g;
+        CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+        spec_verify_forward(v, d2_vtaps);
+        spec_verify_tail(v);
+        CUDA_CHECK(cudaStreamEndCapture(stm, &g));
+        CUDA_CHECK(cudaGraphInstantiate(&d2_verify_exec, g, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(g));
+        d2_on = true;
+        fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s\n", d2_k, d2_w,
+                vh);
+    }
+    // Called at the end of prefill: cold-reset the drafter ring, snapshot the
+    // pending token + committed position for the decode loop.
+    void d2_prefill_done(int NP) {
+        if (!d2_on) return;
+        d2->reset_ctx();
+        d2_pos = NP - 1;
+        CUDA_CHECK(cudaMemcpy(&d2_pending, d_token, 4, cudaMemcpyDeviceToHost));
+        last_pending = d2_pending;
+    }
+    // One DFlash2 decode round -- spec_round's contract (d_token=pending,
+    // d_P=last committed, h_next set on entry; emits up to n tokens, updates
+    // d_P/d_token/last_pending, sets fold_pending for post_round's fold).
+    int dflash2_round(int* emit) {
+        flush_fold(stm); // belt: fold the previous round before this verify reads state
+        d2->draft(d2_pending, d2_pos + 1, d2_k, stm); // proposals -> d2->d_prop (device)
+        q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome, stm);
+        for (int k = 0; k < d2_k; k++)
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], d2->d_prop + k, 4,
+                                       cudaMemcpyDeviceToDevice, stm));
+        CUDA_CHECK(cudaGraphLaunch(d2_verify_exec, stm));
+        int oc[OUTCOME_INTS];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
+        CUDA_CHECK(cudaStreamSynchronize(stm));
+        const int n = oc[0];
+        // ingest the accepted lanes' taps into the drafter ring
+        int ipos[W_MAX];
+        for (int k = 0; k < n; k++) ipos[k] = d2_pos + 1 + k;
+        d2->ingest(d2_vtaps, ipos, n, stm);
+        for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
+        d2_pending = oc[OUTCOME_INTS - 1];
+        last_pending = d2_pending;
+        d2_pos += n;
+        fold_pending = n - 1; // post_round folds after on_round truncation
+        return n;
+    }
+
     int spec_round(int* emit) {
         // M1 belt: decode_step/post_round folds every round, but direct-call
         // rigs (CLI spec loop, smoke harnesses) drive spec_round without
@@ -4414,6 +4500,8 @@ struct Engine {
             n = sample_round(em);
             install_forced_pending(t);
             em[0] = t.forced_id;
+        } else if (d2_on && !t.sampling) {
+            n = dflash2_round(em);
         } else {
             n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
                            : spec_round(em);
@@ -4695,6 +4783,7 @@ struct Engine {
         live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
         live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;
+        d2_prefill_done(NP); // DFlash2: cold-reset the drafter ring for this turn
         return true;
     }
 

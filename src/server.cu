@@ -1038,6 +1038,20 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // DFlash2 (Q27_DFLASH2): the drafter pack + ring + scratch load in
+        // d2_setup, which runs AFTER this pool grabs its VRAM -- so carve the
+        // drafter's footprint out of the pool now or d2_setup OOMs. The serving
+        // pack is ~1.2 GB (Q4 matmuls + codebooks; head/embed reuse the
+        // engine's), + ring/scratch; reserve 2.0 GB. Override: Q27_DFLASH2_RESERVE_GB.
+        if (getenv("Q27_DFLASH2") && pool_b > 0) {
+            double d2_reserve = 2.0e9;
+            if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
+            const double was = pool_b;
+            pool_b = pool_b > d2_reserve ? pool_b - d2_reserve : 0;
+            fprintf(stderr, "[pool] reserved %.2f GB for the DFlash2 drafter; pool %.2f -> "
+                            "%.2f GB\n",
+                    d2_reserve / 1e9, was / 1e9, pool_b / 1e9);
+        }
         // 17 pairs share the pool; split K:V by row-byte ratio.
         if (pool_b > 0) {
             const double kfrac = (double)k_row / (double)(k_row + v_row);

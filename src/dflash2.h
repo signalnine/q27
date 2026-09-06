@@ -93,12 +93,26 @@ struct Dflash2 {
         ehead_scales = scales;
         ehead_q4 = q4;
     }
+    // Engine Q8 embedding reuse (serving): the drafter's anchor/mask embed
+    // rows come from the engine's own token_embd (Q8_G128) instead of a
+    // packed fp16 target.embed -- saves 2.5 GB of VRAM (= more KV/ctx).
+    const int8_t* eembed_data = nullptr;
+    const __half* eembed_scales = nullptr;
+    int* d_anchor_tok = nullptr;
+    int* d_mask_tok = nullptr;
+    void set_engine_embed(const int8_t* data, const __half* scales) {
+        eembed_data = data;
+        eembed_scales = scales;
+    }
     void alloc(int cap);
 
     // append T committed-token context rows. taps: device [T][TAPD] fp32,
     // positions: host absolute positions (uploaded internally). Batched: the
-    // fc weight (131 MB fp16) is read ONCE for all T rows.
+    // fc weight (131 MB fp16) is read ONCE for all T rows. Serving: the ring
+    // slides -- when it would overflow, the oldest rows past the sliding
+    // window are dropped (lossless: the drafter attends only D2_WINDOW back).
     void ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st);
+    void reset_ctx() { ctx_n = 0; } // new conversation/turn: cold ring
 
     // one draft block of K proposals (width K+1): anchor (pending) token at
     // anchor_pos. Fully device-side; proposals land in d_prop[0..K-1]. No

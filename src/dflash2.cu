@@ -408,16 +408,46 @@ void Dflash2::alloc(int cap) {
     // drafter activation-quant scratch, sized to the widest activation (the
     // fc input = concatenated taps, TAPD=25600)
     for (int i = 0; i < D2_WMAX; i++) dxq[i] = q27k::xquant_alloc(D2_TAPD);
-    // cache the mask-token embedding once
-    k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
-                              D2_H);
+    // cache the mask-token embedding once (engine Q8 embed if set, else the
+    // packed fp16 target.embed)
+    if (eembed_data) {
+        D2CHECK(cudaMalloc(&d_anchor_tok, 4));
+        D2CHECK(cudaMalloc(&d_mask_tok, 4));
+        const int mtok = D2_MASK;
+        D2CHECK(cudaMemcpy(d_mask_tok, &mtok, 4, cudaMemcpyHostToDevice));
+        q27k::embed_row_q8(eembed_data, eembed_scales, d_mask_tok, D2_H, maskrow, 0);
+    } else {
+        k_d2_rowcast<<<40, 256>>>(f16("target.embed.weight") + (size_t)D2_MASK * D2_H, maskrow,
+                                  D2_H);
+    }
     D2CHECK(cudaDeviceSynchronize());
 }
 
 // ---- context ingest (batched: fc weight read once for all T rows) -------
 
 void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st) {
-    assert(ctx_n + T <= ctx_cap && T <= 4096);
+    assert(T <= 4096);
+    // Slide the ring: keep only the most recent D2_WINDOW rows so a long
+    // conversation never overruns the fixed allocation. The drafter's
+    // attention masks anything older than D2_WINDOW anyway, so dropping the
+    // head is lossless. Compact by keeping the tail block contiguous.
+    if (ctx_n + T > ctx_cap) {
+        const int keep = std::min(ctx_n, D2_WINDOW);
+        const int src0 = ctx_n - keep;
+        if (src0 > 0) {
+            for (int l = 0; l < D2_LAYERS; l++) {
+                D2CHECK(cudaMemcpyAsync(ringK[l], ringK[l] + (size_t)src0 * D2_KVD,
+                                        (size_t)keep * D2_KVD * 4, cudaMemcpyDeviceToDevice,
+                                        st));
+                D2CHECK(cudaMemcpyAsync(ringV[l], ringV[l] + (size_t)src0 * D2_KVD,
+                                        (size_t)keep * D2_KVD * 4, cudaMemcpyDeviceToDevice,
+                                        st));
+            }
+            D2CHECK(cudaMemcpyAsync(d_ring_pos, d_ring_pos + src0, keep * 4,
+                                    cudaMemcpyDeviceToDevice, st));
+        }
+        ctx_n = keep;
+    }
     D2CHECK(cudaMemcpyAsync(d_ing_pos, h_pos, T * 4, cudaMemcpyHostToDevice, st));
     D2CHECK(cudaMemcpyAsync(d_ring_pos + ctx_n, h_pos, T * 4, cudaMemcpyHostToDevice, st));
     for (int c0 = 0; c0 < T; c0 += D2_WMAX) {
@@ -456,8 +486,13 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
     const int W = K + 1;
     char nm[64];
     // noise rows: anchor embedding + K mask embeddings
-    k_d2_rowcast<<<40, 256, 0, st>>>(
-        f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
+    if (eembed_data) {
+        D2CHECK(cudaMemcpyAsync(d_anchor_tok, &anchor_token, 4, cudaMemcpyHostToDevice, st));
+        q27k::embed_row_q8(eembed_data, eembed_scales, d_anchor_tok, D2_H, nx, st);
+    } else {
+        k_d2_rowcast<<<40, 256, 0, st>>>(
+            f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
+    }
     for (int r = 1; r < W; r++)
         D2CHECK(cudaMemcpyAsync(nx + (size_t)r * D2_H, maskrow, D2_H * 4,
                                 cudaMemcpyDeviceToDevice, st));

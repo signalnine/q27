@@ -15709,3 +15709,28 @@ that engine-core fix, tracked separately.
 Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
+
+## 2026-09-06 (e): DFlash2 Phase 6 -- server wiring + the live-CC verdict (NOT a serving win yet)
+
+Wired dflash2 into serving (Q27_DFLASH2=<pack>, single-slot/Q27_BATCH=0):
+per-engine Dflash2 with a sliding ring, dflash2_round in decode_step, verify
+graph captured in d2_setup, drafter reuses the engine's Q8 head AND Q8 embed
+(serving pack drops fp16 head+embed -> 1.2 GB; KV pool reserves ~2 GB up front
+via Q27_DFLASH2_RESERVE_GB or d2_setup OOMs -- the pool otherwise eats all free
+VRAM). Ring cold-resets per turn (warm turns restore target state, NOT the
+drafter's prefix taps).
+
+Works + correct: real Claude Code (SWE-bench flask+requests) ran to completion,
+edited the right files, hit prefix-cache warm turns. But LOSES on live agentic
+traffic (same 2 instances, single-slot, only the drafter differs): dflash2 164.6
+t/s agg / 3.17 tok/round vs ladder+suffix 177.5 / 3.43 -- -7.2%. Single-turn CLI
+wins DON'T transfer: agentic CC is many short turns, the ring cold-starts each
+turn and the drafter has no prefix context, while the MTP head always drafts
+from the target's hidden state (context via KV). The CLI benches had one
+prefill + one long decode -> ring warmed once. (Suffix accepted 0 tok here; the
+incumbent is pure MTP.)
+
+Gated on: (1) prefill tap capture (last ~2048 prompt taps into the ring during
+prefill_chunk -- the whole -7% is cold-start), (2) composition with the ladder
+for cold rounds. Until (1), dflash2 is a CLI/warm-context win, NOT a serving
+default. Honest state -- exactly what the live-CC trial is for.
