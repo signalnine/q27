@@ -1,0 +1,11 @@
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]Loading weights: 100%|██████████| 851/851 [00:00<00:00, 24830.97it/s]
+Loading weights:   0%|          | 0/81 [00:00<?, ?it/s]Loading weights: 100%|██████████| 81/81 [00:00<00:00, 25150.92it/s]
+[load] ok
+[tie/full-prefill] top3: 'ISO' 24.7500 | 'We' 24.3750 | 'Need' 24.0000 | margin 0.3750
+[tie/split-prefill] top3: 'ISO' 24.7500 | 'We' 24.3750 | 'Need' 24.1250 | margin 0.3750
+[al/code-write] 192 tok, 42 rounds, 4.55 tok/round, hist={1: 5, 2: 6, 3: 5, 4: 7, 5: 5, 6: 1, 7: 4, 8: 9} (69s)
+[al/prose] 192 tok, 65 rounds, 2.94 tok/round, hist={1: 22, 2: 15, 3: 9, 4: 7, 5: 3, 6: 1, 7: 1, 8: 7} (104s)
+[al/code-edit] 192 tok, 59 rounds, 3.24 tok/round, hist={1: 20, 2: 14, 3: 5, 4: 2, 5: 5, 6: 4, 7: 1, 8: 8} (96s)
+[al/echo] 192 tok, 26 rounds, 7.35 tok/round, hist={2: 2, 5: 1, 6: 1, 8: 22} (43s)
+[summary] {"code-write": {"tok_per_round": 4.5476190476190474, "rounds": 42, "tokens": 192, "hist": {"1": 5, "2": 6, "3": 5, "4": 7, "5": 5, "6": 1, "7": 4, "8": 9}}, "prose": {"tok_per_round": 2.9384615384615387, "rounds": 65, "tokens": 192, "hist": {"1": 22, "2": 15, "3": 9, "4": 7, "5": 3, "6": 1, "7": 1, "8": 7}}, "code-edit": {"tok_per_round": 3.23728813559322, "rounds": 59, "tokens": 192, "hist": {"1": 20, "2": 14, "3": 5, "4": 2, "5": 5, "6": 4, "7": 1, "8": 8}}, "echo": {"tok_per_round": 7.346153846153846, "rounds": 26, "tokens": 192, "hist": {"2": 2, "5": 1, "6": 1, "8": 22}}}
+[done]

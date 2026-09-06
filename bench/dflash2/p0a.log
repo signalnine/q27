@@ -1,0 +1,13 @@
+
+[load] target Qwen3_5ForCausalLM via AutoModelForCausalLM in 3s
+
+[load] draft in 0s, taps [5, 19, 33, 47, 61], K=7
+[prompt] 87 tokens
+[base] 128 tokens in 210s (0.61 t/s)
+[base text] "We need answer user: \"Write a Python function that parses an ISO-8601 duration string like 'P3DT4H59M' into a datetime.timedelta. Handle edge cases.\"\n\nNeed produce final with code and explanation. Need think through robust parser.\n\nISO 8601 duration format: P[n]Y[n]M[n]DT[n]H[n]M[n]S, but years/months variable length not fixed, cannot convert to timedelta exactly unless assume? User asks parse int"
+[dflash] 128 tokens in 61s | rounds=30 | tok/round mean=4.23
+[dflash] tok/round histogram: {1: 5, 2: 5, 3: 4, 4: 4, 5: 3, 7: 3, 8: 6}
+[identity] first 128 tokens identical: False
+[identity] diverges at 57: base='ISO 8601 duration format' vs dflash='We need write Python function parse ISO-'
+[dflash text] "We need answer user: \"Write a Python function that parses an ISO-8601 duration string like 'P3DT4H59M' into a datetime.timedelta. Handle edge cases.\"\n\nNeed produce final with code and explanation. Need think through robust parser.\n\nWe need write Python function parse ISO-8601 duration string to datetime.timedelta. Need consider ISO 8601 duration grammar: PnYnMnDTnHnMnS? Actually ISO 8601 durations"
+[done]

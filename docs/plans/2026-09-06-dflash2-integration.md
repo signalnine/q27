@@ -1,6 +1,7 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: DESIGN, pre-measurement. Supersedes
+Status: Phase 0 EXECUTED 2026-09-06 (results section below) -- GO for
+Phase 1, with the quant-tap kill gate still open. Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -140,6 +141,89 @@ bring-up.
 - The composition bet could fail: suffix and DFlash2 may fight over the
   same accept opportunities on mixed traffic. Phase 3's three-way A/B is
   designed to catch exactly that.
+
+## Phase 0 results (2026-09-06, same day)
+
+Rig: z-lab's own `dflash` package (clone at `/mnt/ai/projects/dflash`) run
+against the checkpoint on disk, target = the BF16 HF checkpoint loaded as
+`Qwen3_5ForCausalLM` (needs transformers 5.15; venv `/mnt/ai/venvs/dflash2`
+over system torch). CPU-only, so the serving GPUs stayed untouched. Scripts:
+`bench/dflash2/`.
+
+**P0a -- drafter works, and the tap ids are config truth.** The z-lab class
+maps our drafter checkpoint exactly (1.92B params, taps [5,19,33,47,61] read
+from `dflash_config`, not the generic-formula fallback, which would give the
+v1 ids). E2E greedy through their `dflash_generate` on four 192-token
+prompts, BF16 taps, K=7 -- and the same four prompts through live q27-38
+serving (temperature 0, `[req] dec/rounds`) as the same-traffic incumbent:
+
+| traffic    | ladder+suffix tok/round @ round ms | DFlash2 BF16 tok/round | tok/ms ratio* |
+|------------|-----------------------------------:|-----------------------:|--------------:|
+| code-write |                        2.53 @ 16.2 |                   4.55 |     **1.65x** |
+| prose      |                        2.29 @ 15.8 |                   2.94 |     **1.18x** |
+| code-edit  |                        3.31 @ 16.4 |                   3.24 |         0.90x |
+| echo       |                        6.86 @ 18.4 |        7.35 (cap is 8) |         0.99x |
+
+*DFlash2 charged the incumbent's full round wall plus 1.5 ms of drafter --
+conservative twice over: a dflash2 round drops the ladder's MTP passes from
+the wall, and the Q4 drafter floor is under 1 ms (P0b).
+
+Two findings that reshape the plan:
+
+1. **The 5.3-5.8 tok/round live figure is an echo-heavy cctx anchor, not
+   what the ladder yields on think-prose.** On the traffic that dominates
+   CC decode time (thinking + code-write) the incumbent runs 2.3-2.5
+   tok/round, and DFlash2 beats it by up to 80% -- consistent with
+   ninfer's +40% on think-on decode. The GO gate as originally written
+   (beat 5.3/26 ms) compared against the wrong denominator.
+2. **The composition thesis was backwards.** DFlash2 is STRONGEST on echo
+   (22/26 rounds accepted the full 8-token block) and weakest on prose --
+   both drafters feast on echo; they are correlated, not anti-correlated.
+   The stack still matters, but for a different reason: dflash2-alone
+   REGRESSES echo (capped at 8 vs suffix rounds reaching 12), so suffix
+   lanes 8..11 stacked on top (or K=11) are what protects echo-heavy
+   stretches, while the drafter's real margin is prose/code-write. Phase
+   2's K sweep and stacking A/B are now data-motivated, not a bet.
+
+Greedy identity vs plain HF generate diverged once in 128 tokens at a
+0.375-logit margin (~3 bf16 ulps at logit scale 25): accumulated
+batched-vs-serial bf16 cache divergence, both continuations coherent. Not a
+rig bug and not a q27 concern -- q27's verify lanes are bitwise twins of
+plain decode, so identity holds by construction there.
+
+Still open, and it is the one kill gate left: every DFlash2 number above is
+on BF16 target hiddens. The quant-tap leg (q27 5.25-bpw residuals + fp8 KV)
+needs the engine's tap-dump plumbing -- first thing in Phase 1.
+
+**P0b -- drafter cost.** Eager bf16 on the 3090: 9.7-10.9 ms/round, flat in
+context rows and accepted count = launch/python-bound, decomposed as forward
+6.5 ms + propose 3.2 ms (the propose is a 7-step python loop; in q27 it is
+one tiny kernel). Weight-read floors: bf16 3.85 GB = 4.1 ms on the 3090,
+2.2 ms on the 5090; Q4 ~1.1 GB = ~0.6 ms. The design's 1-2 ms/round Q4
+estimate stands; bf16 bring-up ~2.5-3 ms is plausible once graphed.
+
+**P0c -- fold audit: CONFIRMED safe.** `k_finish_round`'s acceptance is a
+pure equality chain over draft slots that are bare device ints (the MTP
+chain writes 1..7 by name, the suffix drafter stages 8..W_PLUMB-1 -- the
+pre-staged-draft pattern DFlash2 needs already exists); the record arena is
+lane-indexed with no draft provenance; `flush_fold` replays by accepted
+count alone; `refinish_round` is generic in m. No ladder assumption a block
+drafter violates. One Phase-1 delta it surfaces: dflash2 rounds need a
+verify-graph variant in which the MTP chain does not write the same slots
+the drafter staged.
+
+**Port-surface addendum.** Every draft layer wraps BOTH its attention and
+its MLP in a `GroupedDynamicCausalConv` (kernel 2, group 16: a per-token
+dynamic kernel added to a learned base, prepare/finish pair around each
+block). The context rows still bypass all of it -- the "no conv on context
+rows" claim above holds -- but the noise-row path is more than the plain
+5-layer transformer the cost model described. Small tensors, elementwise
+cost, real implementation surface.
+
+**Tap contract for Phase 1.** HF `hidden_states[i+1]` = the residual stream
+after layer i's second residual add, no final norm (entry 0 = embedding;
+z-lab's `extract_context_feature` uses offset=1). So q27 taps x after the
+post-FFN residual add at layers 5/19/33/47/61 -- matching ninfer's r_t^l.
 
 ## Prior art
 
