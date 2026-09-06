@@ -22,6 +22,7 @@ set -uo pipefail
 
 Q27_BIN=/mnt/ai/projects/q27/build/q27-server
 NINFER_BIN=/mnt/ai/projects/ninfer/build/apps/ninfer-serve
+NINFER_MASTER_BIN=/mnt/ai/projects/ninfer-master/build/apps/ninfer-serve
 Q27_TOK=/mnt/ai/models/qwen36-27b-mtp/qwen36-27b-mtp.tok
 Q38_TOK=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.tok
 MODELS=/mnt/ai/models
@@ -44,7 +45,7 @@ HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 leg_engine() {
   case "$1" in
     q4s|q5f|q38|q38q4s) echo q27 ;;
-    nint|nvfp4) echo ninfer ;;
+    nint|nvfp4|nvfp4m) echo ninfer ;;
     llama|llama38) echo llama ;;
     vllm) echo vllm ;;
     *) echo "?" ;;
@@ -59,6 +60,7 @@ leg_artifact() {
     q38q4s) echo $MODELS/qwen38-27b-mtp/qwen38-27b-mtp-q4s.q27 ;;
     nint)  echo $MODELS/ninfer/qwen3_6_27b.ninfer ;;
     nvfp4) echo $MODELS/ninfer/qwen3_6_27b_nvfp4.ninfer ;;
+    nvfp4m) echo $MODELS/ninfer/qwen38-nvfp4-release/qwen3_8_27b_nvfp4.ninfer ;;
     llama) echo $LLAMA_GGUF ;;
     llama38) echo $LLAMA38_GGUF ;;
     vllm)  echo "$VLLM_MODEL" ;;   # HF id, resolved from the local cache
@@ -79,6 +81,7 @@ leg_port() {
     q4s) base=8110;; nint) base=8120;; q5f) base=8130;; nvfp4) base=8140;;
     llama) base=8150;; vllm) base=8160;;
     q38) base=8170;; q38q4s) base=8180;; llama38) base=8190;;
+    nvfp4m) base=8200;;
   esac
   case "$2" in agentic) echo $((base+0));; ladder) echo $((base+1));; quality) echo $((base+2));; esac
 }
@@ -219,8 +222,11 @@ leg_start() {
     # Anthropic endpoint is lenient, which is why the agentic arm worked while
     # quality scored 0/75). q27 ignores the field entirely. Naming the artifact
     # after the leg makes one client config work against both engines.
-    nohup "$NINFER_BIN" "$art" --port "$port" --model-id "$leg" \
-      --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft \
+    local nbin="$NINFER_BIN" spec=(--spec mtp --draft-tokens 3 --lm-head-draft)
+    # nvfp4m: ninfer MASTER + their DFlash2 drafter (their current best on 3.8)
+    if [ "$leg" = nvfp4m ]; then nbin="$NINFER_MASTER_BIN"; spec=(--spec dflash2 --draft-tokens 7); fi
+    nohup "$nbin" "$art" --port "$port" --model-id "$leg" \
+      --kv-dtype int8 "${spec[@]}" \
       --prefill-chunk 1024 --no-thinking \
       --request-log-jsonl "${log%.log}.reqlog.jsonl" \
       "${extra[@]}" >"$log" 2>&1 &

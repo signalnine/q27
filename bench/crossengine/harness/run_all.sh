@@ -75,7 +75,7 @@ cleanup() { tap_stop; [ -n "${CUR_LOG:-}" ] && leg_stop "$CUR_LOG"; }
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- serving arms
-for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s llama38; do
+for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s llama38 nvfp4m; do
   has_leg "$LEG" || continue
   { has_arm agentic || has_arm quality; } || continue
   [ -s "$OUT/agentic.$LEG.jsonl" ] && [ -s "$OUT/quality.$LEG.json" ] && \
@@ -110,7 +110,7 @@ done
 
 # ----------------------------------------------------------------- ladder arm
 if has_arm ladder; then
-for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s llama38; do
+for LEG in q4s nint q5f nvfp4 llama vllm q38 q38q4s llama38 nvfp4m; do
   has_leg "$LEG" || continue
   [ -s "$OUT/ladder.$LEG.txt" ] && { echo "[skip] $LEG ladder already done"; continue; }
 
