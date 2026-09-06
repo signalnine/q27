@@ -18,3 +18,8 @@ q27 commit: 9b10e16
 vllm image: nightly 0.26.1rc1.dev1177+ga9a17e709
 driver: 580.119.02
 writeup: LONGCTX.md
+
+run: 2026-09-06  (ninfer re-bench: agent prefix-reuse fix + DFlash2)
+arms: agentic (nvfp4m, same 3.6 artifact bytes as 08-17), longctx arm A (3.8 released artifact, dflash2 + mtp3 paired)
+ninfer: master 487f897, fresh worktree build; pinned 08-15 binary untouched
+writeup: NINFER-REBENCH.md; raw: rebench-2026-09-06/

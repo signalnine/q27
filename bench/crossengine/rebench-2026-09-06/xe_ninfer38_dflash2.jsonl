@@ -1,0 +1,6 @@
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 94, "tps": 221.4, "ttft": 0.083, "gen": 512, "n": 3}
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 3324, "tps": 223.9, "ttft": 0.423, "gen": 512, "n": 3}
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 6591, "tps": 216.1, "ttft": 0.796, "gen": 512, "n": 3}
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 12510, "tps": 203.3, "ttft": 1.559, "gen": 512, "n": 3}
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 26123, "tps": 186.0, "ttft": 3.635, "gen": 512, "n": 3}
+{"arm": "A", "label": "ninfer38-dflash2", "ctx": 51204, "tps": 181.0, "ttft": 8.704, "gen": 512, "n": 3}

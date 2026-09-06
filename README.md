@@ -24,6 +24,9 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   prefix reuse, not raw decode -- ninfer decodes faster and still takes 2-7x
   the wall time. **Where q27 loses:** ninfer's NVFP4 peaks 1.57x higher at 8
   concurrent streams (834 vs 531 t/s). Logged at the same rate as the wins.
+  *(Dated 2026-09-06: ninfer shipped an agent prefix-reuse fix; on the same
+  artifact and harness, current master measures 51 s/inst at 91.3% reuse --
+  [bench/crossengine/NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md).)*
 - **Self-speculation as the whole design**: trained-in MTP ladder + free
   suffix drafter through one shared-KV MMA verify -- 5.3-5.8 accepted tokens
   per weight read on live traffic (231-246 t/s aggregate on a 5090).
@@ -200,11 +203,14 @@ order-dependent recurrent summary that cannot be paged, shared by hash, or
 rebuilt from cached blocks. A block cache covers 17/65 layers; without the
 matching GDN state those blocks are dead weight.
 
-Measured consequence (08-17 four-engine run): ninfer gets **0% reuse** on real
-Claude-Code traffic -- 541 requests, every one a `full_reset` -- and pays
-97-327 s/instance against q27's 47 while *decoding faster*. Not a
-misconfiguration: their design admits two resume offsets and documents
-arbitrary prefix reuse as a non-goal. llama.cpp reaches 93.9% by checkpointing
+Measured consequence (08-17 four-engine run): ninfer got **0% reuse** on real
+Claude-Code traffic -- 541 requests, every one a `full_reset` -- and paid
+97-327 s/instance against q27's 47 while *decoding faster*. At the time this
+was by design: two resume offsets, arbitrary prefix reuse a documented
+non-goal. That position changed -- their 2026-09-03 exact-identity reuse fix
+measures **91.3% reuse and 51 s/inst** on the same artifact and harness
+([NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md)); the hybrid-GDN
+analysis above stands, the ninfer example is now historical. llama.cpp reaches 93.9% by checkpointing
 recurrent state per slot at ~1 GiB each, which caps it at 6 slots on 32 GB.
 vLLM reaches 89.8% (fixed upstream since the 07-15 run measured 0%).
 
