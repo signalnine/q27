@@ -1,7 +1,8 @@
 # DFlash2 drafter integration -- design v2 (2026-09-06)
 
-Status: Phase 0 EXECUTED 2026-09-06 (results section below) -- GO for
-Phase 1, with the quant-tap kill gate still open. Supersedes
+Status: Phase 0 EXECUTED 2026-09-06 (results section below); Phase 1
+quant-tap kill gate PASSED same day (see "Phase 1: quant-tap gate") --
+drafter runtime bring-up in progress. Supersedes
 `docs/dflash-block-verify-design.md` (2026-07-09, v1 drafter, parked at
 Phase 0). This is a delta document: the v1 doc's motivation, bitwise
 contract, and Phase-0 discipline carry forward; the drafter generation, the
@@ -224,6 +225,35 @@ cost, real implementation surface.
 after layer i's second residual add, no final norm (entry 0 = embedding;
 z-lab's `extract_context_feature` uses offset=1). So q27 taps x after the
 post-FFN residual add at layers 5/19/33/47/61 -- matching ninfer's r_t^l.
+
+## Phase 1: quant-tap gate (2026-09-06, same day) -- PASSED
+
+The last kill gate is closed, and not narrowly. Method: `DFLASH_TAPS`
+bumped to the v2 ids {5,19,33,47,61} (the v1 `--dump-taps` rig from the
+parked design still works end to end), the four Phase-0 prompts dumped
+through the CLI plain-greedy path on the 5.25-bpw artifact, and the drafter
+replayed offline over those taps (`bench/dflash2/p1_qtap_al.py`). Controls:
+the replay rig reproduces `dflash_generate`'s own acceptance on the same
+trajectory (4.44 vs 4.55 tok/round, recompute-vs-cache numerics); and the
+controlled leg teacher-forces the SAME q27 token streams through the BF16
+target so only the tap source differs:
+
+| traffic    | BF16 taps | q27 taps | delta |
+|------------|----------:|---------:|------:|
+| code-write |      3.18 |     3.24 |   +2% |
+| prose      |      2.45 |     2.55 |   +4% |
+| code-edit  |      4.06 |     4.44 |   +9% |
+| echo       |      7.64 |     7.64 |    0% |
+
+q27 taps are not degraded at all -- they score marginally HIGHER on every
+non-echo type, which has a plausible mechanism: the live taps are
+self-consistent with the trajectory that produced them, while the BF16
+teacher-forced taps are slightly off-policy. (The uncontrolled per-prompt
+swings, e.g. code-write 4.55 BF16-trajectory vs 3.24 q27-trajectory, are
+trajectory content variance, not tap quality -- the controlled table is the
+comparison that counts.) The int8 embedding rows feeding the noise columns
+remain a small untested delta; they are high-fidelity (q8 + fp16 row
+scales) and get covered by the bring-up parity test.
 
 ## Prior art
 

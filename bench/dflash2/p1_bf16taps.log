@@ -1,0 +1,4 @@
+[bf16-tap/code-write] 191 tok, 60 rounds, 3.18 tok/round, hist={1: 19, 2: 14, 3: 10, 4: 3, 5: 2, 6: 1, 7: 2, 8: 9}
+[bf16-tap/prose] 191 tok, 78 rounds, 2.45 tok/round, hist={1: 33, 2: 20, 3: 10, 4: 6, 5: 1, 6: 2, 7: 1, 8: 5}
+[bf16-tap/code-edit] 191 tok, 47 rounds, 4.06 tok/round, hist={1: 11, 2: 9, 3: 2, 4: 7, 5: 2, 6: 3, 7: 4, 8: 9}
+[bf16-tap/echo] 191 tok, 25 rounds, 7.64 tok/round, hist={2: 1, 5: 1, 8: 23}

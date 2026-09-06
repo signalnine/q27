@@ -1539,7 +1539,12 @@ struct Engine {
     // P0a) -- when non-null, the residual stream h is copied after each
     // DFLASH_TAP layer. Host-side branch only: build_graph captures with
     // taps == nullptr, so the graphed paths are byte-identical.
-    static constexpr int DFLASH_TAPS[5] = {1, 16, 31, 46, 61}; // z-lab target_layer_ids; P0a measured the +-1 convention equal (AL 2.10 vs 2.18)
+    // DFlash2 (v2) tap ids from the checkpoint's dflash_config -- NOT the
+    // z-lab generic formula, which gives the v1 ids {1,16,31,46,61} this
+    // constant used to hold (v1 P0a measured the +-1 convention equal,
+    // AL 2.10 vs 2.18). Convention: residual stream AFTER layer il's second
+    // add = HF hidden_states[il+1] (docs/plans/2026-09-06-dflash2-integration.md).
+    static constexpr int DFLASH_TAPS[5] = {5, 19, 33, 47, 61};
     void token_launches(float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_row_q8((const int8_t*)emb.data, (const __half*)emb.scales, d_token, N_EMBD, h,
