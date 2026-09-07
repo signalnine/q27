@@ -2757,10 +2757,12 @@ struct Engine {
     // byte-identical to the ladder's greedy regardless of drafter quality.
     q27d2::Dflash2* d2 = nullptr;
     float* d2_vtaps = nullptr;
+    float* d2_pf_taps = nullptr; // [PF_T][5*N_EMBD] prefill-window tap scratch
     cudaGraphExec_t d2_verify_exec = nullptr;
     bool d2_on = false;
     int d2_k = 7;
     int d2_pending = 0, d2_pos = 0;
+    static constexpr int D2_SEED_WINDOW = 2048; // prompt-tail tokens seeded into the ring
     void d2_setup() {
         const char* pk = getenv("Q27_DFLASH2");
         if (!pk) return;
@@ -2784,6 +2786,7 @@ struct Engine {
         d2->alloc(4096); // sliding ring (window 2048 + headroom)
         set_round_width(d2_w);
         CUDA_CHECK(cudaMalloc((void**)&d2_vtaps, (size_t)W_MAX * 5 * N_EMBD * 4));
+        CUDA_CHECK(cudaMalloc((void**)&d2_pf_taps, (size_t)PF_T * 5 * N_EMBD * 4));
         LaneView v = solo_view();
         v.vw = d2_w;
         cudaGraph_t g;
@@ -2797,11 +2800,32 @@ struct Engine {
         fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s\n", d2_k, d2_w,
                 vh);
     }
-    // Called at the end of prefill: cold-reset the drafter ring, snapshot the
-    // pending token + committed position for the decode loop.
+    // Called at prefill START: clear the drafter ring for this turn. The
+    // prefill loops then re-seed it with the prompt tail (d2_seed_chunk), so
+    // the drafter starts decode WARM instead of cold. Warm turns re-seed from
+    // whatever the prefix cache left to prefill, which always includes the
+    // prompt tail (older restored prefix is masked by the drafter's window).
+    void d2_prefill_begin() {
+        if (d2_on) d2->reset_ctx();
+    }
+    // Seed the ring from one prefill chunk's taps: ingest the tokens in this
+    // chunk that fall inside the last-D2_SEED_WINDOW of the prompt. taps holds
+    // the chunk's [Tc][5*N_EMBD] residuals (captured by prefill_chunk).
+    void d2_seed_chunk(int c0, int Tc, int NP) {
+        if (!d2_on) return;
+        const int lo = std::max(c0, NP - D2_SEED_WINDOW);
+        const int hi = c0 + Tc; // exclusive
+        if (lo >= hi) return;
+        const int off = lo - c0;             // first in-window token within the chunk
+        const int cnt = hi - lo;
+        int hpos[/*PF_T*/ 4096];
+        for (int i = 0; i < cnt && i < 4096; i++) hpos[i] = lo + i;
+        d2->ingest(d2_pf_taps + (size_t)off * 5 * N_EMBD, hpos, std::min(cnt, 4096), stm);
+    }
+    // Called at the end of prefill: snapshot the pending token + committed
+    // position for the decode loop (the ring is already seeded).
     void d2_prefill_done(int NP) {
         if (!d2_on) return;
-        d2->reset_ctx();
         d2_pos = NP - 1;
         CUDA_CHECK(cudaMemcpy(&d2_pending, d_token, 4, cudaMemcpyDeviceToHost));
         last_pending = d2_pending;
@@ -3629,10 +3653,15 @@ struct Engine {
     // Forward a chunk of T prompt tokens starting at absolute position `base`.
     // Leaves hT = final residual for each token. Updates conv rings, GDN state,
     // attention KV caches in place.
-    void prefill_chunk(const int* d_toks, int base, int T) {
+    // taps (DFlash2 prefill warming, default nullptr): scatter the residual
+    // stream after the DFLASH_TAPS layers into taps[T][5*N_EMBD] so the drafter
+    // ring can be seeded with the prompt tail. Host branch only (memcpy, no
+    // compute change) -- prefill stays byte-identical when taps == nullptr.
+    void prefill_chunk(const int* d_toks, int base, int T, float* taps = nullptr) {
         const DevTensor& emb = dm.get("token_embd.weight");
         q27k::embed_rows_q8_T((const int8_t*)emb.data, (const __half*)emb.scales, d_toks,
                               N_EMBD, T, hT, stm);
+        int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             q27k::rmsnorm_T(hT, (const float*)T2(il, "attn_norm.weight").data, x1T, N_EMBD, T,
                             EPS, stm);
@@ -3647,6 +3676,13 @@ struct Engine {
                             N_EMBD, T, EPS, stm);
             ffn_T(il, T);
             q27k::add_inplace(hT, yT, (int64_t)T * N_EMBD, stm);
+            if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
+                // scatter hT [T][N_EMBD] into taps[t][tap_k][N_EMBD] (stride 5*N_EMBD)
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    taps + (size_t)tap_k * N_EMBD, (size_t)5 * N_EMBD * 4, hT,
+                    (size_t)N_EMBD * 4, (size_t)N_EMBD * 4, T, cudaMemcpyDeviceToDevice, stm));
+                tap_k++;
+            }
         }
     }
 
@@ -4538,6 +4574,7 @@ struct Engine {
             sfx.reset(prompt);
             sfx_valid = false;
         }
+        d2_prefill_begin(); // DFlash2: clear the drafter ring; the loops re-seed the prompt tail
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -4702,7 +4739,9 @@ struct Engine {
             for (int c0 = base; c0 < snap_upto; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, snap_upto - c0);
                 if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
-                prefill_chunk(d_prompt + c0, c0, Tc);
+                float* d2t = (d2_on && c0 + Tc > NP - D2_SEED_WINDOW) ? d2_pf_taps : nullptr;
+                prefill_chunk(d_prompt + c0, c0, Tc, d2t);
+                if (d2t) d2_seed_chunk(c0, Tc, NP);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
@@ -4729,7 +4768,9 @@ struct Engine {
             for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
                 int Tc = std::min((int)PF_T, (NP - 1) - c0);
                 if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
-                prefill_chunk(d_prompt + c0, c0, Tc);
+                float* d2t = (d2_on && c0 + Tc > NP - D2_SEED_WINDOW) ? d2_pf_taps : nullptr;
+                prefill_chunk(d_prompt + c0, c0, Tc, d2t);
+                if (d2t) d2_seed_chunk(c0, Tc, NP);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
                 mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
