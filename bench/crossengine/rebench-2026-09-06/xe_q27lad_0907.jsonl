@@ -1,0 +1,6 @@
+{"arm": "A", "label": "q27lad-0907", "ctx": 102, "tps": 156.2, "ttft": 0.097, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27lad-0907", "ctx": 3281, "tps": 179.9, "ttft": 0.927, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27lad-0907", "ctx": 6493, "tps": 170.8, "ttft": 1.81, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27lad-0907", "ctx": 12522, "tps": 181.9, "ttft": 3.548, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27lad-0907", "ctx": 25707, "tps": 175.9, "ttft": 7.677, "gen": 512, "n": 3}
+{"arm": "A", "label": "q27lad-0907", "ctx": 50364, "tps": 163.2, "ttft": 16.576, "gen": 512, "n": 3}
