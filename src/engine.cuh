@@ -2841,18 +2841,21 @@ struct Engine {
     cudaEvent_t d2_ev[4] = {};
     double d2_t_draft = 0, d2_t_verify = 0, d2_t_ingest = 0;
     long d2_t_n = 0;
+    double d2_t_fold = 0, d2_t_wall = 0;
     int dflash2_round(int* emit) {
-        flush_fold(stm); // belt: fold the previous round before this verify reads state
         if (d2_timing && !d2_ev[0]) for (auto& e : d2_ev) cudaEventCreate(&e);
+        auto wall0 = std::chrono::steady_clock::now();
         if (d2_timing) cudaEventRecord(d2_ev[0], stm);
+        flush_fold(stm); // belt: fold the previous round before this verify reads state
+        if (d2_timing) cudaEventRecord(d2_ev[1], stm);
         d2->draft(d2_pending, d2_pos + 1, d2_k, stm); // proposals -> d2->d_prop (device)
         q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome, stm);
         for (int k = 0; k < d2_k; k++)
             CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], d2->d_prop + k, 4,
                                        cudaMemcpyDeviceToDevice, stm));
-        if (d2_timing) cudaEventRecord(d2_ev[1], stm);
-        CUDA_CHECK(cudaGraphLaunch(d2_verify_exec, stm));
         if (d2_timing) cudaEventRecord(d2_ev[2], stm);
+        CUDA_CHECK(cudaGraphLaunch(d2_verify_exec, stm));
+        if (d2_timing) cudaEventRecord(d2_ev[3], stm);
         int oc[OUTCOME_INTS];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
@@ -2862,17 +2865,22 @@ struct Engine {
         for (int k = 0; k < n; k++) ipos[k] = d2_pos + 1 + k;
         d2->ingest(d2_vtaps, ipos, n, stm);
         if (d2_timing) {
-            cudaEventRecord(d2_ev[3], stm);
-            cudaEventSynchronize(d2_ev[3]);
-            float a, b, c;
-            cudaEventElapsedTime(&a, d2_ev[0], d2_ev[1]);
-            cudaEventElapsedTime(&b, d2_ev[1], d2_ev[2]);
-            cudaEventElapsedTime(&c, d2_ev[2], d2_ev[3]);
-            d2_t_draft += a; d2_t_verify += b; d2_t_ingest += c; d2_t_n++;
+            float fo, dr, ve;
+            cudaEventElapsedTime(&fo, d2_ev[0], d2_ev[1]);
+            cudaEventElapsedTime(&dr, d2_ev[1], d2_ev[2]);
+            cudaEventElapsedTime(&ve, d2_ev[2], d2_ev[3]);
+            d2_t_fold += fo; d2_t_draft += dr; d2_t_verify += ve;
+            d2_t_wall +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0)
+                    .count();
+            d2_t_n++;
             if (d2_t_n % 200 == 0)
-                fprintf(stderr, "[d2timing] over %ld rounds: draft %.2f verify %.2f ingest %.2f "
-                                "ms/round\n", d2_t_n, d2_t_draft / d2_t_n, d2_t_verify / d2_t_n,
-                        d2_t_ingest / d2_t_n);
+                fprintf(stderr,
+                        "[d2timing] %ld rounds: wall %.2f = fold %.2f + draft %.2f + verify %.2f "
+                        "+ host %.2f ms/round\n",
+                        d2_t_n, d2_t_wall / d2_t_n, d2_t_fold / d2_t_n, d2_t_draft / d2_t_n,
+                        d2_t_verify / d2_t_n,
+                        (d2_t_wall - d2_t_fold - d2_t_draft - d2_t_verify) / d2_t_n);
         }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         d2_pending = oc[OUTCOME_INTS - 1];
