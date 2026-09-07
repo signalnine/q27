@@ -2663,15 +2663,23 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
     constexpr int SK = 128;
     constexpr int GDN_CH = 10240;
     constexpr int NH = 48;
-    // 2026-09-07 register-resident state: the [128][128] fold state chains in
-    // registers (float sreg[32] per thread, thread owns column j, rows
-    // i0..i0+31), the k_delta_step (blocks.cu) pattern -- only sq/sk/part/dj
-    // stay in smem. Bitwise-identical (sreg[k] == old S[(i0+k)*SK+j]); gated by
-    // ninv_test's FOLD leg (serial delta_step reference) + E2E byte-identity.
-    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
-    const int h = blockIdx.x;
-    const int j = threadIdx.x & (SK - 1);
-    const int it = threadIdx.x >> 7;
+    // 2026-09-07 register-resident state + column-tile split. The [128][128]
+    // fold state chains in registers (float sreg[32] per thread), the
+    // k_delta_step (blocks.cu) pattern. AND: the 128 v-columns are independent
+    // (pred_j, dj, o_j read only column j), so split them into CT tiles of CW
+    // columns -> gridDim CT*48 fills more SMs (the head-per-block grid was 48
+    // blocks on ~170 SMs). Each block owns one head's CW-column slice, all 128
+    // rows (4 row-tiles), so the per-column arithmetic AND the part[0..3]
+    // reduction order are unchanged -> bitwise-identical (gated by ninv_test's
+    // FOLD leg vs the serial delta_step reference + E2E byte-identity).
+    constexpr int CT = 4, CW = SK / CT; // 4 column-tiles x 32 columns
+    __shared__ float sq[SK], sk[SK], part[4][CW], dj[CW];
+    const int h = blockIdx.x / CT;
+    const int ct = blockIdx.x % CT;
+    const int lane = threadIdx.x;    // 0..127 (blockDim.x == 128)
+    const int cc = lane & (CW - 1);  // column within this tile, 0..CW-1
+    const int it = lane >> 5;        // row-tile 0..3 (CW==32 -> lane>>5)
+    const int j = ct * CW + cc;      // actual v-column 0..127
     const int i0 = it * 32;
     const int qk = h % 16;
     const float scale = rsqrtf((float)SK);
@@ -2683,10 +2691,10 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
 
     for (int t = 0; t < T; t++) {
         const float* conv = convT + (size_t)t * GDN_CH;
-        if (it == 0) {
-            sq[j] = conv[qk * SK + j] * scale;
-            sk[j] = conv[2048 + qk * SK + j];
-        }
+        // sq/sk are row-indexed in the reductions, so every block loads the
+        // FULL 128 (all 128 lanes cooperate: lane -> entry lane).
+        sq[lane] = conv[qk * SK + lane] * scale;
+        sk[lane] = conv[2048 + qk * SK + lane];
         __syncthreads();
         const float decay = expf(gT[(size_t)t * NH + h]);
         float pred = 0.f;
@@ -2696,15 +2704,15 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
             sreg[k] = s;
             pred += sk[i0 + k] * s;
         }
-        part[it][j] = pred;
+        part[it][cc] = pred;
         __syncthreads();
         if (it == 0) {
-            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float p = part[0][cc] + part[1][cc] + part[2][cc] + part[3][cc];
             float vj = conv[4096 + h * SK + j];
-            dj[j] = betaT[(size_t)t * NH + h] * (vj - p);
+            dj[cc] = betaT[(size_t)t * NH + h] * (vj - p);
         }
         __syncthreads();
-        float d = dj[j];
+        float d = dj[cc];
         float acc = 0.f;
 #pragma unroll 8
         for (int k = 0; k < 32; k++) {
@@ -2712,11 +2720,11 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
             sreg[k] = s;
             acc += sq[i0 + k] * s;
         }
-        part[it][j] = acc;
+        part[it][cc] = acc;
         __syncthreads();
         if (it == 0)
             oT[(size_t)t * (NH * SK) + h * SK + j] =
-                part[0][j] + part[1][j] + part[2][j] + part[3][j];
+                part[0][cc] + part[1][cc] + part[2][cc] + part[3][cc];
         __syncthreads();
     }
 
@@ -3217,7 +3225,7 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
 void delta_scan_seq(float* S_global, const float* convT, const float* gT, const float* betaT,
                     float* oT, int T, cudaStream_t st) {
     // register-resident state: only the static sq/sk/part/dj smem now.
-    k_delta_scan_T<<<48, 512, 0, st>>>(S_global, convT, gT, betaT, oT, T);
+    k_delta_scan_T<<<48 * 4, 128, 0, st>>>(S_global, convT, gT, betaT, oT, T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3237,7 +3245,7 @@ void delta_scan_T(float* S_global, const float* convT, const float* gT, const fl
     const int cs = delta_scan_nsplit(T);
     if (cs == 1) {
         // register-resident state: only the static sq/sk/part/dj smem now.
-        k_delta_scan_T<<<48, 512, 0, st>>>(S_global, convT, gT, betaT, oT, T);
+        k_delta_scan_T<<<48 * 4, 128, 0, st>>>(S_global, convT, gT, betaT, oT, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
