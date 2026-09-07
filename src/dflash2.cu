@@ -371,6 +371,31 @@ void Dflash2::mmq(const std::string& name, const float* act, float* out, int W,
                         st);
 }
 
+void Dflash2::quant_act(const float* act, int cols, int W, cudaStream_t st) {
+    q27k::XQ3 xq{};
+    for (int i = 0; i < 16; i++) xq.q[i] = dxq[i < W ? i : 0];
+    q27k::quantize3(mkCP3(act, cols, W), cols, xq, st, W);
+}
+
+// gemv using the activation already quantized into dxq by quant_act. W >= 2
+// (the shared-activation groups in draft_compute are always width K+1 >= 2).
+void Dflash2::mmq_pre(const std::string& name, float* out, int W, cudaStream_t st) {
+    const D2Tensor& t = T(name);
+    const int cols = (int)t.cols, rows = (int)t.rows;
+    q27k::XQuant qs[16];
+    float* ysa[16];
+    for (int i = 0; i < 16; i++) {
+        qs[i] = dxq[i < W ? i : 0];
+        ysa[i] = out + (size_t)(i < W ? i : 0) * rows;
+    }
+    if (t.dtype == 2)
+        q27k::gemv_q4_n((const uint8_t*)t.dev, (const __half*)t.dscales, qs, W, ysa, rows,
+                        cols, st);
+    else
+        q27k::gemv_q8_n((const int8_t*)t.dev, (const __half*)t.dscales, qs, W, ysa, rows, cols,
+                        st);
+}
+
 void Dflash2::alloc(int cap) {
     ctx_cap = cap;
     for (int l = 0; l < D2_LAYERS; l++) {
@@ -457,6 +482,8 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
         mmq("fc.weight", d_taps + (size_t)c0 * D2_TAPD, s_fc, n, st);
         q27k::rmsnorm3(mkCP3(s_fc, D2_H, n), f32("hidden_norm.weight"), mkP3(s_ct, D2_H, n),
                        D2_H, D2_EPS, st, n);
+        // all 10 K/V projections read the SAME s_ct -- quantize it once (n>=2)
+        if (n >= 2) quant_act(s_ct, D2_H, n, st);
         for (int l = 0; l < D2_LAYERS; l++) {
             char nm[64];
             // ring rows for this chunk are contiguous [n][KVD] from base+ctx_n+c0
@@ -465,7 +492,7 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
             P3 kr{};
             for (int i = 0; i < 16; i++) kr.p[i] = kr0 + (size_t)(i < n ? i : 0) * D2_KVD;
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-            mmq(nm, s_ct, kr0, n, st);
+            if (n >= 2) mmq_pre(nm, kr0, n, st); else mmq(nm, s_ct, kr0, n, st);
             snprintf(nm, sizeof nm, "layers.%d.self_attn.k_norm.weight", l);
             q27k::rmsnorm_heads(kr0, f32(nm), kr0, n * D2_NKV, D2_HD, D2_HD, D2_EPS, st);
             {
@@ -474,7 +501,7 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
                 q27k::rope3(kr, D2_NKV, D2_HD, D2_HD, D2_HD, ip, D2_THETA, st, n);
             }
             snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-            mmq(nm, s_ct, vr0, n, st);
+            if (n >= 2) mmq_pre(nm, vr0, n, st); else mmq(nm, s_ct, vr0, n, st);
         }
     }
     ctx_n += T;
@@ -551,12 +578,14 @@ void Dflash2::draft_compute(int K, cudaStream_t st) {
         snprintf(nm, sizeof nm, "layers.%d.attention_conv.base_kernel", l);
         const float* baseA = f32(nm);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseA, ny0, W, 0);
+        // q/k/v all read ny0 (post attention-conv) -- quantize it ONCE
+        quant_act(ny0, D2_H, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.q_proj.weight", l);
-        mmq(nm, ny0, nq, W, st);
+        mmq_pre(nm, nq, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.k_proj.weight", l);
-        mmq(nm, ny0, nk, W, st);
+        mmq_pre(nm, nk, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.v_proj.weight", l);
-        mmq(nm, ny0, nv, W, st);
+        mmq_pre(nm, nv, W, st);
         // nq/nk are [W][*D] contiguous and each head is exactly head_dim with
         // stride head_dim, so all W rows' heads norm in ONE launch (W*NH and
         // W*NKV heads) -- bit-identical to the per-row loop, W-1 fewer launches.
@@ -587,10 +616,12 @@ void Dflash2::draft_compute(int K, cudaStream_t st) {
         snprintf(nm, sizeof nm, "layers.%d.mlp_conv.base_kernel", l);
         const float* baseM = f32(nm);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(nh1, ndyn, baseM, ny0, W, 0);
+        // gate/up both read ny0 (post mlp-conv) -- quantize it ONCE
+        quant_act(ny0, D2_H, W, st);
         snprintf(nm, sizeof nm, "layers.%d.mlp.gate_proj.weight", l);
-        mmq(nm, ny0, ngate, W, st);
+        mmq_pre(nm, ngate, W, st);
         snprintf(nm, sizeof nm, "layers.%d.mlp.up_proj.weight", l);
-        mmq(nm, ny0, nup, W, st);
+        mmq_pre(nm, nup, W, st);
         q27k::silu_mul3(mkP3(ngate, D2_I, W), mkCP3(nup, D2_I, W), D2_I, st, W);
         snprintf(nm, sizeof nm, "layers.%d.mlp.down_proj.weight", l);
         mmq(nm, ngate, no, W, st);

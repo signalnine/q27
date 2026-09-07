@@ -52,6 +52,12 @@ struct Dflash2 {
     // vs gemv_f16_3's per-column re-read). act is [W][cols] contiguous, out is
     // [W][rows] contiguous (cols/rows from the tensor shape).
     void mmq(const std::string& name, const float* act, float* out, int W, cudaStream_t st);
+    // Split of mmq for shared activations: quantize the W-col activation into
+    // dxq once, then mmq_pre reuses it for each weight that reads the SAME
+    // activation (q/k/v share one input, gate/up share one). Byte-identical to
+    // separate mmq calls; removes redundant quantize launches.
+    void quant_act(const float* act, int cols, int W, cudaStream_t st);
+    void mmq_pre(const std::string& name, float* out, int W, cudaStream_t st);
     q27k::XQuant dxq[D2_WMAX] = {}; // activation-quant scratch (sized to TAPD)
 
     // ---- context ring (bring-up: append-only, capacity-capped, no wrap) ----
