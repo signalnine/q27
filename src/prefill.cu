@@ -2663,8 +2663,11 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
     constexpr int SK = 128;
     constexpr int GDN_CH = 10240;
     constexpr int NH = 48;
-    extern __shared__ float smem[];
-    float* S = smem;                       // [128][128]
+    // 2026-09-07 register-resident state: the [128][128] fold state chains in
+    // registers (float sreg[32] per thread, thread owns column j, rows
+    // i0..i0+31), the k_delta_step (blocks.cu) pattern -- only sq/sk/part/dj
+    // stay in smem. Bitwise-identical (sreg[k] == old S[(i0+k)*SK+j]); gated by
+    // ninv_test's FOLD leg (serial delta_step reference) + E2E byte-identity.
     __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
     const int h = blockIdx.x;
     const int j = threadIdx.x & (SK - 1);
@@ -2674,8 +2677,9 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
     const float scale = rsqrtf((float)SK);
 
     float* Sgh = Sg + (size_t)h * SK * SK;
-    for (int i = i0; i < i0 + 32; i++) S[i * SK + j] = Sgh[i * SK + j];
-    __syncthreads();
+    float sreg[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) sreg[k] = Sgh[(size_t)(i0 + k) * SK + j];
 
     for (int t = 0; t < T; t++) {
         const float* conv = convT + (size_t)t * GDN_CH;
@@ -2687,10 +2691,10 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
         const float decay = expf(gT[(size_t)t * NH + h]);
         float pred = 0.f;
 #pragma unroll 8
-        for (int i = i0; i < i0 + 32; i++) {
-            float s = S[i * SK + j] * decay;
-            S[i * SK + j] = s;
-            pred += sk[i] * s;
+        for (int k = 0; k < 32; k++) {
+            float s = sreg[k] * decay;
+            sreg[k] = s;
+            pred += sk[i0 + k] * s;
         }
         part[it][j] = pred;
         __syncthreads();
@@ -2703,10 +2707,10 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
         float d = dj[j];
         float acc = 0.f;
 #pragma unroll 8
-        for (int i = i0; i < i0 + 32; i++) {
-            float s = S[i * SK + j] + sk[i] * d;
-            S[i * SK + j] = s;
-            acc += sq[i] * s;
+        for (int k = 0; k < 32; k++) {
+            float s = sreg[k] + sk[i0 + k] * d;
+            sreg[k] = s;
+            acc += sq[i0 + k] * s;
         }
         part[it][j] = acc;
         __syncthreads();
@@ -2716,7 +2720,8 @@ __global__ void k_delta_scan_T(float* __restrict__ Sg, const float* __restrict__
         __syncthreads();
     }
 
-    for (int i = i0; i < i0 + 32; i++) Sgh[i * SK + j] = S[i * SK + j];
+#pragma unroll
+    for (int k = 0; k < 32; k++) Sgh[(size_t)(i0 + k) * SK + j] = sreg[k];
 }
 
 // P6: column-split scan. S columns are independent (pred_j, dj and o_j read
@@ -3211,14 +3216,8 @@ static void delta_scan_wy(float* S_global, const float* convT, const float* gT,
 // through delta_scan_T: the WY default reorders reductions = format change.
 void delta_scan_seq(float* S_global, const float* convT, const float* gT, const float* betaT,
                     float* oT, int T, cudaStream_t st) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        128 * 128 * 4));
-        attr_set = true;
-    }
-    k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+    // register-resident state: only the static sq/sk/part/dj smem now.
+    k_delta_scan_T<<<48, 512, 0, st>>>(S_global, convT, gT, betaT, oT, T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3237,14 +3236,8 @@ void delta_scan_T(float* S_global, const float* convT, const float* gT, const fl
     }
     const int cs = delta_scan_nsplit(T);
     if (cs == 1) {
-        static bool attr_set = false;
-        if (!attr_set) {
-            CUDA_CHECK(cudaFuncSetAttribute(k_delta_scan_T,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            128 * 128 * 4));
-            attr_set = true;
-        }
-        k_delta_scan_T<<<48, 512, 128 * 128 * 4, st>>>(S_global, convT, gT, betaT, oT, T);
+        // register-resident state: only the static sq/sk/part/dj smem now.
+        k_delta_scan_T<<<48, 512, 0, st>>>(S_global, convT, gT, betaT, oT, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
