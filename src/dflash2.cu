@@ -242,12 +242,12 @@ __global__ void k_d2_top16b(const float* __restrict__ c1v, const int* __restrict
 // host walk's strict-> semantics). prev chains; out[pos] = the pick.
 __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict__ cval,
                           const float* __restrict__ hp, const __half* __restrict__ pred,
-                          const __half* __restrict__ succ, int anchor, int K,
-                          int* __restrict__ out) {
+                          const __half* __restrict__ succ, const int* __restrict__ d_anchor,
+                          int K, int* __restrict__ out) {
     __shared__ float ph[D2_RANK];
     __shared__ float sc[D2_TOPK][256 / 32]; // per-warp partials per candidate
     __shared__ int s_prev;
-    if (threadIdx.x == 0) s_prev = anchor;
+    if (threadIdx.x == 0) s_prev = *d_anchor; // device-read: graph-stable anchor
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int pos = 0; pos < K; pos++) {
@@ -408,10 +408,12 @@ void Dflash2::alloc(int cap) {
     // drafter activation-quant scratch, sized to the widest activation (the
     // fc input = concatenated taps, TAPD=25600)
     for (int i = 0; i < D2_WMAX; i++) dxq[i] = q27k::xquant_alloc(D2_TAPD);
+    // anchor-token device buffer (always: the selector walk reads it on
+    // device so the drafter forward is graph-capturable)
+    D2CHECK(cudaMalloc(&d_anchor_tok, 4));
     // cache the mask-token embedding once (engine Q8 embed if set, else the
     // packed fp16 target.embed)
     if (eembed_data) {
-        D2CHECK(cudaMalloc(&d_anchor_tok, 4));
         D2CHECK(cudaMalloc(&d_mask_tok, 4));
         const int mtok = D2_MASK;
         D2CHECK(cudaMemcpy(d_mask_tok, &mtok, 4, cudaMemcpyHostToDevice));
@@ -484,21 +486,53 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
 void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, int* out_host) {
     assert(K >= 1 && K < D2_WMAX);
     const int W = K + 1;
-    char nm[64];
-    // noise rows: anchor embedding + K mask embeddings
-    if (eembed_data) {
-        D2CHECK(cudaMemcpyAsync(d_anchor_tok, &anchor_token, 4, cudaMemcpyHostToDevice, st));
-        q27k::embed_row_q8(eembed_data, eembed_scales, d_anchor_tok, D2_H, nx, st);
-    } else {
-        k_d2_rowcast<<<40, 256, 0, st>>>(
-            f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
-    }
-    for (int r = 1; r < W; r++)
-        D2CHECK(cudaMemcpyAsync(nx + (size_t)r * D2_H, maskrow, D2_H * 4,
-                                cudaMemcpyDeviceToDevice, st));
+    // per-round H2D (NEVER inside the captured graph): anchor token + positions
+    D2CHECK(cudaMemcpyAsync(d_anchor_tok, &anchor_token, 4, cudaMemcpyHostToDevice, st));
     int hpos[D2_WMAX];
     for (int i = 0; i < W; i++) hpos[i] = anchor_pos + i;
     D2CHECK(cudaMemcpyAsync(d_posW, hpos, W * 4, cudaMemcpyHostToDevice, st));
+    if (!eembed_data) // eager fallback (CLI): anchor row from the fp16 embed
+        k_d2_rowcast<<<40, 256, 0, st>>>(
+            f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
+    if (draft_exec && draft_exec_k == K)
+        CUDA_CHECK(cudaGraphLaunch(draft_exec, st));
+    else
+        draft_compute(K, st);
+    if (out_host) {
+        D2CHECK(cudaMemcpyAsync(out_host, d_prop, K * 4, cudaMemcpyDeviceToHost, st));
+        D2CHECK(cudaStreamSynchronize(st));
+    }
+}
+
+// Capture the drafter compute once and reuse it (replaces ~50 eager launches
+// per round with one graph launch). Only when the engine Q8 embed is set (the
+// anchor lookup + walk read d_anchor_tok on device); the CLI path stays eager.
+void Dflash2::capture_draft(int K, cudaStream_t st) {
+    if (!eembed_data) return;
+    // seed the per-round device inputs so the warm run + capture are valid
+    const int a0 = 0, p0[D2_WMAX] = {0};
+    D2CHECK(cudaMemcpyAsync(d_anchor_tok, &a0, 4, cudaMemcpyHostToDevice, st));
+    D2CHECK(cudaMemcpyAsync(d_posW, p0, (K + 1) * 4, cudaMemcpyHostToDevice, st));
+    draft_compute(K, st); // warm (init lazy state)
+    D2CHECK(cudaStreamSynchronize(st));
+    cudaGraph_t g;
+    D2CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+    draft_compute(K, st);
+    D2CHECK(cudaStreamEndCapture(st, &g));
+    D2CHECK(cudaGraphInstantiate(&draft_exec, g, nullptr, nullptr, 0));
+    D2CHECK(cudaGraphDestroy(g));
+    draft_exec_k = K;
+}
+
+void Dflash2::draft_compute(int K, cudaStream_t st) {
+    const int W = K + 1;
+    char nm[64];
+    // anchor row (engine Q8 embed, device anchor) + K mask rows
+    if (eembed_data)
+        q27k::embed_row_q8(eembed_data, eembed_scales, d_anchor_tok, D2_H, nx, st);
+    for (int r = 1; r < W; r++)
+        D2CHECK(cudaMemcpyAsync(nx + (size_t)r * D2_H, maskrow, D2_H * 4,
+                                cudaMemcpyDeviceToDevice, st));
     IP3 posW{};
     for (int i = 0; i < 16; i++) posW.p[i] = d_posW + (i < W ? i : 0);
 
@@ -534,7 +568,10 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
         q27k::rope3(mkP3(nk, D2_KVD, W), D2_NKV, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
         {
             dim3 grid(W, D2_NH);
-            size_t smem = (size_t)(ctx_n + W) * 4;
+            // fixed max smem (ring cap + block) so the launch config is
+            // graph-stable across rounds; the kernel reads d_ctx_n for the
+            // live count and uses only that many score slots.
+            size_t smem = (size_t)(ctx_cap + D2_WMAX) * 4;
             k_d2_attn<<<grid, 128, smem, st>>>(nq, ringK[l], ringV[l], d_ring_pos, d_ctx_n, nk,
                                                nv, d_posW, natt, W);
         }
@@ -591,12 +628,8 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
     k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, nhp,
                                  (const __half*)T("candidate_selector.predecessor_codebook").dev,
                                  (const __half*)T("candidate_selector.successor_codebook").dev,
-                                 anchor_token, K, d_prop);
+                                 d_anchor_tok, K, d_prop);
     D2CHECK(cudaGetLastError());
-    if (out_host) {
-        D2CHECK(cudaMemcpyAsync(out_host, d_prop, K * 4, cudaMemcpyDeviceToHost, st));
-        D2CHECK(cudaStreamSynchronize(st));
-    }
 }
 
 } // namespace q27d2

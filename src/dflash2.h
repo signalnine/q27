@@ -119,6 +119,14 @@ struct Dflash2 {
     // stream sync. out_host (optional): also D2H the proposals (syncs).
     void draft(int anchor_token, int anchor_pos, int K, cudaStream_t st,
                int* out_host = nullptr);
+    // The device-side compute of one draft (everything after the per-round
+    // H2D of anchor/positions) -- captured once by capture_draft and replayed,
+    // dropping the ~50 eager launches per round. Requires the engine Q8 embed
+    // (device anchor lookup); falls back to eager when unavailable.
+    void draft_compute(int K, cudaStream_t st);
+    void capture_draft(int K, cudaStream_t st);
+    cudaGraphExec_t draft_exec = nullptr;
+    int draft_exec_k = 0;
 };
 
 } // namespace q27d2
