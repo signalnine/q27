@@ -77,7 +77,14 @@ only), toolgram (accept-cap path unchanged), dctl, DFlash2.
 - Adaptive policy: CLI seeded A/B reproduces the old depth-4 numbers exactly
   on short think traffic (dctl holds at 4 without saturation evidence) =
   no regression; deep rounds engage only where realized accepts justify
-  them. The n>5 mass now appears in live gnh histograms when traffic
+  them. PAIRED-SEED serving A/B (old vs new q27-server, identical prompts +
+  request seeds, 6 seeds x {12.5K, 50K}): new equal-or-better on 11/12 pairs
+  (+0.45% mean at 12.5K; one 50K seed diverged after a promotion changed its
+  token stream). The unseeded arm-A sweep's apparent -10/-21% was
+  per-request acceptance variance (tok/round spans 2.07-3.58 across trials at
+  one ctx; n=3 medians) -- round wall was identical across builds at every
+  matched point. Seed-paired probes are the right instrument for ladder
+  A/Bs; the driver is drive_seeded.py in the session scratchpad. The n>5 mass now appears in live gnh histograms when traffic
   saturates. The UPSIDE is gated on lever 3 (bar/theta retune): the margin
   gate prices greedy confidence, but sampled acceptance is p_served (temp
   1.0) -- margins cleared 4-deep on 63% of sweep rounds while only 24%
