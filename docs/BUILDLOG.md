@@ -15710,6 +15710,52 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (h): DFlash2 round premium -- measured, one small lever shipped, one negative
+
+Item 1 of docs/plans/2026-09-08-dflash2-close-the-arm-gap.md, measurement
+first. nsys on the CLI --dflash2 run (eager drafter, so per-kernel times are
+visible; per-round window = verify-tail end -> walk end, 61 rounds, code-edit
+prompt, ring ~1.2K rows): 3.3 ms of which idle launch gaps 0.53 (absent in
+serving: the drafter is graphed), the GDN commit-fold 0.42 (post_round's in
+serving), ingest ~0.08, and the drafter proper: 47 Q4 gemvs at width 8
+0.89 ms (1.2 GB read at ~75% of peak -- near floor), head gemv 0.78 (Q8 head
+in the CLI; serving's Q4 head ~0.4), k_d2_attn 0.24 (5 x 48 us),
+top-16 0.17 (65 + 106 us), ~110 tiny kernels ~0.2, walk 0.014. Serving
+Q27_D2_TIMING agrees: draft ~2.5 ms at 12.5K (3.7 with both vox
+transcribers running -- host jitter; stop them for any drafter timing).
+
+The addressable part is ~1 ms (attention, top-16, tiny-kernel chatter, small
+low-occupancy gemvs); the gemv floor (1.2 GB backbone + 0.64 GB head) is
+~1 ms and needs an fp4/fp8 repack or ninfer's 131072-row draft head to move.
+
+SHIPPED (bitwise-neutral -- the drafter's arithmetic is unchanged, so the
+serving A/B reproduces the incumbent's streams exactly: 855 rounds / 3.593
+tok/round both binaries; greedy CLI identity on code-edit + prose):
+- top-16: two in-smem bitonic sorts (256 blocks x 1024-tile per row, then
+  one 4096-candidate block) with (value, id) keys -> exact (value desc, id
+  asc); 171 -> 91 us/round. test_d2_top16 vs a CPU partial_sort with ties
+  across slice boundaries.
+- attention: the score loop skips ring rows older than D2_WINDOW (up to half
+  the ring between slides); exact zeros dropped from serial fp32 sums.
+  test_d2_attn vs a CPU reference over a 3000-row ring.
+- Incumbent-vs-new A/B, vox stopped, 12.5K seeded think: draft 3.74/3.75 ->
+  3.55 ms, round 22.09/22.17 -> 21.89 ms, t/s 163.8/163.2 -> 165.3 (+1%).
+
+NEGATIVE: an smem-tiled attention (32-row tiles staged with float4 loads,
+warp-per-key dot products, block-parallel softmax) measured SLOWER in
+serving -- draft 4.64 vs 3.76 ms/round -- and a parallel-softmax-only
+version was flat (43 vs 46 us/launch): this kernel's cost is the per-thread
+key-row walk (L1-friendly, no barriers), and 32-row tiles do too little work
+per barrier at 256 blocks x 128 threads. A real win needs a flash-decoding
+split (key ranges per block + combine) or K/V shared across the 4 GQA heads
+per block; ~0.2-0.4 ms/round on the table, not taken tonight. Lesson (again):
+the profile said 43 of 48 us was NOT the softmax; believe the profile.
+
+Instrument: bench the incumbent in the SAME session (git worktree of the
+previous commit, same unit recipe) -- the drafter's timing varies 2.5-3.8 ms
+across sessions with host load, so only a paired A/B on a quiet box means
+anything; the incumbent reproduced 3.74/3.75 and NEW 3.55 in interleaved legs.
+
 ## 2026-09-07 (g): DFlash2 ring retention across turns + the missing last-token row
 
 The (f) probe exposed warm-turn ring starvation: generate_prefill reset the

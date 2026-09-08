@@ -1,5 +1,6 @@
 // Self-consistency tests: GPU kernels vs CPU reference over the same q27 data.
 // No external ground truth needed; validates layout, nibble order, scales, GEMV.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -3427,6 +3428,119 @@ static void test_d2_walk_reject() {
     CUDA_CHECK(cudaFree(d_cap)); CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_sp));
 }
 
+// DFlash2 drafter top-16 (bitonic rewrite, 2026-09-07): exact vs a CPU sort
+// by (value desc, id asc) over the full vocab, with injected ties across
+// slice boundaries and a spike; K=3 rows.
+static void test_d2_top16() {
+    using q27d2::D2_V; using q27d2::D2_TOPK;
+    const int K = 3;
+    std::vector<float> lg = rand_vec((size_t)K * D2_V, 55123);
+    // ties: row 0 -- the same value at ids spanning several 970-slices;
+    // row 1 -- a spike; row 2 -- many equal maxima (16+ of them)
+    for (int t = 0; t < 40; t++) lg[(size_t)0 * D2_V + 970 * t + 7] = 6.5f;
+    lg[(size_t)1 * D2_V + 248000] = 40.0f;
+    for (int t = 0; t < 24; t++) lg[(size_t)2 * D2_V + 1000 * t + 3] = 9.0f;
+    float* d_lg; unsigned long long* d_c1; int* d_cand; float* d_cval;
+    CUDA_CHECK(cudaMalloc(&d_lg, lg.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_c1, (size_t)K * 256 * D2_TOPK * 8));
+    CUDA_CHECK(cudaMalloc(&d_cand, K * D2_TOPK * 4));
+    CUDA_CHECK(cudaMalloc(&d_cval, K * D2_TOPK * 4));
+    CUDA_CHECK(cudaMemcpy(d_lg, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
+    q27d2::d2_top16_launch(d_lg, d_c1, d_cand, d_cval, K, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<int> cand(K * D2_TOPK); std::vector<float> cval(K * D2_TOPK);
+    CUDA_CHECK(cudaMemcpy(cand.data(), d_cand, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(cval.data(), d_cval, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+    int bad = 0;
+    for (int r = 0; r < K; r++) {
+        std::vector<int> ids(D2_V);
+        for (int i = 0; i < D2_V; i++) ids[i] = i;
+        const float* row = lg.data() + (size_t)r * D2_V;
+        std::partial_sort(ids.begin(), ids.begin() + D2_TOPK, ids.end(), [&](int a, int b) {
+            return row[a] > row[b] || (row[a] == row[b] && a < b);
+        });
+        for (int c = 0; c < D2_TOPK; c++)
+            if (cand[r * D2_TOPK + c] != ids[c] || cval[r * D2_TOPK + c] != row[ids[c]]) bad++;
+    }
+    check("d2 top-16 bitonic == CPU (value desc, id asc)", (double)bad, 0.5);
+    CUDA_CHECK(cudaFree(d_lg)); CUDA_CHECK(cudaFree(d_c1));
+    CUDA_CHECK(cudaFree(d_cand)); CUDA_CHECK(cudaFree(d_cval));
+}
+
+// DFlash2 drafter attention (parallel softmax + window-restricted ring loop,
+// 2026-09-07) vs a CPU reference: 3000 contiguous ring rows (more than the
+// 2048 window, so the restriction is exercised and rows older than the
+// window must contribute nothing), 8 query rows at the ring's end, GQA 4:1.
+static void test_d2_attn() {
+    using namespace q27d2;
+    const int R = 3000, W = 8;
+    std::vector<float> q = rand_vec((size_t)W * D2_QD, 601), rk = rand_vec((size_t)R * D2_KVD, 602),
+                       rv = rand_vec((size_t)R * D2_KVD, 603), nk = rand_vec((size_t)W * D2_KVD, 604),
+                       nv = rand_vec((size_t)W * D2_KVD, 605);
+    for (auto& x : q) x *= 0.3f;
+    for (auto& x : rk) x *= 0.3f;
+    for (auto& x : nk) x *= 0.3f;
+    std::vector<int> rpos(R), npos(W);
+    for (int i = 0; i < R; i++) rpos[i] = 5000 + i;      // ring positions 5000..7999
+    for (int i = 0; i < W; i++) npos[i] = 8000 + i;      // queries right after
+    float *d_q, *d_rk, *d_rv, *d_nk, *d_nv, *d_out; int *d_rpos, *d_npos, *d_ctx;
+    CUDA_CHECK(cudaMalloc(&d_q, q.size() * 4)); CUDA_CHECK(cudaMalloc(&d_rk, rk.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_rv, rv.size() * 4)); CUDA_CHECK(cudaMalloc(&d_nk, nk.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_nv, nv.size() * 4)); CUDA_CHECK(cudaMalloc(&d_out, (size_t)W * D2_QD * 4));
+    CUDA_CHECK(cudaMalloc(&d_rpos, R * 4)); CUDA_CHECK(cudaMalloc(&d_npos, W * 4));
+    CUDA_CHECK(cudaMalloc(&d_ctx, 4));
+    CUDA_CHECK(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rk, rk.data(), rk.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rv, rv.data(), rv.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nk, nk.data(), nk.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nv, nv.data(), nv.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rpos, rpos.data(), R * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_npos, npos.data(), W * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ctx, &R, 4, cudaMemcpyHostToDevice));
+    q27d2::d2_attn_launch(d_q, d_rk, d_rv, d_rpos, d_ctx, d_nk, d_nv, d_npos, d_out, W,
+                          R + D2_WMAX, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> out((size_t)W * D2_QD);
+    CUDA_CHECK(cudaMemcpy(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost));
+    // CPU reference over ALL rows with the position mask (rows older than
+    // the window are masked anyway, so the restricted loop must agree)
+    double maxerr = 0;
+    const double scale = 1.0 / std::sqrt((double)D2_HD);
+    std::vector<double> sc(R + W);
+    for (int r = 0; r < W; r++)
+        for (int h = 0; h < D2_NH; h++) {
+            const int kh = h / (D2_NH / D2_NKV);
+            const float* qv = q.data() + (size_t)r * D2_QD + (size_t)h * D2_HD;
+            double m = -1e300;
+            for (int j = 0; j < R + W; j++) {
+                const float* kv = j < R ? rk.data() + (size_t)j * D2_KVD + (size_t)kh * D2_HD
+                                        : nk.data() + (size_t)(j - R) * D2_KVD + (size_t)kh * D2_HD;
+                const int kpos = j < R ? rpos[j] : npos[j - R];
+                const bool vis = (npos[r] - kpos) < D2_WINDOW && (kpos - npos[r]) < D2_WINDOW;
+                double d = 0;
+                for (int c = 0; c < D2_HD; c++) d += (double)qv[c] * kv[c];
+                sc[j] = vis ? d * scale : -1e300;
+                m = std::max(m, sc[j]);
+            }
+            double sum = 0;
+            for (int j = 0; j < R + W; j++) { sc[j] = sc[j] > -1e299 ? std::exp(sc[j] - m) : 0.0; sum += sc[j]; }
+            for (int c = 0; c < D2_HD; c++) {
+                double acc = 0;
+                for (int j = 0; j < R + W; j++) {
+                    if (sc[j] == 0.0) continue;
+                    const float* vv = j < R ? rv.data() + (size_t)j * D2_KVD + (size_t)kh * D2_HD
+                                            : nv.data() + (size_t)(j - R) * D2_KVD + (size_t)kh * D2_HD;
+                    acc += sc[j] / sum * vv[c];
+                }
+                maxerr = std::max(maxerr, std::fabs(acc - out[(size_t)r * D2_QD + (size_t)h * D2_HD + c]));
+            }
+        }
+    check("d2 attention (windowed ring) vs CPU", maxerr, 1e-4);
+    CUDA_CHECK(cudaFree(d_q)); CUDA_CHECK(cudaFree(d_rk)); CUDA_CHECK(cudaFree(d_rv));
+    CUDA_CHECK(cudaFree(d_nk)); CUDA_CHECK(cudaFree(d_nv)); CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_rpos)); CUDA_CHECK(cudaFree(d_npos)); CUDA_CHECK(cudaFree(d_ctx));
+}
+
 int main(int argc, char** argv) {
     // The sampler kernels are synthetic (no weights). --sampling-only runs just
     // them, skipping the 17.7GB model load, so they can be validated while a
@@ -3440,6 +3554,8 @@ int main(int argc, char** argv) {
         test_sample();
         test_spec_sample();
         test_d2_walk_reject();
+        test_d2_top16();
+        test_d2_attn();
         printf("%s\n", g_fail ? "FAILED" : "ALL PASS");
         return g_fail ? 1 : 0;
     }
@@ -3474,6 +3590,8 @@ int main(int argc, char** argv) {
     test_sample();
     test_spec_sample();
     test_d2_walk_reject();
+    test_d2_top16();
+    test_d2_attn();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();

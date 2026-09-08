@@ -143,6 +143,29 @@ Measured (bench/ladder/drive_warm_turn.py, keep vs Q27_D2_RING=reset):
   gpt-6-astra review P2s (overlapping compaction copy, fused-batch bypass,
   latched contiguity flag) fixed before commit.
 
+## Progress 2026-09-07 late (2): item 1 measured; small lever shipped
+
+Serving d2 round (12.5K think, vox stopped): draft 3.7 -> 3.55 ms after the
+top-16 bitonic rewrite + windowed attention loop (bitwise-neutral), verify
+17.7, host 0.58, plus post_round's fold ~0.4 -> ~22 ms vs ninfer 18.0.
+Drafter decomposition (nsys, BUILDLOG 2026-09-07 (h)): 47 Q4 gemvs 0.89 ms
+(near the 1.2 GB floor), Q4 head 0.4, attention 0.24-0.5 (ring 1.2K-2.5K
+rows), top-16 now 0.09, ~110 tiny kernels ~0.2, walk 0.01, residual graph
+gaps. Remaining levers, ranked:
+- (i) attention flash-decoding split or K/V shared across the 4 GQA heads
+  per block: 0.2-0.4 ms (the naive smem-tiled version was SLOWER; see (h)).
+- (ii) head: ninfer's optimized route (131072-row draft head, 0.34 GB Q4)
+  ~0.2 ms, acceptance impact to measure; or an fp8/fp4 head.
+- (iii) fp4 backbone repack (sm_120a block-scaled MMA works): ~0.45 ms,
+  needs the Phase-4 numerics gate.
+- (iv) fuse the tiny kernels (norm+quantize, dconv+quantize): ~0.1 ms.
+- (v) adaptive verify width (K=7 drafts, W<8 verify when unconfident): the
+  width_bench says ~0.12 ms/lane, so ~0.5 ms at best, minus the sync and
+  the acceptance cap -- last.
+Honest ceiling for the drafter: ~1.5 ms (from 3.55) = -2 ms/round = +10%
+t/s; the verify (17.7 vs ninfer ~16.5) and post_round (~1 ms) are separate
+engine work.
+
 ## Standing cautions
 
 - Round truncation/forced-transition d2 state sync + ctx reserve fixes are

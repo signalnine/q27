@@ -94,8 +94,7 @@ struct Dflash2 {
     const q27k::SampleParams* d_sp = nullptr; // engine's device sampler params (fixed ptr)
     void set_sampler(const q27k::SampleParams* sp) { d_sp = sp; }
     int* d_ctx_n = nullptr;  // device mirror of ctx_n (graph-stable attn)
-    float* d_c1v = nullptr;  // top-16 stage-1 candidates [WMAX-1][512*16]
-    int* d_c1i = nullptr;
+    unsigned long long* d_c1 = nullptr; // top-16 stage-1 (value,id) keys [WMAX-1][256*16]
     // Phase 2: engine quantized-head reuse for drafter logits (replaces the
     // 2.5 GB fp16 target.head gemv, ~10.4 -> ~1 ms/round). Numerics shift
     // (Q4/Q8 head vs fp16) -- acceptance impact measured E2E; output tokens
@@ -174,8 +173,14 @@ struct Dflash2 {
     int draft_exec_k = 0;
 };
 
-// Bare launcher for the selector walk kernel (test_kernels: integrated
-// device-walk + sparse-q verify gate on synthetic candidates/codebooks).
+// Bare launchers for test_kernels: top-16 (exact vs a CPU sort), attention
+// (vs a CPU reference over a windowed ring), and the selector walk
+// (integrated device-walk + sparse-q verify gate on synthetic codebooks).
+void d2_top16_launch(const float* d_logits, unsigned long long* d_c1, int* d_cand, float* d_cval,
+                     int K, cudaStream_t st);
+void d2_attn_launch(const float* q, const float* ringK, const float* ringV, const int* ring_pos,
+                    const int* d_ctx_n, const float* nk, const float* nv, const int* npos,
+                    float* out, int nrows, int smem_rows, cudaStream_t st);
 void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
                     const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
                     int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,

@@ -83,22 +83,35 @@ __global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__
                           const int* __restrict__ d_ctx_n, const float* __restrict__ nk,
                           const float* __restrict__ nv, const int* __restrict__ npos,
                           float* __restrict__ out, int nrows) {
-    extern __shared__ float sc[]; // scores [ctx_n + nrows]
+    extern __shared__ float sc[]; // scores [nctx + nrows]
     const int r = blockIdx.x, h = blockIdx.y, kh = h / (D2_NH / D2_NKV);
     if (r >= nrows) return;
     const int ctx_n = *d_ctx_n;
+    // 2026-09-07: only the last D2_WINDOW ring rows can be visible from any
+    // query (rows are position-contiguous; ingest drops disconnected
+    // history), so skip older rows instead of scoring and masking them --
+    // the ring holds up to 2 * D2_WINDOW rows between slides. Bitwise-neutral:
+    // a masked row contributes exp(-inf) = 0 to the sum and 0 * v to the
+    // output, and dropping exact zeros from a serial fp32 sum changes
+    // nothing. The position mask below stays authoritative. (A smem-tiled
+    // rewrite with a block-parallel softmax measured SLOWER -- draft
+    // 4.64 vs 3.76 ms/round, incumbent A/B 2026-09-07 -- this kernel's cost
+    // is the per-thread row walk, not the softmax; left as the bring-up
+    // kernel until a flash-decoding split is worth the effort.)
+    const int j0 = ctx_n > D2_WINDOW ? ctx_n - D2_WINDOW : 0;
+    const int nctx = ctx_n - j0;
     const float scale = rsqrtf((float)D2_HD);
     const float* qv = q + (size_t)r * D2_QD + (size_t)h * D2_HD;
-    const int qpos = npos[r], total = ctx_n + nrows;
+    const int qpos = npos[r], total = nctx + nrows;
     for (int j = threadIdx.x; j < total; j += blockDim.x) {
         const float* kv;
         int kpos;
-        if (j < ctx_n) {
-            kv = ringK + (size_t)j * D2_KVD + (size_t)kh * D2_HD;
-            kpos = ring_pos[j];
+        if (j < nctx) {
+            kv = ringK + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD;
+            kpos = ring_pos[j0 + j];
         } else {
-            kv = nk + (size_t)(j - ctx_n) * D2_KVD + (size_t)kh * D2_HD;
-            kpos = npos[j - ctx_n];
+            kv = nk + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
+            kpos = npos[j - nctx];
         }
         bool vis = (qpos - kpos) < D2_WINDOW && (kpos - qpos) < D2_WINDOW;
         float d = 0.f;
@@ -121,121 +134,108 @@ __global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__
     for (int c = threadIdx.x; c < D2_HD; c += blockDim.x) {
         float acc = 0.f;
         for (int j = 0; j < total; j++) {
-            const float* vv = j < ctx_n
-                                  ? ringV + (size_t)j * D2_KVD + (size_t)kh * D2_HD
-                                  : nv + (size_t)(j - ctx_n) * D2_KVD + (size_t)kh * D2_HD;
+            const float* vv = j < nctx
+                                  ? ringV + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD
+                                  : nv + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
             acc += sc[j] * vv[c];
         }
         out[(size_t)r * D2_QD + (size_t)h * D2_HD + c] = acc;
     }
 }
+// Bare launchers for test_kernels (exactness vs CPU references).
+void d2_attn_launch(const float* q, const float* ringK, const float* ringV, const int* ring_pos,
+                    const int* d_ctx_n, const float* nk, const float* nv, const int* npos,
+                    float* out, int nrows, int smem_rows, cudaStream_t st) {
+    dim3 grid(nrows, D2_NH);
+    k_d2_attn<<<grid, 128, (size_t)smem_rows * 4, st>>>(q, ringK, ringV, ring_pos, d_ctx_n, nk,
+                                                        nv, npos, out, nrows);
+    D2CHECK(cudaGetLastError());
+}
 
-// Per-row top-16 over the vocab, two stages so the whole grid participates
-// (the one-block iterative version measured 4 ms/round). Tie semantics = the
-// host scan's (equal values: lowest vocab id ranks first) -- stage 2 orders
-// by (value desc, id asc), and any global top-16 element is necessarily in
-// its slice's local top-16, so the result is exact.
-constexpr int D2_T16B = 512; // stage-1 blocks per row
+// Per-row top-16 over the vocab (2026-09-07 rewrite: two in-smem bitonic
+// sorts replace two 16-iteration argmax loops that cost 171 us/round, ~40%
+// of the drafter's non-gemv time). Stage 1: 256 blocks per row each sort
+// their 970-element slice (padded to 1024) and emit their top 16; stage 2:
+// one block per row sorts the 4096 survivors. Keys pack (value, id) so a
+// descending sort orders by value desc then id asc -- the host scan's tie
+// rule -- and any global top-16 element is necessarily in its slice's top
+// 16, so the result is exact (test_kernels test_d2_top16 vs a CPU sort).
+constexpr int D2_T16B = 256;    // stage-1 blocks per row
+constexpr int D2_T16A_N = 1024; // stage-1 sorted tile (slice 970 padded)
+constexpr int D2_T16B_N = D2_T16B * D2_TOPK; // 4096 stage-2 candidates
+static_assert(D2_V % D2_T16B == 0 && D2_V / D2_T16B <= D2_T16A_N, "top-16 slice geometry");
 
-__global__ void k_d2_top16a(const float* __restrict__ logits, float* __restrict__ c1v,
-                            int* __restrict__ c1i, int rows) {
+// (value, id) -> orderable u64: monotonic float map in the high word (same
+// transform as blocks.cu am_pack), ~id in the low word so equal values order
+// by ascending id under a DESCENDING sort. Padding key 0 sorts last (a real
+// key's high word is never 0).
+__device__ __forceinline__ unsigned long long d2_key(float v, int id) {
+    unsigned u = __float_as_uint(v);
+    if ((u & 0x7fffffffu) == 0) u = 0;
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long)u << 32) | (unsigned)(~id);
+}
+__device__ __forceinline__ float d2_key_val(unsigned long long k) {
+    unsigned u = (unsigned)(k >> 32);
+    return __uint_as_float((u & 0x80000000u) ? (u & 0x7fffffffu) : ~u);
+}
+__device__ __forceinline__ int d2_key_id(unsigned long long k) {
+    return (int)~(unsigned)(k & 0xffffffffull);
+}
+// In-smem bitonic sort, descending, N a power of two, any blockDim.
+template <int N>
+__device__ __forceinline__ void d2_bitonic_desc(unsigned long long* s) {
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < N; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const unsigned long long a = s[i], b = s[ixj];
+                    const bool desc = (i & k) == 0;
+                    if (desc ? (a < b) : (a > b)) { s[i] = b; s[ixj] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void k_d2_top16a(const float* __restrict__ logits, unsigned long long* __restrict__ c1,
+                            int rows) {
     const int r = blockIdx.x, b = blockIdx.y;
     if (r >= rows) return;
-    const int slice = (D2_V + D2_T16B - 1) / D2_T16B;
-    const int v0 = b * slice, v1 = min(v0 + slice, D2_V);
+    constexpr int slice = D2_V / D2_T16B;
+    const int v0 = b * slice;
     const float* lg = logits + (size_t)r * D2_V;
-    __shared__ float sv[128];
-    __shared__ int si[128];
-    __shared__ int picked[D2_TOPK];
-    for (int it = 0; it < D2_TOPK; it++) {
-        float best = -INFINITY;
-        int besti = -1;
-        for (int v = v0 + threadIdx.x; v < v1; v += blockDim.x) {
-            bool skip = false;
-            for (int p = 0; p < it; p++) skip |= (picked[p] == v);
-            if (skip) continue;
-            float x = lg[v];
-            if (x > best || (x == best && v < besti)) { best = x; besti = v; }
-        }
-        sv[threadIdx.x] = best;
-        si[threadIdx.x] = besti;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                float xo = sv[threadIdx.x + s];
-                int io = si[threadIdx.x + s];
-                if (xo > sv[threadIdx.x] ||
-                    (xo == sv[threadIdx.x] && io != -1 &&
-                     (si[threadIdx.x] == -1 || io < si[threadIdx.x]))) {
-                    sv[threadIdx.x] = xo;
-                    si[threadIdx.x] = io;
-                }
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            picked[it] = si[0];
-            c1v[((size_t)r * D2_T16B + b) * D2_TOPK + it] = sv[0];
-            c1i[((size_t)r * D2_T16B + b) * D2_TOPK + it] = si[0];
-        }
-        __syncthreads();
-    }
+    __shared__ unsigned long long s[D2_T16A_N];
+    for (int i = threadIdx.x; i < D2_T16A_N; i += blockDim.x)
+        s[i] = i < slice ? d2_key(lg[v0 + i], v0 + i) : 0ull;
+    __syncthreads();
+    d2_bitonic_desc<D2_T16A_N>(s);
+    if (threadIdx.x < D2_TOPK)
+        c1[((size_t)r * D2_T16B + b) * D2_TOPK + threadIdx.x] = s[threadIdx.x];
 }
 
-__global__ void k_d2_top16b(const float* __restrict__ c1v, const int* __restrict__ c1i,
-                            int* __restrict__ cand, float* __restrict__ cval, int rows) {
+__global__ void k_d2_top16b(const unsigned long long* __restrict__ c1, int* __restrict__ cand,
+                            float* __restrict__ cval, int rows) {
     const int r = blockIdx.x;
     if (r >= rows) return;
-    const int N = D2_T16B * D2_TOPK;
-    const float* cv = c1v + (size_t)r * N;
-    const int* ci = c1i + (size_t)r * N;
-    __shared__ float sv[256];
-    __shared__ int si[256];
-    __shared__ int picked[D2_TOPK]; // candidate-array slots already taken
-    for (int it = 0; it < D2_TOPK; it++) {
-        float best = -INFINITY;
-        int besti = -1; // slot in the candidate array
-        for (int j = threadIdx.x; j < N; j += blockDim.x) {
-            bool skip = false;
-            for (int p = 0; p < it; p++) skip |= (picked[p] == j);
-            if (skip) continue;
-            float x = cv[j];
-            if (x > best ||
-                (x == best && besti != -1 && ci[j] < ci[besti]) ||
-                (x == best && besti == -1)) {
-                best = x;
-                besti = j;
-            }
-        }
-        sv[threadIdx.x] = best;
-        si[threadIdx.x] = besti;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                float xo = sv[threadIdx.x + s];
-                int io = si[threadIdx.x + s];
-                bool take = false;
-                if (io != -1) {
-                    if (si[threadIdx.x] == -1) take = xo > -INFINITY || true;
-                    else if (xo > sv[threadIdx.x]) take = true;
-                    else if (xo == sv[threadIdx.x] && ci[io] < ci[si[threadIdx.x]]) take = true;
-                }
-                if (take) {
-                    sv[threadIdx.x] = xo;
-                    si[threadIdx.x] = io;
-                }
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            picked[it] = si[0];
-            cand[(size_t)r * D2_TOPK + it] = ci[si[0]];
-            cval[(size_t)r * D2_TOPK + it] = sv[0];
-        }
-        __syncthreads();
+    extern __shared__ unsigned long long sb[]; // [D2_T16B_N]
+    const unsigned long long* src = c1 + (size_t)r * D2_T16B_N;
+    for (int i = threadIdx.x; i < D2_T16B_N; i += blockDim.x) sb[i] = src[i];
+    __syncthreads();
+    d2_bitonic_desc<D2_T16B_N>(sb);
+    if (threadIdx.x < D2_TOPK) {
+        cand[(size_t)r * D2_TOPK + threadIdx.x] = d2_key_id(sb[threadIdx.x]);
+        cval[(size_t)r * D2_TOPK + threadIdx.x] = d2_key_val(sb[threadIdx.x]);
     }
 }
-
+static void d2_top16_launches(const float* logits, unsigned long long* c1, int* cand, float* cval,
+                              int K, cudaStream_t st) {
+    dim3 g1(K, D2_T16B);
+    k_d2_top16a<<<g1, 256, 0, st>>>(logits, c1, K);
+    k_d2_top16b<<<K, 1024, (size_t)D2_T16B_N * 8, st>>>(c1, cand, cval, K);
+}
 // Selector path walk (z-lab CandidateSelector.select, greedy): one block,
 // K sequential positions. score(c) = unary logit + dot(pred_row(prev) *
 // hp_row, succ_row(c)); argmax with ties to the lower candidate slot (the
@@ -316,6 +316,12 @@ __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict_
         }
         __syncthreads();
     }
+}
+
+void d2_top16_launch(const float* d_logits, unsigned long long* d_c1, int* d_cand, float* d_cval,
+                     int K, cudaStream_t st) {
+    d2_top16_launches(d_logits, d_c1, d_cand, d_cval, K, st);
+    D2CHECK(cudaGetLastError());
 }
 
 void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
@@ -475,8 +481,7 @@ void Dflash2::alloc(int cap) {
     D2CHECK(cudaMalloc(&d_qrow, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
     D2CHECK(cudaMemset(d_qrow, 0, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
     D2CHECK(cudaMalloc(&d_prop, (size_t)(D2_WMAX - 1) * 4));
-    D2CHECK(cudaMalloc(&d_c1v, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
-    D2CHECK(cudaMalloc(&d_c1i, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
+    D2CHECK(cudaMalloc(&d_c1, (size_t)(D2_WMAX - 1) * D2_T16B_N * 8));
     // device scalar mirror of ctx_n for the attention kernel (graph-stable);
     // zeroed so capture_draft's warm run (before any ingest/draft uploads
     // the live count) attends over an EMPTY ring, not garbage.
@@ -750,9 +755,7 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     mmq("candidate_selector.hidden_projection.weight", nhf, nhp, K, st);
     // on-device top-16 (two-stage) + selector walk; proposals land in d_prop
     {
-        dim3 g1(K, D2_T16B);
-        k_d2_top16a<<<g1, 128, 0, st>>>(nlogits, d_c1v, d_c1i, K);
-        k_d2_top16b<<<K, 256, 0, st>>>(d_c1v, d_c1i, d_cand, d_cval, K);
+        d2_top16_launches(nlogits, d_c1, d_cand, d_cval, K, st);
     }
     k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, nhp,
                                  (const __half*)T("candidate_selector.predecessor_codebook").dev,
