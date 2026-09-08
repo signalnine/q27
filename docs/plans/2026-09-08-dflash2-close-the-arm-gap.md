@@ -67,6 +67,63 @@ Combined honest target: dflash2-sampled from ~139 to ~175-190 t/s think
 (ninfer at 203 on the same instrument); echo already wins at 50K (+10% over
 our ladder).
 
+## Progress 2026-09-07 late: item 2 root-caused and mostly closed
+
+Item 2 was NOT quant/taps/ring/provenance. Cheap-first diagnostics:
+
+- (d) provenance CLOSED: ninfer's pack is a straight conversion of the same
+  z-lab checkpoint (docs/maintainer/qwen3.8-27b-dflash2.md pins revision
+  50307d4c; artifact doc: matrices W8G32, norms/conv/selector BF16). No retrain.
+- (b) per-lane localization (dflash2_round now feeds gnh/glf/gla, so a d2
+  profile reads off the [req] journal exactly like the ladder's):
+
+      q27 greedy-walk 12.5K  P>=j: 0.645 0.486 0.354 0.249 0.170 0.105 0.077
+                             cond: 0.645 0.755 0.728 0.703 0.683 0.618 0.733
+      ninfer          12.5K  P>=j: 0.754 0.609 0.444 0.347 0.243 0.160 0.129
+                             cond: 0.754 0.809 0.728 0.783 0.699 0.658 0.805
+
+  Lanes 3..7 conditional match; lane 1 (-0.11) and 2 carry the deficit, and
+  greedy no-think acceptance was already identical -> the SAMPLED proposal
+  law. q27's selector walk was greedy in sampled rounds (one-hot q, accept
+  prob p(argmax E)); ninfer draws the path from softmax(E/T) and rejects
+  against that sparse q (candidate_selector_path.cu draw_rank +
+  speculative_round.cuh speculative_sparse_warp_accept; expected accept
+  sum_v min(p, q)).
+
+SHIPPED: sampled selector walk + sparse-q rejection tail (k_d2_walk sampled
+branch + second draft graph; k_d2_spec_accept / k_d2_sample_stop /
+k_d2_stop_fallback; spec_verify_tail_sampled_d2; Q27_D2_WALK=greedy = old
+behaviour). Design + implementation reviewed by gpt-6-astra
+(docs/reviews/2026-09-07-gpt6astra-d2-sampled-walk-*.md). Gates:
+test_kernels --sampling-only test_d2_walk_reject (device walk + device tail:
+output ~ p by chi-square, accept rate == sum min(p,q), one-hot q bit-identical
+to the ladder's tail, cap and empty-residual paths), greedy CLI byte-identity,
+seeded think driver.
+
+Result (same instrument, same night, quiet box):
+
+      q27 sampled-walk 12.5K  P>=j: 0.751 0.575 0.424 0.278 0.184 0.109 0.076
+                              cond: 0.751 0.765 0.738 0.655 0.663 0.593 0.697
+      tok/round 12.5K 3.075 -> 3.383 (ninfer 3.69); 50K 3.036 -> 3.234 (3.59)
+      t/s       12.5K 138.9 -> 153.3 (+10%);        50K 132.0 -> 141.7 (+7%)
+      round wall unchanged (22.2 / 23.3 ms) -- the walk costs nothing.
+
+Lane 1 is at parity (0.751 vs 0.754). The residual (-8% tok/round) now sits
+in lanes 4..7 (cond 0.655/0.663/0.593/0.697 vs 0.783/0.699/0.658/0.805):
+deeper mask rows, i.e. drafter numerics (Q4-g64 vs their W8) and/or ring
+coverage, not the walk. Q8 serving pack A/B: see below.
+
+NEW LEVER FOUND (queue next): WARM-TURN RING STARVATION. d2_prefill_begin
+resets the ring every turn and prefill re-seeds only the UNCACHED tail, so a
+prefix-cache warm turn starts the drafter with 1-5 context rows. Measured on
+three identical seeded requests: tok/round 3.28 (cold, pf=3023) -> 3.16
+(warm, pf=5) -> 3.05 (warm, pf=1). Agentic traffic is almost all warm turns
+-- this is a candidate for the live-CC -7%. Fix shape: on a same-lineage
+in-memory prefix hit, roll the ring back to the hit position instead of
+resetting (rows are keyed by absolute position; taps for positions < hit are
+unchanged), reset only on lineage change / disk restore. Needs the slot
+lineage signal claim_slot already has.
+
 ## Standing cautions
 
 - Round truncation/forced-transition d2 state sync + ctx reserve fixes are

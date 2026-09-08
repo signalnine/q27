@@ -15710,6 +15710,71 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (f): DFlash2 sampled selector walk + sparse-q rejection -- the sampled acceptance gap was the proposal law
+
+Where 09-07 left it (docs/plans/2026-09-08-dflash2-close-the-arm-gap.md):
+q27's engine beats ninfer at equal acceptance, and their whole lead is the
+DFlash2 arm -- 3.65 tok/round vs our dflash2-sampled 3.08 on the seeded think
+instrument, same drafter class. Item 2 (acceptance delta) closed cheap-first:
+
+- Provenance: ninfer's pack is a straight conversion of the same z-lab
+  checkpoint (pinned revision, W8G32 matrices, BF16 elsewhere). Not a retrain.
+- Per-lane localization: dflash2_round now feeds the [req] gnh/glf/gla
+  counters (it never did -- gnh was all zero in every d2 journal), so the d2
+  profile reads off the journal like the ladder's. Against ninfer's
+  accepted_per_position (rebench-2026-09-07 logs): lanes 3..7 conditional
+  IDENTICAL, lane 1 0.645 vs 0.754. Greedy no-think acceptance was already
+  identical (4.86 vs 4.87), so the deficit was the SAMPLED proposal law:
+  k_d2_walk was greedy in sampled rounds (one-hot q, accept prob p(argmax E))
+  while ninfer draws the path from softmax(E/T) over the 16 candidates and
+  rejects against that sparse q (expected accept sum_v min(p,q) = 1 - TV).
+
+Shipped (design + implementation reviewed by gpt-6-astra, docs/reviews/
+2026-09-07-gpt6astra-d2-sampled-walk-*.md): k_d2_walk sampled branch (softmax
+over the 16 scores at the request temperature, one Philox uniform keyed on
+(seed, mask-row position, KIND_D2_PROPOSAL=4), inverse-CDF, q row retained in
+d_qrow; fp32-cdf fallback to the last q>0 slot); a second captured draft graph
+for the sampled walk; k_d2_spec_accept (accept iff p>0 && (p>=q || u*q<p),
+cap branch preserved) + k_d2_sample_stop (Gumbel-max over max(p-q,0), q
+subtracted ONLY on an actual rejection; non-candidate keys bit-identical to
+k_sample_stop so bonus/cap draws are unchanged) + k_d2_stop_fallback (gated on
+an empty residual: sample_stop's exclude-d draw); spec_verify_tail_sampled_d2
+captured as the d2 sampled twin; Q27_D2_WALK=greedy restores the old walk AND
+the old one-hot tail (A/B). philox_uniform moved to blocks.cuh. Two
+pre-existing bugs fixed on the way: d_ctx_n was never initialised before
+capture_draft's warm run (k_d2_attn read garbage), and the ladder's sampled
+warm never exercised d2-only kernels.
+
+Gates: test_kernels --sampling-only test_d2_walk_reject (integrated DEVICE
+walk + DEVICE tail on synthetic candidates with zeroed codebooks: committed
+token ~ served p by chi-square regardless of q; lane-0 accept == sum min(p,q);
+one-hot q reproduces spec_accept/sample_stop bit-for-bit; cap = plain draw;
+empty residual -> fallback == sample_stop) ALL PASS; make test-tools pass;
+greedy CLI --dflash2 byte-identical to --spec (greedy walk untouched).
+
+Measured (seeded think driver, 6 seeds x {12.5K, 50K}, quiet box):
+
+    q27 d2 sampled-walk 12.5K  P>=j 0.751 0.575 0.424 0.278 0.184 0.109 0.076
+    (was greedy walk)          was  0.645 0.486 0.354 0.249 0.170 0.105 0.077
+    ninfer                          0.754 0.609 0.444 0.347 0.243 0.160 0.129
+    tok/round 12.5K 3.075 -> 3.383 (ninfer 3.69); 50K 3.036 -> 3.234 (3.59)
+    t/s       12.5K 138.9 -> 153.3 (+10%);        50K 132.0 -> 141.7 (+7%)
+    round wall unchanged: 22.2 / 23.3 ms (the walk is free)
+
+Lane 1 at parity. Q8 serving pack A/B (tools/dflash2_pack.py --q8, no head/
+embed, 2.08 GB, Q27_DFLASH2_RESERVE_GB=3): tok/round +5.7/+5.9% (3.576 /
+3.425; lanes 3-5 reach ninfer's) but the drafter reads 2x bytes -> round
++0.6 ms -> net t/s +2.4% (156.9 / 144.5). Q8 is the better serving pack; the
++4.8 ms d2 round premium (item 1) is now the dominant lever. Instrument traps:
+the [req] counters are cumulative per engine -- diff within ONE unit
+invocation (journalctl _SYSTEMD_INVOCATION_ID=...), never across a restart;
+and nvcc builds on the box add ~2 ms/round of host jitter to a serving bench.
+
+NEW LEVER (queued): warm-turn ring starvation -- the ring cold-resets every
+turn and prefill re-seeds only the uncached tail, so prefix-cache warm turns
+start the drafter with 1-5 rows: tok/round 3.28 (cold) -> 3.16 (pf=5) -> 3.05
+(pf=1) on identical seeded requests. Agentic traffic is all warm turns.
+
 ## 2026-09-06 (e): DFlash2 Phase 6 -- server wiring + the live-CC verdict (NOT a serving win yet)
 
 Wired dflash2 into serving (Q27_DFLASH2=<pack>, single-slot/Q27_BATCH=0):

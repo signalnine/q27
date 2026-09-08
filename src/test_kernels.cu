@@ -11,6 +11,7 @@
 #include "blocks.cuh"
 #include "cuda_common.h"
 #include "device_model.h"
+#include "dflash2.h"
 #include "kernels.cuh"
 #include "loader.h"
 #include "prefill.cuh"
@@ -3024,6 +3025,408 @@ static void test_spec_sample() {
     CUDA_CHECK(cudaFree(d_cap)); CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_sp));
 }
 
+// DFlash2 sampled selector walk + sparse-q rejection (2026-09-07). Integrated
+// DEVICE gate (gpt-6-astra design review: host-q histograms miss the real
+// failures): the device walk (k_d2_walk, sampled) draws each position's draft
+// from q = softmax(invT * score) over its 16 candidates -- codebooks zeroed so
+// score == the unary logit -- and the device tail (d2_spec_accept +
+// d2_sample_stop) verifies them against a synthetic target. Checks:
+//   (a) greedy walk == argmax and never touches qrow;
+//   (b) sampled walk: q rows match the CPU softmax, picks follow q (chi2),
+//       seeded identity;
+//   (c) committed token at lane 0 ~ served target p regardless of q (chi2),
+//       in-nucleus, rejected draft never reappears, lane-0 accept rate ==
+//       sum_c min(q_c, p(cand_c)) (the min(p,q) overlap);
+//   (d) one-hot q reproduces the ladder's spec_accept/sample_stop verdicts
+//       and tokens bit-for-bit;
+//   (e) reasoning cap: {n=1, stop=0, exclude=-1} and a plain-p draw identical
+//       to sample_stop's (q NOT subtracted on a non-rejection);
+//   (f) numerically empty residual (q >= p on the whole nucleus) falls back
+//       to sample_stop's exclude-d draw instead of emitting garbage.
+static void test_d2_walk_reject() {
+    using q27d2::D2_TOPK;
+    using q27d2::D2_RANK;
+    const int V = 64, K = 3, LANES = K + 1, W = K + 1;
+    const float invT = 1.0f / 0.9f, topp = 0.92f;
+    const unsigned long long seed = 20260907ull;
+    // target logits per verify lane; lane 3 is a spike (nucleus == {7}) for (f)
+    std::vector<float> flat(LANES * V);
+    std::vector<std::vector<float>> L(LANES);
+    for (int k = 0; k < LANES; k++) {
+        L[k] = rand_vec(V, 300 + k * 11);
+        for (auto& v : L[k]) v *= 2.0f;
+        if (k == 3) L[k][7] = 30.0f;
+        for (int i = 0; i < V; i++) flat[k * V + i] = L[k][i];
+    }
+    // drafter: per position 16 DISTINCT candidate ids in [0,V) + unary logits
+    std::vector<int> cand(K * D2_TOPK);
+    std::vector<float> cval = rand_vec(K * D2_TOPK, 777);
+    for (int pos = 0; pos < K; pos++)
+        for (int c = 0; c < D2_TOPK; c++) {
+            cand[pos * D2_TOPK + c] = (pos * 5 + c * 3) % V;
+            cval[pos * D2_TOPK + c] *= 3.0f;
+        }
+    // CPU q per position (codebooks zero => score == cval)
+    std::vector<std::vector<double>> q(K, std::vector<double>(D2_TOPK));
+    std::vector<int> amax(K);
+    for (int pos = 0; pos < K; pos++) {
+        double mx = -1e30; int bi = 0;
+        for (int c = 0; c < D2_TOPK; c++)
+            if (cval[pos * D2_TOPK + c] > mx) { mx = cval[pos * D2_TOPK + c]; bi = c; }
+        amax[pos] = bi;
+        double Z = 0;
+        for (int c = 0; c < D2_TOPK; c++) { q[pos][c] = std::exp((double)invT * (cval[pos * D2_TOPK + c] - mx)); Z += q[pos][c]; }
+        for (int c = 0; c < D2_TOPK; c++) q[pos][c] /= Z;
+    }
+
+    int *d_cand, *d_anchor, *d_posW, *d_prop, *d_spec, *d_out, *d_P, *d_cap, *d_spec_h;
+    float *d_cval, *d_hp, *d_qrow, *d_logits2, *d_nuc;
+    __half *d_pred, *d_succ;
+    unsigned long long* d_scr;
+    q27k::SampleParams* d_sp;
+    CUDA_CHECK(cudaMalloc(&d_cand, K * D2_TOPK * 4));
+    CUDA_CHECK(cudaMalloc(&d_cval, K * D2_TOPK * 4));
+    CUDA_CHECK(cudaMalloc(&d_hp, K * D2_RANK * 4));
+    CUDA_CHECK(cudaMalloc(&d_pred, (size_t)V * D2_RANK * 2));
+    CUDA_CHECK(cudaMalloc(&d_succ, (size_t)V * D2_RANK * 2));
+    CUDA_CHECK(cudaMalloc(&d_anchor, 4));
+    CUDA_CHECK(cudaMalloc(&d_posW, W * 4));
+    CUDA_CHECK(cudaMalloc(&d_prop, K * 4));
+    CUDA_CHECK(cudaMalloc(&d_qrow, K * D2_TOPK * 4));
+    CUDA_CHECK(cudaMalloc(&d_logits2, LANES * V * 4));
+    CUDA_CHECK(cudaMalloc(&d_nuc, LANES * 4 * 4));
+    CUDA_CHECK(cudaMalloc(&d_spec, 3 * 4));
+    CUDA_CHECK(cudaMalloc(&d_spec_h, 3 * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, 4));
+    CUDA_CHECK(cudaMalloc(&d_P, 4));
+    CUDA_CHECK(cudaMalloc(&d_cap, 4));
+    CUDA_CHECK(cudaMalloc(&d_scr, 16)); // 2 words: pack + d2 fallback latch
+    CUDA_CHECK(cudaMalloc(&d_sp, sizeof(q27k::SampleParams)));
+    CUDA_CHECK(cudaMemcpy(d_cand, cand.data(), K * D2_TOPK * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cval, cval.data(), K * D2_TOPK * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_hp, 0, K * D2_RANK * 4));
+    CUDA_CHECK(cudaMemset(d_pred, 0, (size_t)V * D2_RANK * 2));
+    CUDA_CHECK(cudaMemset(d_succ, 0, (size_t)V * D2_RANK * 2));
+    CUDA_CHECK(cudaMemcpy(d_logits2, flat.data(), LANES * V * 4, cudaMemcpyHostToDevice));
+    int zero = 0, anchor = 1;
+    CUDA_CHECK(cudaMemcpy(d_cap, &zero, 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_anchor, &anchor, 4, cudaMemcpyHostToDevice));
+    q27k::SampleParams sp{invT, topp, seed};
+    CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
+    {
+        q27k::CP3 lgs{};
+        for (int k = 0; k < LANES; k++) lgs.p[k] = d_logits2 + k * V;
+        q27k::nucleus_multi(lgs, V, d_sp, d_nuc, LANES, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    float nuc[LANES * 4];
+    CUDA_CHECK(cudaMemcpy(nuc, d_nuc, LANES * 4 * 4, cudaMemcpyDeviceToHost));
+    // CPU served distributions per lane
+    std::vector<std::vector<double>> ps(LANES, std::vector<double>(V, 0.0));
+    for (int k = 0; k < LANES; k++) {
+        const float thr = nuc[k * 4];
+        double Mx = L[k][0]; for (int i = 1; i < V; i++) Mx = std::max(Mx, (double)L[k][i]);
+        double Z = 0; std::vector<double> sf(V);
+        for (int i = 0; i < V; i++) { sf[i] = std::exp((double)invT * (L[k][i] - Mx)); Z += sf[i]; }
+        double mass = 0;
+        for (int i = 0; i < V; i++) if (L[k][i] >= thr) mass += sf[i] / Z;
+        for (int i = 0; i < V; i++) if (L[k][i] >= thr) ps[k][i] = sf[i] / Z / mass;
+    }
+    int nuc3 = 0; for (int i = 0; i < V; i++) if (L[3][i] >= nuc[12]) nuc3++;
+    check("d2 spike lane nucleus == {7}", (double)(nuc3 != 1 || L[3][7] < nuc[12]), 0.5);
+
+    auto walk = [&](int t, bool sampled) {
+        int posW[W];
+        for (int i = 0; i < W; i++) posW[i] = t * 16 + i;
+        CUDA_CHECK(cudaMemcpy(d_posW, posW, W * 4, cudaMemcpyHostToDevice));
+        q27d2::d2_walk_launch(d_cand, d_cval, d_hp, d_pred, d_succ, d_anchor, K, d_prop, sampled,
+                              d_sp, d_posW, d_qrow, 0);
+    };
+    auto tail = [&](int P, int md, int& n, int& stop, int& excl, int& nt) {
+        CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
+        q27k::IP3 dpk{};
+        for (int k = 0; k < K; k++) dpk.p[k] = d_prop + k;
+        q27k::d2_spec_accept(d_logits2, d_nuc, dpk, d_cand, d_qrow, d_sp, d_P, d_cap, md, V,
+                             d_spec, 0);
+        q27k::d2_sample_stop(d_logits2, d_nuc, d_spec, d_cand, d_qrow, d_sp, d_P, V, md, d_out,
+                             d_scr, 0);
+        int s3[3];
+        CUDA_CHECK(cudaMemcpy(s3, d_spec, 12, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&nt, d_out, 4, cudaMemcpyDeviceToHost));
+        n = s3[0]; stop = s3[1]; excl = s3[2];
+    };
+    auto tail_ladder = [&](int P, int md, int& n, int& stop, int& excl, int& nt) {
+        CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
+        q27k::IP3 dpk{};
+        for (int k = 0; k < K; k++) dpk.p[k] = d_prop + k;
+        q27k::spec_accept(d_logits2, d_nuc, dpk, d_sp, d_P, d_cap, md, V, d_spec, 0);
+        q27k::sample_stop(d_logits2, d_nuc, d_spec, d_sp, d_P, V, d_out, d_scr, 0);
+        int s3[3];
+        CUDA_CHECK(cudaMemcpy(s3, d_spec, 12, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&nt, d_out, 4, cudaMemcpyDeviceToHost));
+        n = s3[0]; stop = s3[1]; excl = s3[2];
+    };
+
+    // (a) greedy walk: argmax picks, qrow untouched
+    {
+        std::vector<float> sentinel(K * D2_TOPK, -7.0f), back(K * D2_TOPK);
+        CUDA_CHECK(cudaMemcpy(d_qrow, sentinel.data(), K * D2_TOPK * 4, cudaMemcpyHostToDevice));
+        walk(0, false);
+        int prop[K];
+        CUDA_CHECK(cudaMemcpy(prop, d_prop, K * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(back.data(), d_qrow, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        for (int pos = 0; pos < K; pos++) if (prop[pos] != cand[pos * D2_TOPK + amax[pos]]) bad++;
+        for (int i = 0; i < K * D2_TOPK; i++) if (back[i] != -7.0f) bad++;
+        check("d2 greedy walk == argmax, qrow untouched", (double)bad, 0.5);
+    }
+    // (b) sampled walk: q rows vs CPU softmax, picks ~ q, seeded identity
+    {
+        const int N = 8192;
+        std::vector<std::vector<int>> pick(K, std::vector<int>(D2_TOPK, 0));
+        double qerr = 0; int ident = 0;
+        for (int t = 0; t < N; t++) {
+            walk(t, true);
+            int prop[K]; float qr[K * D2_TOPK];
+            CUDA_CHECK(cudaMemcpy(prop, d_prop, K * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(qr, d_qrow, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+            for (int pos = 0; pos < K; pos++) {
+                int c = -1;
+                for (int j = 0; j < D2_TOPK; j++) if (cand[pos * D2_TOPK + j] == prop[pos]) c = j;
+                if (c >= 0) pick[pos][c]++;
+                for (int j = 0; j < D2_TOPK; j++) qerr = std::max(qerr, std::fabs(qr[pos * D2_TOPK + j] - q[pos][j]));
+            }
+            if (t == 5) { // identity: same posW -> same picks
+                int p2[K]; walk(5, true);
+                CUDA_CHECK(cudaMemcpy(p2, d_prop, K * 4, cudaMemcpyDeviceToHost));
+                for (int pos = 0; pos < K; pos++) if (p2[pos] != prop[pos]) ident++;
+            }
+        }
+        check("d2 sampled walk q == CPU softmax", qerr, 1e-5);
+        check("d2 sampled walk seeded identity", (double)ident, 0.5);
+        double worst = 0;
+        for (int pos = 0; pos < K; pos++) {
+            double chi2 = 0; int df = -1;
+            for (int c = 0; c < D2_TOPK; c++) {
+                double e = N * q[pos][c];
+                if (e < 5) continue;
+                chi2 += (pick[pos][c] - e) * (pick[pos][c] - e) / e; df++;
+            }
+            double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
+            worst = std::max(worst, chi2 / bound);
+        }
+        printf("    [d2 walk pick chi2/bound worst=%.3f]\n", worst);
+        check("d2 sampled walk picks ~ softmax(score/T)", worst < 1.0 ? 0.0 : 1.0, 0.5);
+    }
+    // (c) integrated: committed token at lane 0 ~ p, in-nucleus, no draft
+    //     reappearance, accept rate == sum_c min(q_c, p(cand_c))
+    {
+        const int N = 8192;
+        const float thr0 = nuc[0];
+        std::vector<int> obs(V, 0);
+        int accepts = 0, excl_viol = 0, oob = 0;
+        for (int t = 0; t < N; t++) {
+            walk(100000 + t, true);
+            int prop[K], n, stop, excl, nt;
+            CUDA_CHECK(cudaMemcpy(prop, d_prop, K * 4, cudaMemcpyDeviceToHost));
+            tail(500000 + t, K, n, stop, excl, nt);
+            if (n >= 2) accepts++;
+            int commit = (n == 1) ? nt : prop[0];
+            if (n == 1 && nt == prop[0]) excl_viol++;
+            if (L[0][commit] < thr0) oob++;
+            obs[commit]++;
+        }
+        double exp_acc = 0;
+        for (int c = 0; c < D2_TOPK; c++) exp_acc += std::min(q[0][c], ps[0][cand[c]]);
+        double emp = (double)accepts / N;
+        printf("    [d2 lane0 accept emp=%.4f  sum min(p,q)=%.4f  p(argmax)=%.4f]\n", emp, exp_acc,
+               ps[0][cand[amax[0]]]);
+        check("d2 lane0 accept rate == sum min(p,q)", std::fabs(emp - exp_acc), 0.03);
+        check("d2 reject excludes draft", (double)excl_viol, 0.5);
+        check("d2 commit in-nucleus", (double)oob, 0.5);
+        double chi2 = 0; int df = -1;
+        for (int i = 0; i < V; i++) {
+            if (L[0][i] < thr0) { if (obs[i]) chi2 = 1e9; continue; }
+            double e = N * ps[0][i];
+            if (e < 5) continue;
+            chi2 += (obs[i] - e) * (obs[i] - e) / e; df++;
+        }
+        double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
+        printf("    [d2 chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
+        check("d2 sparse-q rejection vs served target", chi2 < bound ? 0.0 : 1.0, 0.5);
+    }
+    // (d) one-hot q: greedy walk drafts + host one-hot rows -> verdict and
+    //     token identical to the ladder's spec_accept/sample_stop
+    {
+        std::vector<float> onehot(K * D2_TOPK, 0.f);
+        for (int pos = 0; pos < K; pos++) onehot[pos * D2_TOPK + amax[pos]] = 1.f;
+        CUDA_CHECK(cudaMemcpy(d_qrow, onehot.data(), K * D2_TOPK * 4, cudaMemcpyHostToDevice));
+        walk(0, false);
+        int mism = 0;
+        for (int t = 0; t < 2048; t++) {
+            int n1, s1, e1, t1, n2, s2, e2, t2;
+            tail(700000 + t, K, n1, s1, e1, t1);
+            tail_ladder(700000 + t, K, n2, s2, e2, t2);
+            if (n1 != n2 || s1 != s2 || e1 != e2 || t1 != t2) mism++;
+        }
+        check("d2 one-hot q == ladder spec_accept/sample_stop", (double)mism, 0.5);
+    }
+    // (e) reasoning cap: n=1, exclude=-1, plain-p draw identical to sample_stop
+    {
+        walk(0, true); // real q rows in place: must NOT be subtracted under the cap
+        int one = 1;
+        CUDA_CHECK(cudaMemcpy(d_cap, &one, 4, cudaMemcpyHostToDevice));
+        int bad = 0;
+        for (int t = 0; t < 512; t++) {
+            int n1, s1, e1, t1, n2, s2, e2, t2;
+            tail(800000 + t, K, n1, s1, e1, t1);
+            tail_ladder(800000 + t, K, n2, s2, e2, t2);
+            if (n1 != 1 || s1 != 0 || e1 != -1 || n1 != n2 || t1 != t2) bad++;
+        }
+        CUDA_CHECK(cudaMemcpy(d_cap, &zero, 4, cudaMemcpyHostToDevice));
+        check("d2 cap: n=1 + plain draw == sample_stop", (double)bad, 0.5);
+    }
+    // (f) empty residual: lane 3's nucleus is {7}; candidate 7 with q=1 makes
+    //     r <= 0 everywhere -> the fallback draw must return sample_stop's
+    //     exclude-d token (7), not the zero-pack sentinel's token 0.
+    {
+        // Host-written verdict {n=1, stop=3, exclude=9} against target lane 3
+        // (max_draft=4 so lane 3 is a rejection lane, not the bonus), with a
+        // 4-row candidate buffer whose row 3 holds token 7 at q=1: every
+        // nucleus token has r = p - q <= 0, so the residual draw finds nothing
+        // and the fallback kernel must reproduce sample_stop's draw.
+        int cand4[4 * D2_TOPK];
+        for (int i = 0; i < 3 * D2_TOPK; i++) cand4[i] = cand[i];
+        for (int c = 0; c < D2_TOPK; c++) cand4[3 * D2_TOPK + c] = (7 + c) % V; // includes 7 at c=0
+        int* d_cand4; float* d_q4;
+        CUDA_CHECK(cudaMalloc(&d_cand4, 4 * D2_TOPK * 4));
+        CUDA_CHECK(cudaMalloc(&d_q4, 4 * D2_TOPK * 4));
+        std::vector<float> q4(4 * D2_TOPK, 1.f);
+        CUDA_CHECK(cudaMemcpy(d_cand4, cand4, 4 * D2_TOPK * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_q4, q4.data(), 4 * D2_TOPK * 4, cudaMemcpyHostToDevice));
+        int spec[3] = {1, 3, 9};
+        CUDA_CHECK(cudaMemcpy(d_spec_h, spec, 12, cudaMemcpyHostToDevice));
+        int P = 900001, nt1 = -1, nt2 = -2;
+        CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
+        q27k::d2_sample_stop(d_logits2, d_nuc, d_spec_h, d_cand4, d_q4, d_sp, d_P, V, 4, d_out,
+                             d_scr, 0);
+        CUDA_CHECK(cudaMemcpy(&nt1, d_out, 4, cudaMemcpyDeviceToHost));
+        q27k::sample_stop(d_logits2, d_nuc, d_spec_h, d_sp, d_P, V, d_out, d_scr, 0);
+        CUDA_CHECK(cudaMemcpy(&nt2, d_out, 4, cudaMemcpyDeviceToHost));
+        printf("    [d2 empty-residual fallback: d2=%d ladder=%d]\n", nt1, nt2);
+        check("d2 empty residual -> sample_stop fallback", (double)(nt1 != nt2 || nt1 != 7), 0.5);
+        CUDA_CHECK(cudaFree(d_cand4));
+        CUDA_CHECK(cudaFree(d_q4));
+    }
+    // (h) multi-block empty residual: a 40000-token vocabulary spans all 128
+    //     fallback blocks; the sole nucleus token (39000) lives in a high
+    //     block. The fallback predicate must be a snapshot, not the running
+    //     reduction, or an early block's write suppresses the block that owns
+    //     the only valid token (returning token 0, outside the nucleus).
+    {
+        const int VB = 40000, RB = 1; // one verify lane
+        std::vector<float> xb = rand_vec(VB, 4141);
+        for (auto& v : xb) v *= 2.0f;
+        xb[39000] = 40.0f;
+        float *d_xb, *d_nucb;
+        int *d_candb, *d_specb;
+        float* d_qb;
+        CUDA_CHECK(cudaMalloc(&d_xb, (size_t)VB * 4));
+        CUDA_CHECK(cudaMalloc(&d_nucb, RB * 4 * 4));
+        CUDA_CHECK(cudaMalloc(&d_candb, D2_TOPK * 4));
+        CUDA_CHECK(cudaMalloc(&d_qb, D2_TOPK * 4));
+        CUDA_CHECK(cudaMalloc(&d_specb, 12));
+        CUDA_CHECK(cudaMemcpy(d_xb, xb.data(), (size_t)VB * 4, cudaMemcpyHostToDevice));
+        int candb[D2_TOPK];
+        for (int c = 0; c < D2_TOPK; c++) candb[c] = 39000 + c; // includes the spike at c=0
+        std::vector<float> qb(D2_TOPK, 1.f);
+        CUDA_CHECK(cudaMemcpy(d_candb, candb, D2_TOPK * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_qb, qb.data(), D2_TOPK * 4, cudaMemcpyHostToDevice));
+        {
+            q27k::CP3 lgs{};
+            lgs.p[0] = d_xb;
+            q27k::nucleus_multi(lgs, VB, d_sp, d_nucb, 1, 0);
+        }
+        int specb[3] = {1, 0, 5};
+        CUDA_CHECK(cudaMemcpy(d_specb, specb, 12, cudaMemcpyHostToDevice));
+        int bad = 0;
+        for (int t = 0; t < 64; t++) {
+            int P = 910000 + t, o1 = -1, o2 = -2;
+            CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
+            q27k::d2_sample_stop(d_xb, d_nucb, d_specb, d_candb, d_qb, d_sp, d_P, VB, 1, d_out,
+                                 d_scr, 0);
+            CUDA_CHECK(cudaMemcpy(&o1, d_out, 4, cudaMemcpyDeviceToHost));
+            q27k::sample_stop(d_xb, d_nucb, d_specb, d_sp, d_P, VB, d_out, d_scr, 0);
+            CUDA_CHECK(cudaMemcpy(&o2, d_out, 4, cudaMemcpyDeviceToHost));
+            if (o1 != 39000 || o2 != 39000) bad++;
+        }
+        check("d2 multi-block empty residual fallback", (double)bad, 0.5);
+        CUDA_CHECK(cudaFree(d_xb)); CUDA_CHECK(cudaFree(d_nucb)); CUDA_CHECK(cudaFree(d_candb));
+        CUDA_CHECK(cudaFree(d_qb)); CUDA_CHECK(cudaFree(d_specb));
+    }
+    // (g) chained conditioning with REAL codebooks: nonzero pred/succ/hp so
+    //     each position's scores depend on the previous pick. For every trial
+    //     the host recomputes q_pos given the DEVICE's own previous pick
+    //     (anchor for pos 0) and the stored q rows must match -- i.e. the q
+    //     the tail rejects against is the q the walk actually drew from, and
+    //     the chain threads the sampled pick, not the argmax.
+    {
+        std::vector<float> hpv = rand_vec(K * D2_RANK, 9001);
+        std::vector<float> predv = rand_vec((size_t)V * D2_RANK, 9002);
+        std::vector<float> succv = rand_vec((size_t)V * D2_RANK, 9003);
+        for (auto& v : hpv) v *= 0.25f;
+        std::vector<__half> predh(predv.size()), succh(succv.size());
+        for (size_t i = 0; i < predv.size(); i++) {
+            predh[i] = __float2half(predv[i]); predv[i] = __half2float(predh[i]);
+            succh[i] = __float2half(succv[i]); succv[i] = __half2float(succh[i]);
+        }
+        CUDA_CHECK(cudaMemcpy(d_hp, hpv.data(), K * D2_RANK * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_pred, predh.data(), predh.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_succ, succh.data(), succh.size() * 2, cudaMemcpyHostToDevice));
+        double qerr = 0; int chain_bad = 0, argmax_only = 0;
+        for (int t = 0; t < 512; t++) {
+            walk(300000 + t, true);
+            int prop[K]; float qr[K * D2_TOPK];
+            CUDA_CHECK(cudaMemcpy(prop, d_prop, K * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(qr, d_qrow, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+            int prev = anchor;
+            for (int pos = 0; pos < K; pos++) {
+                double s[D2_TOPK], mx = -1e30; int bi = 0;
+                for (int c = 0; c < D2_TOPK; c++) {
+                    const int tok = cand[pos * D2_TOPK + c];
+                    double dot = 0;
+                    for (int i = 0; i < D2_RANK; i++)
+                        dot += (double)predv[(size_t)prev * D2_RANK + i] * hpv[pos * D2_RANK + i] *
+                               succv[(size_t)tok * D2_RANK + i];
+                    s[c] = cval[pos * D2_TOPK + c] + dot;
+                    if (s[c] > mx) { mx = s[c]; bi = c; }
+                }
+                double Z = 0, qq[D2_TOPK];
+                for (int c = 0; c < D2_TOPK; c++) { qq[c] = std::exp((double)invT * (s[c] - mx)); Z += qq[c]; }
+                int pc = -1;
+                for (int c = 0; c < D2_TOPK; c++) {
+                    qq[c] /= Z;
+                    qerr = std::max(qerr, std::fabs(qr[pos * D2_TOPK + c] - qq[c]));
+                    if (cand[pos * D2_TOPK + c] == prop[pos]) pc = c;
+                }
+                if (pc < 0 || qr[pos * D2_TOPK + pc] <= 0.f) chain_bad++;
+                if (pc == bi) argmax_only++;
+                prev = prop[pos]; // thread the DEVICE's pick into the next position
+            }
+        }
+        printf("    [d2 chained q err=%.2e  argmax picks %d/%d]\n", qerr, argmax_only, 512 * K);
+        check("d2 chained walk: stored q == q(prev = device pick)", qerr, 2e-4);
+        check("d2 chained walk: pick in row with q>0", (double)chain_bad, 0.5);
+        check("d2 chained walk: not always argmax", argmax_only < 512 * K ? 0.0 : 1.0, 0.5);
+    }
+    CUDA_CHECK(cudaFree(d_cand)); CUDA_CHECK(cudaFree(d_cval)); CUDA_CHECK(cudaFree(d_hp));
+    CUDA_CHECK(cudaFree(d_pred)); CUDA_CHECK(cudaFree(d_succ)); CUDA_CHECK(cudaFree(d_anchor));
+    CUDA_CHECK(cudaFree(d_posW)); CUDA_CHECK(cudaFree(d_prop)); CUDA_CHECK(cudaFree(d_qrow));
+    CUDA_CHECK(cudaFree(d_logits2)); CUDA_CHECK(cudaFree(d_nuc)); CUDA_CHECK(cudaFree(d_spec));
+    CUDA_CHECK(cudaFree(d_spec_h)); CUDA_CHECK(cudaFree(d_out)); CUDA_CHECK(cudaFree(d_P));
+    CUDA_CHECK(cudaFree(d_cap)); CUDA_CHECK(cudaFree(d_scr)); CUDA_CHECK(cudaFree(d_sp));
+}
+
 int main(int argc, char** argv) {
     // The sampler kernels are synthetic (no weights). --sampling-only runs just
     // them, skipping the 17.7GB model load, so they can be validated while a
@@ -3036,6 +3439,7 @@ int main(int argc, char** argv) {
         test_masked_argmax();
         test_sample();
         test_spec_sample();
+        test_d2_walk_reject();
         printf("%s\n", g_fail ? "FAILED" : "ALL PASS");
         return g_fail ? 1 : 0;
     }
@@ -3069,6 +3473,7 @@ int main(int argc, char** argv) {
     test_argmax_top2();
     test_sample();
     test_spec_sample();
+    test_d2_walk_reject();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();

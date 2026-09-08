@@ -1003,7 +1003,7 @@ struct Engine {
         // prompt > 65536 with --ctx > 65536 wrote OOB (CUDA-review #1). NP is
         // already bounded <= max_ctx by the generate() guard, so this is exact.
         A((void**)&d_gen, (size_t)max_ctx * 4);
-        A((void**)&d_amax, 8);
+        A((void**)&d_amax, 16); // 2 u64: argmax pack + the d2 stop-fallback latch
         A((void**)&d_samp, sizeof(q27k::SampleParams));
         // d_nuc: W_PLUMB lanes x {thresh,M,logZ,mass} (plumb-wide per the lane
         // rule; sampled verify fills vw lanes, up to gate_maxd+1 since the
@@ -2393,6 +2393,27 @@ struct Engine {
         spec_verify_forward(v);
         spec_verify_tail_sampled(v);
     }
+    // DFlash2 sampled tail (2026-09-07): the drafter's walk SAMPLED its path
+    // (q retained in d2->d_qrow over d2->d_cand), so lane k accepts with
+    // min(1, p/q) and the correction is drawn from max(p - q, 0) -- the
+    // sparse-q rejection rule (ninfer draw_rank + speculative_sparse_warp_
+    // accept). Same nucleus stats + finish as the ladder's sampled tail; only
+    // the accept/stop kernels differ. Lives only in the d2 sampled graph.
+    void spec_verify_tail_sampled_d2(const LaneView& v) {
+        {
+            q27k::CP3 lgs{};
+            for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
+            q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
+        }
+        q27k::IP3 drafts{};
+        for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
+        q27k::d2_spec_accept(logits2, d_nuc, drafts, d2->d_cand, d2->d_qrow, d_samp, d_P,
+                             d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
+        q27k::d2_sample_stop(logits2, d_nuc, d_spec, d2->d_cand, d2->d_qrow, d_samp, d_P, VOCAB,
+                             v.vw - 1, d_token, d_amax, v.stm);
+        q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
+                             N_EMBD, v.stm);
+    }
 
     void spec_round_launches() {
         spec_draft_launches();
@@ -2794,8 +2815,12 @@ struct Engine {
         if (!pk) return;
         if (const char* k = getenv("Q27_DFLASH2_K")) d2_k = atoi(k);
         const int d2_w = d2_k + 1;
-        if (d2_k < 1 || d2_w > W_MAX) {
-            fprintf(stderr, "Q27_DFLASH2_K=%d out of range (1..%d)\n", d2_k, W_MAX - 1);
+        // Bound by BOTH the engine verify width and the drafter's own row
+        // capacity (D2_WMAX rows of candidates/q/positions) -- a wider W_MAX
+        // build must not index past the drafter's buffers.
+        const int d2_kmax = std::min(W_MAX, q27d2::D2_WMAX) - 1;
+        if (d2_k < 1 || d2_k > d2_kmax) {
+            fprintf(stderr, "Q27_DFLASH2_K=%d out of range (1..%d)\n", d2_k, d2_kmax);
             exit(1);
         }
         d2 = new q27d2::Dflash2();
@@ -2828,11 +2853,31 @@ struct Engine {
         // needed there). The tail kernels are runtime-width, warmed at width
         // gate_maxd+1 >= any d2_w <= 8; wider K reuses the greedy warm's
         // forward widths.
+        // Sampled selector walk (default; Q27_D2_WALK=greedy restores the
+        // argmax walk + one-hot tail for A/B): the drafter draws its path from
+        // softmax(E/T) and the verify tail rejects against that sparse q.
+        if (const char* wm = getenv("Q27_D2_WALK")) d2_walk_sampled = strcmp(wm, "greedy") != 0;
         if (sampled_graphs) {
+            if (d2_walk_sampled) {
+                d2->set_sampler(d_samp); // before capture_draft (twin graph)
+                // Warm the sparse-q tail kernels eagerly before capture (the
+                // ladder's sampled warm only exercised its own tail; first
+                // launches must not happen inside capture). Every index the
+                // tail derives from data is made valid first: draft slots
+                // (token ids -> logits rows) zeroed, d_cand zeroed at alloc,
+                // d_qrow zeroed at alloc; logits/nucleus contents may be
+                // stale floats (lanes past the ladder's warm width) but are
+                // only compared, never indexed by.
+                for (int k = 0; k + 1 < W_PLUMB; k++)
+                    CUDA_CHECK(cudaMemsetAsync(d_draft_L[k], 0, 4, stm));
+                spec_verify_tail_sampled_d2(v);
+                CUDA_CHECK(cudaStreamSynchronize(stm));
+            }
             cudaGraph_t gsmp;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_verify_forward(v, d2_vtaps);
-            spec_verify_tail_sampled(v);
+            if (d2_walk_sampled) spec_verify_tail_sampled_d2(v);
+            else spec_verify_tail_sampled(v);
             CUDA_CHECK(cudaStreamEndCapture(stm, &gsmp));
             CUDA_CHECK(cudaGraphInstantiate(&d2_verify_sample_exec, gsmp, nullptr, nullptr, 0));
             CUDA_CHECK(cudaGraphDestroy(gsmp));
@@ -2840,9 +2885,10 @@ struct Engine {
         d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
         d2_timing = getenv("Q27_D2_TIMING") != nullptr;
         d2_on = true;
-        fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s\n", d2_k, d2_w,
-                vh);
+        fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s, walk %s\n",
+                d2_k, d2_w, vh, d2_walk_sampled ? "sampled" : "greedy");
     }
+    bool d2_walk_sampled = true; // sampled rounds draw the selector path (Q27_D2_WALK)
     // Called at prefill START: clear the drafter ring for this turn. The
     // prefill loops then re-seed it with the prompt tail (d2_seed_chunk), so
     // the drafter starts decode WARM instead of cold. Warm turns re-seed from
@@ -2901,7 +2947,8 @@ struct Engine {
         if (d2_timing) cudaEventRecord(d2_ev[0], stm);
         flush_fold(stm); // belt: fold the previous round before this verify reads state
         if (d2_timing) cudaEventRecord(d2_ev[1], stm);
-        d2->draft(d2_pending, d2_pos + 1, d2_k, stm); // proposals -> d2->d_prop (device)
+        // proposals -> d2->d_prop (device); sampled rounds draw the walk
+        d2->draft(d2_pending, d2_pos + 1, d2_k, stm, nullptr, sampling && d2_walk_sampled);
         q27k::prep_round(d_P, d_token, lane_pos(), mtp_pos(), W_MAX, D_MAX_MTP, d_outcome, stm);
         for (int k = 0; k < d2_k; k++)
             CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], d2->d_prop + k, 4,
@@ -2916,6 +2963,16 @@ struct Engine {
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         const int n = oc[0];
+        // Per-lane accept telemetry: a d2 round always verifies all d2_k
+        // lanes, so every lane "fires"; lane j accepted iff n >= j+1. Feeds
+        // the [req] gnh/glf/gla counters so a d2 acceptance profile reads off
+        // the journal exactly like the ladder's (per-lane localization vs
+        // ninfer's accepted_per_position).
+        gate_n_hist[n]++;
+        for (int j = 1; j <= d2_k; j++) {
+            gate_lane_fired[j]++;
+            if (n >= j + 1) gate_lane_acc[j]++;
+        }
         // ingest the accepted lanes' taps into the drafter ring
         int ipos[W_MAX];
         for (int k = 0; k < n; k++) ipos[k] = d2_pos + 1 + k;

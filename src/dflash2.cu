@@ -240,10 +240,19 @@ __global__ void k_d2_top16b(const float* __restrict__ c1v, const int* __restrict
 // K sequential positions. score(c) = unary logit + dot(pred_row(prev) *
 // hp_row, succ_row(c)); argmax with ties to the lower candidate slot (the
 // host walk's strict-> semantics). prev chains; out[pos] = the pick.
+// sampled (2026-09-07, ninfer draw_rank semantics): the pick is DRAWN from
+// q = softmax(inv_temp * (score - max)) over the 16 candidates with one Philox
+// uniform keyed (seed, posW[pos], KIND_D2_PROPOSAL); q is retained in qrow so
+// the verify tail can accept with min(1, p/q) and correct from max(p - q, 0).
+// Expected lane accept becomes sum_v min(p, q) instead of p(argmax) -- the
+// sampled-serving acceptance gap vs ninfer (0.645 vs 0.754 lane-1). The
+// greedy branch is the unchanged code path (bitwise).
 __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict__ cval,
                           const float* __restrict__ hp, const __half* __restrict__ pred,
                           const __half* __restrict__ succ, const int* __restrict__ d_anchor,
-                          int K, int* __restrict__ out) {
+                          int K, int* __restrict__ out, int sampled,
+                          const q27k::SampleParams* __restrict__ sp,
+                          const int* __restrict__ posW, float* __restrict__ qrow) {
     __shared__ float ph[D2_RANK];
     __shared__ float sc[D2_TOPK][256 / 32]; // per-warp partials per candidate
     __shared__ int s_prev;
@@ -269,15 +278,53 @@ __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict_
         if (threadIdx.x == 0) {
             float best = -INFINITY;
             int besti = 0;
+            float s[D2_TOPK];
             for (int i = 0; i < D2_TOPK; i++) {
-                float s = cval[(size_t)pos * D2_TOPK + i] + sc[i][0];
-                if (s > best) { best = s; besti = i; }
+                s[i] = cval[(size_t)pos * D2_TOPK + i] + sc[i][0];
+                if (s[i] > best) { best = s[i]; besti = i; }
+            }
+            if (sampled) {
+                const float invT = sp->inv_temp;
+                float w[D2_TOPK], sum = 0.f;
+                for (int i = 0; i < D2_TOPK; i++) {
+                    w[i] = expf(invT * (s[i] - best));
+                    sum += w[i];
+                }
+                const float inv = 1.f / sum;
+                const float u = q27k::philox_uniform(sp->seed, (unsigned)posW[pos],
+                                                     q27k::KIND_D2_PROPOSAL, 0u);
+                float q[D2_TOPK], cdf = 0.f;
+                int pick = -1, last_pos = 0;
+                for (int i = 0; i < D2_TOPK; i++) {
+                    q[i] = w[i] * inv;
+                    cdf += q[i];
+                    if (q[i] > 0.f) last_pos = i;
+                    if (pick < 0 && u < cdf) pick = i;
+                }
+                // fp32 cdf can end below u (rounding): fall back to the LAST
+                // candidate with q > 0, never a zero-probability slot (the
+                // tail would otherwise accept an unproposable token with
+                // p >= q == 0; gpt-6-astra design review). The stored law
+                // must equal the realized draw law, so that slot's q absorbs
+                // the cdf tail P(u >= cdf) = 1 - cdf it actually wins.
+                if (cdf < 1.f) q[last_pos] += 1.f - cdf;
+                for (int i = 0; i < D2_TOPK; i++) qrow[(size_t)pos * D2_TOPK + i] = q[i];
+                besti = pick < 0 ? last_pos : pick;
             }
             s_prev = cand[(size_t)pos * D2_TOPK + besti];
             out[pos] = s_prev;
         }
         __syncthreads();
     }
+}
+
+void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
+                    const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
+                    int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,
+                    float* d_qrow, cudaStream_t st) {
+    k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, d_hp, d_pred, d_succ, d_anchor, K, d_out,
+                                 sampled ? 1 : 0, d_sp, d_posW, d_qrow);
+    D2CHECK(cudaGetLastError());
 }
 
 // ---- pack loader --------------------------------------------------------
@@ -423,12 +470,18 @@ void Dflash2::alloc(int cap) {
     D2CHECK(cudaMalloc(&d_posW, D2_WMAX * 4));
     D2CHECK(cudaMalloc(&d_ing_pos, 4096 * 4));
     D2CHECK(cudaMalloc(&d_cand, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
+    D2CHECK(cudaMemset(d_cand, 0, (size_t)(D2_WMAX - 1) * D2_TOPK * 4)); // valid ids pre-warm
     D2CHECK(cudaMalloc(&d_cval, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
+    D2CHECK(cudaMalloc(&d_qrow, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
+    D2CHECK(cudaMemset(d_qrow, 0, (size_t)(D2_WMAX - 1) * D2_TOPK * 4));
     D2CHECK(cudaMalloc(&d_prop, (size_t)(D2_WMAX - 1) * 4));
     D2CHECK(cudaMalloc(&d_c1v, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
     D2CHECK(cudaMalloc(&d_c1i, (size_t)(D2_WMAX - 1) * D2_T16B * D2_TOPK * 4));
-    // device scalar mirror of ctx_n for the attention kernel (graph-stable)
+    // device scalar mirror of ctx_n for the attention kernel (graph-stable);
+    // zeroed so capture_draft's warm run (before any ingest/draft uploads
+    // the live count) attends over an EMPTY ring, not garbage.
     D2CHECK(cudaMalloc(&d_ctx_n, 4));
+    D2CHECK(cudaMemset(d_ctx_n, 0, 4));
     for (int i = 0; i < D2_WMAX - 1; i++) hxq[i] = q27k::xquant_alloc(D2_H);
     // drafter activation-quant scratch, sized to the widest activation (the
     // fc input = concatenated taps, TAPD=25600)
@@ -510,7 +563,8 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
 
 // ---- draft block --------------------------------------------------------
 
-void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, int* out_host) {
+void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, int* out_host,
+                    bool sampling) {
     assert(K >= 1 && K < D2_WMAX);
     const int W = K + 1;
     // per-round H2D (NEVER inside the captured graph): anchor token + positions
@@ -527,10 +581,11 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
     if (!eembed_data) // eager fallback (CLI): anchor row from the fp16 embed
         k_d2_rowcast<<<40, 256, 0, st>>>(
             f16("target.embed.weight") + (size_t)anchor_token * D2_H, nx, D2_H);
-    if (draft_exec && draft_exec_k == K)
-        CUDA_CHECK(cudaGraphLaunch(draft_exec, st));
+    const bool samp = sampling && d_sp; // sampled walk needs the engine sampler params
+    if (draft_exec && draft_exec_k == K && (!samp || draft_exec_s))
+        CUDA_CHECK(cudaGraphLaunch(samp ? draft_exec_s : draft_exec, st));
     else
-        draft_compute(K, st);
+        draft_compute(K, st, samp);
     if (out_host) {
         D2CHECK(cudaMemcpyAsync(out_host, d_prop, K * 4, cudaMemcpyDeviceToHost, st));
         D2CHECK(cudaStreamSynchronize(st));
@@ -543,7 +598,9 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
 void Dflash2::capture_draft(int K, cudaStream_t st) {
     if (!eembed_data) return;
     // seed the per-round device inputs so the warm run + capture are valid
+    // (anchor, positions, AND the ring count the attention kernel reads)
     const int a0 = 0, p0[D2_WMAX] = {0};
+    D2CHECK(cudaMemcpyAsync(d_ctx_n, &ctx_n, 4, cudaMemcpyHostToDevice, st));
     D2CHECK(cudaMemcpyAsync(d_anchor_tok, &a0, 4, cudaMemcpyHostToDevice, st));
     D2CHECK(cudaMemcpyAsync(d_posW, p0, (K + 1) * 4, cudaMemcpyHostToDevice, st));
     draft_compute(K, st); // warm (init lazy state)
@@ -555,9 +612,19 @@ void Dflash2::capture_draft(int K, cudaStream_t st) {
     D2CHECK(cudaGraphInstantiate(&draft_exec, g, nullptr, nullptr, 0));
     D2CHECK(cudaGraphDestroy(g));
     draft_exec_k = K;
+    if (d_sp) { // sampled-walk twin: identical forward, walk kernel in sampled mode
+        draft_compute(K, st, true); // warm
+        D2CHECK(cudaStreamSynchronize(st));
+        cudaGraph_t gs;
+        D2CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+        draft_compute(K, st, true);
+        D2CHECK(cudaStreamEndCapture(st, &gs));
+        D2CHECK(cudaGraphInstantiate(&draft_exec_s, gs, nullptr, nullptr, 0));
+        D2CHECK(cudaGraphDestroy(gs));
+    }
 }
 
-void Dflash2::draft_compute(int K, cudaStream_t st) {
+void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     const int W = K + 1;
     char nm[64];
     // anchor row (engine Q8 embed, device anchor) + K mask rows
@@ -665,7 +732,8 @@ void Dflash2::draft_compute(int K, cudaStream_t st) {
     k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, nhp,
                                  (const __half*)T("candidate_selector.predecessor_codebook").dev,
                                  (const __half*)T("candidate_selector.successor_codebook").dev,
-                                 d_anchor_tok, K, d_prop);
+                                 d_anchor_tok, K, d_prop, (sampling && d_sp) ? 1 : 0, d_sp,
+                                 d_posW, d_qrow);
     D2CHECK(cudaGetLastError());
 }
 

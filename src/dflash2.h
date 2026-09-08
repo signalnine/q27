@@ -16,6 +16,8 @@
 
 #include "kernels.cuh" // XQuant (engine-head reuse)
 
+namespace q27k { struct SampleParams; } // blocks.cuh (sampled selector walk)
+
 namespace q27d2 {
 
 // geometry (z-lab/Qwen3.8-27B-DFlash2 checkpoint; asserts at load)
@@ -83,6 +85,14 @@ struct Dflash2 {
     int* d_cand = nullptr;   // [WMAX-1][TOPK]
     float* d_cval = nullptr; // [WMAX-1][TOPK]
     int* d_prop = nullptr;   // [WMAX-1] the walked draft tokens
+    // Sampled selector walk (2026-09-07): per position the 16-way proposal
+    // distribution q = softmax(E/T) the walk actually drew from, over the
+    // d_cand ids of that position. The engine's sparse-q rejection tail reads
+    // it (accept min(1,p/q), correct from max(p-q,0)). Written ONLY by the
+    // sampled walk; the greedy walk (and graph) never touch it.
+    float* d_qrow = nullptr; // [WMAX-1][TOPK]
+    const q27k::SampleParams* d_sp = nullptr; // engine's device sampler params (fixed ptr)
+    void set_sampler(const q27k::SampleParams* sp) { d_sp = sp; }
     int* d_ctx_n = nullptr;  // device mirror of ctx_n (graph-stable attn)
     float* d_c1v = nullptr;  // top-16 stage-1 candidates [WMAX-1][512*16]
     int* d_c1i = nullptr;
@@ -130,16 +140,28 @@ struct Dflash2 {
     // one draft block of K proposals (width K+1): anchor (pending) token at
     // anchor_pos. Fully device-side; proposals land in d_prop[0..K-1]. No
     // stream sync. out_host (optional): also D2H the proposals (syncs).
+    // sampling: the selector walk SAMPLES its path from softmax(E/T) (needs
+    // set_sampler; ignored otherwise) and retains q in d_qrow. Greedy walk
+    // (default) is the bitwise-unchanged argmax path.
     void draft(int anchor_token, int anchor_pos, int K, cudaStream_t st,
-               int* out_host = nullptr);
+               int* out_host = nullptr, bool sampling = false);
     // The device-side compute of one draft (everything after the per-round
     // H2D of anchor/positions) -- captured once by capture_draft and replayed,
     // dropping the ~50 eager launches per round. Requires the engine Q8 embed
     // (device anchor lookup); falls back to eager when unavailable.
-    void draft_compute(int K, cudaStream_t st);
+    void draft_compute(int K, cudaStream_t st, bool sampling = false);
+    // Captures the greedy graph, plus the sampled-walk twin when a sampler is
+    // set (identical forward, only the walk kernel's mode differs).
     void capture_draft(int K, cudaStream_t st);
-    cudaGraphExec_t draft_exec = nullptr;
+    cudaGraphExec_t draft_exec = nullptr, draft_exec_s = nullptr;
     int draft_exec_k = 0;
 };
+
+// Bare launcher for the selector walk kernel (test_kernels: integrated
+// device-walk + sparse-q verify gate on synthetic candidates/codebooks).
+void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
+                    const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
+                    int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,
+                    float* d_qrow, cudaStream_t st);
 
 } // namespace q27d2

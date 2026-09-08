@@ -126,6 +126,40 @@ struct SampleParams {
     float min_p = 0.f; // <=0 => off; keep p_i >= min_p * p_max
 };
 
+// Philox4x32-10 (Salmon et al. 2011): counter-based, stateless. One uniform
+// in (0,1) from counter word 0. key = 64-bit seed; counter = (c0,c1,c2,0).
+// Header-resident (was blocks.cu-local) so the DFlash2 drafter's sampled
+// selector walk draws from the SAME generator as the verify tail; the draw
+// kinds (counter word c1) stay disjoint across every site: 0/1 plain
+// eager/graph, 2 spec accept, 3 spec stop, 4 DFlash2 proposal.
+__device__ __forceinline__ unsigned am_mulhi(unsigned a, unsigned b, unsigned& lo) {
+    unsigned long long p = (unsigned long long)a * b;
+    lo = (unsigned)p;
+    return (unsigned)(p >> 32);
+}
+__device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigned c0,
+                                                 unsigned c1, unsigned c2) {
+    unsigned k0 = (unsigned)seed, k1 = (unsigned)(seed >> 32);
+    unsigned x0 = c0, x1 = c1, x2 = c2, x3 = 0u;
+    const unsigned M0 = 0xD2511F53u, M1 = 0xCD9E8D57u, W0 = 0x9E3779B9u, W1 = 0xBB67AE85u;
+#pragma unroll
+    for (int r = 0; r < 10; r++) {
+        unsigned lo0, lo1;
+        unsigned hi0 = am_mulhi(M0, x0, lo0);
+        unsigned hi1 = am_mulhi(M1, x2, lo1);
+        unsigned n0 = hi1 ^ x1 ^ k0, n1 = lo1, n2 = hi0 ^ x3 ^ k1, n3 = lo0;
+        x0 = n0; x1 = n1; x2 = n2; x3 = n3;
+        k0 += W0; k1 += W1;
+    }
+    // map to (0,1): the top ~128 x0 values round to 2^32 in fp32, giving u==1 ->
+    // -log(-log(u)) = +inf (CUDA-review #2). Clamp to the largest float below 1.
+    float u = ((float)x0 + 0.5f) * (1.0f / 4294967296.0f);
+    return fminf(u, 0x1.fffffep-1f);
+}
+// DFlash2 proposal draw kind: the sampled selector walk keys on the absolute
+// position of the mask row (anchor_pos + i), disjoint from kinds 0..3.
+static constexpr unsigned KIND_D2_PROPOSAL = 4u;
+
 // Gumbel-max over the top-p nucleus S={i: x_i>=logit_thresh} draws exactly
 // softmax(inv_temp*x) renormalized over S. Deterministic given
 // (*d_sp, *d_pos, draw_kind, logits): nucleus stats+top-p threshold are one
@@ -175,5 +209,27 @@ void sample_stop(const float* logits2, const float* d_nuc5, const int* d_spec,
 // [OUTCOME_INTS-1]) -- unified when the sampled ladder widened past depth 4.
 void finish_sampled(int* d_P, const int* d_token, const int* d_spec, IP3 drafts, CP3 x1s,
                     float* h_next, int* outcome, int n_embd, cudaStream_t st = 0);
+
+// DFlash2 sparse-q twins (sampled serving, 2026-09-07). The drafter's selector
+// walk SAMPLED its path from q_k = softmax(E_k / T) over lane k's 16
+// candidates (d_cand[k][16] ids, d_qrow[k][16] probabilities), so lane k's
+// draft d is accepted with min(1, p(d)/q(d)) and the correction is drawn
+// from max(p - q_s, 0) on the stop lane s (Leviathan/Chen 2023 with a
+// non-degenerate q). q one-hot reproduces spec_accept/sample_stop exactly.
+// Same d_spec = {n, stop_lane, exclude} contract; finish_sampled unchanged.
+void d2_spec_accept(const float* logits2, const float* d_nuc, IP3 drafts, const int* d_cand,
+                    const float* d_qrow, const SampleParams* d_sp, const int* d_P,
+                    const int* cap, int max_draft, int vocab, int* d_spec,
+                    cudaStream_t st = 0);
+// Residual resample on the stop lane: Gumbel-max over r(v) = max(p(v) - q(v), 0)
+// with q sparse over that lane's candidates; the bonus lane (stop_lane ==
+// max_draft, all drafts accepted) is a plain nucleus draw with keys identical
+// to sample_stop's. A numerically empty residual falls back to sample_stop's
+// exclude-d draw (second kernel, gated on a flag latched between the two).
+// d_scratch: TWO u64 words (pack reduction + latched flag), not sample_stop's one.
+void d2_sample_stop(const float* logits2, const float* d_nuc5, const int* d_spec,
+                    const int* d_cand, const float* d_qrow, const SampleParams* d_sp,
+                    const int* d_P, int vocab, int max_draft, int* d_out,
+                    unsigned long long* d_scratch, cudaStream_t st = 0);
 
 } // namespace q27k

@@ -503,32 +503,8 @@ void argmax_masked(const float* x, int n, const unsigned* pool, int words, const
 // Greedy is NOT here -- it stays on k_argmax/k_argmax_masked (bitwise). These
 // kernels run only when a request sets temperature>0.
 
-// Philox4x32-10 (Salmon et al. 2011): counter-based, stateless. One uniform
-// in (0,1) from counter word 0. key = 64-bit seed; counter = (c0,c1,c2,0).
-__device__ __forceinline__ unsigned am_mulhi(unsigned a, unsigned b, unsigned& lo) {
-    unsigned long long p = (unsigned long long)a * b;
-    lo = (unsigned)p;
-    return (unsigned)(p >> 32);
-}
-__device__ __forceinline__ float philox_uniform(unsigned long long seed, unsigned c0,
-                                                 unsigned c1, unsigned c2) {
-    unsigned k0 = (unsigned)seed, k1 = (unsigned)(seed >> 32);
-    unsigned x0 = c0, x1 = c1, x2 = c2, x3 = 0u;
-    const unsigned M0 = 0xD2511F53u, M1 = 0xCD9E8D57u, W0 = 0x9E3779B9u, W1 = 0xBB67AE85u;
-#pragma unroll
-    for (int r = 0; r < 10; r++) {
-        unsigned lo0, lo1;
-        unsigned hi0 = am_mulhi(M0, x0, lo0);
-        unsigned hi1 = am_mulhi(M1, x2, lo1);
-        unsigned n0 = hi1 ^ x1 ^ k0, n1 = lo1, n2 = hi0 ^ x3 ^ k1, n3 = lo0;
-        x0 = n0; x1 = n1; x2 = n2; x3 = n3;
-        k0 += W0; k1 += W1;
-    }
-    // map to (0,1): the top ~128 x0 values round to 2^32 in fp32, giving u==1 ->
-    // -log(-log(u)) = +inf (CUDA-review #2). Clamp to the largest float below 1.
-    float u = ((float)x0 + 0.5f) * (1.0f / 4294967296.0f);
-    return fminf(u, 0x1.fffffep-1f);
-}
+// Philox4x32-10 lives in blocks.cuh (philox_uniform / am_mulhi) since the
+// DFlash2 drafter's sampled selector walk draws from the same generator.
 
 // Single block: max M, logsumexp logZ at inv_temp, and the top-p logit
 // threshold via a fixed 12-iteration bisection on a prob cutoff (no sort, no
@@ -860,6 +836,186 @@ void sample_stop(const float* logits2, const float* nuc5, const int* d_spec,
                  unsigned long long* d_scratch, cudaStream_t st) {
     k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
     k_sample_stop<<<128, 256, 0, st>>>(logits2, nuc5, d_spec, d_sp, d_P, vocab, d_scratch);
+    k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------- DFlash2 sparse-q rejection (sampled serving) ----------------
+// The drafter's selector walk sampled lane k's draft from q_k = softmax(E_k/T)
+// over its 16 candidates (cand[k][16] ids, qrow[k][16] probs). Accept with
+// min(1, p/q): reject iff !(p >= q || u*q < p), plus p > 0 (a draft outside
+// the served nucleus is never accepted, whatever q says). Draws key exactly
+// like k_spec_accept (KIND_SPEC_ACCEPT, counter word = lane), so a one-hot q
+// (q(d) = 1) reproduces its accept decisions bit-for-bit.
+__device__ __forceinline__ float d2_sparse_q(const int* __restrict__ cand,
+                                             const float* __restrict__ qrow, int lane,
+                                             int token) {
+    float q = 0.f;
+#pragma unroll
+    for (int c = 0; c < 16; c++)
+        if (cand[lane * 16 + c] == token) { q = qrow[lane * 16 + c]; break; }
+    return q;
+}
+__global__ void k_d2_spec_accept(const float* __restrict__ logits2,
+                                 const float* __restrict__ nuc, IP3 drafts,
+                                 const int* __restrict__ cand, const float* __restrict__ qrow,
+                                 const SampleParams* __restrict__ sp,
+                                 const int* __restrict__ dP, const int* __restrict__ cap,
+                                 int max_draft, int vocab, int* __restrict__ out) {
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*dP;
+    int stop_lane = max_draft, exclude = -1;
+    if (*cap) {
+        stop_lane = 0;
+    } else {
+        for (int k = 0; k < max_draft; k++) {
+            const float* nl = nuc + (size_t)k * 4;
+            const float thr = nl[0], M = nl[1], logZ = nl[2], mass = nl[3];
+            const int d = *drafts.p[k];
+            const float xd = logits2[(size_t)k * vocab + d];
+            const float p = (xd >= thr) ? expf(inv_temp * (xd - M) - logZ) / mass : 0.f;
+            const float q = d2_sparse_q(cand, qrow, k, d);
+            const float u = philox_uniform(seed, pos, KIND_SPEC_ACCEPT, (unsigned)k);
+            if (p > 0.f && (p >= q || u * q < p)) continue; // accept lane k
+            stop_lane = k; exclude = d;
+            break;
+        }
+    }
+    out[0] = stop_lane + 1;
+    out[1] = stop_lane;
+    out[2] = exclude;
+}
+void d2_spec_accept(const float* logits2, const float* d_nuc, IP3 drafts, const int* d_cand,
+                    const float* d_qrow, const SampleParams* d_sp, const int* d_P,
+                    const int* cap, int max_draft, int vocab, int* d_spec, cudaStream_t st) {
+    k_d2_spec_accept<<<1, 1, 0, st>>>(logits2, d_nuc, drafts, d_cand, d_qrow, d_sp, d_P, cap,
+                                      max_draft, vocab, d_spec);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Residual resample: Gumbel-max over the stop lane's nucleus with weight
+// r(v) = max(p(v) - q(v), 0), q sparse over that lane's 16 candidates (zero
+// elsewhere). Non-candidates keep key = inv_temp*x + g, bit-identical to
+// k_sample_stop (log p + g up to the per-lane constant C = inv_temp*M + logZ +
+// log mass); candidates use log(p - q) + C + g on the same scale. Tokens with
+// r <= 0 (includes the rejected draft, whose p < q by construction) never
+// contribute. The bonus lane (stop_lane == max_draft) has no q: plain draw,
+// identical to k_sample_stop's. Threads with no eligible token contribute the
+// zero pack, so *best == 0 afterwards means "residual numerically empty" and
+// k_d2_stop_fallback (below) then runs sample_stop's exclude-d draw instead.
+__global__ void k_d2_sample_stop(const float* __restrict__ logits2,
+                                 const float* __restrict__ nuc5, const int* __restrict__ spec,
+                                 const int* __restrict__ cand, const float* __restrict__ qrow,
+                                 const SampleParams* __restrict__ sp,
+                                 const int* __restrict__ dP, int vocab, int max_draft,
+                                 unsigned long long* __restrict__ best) {
+    const int stop_lane = spec[1];
+    const int exclude = spec[2];
+    // Subtract q ONLY on an actual rejection (exclude >= 0). The bonus lane
+    // (all accepted, stop_lane == max_draft) and the reasoning-boundary cap
+    // ({n=1, stop=0, exclude=-1}) are plain draws from p -- the cap in
+    // particular sits on lane 0 with NO draft rejected, so gating on
+    // stop_lane < max_draft would wrongly subtract lane 0's q (gpt-6-astra
+    // design review P1) and the bonus lane's q[K] does not exist.
+    const bool resid = exclude >= 0;
+    __shared__ int sc_id[16];
+    __shared__ float sc_q[16];
+    if (threadIdx.x < 16) {
+        sc_id[threadIdx.x] = resid ? cand[stop_lane * 16 + threadIdx.x] : -1;
+        sc_q[threadIdx.x] = resid ? qrow[stop_lane * 16 + threadIdx.x] : 0.f;
+    }
+    __syncthreads();
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*dP;
+    const float* x = logits2 + (size_t)stop_lane * vocab;
+    const float* nl = nuc5 + (size_t)stop_lane * 4;
+    const float thresh = nl[0], M = nl[1], logZ = nl[2], mass = nl[3];
+    const float C = inv_temp * M + logZ + logf(mass);
+    unsigned long long bp = 0ull; // zero pack = "nothing eligible"
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x) {
+        if (x[i] < thresh || i == exclude) continue;
+        float q = 0.f;
+        if (resid) {
+#pragma unroll
+            for (int c = 0; c < 16; c++)
+                if (sc_id[c] == i) { q = sc_q[c]; break; }
+        }
+        float u = philox_uniform(seed, pos, KIND_SPEC_STOP, (unsigned)i);
+        float g = -logf(-logf(u));
+        float key;
+        if (q <= 0.f) {
+            key = inv_temp * x[i] + g;
+        } else {
+            const float p = expf(inv_temp * (x[i] - M) - logZ) / mass;
+            const float r = p - q;
+            if (!(r > 0.f)) continue;
+            key = logf(r) + C + g;
+        }
+        const unsigned long long pk = am_pack(key, i);
+        if (pk > bp) bp = pk;
+    }
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = bp;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && sh[0]) atomicMax(best, sh[0]);
+}
+// Latch "the residual draw found nothing" into scratch word 1 BEFORE the
+// fallback kernel runs: the fallback's own blocks write word 0, so a block
+// scheduled after another block's atomicMax would otherwise see a nonzero
+// word 0 and skip its tokens (gpt-6-astra implementation review, P1). The
+// predicate must be an immutable snapshot, separate from the reduction.
+__global__ void k_d2_stop_latch(unsigned long long* __restrict__ best) {
+    best[1] = (best[0] == 0ull) ? 1ull : 0ull;
+}
+// k_sample_stop's body, gated on the latched "residual empty" flag.
+__global__ void k_d2_stop_fallback(const float* __restrict__ logits2,
+                                   const float* __restrict__ nuc5, const int* __restrict__ spec,
+                                   const SampleParams* __restrict__ sp,
+                                   const int* __restrict__ dP, int vocab,
+                                   unsigned long long* __restrict__ best) {
+    if (best[1] == 0ull) return; // residual draw succeeded (snapshot, never written here)
+    const int stop_lane = spec[1];
+    const int exclude = spec[2];
+    const float inv_temp = sp->inv_temp;
+    const unsigned long long seed = sp->seed;
+    const unsigned pos = (unsigned)*dP;
+    const float* x = logits2 + (size_t)stop_lane * vocab;
+    const float thresh = nuc5[(size_t)stop_lane * 4];
+    float bv = -FLT_MAX;
+    int bi = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vocab; i += gridDim.x * blockDim.x) {
+        if (x[i] < thresh || i == exclude) continue;
+        float u = philox_uniform(seed, pos, KIND_SPEC_STOP, (unsigned)i);
+        float g = -logf(-logf(u));
+        float key = inv_temp * x[i] + g;
+        if (key > bv) { bv = key; bi = i; }
+    }
+    unsigned long long p = am_pack(bv, bi);
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = p;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] = max(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(best, sh[0]);
+}
+void d2_sample_stop(const float* logits2, const float* nuc5, const int* d_spec, const int* d_cand,
+                    const float* d_qrow, const SampleParams* d_sp, const int* d_P, int vocab,
+                    int max_draft, int* d_out, unsigned long long* d_scratch, cudaStream_t st) {
+    // d_scratch must hold TWO u64 words: [0] the pack reduction, [1] the
+    // latched empty-residual flag the fallback reads.
+    k_argmax_reset<<<1, 1, 0, st>>>(d_scratch);
+    k_d2_sample_stop<<<128, 256, 0, st>>>(logits2, nuc5, d_spec, d_cand, d_qrow, d_sp, d_P,
+                                          vocab, max_draft, d_scratch);
+    k_d2_stop_latch<<<1, 1, 0, st>>>(d_scratch);
+    k_d2_stop_fallback<<<128, 256, 0, st>>>(logits2, nuc5, d_spec, d_sp, d_P, vocab, d_scratch);
     k_argmax_extract<<<1, 1, 0, st>>>(d_scratch, d_out);
     CUDA_CHECK(cudaGetLastError());
 }
