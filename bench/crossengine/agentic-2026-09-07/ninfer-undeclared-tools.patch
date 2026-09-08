@@ -1,0 +1,18 @@
+diff --git a/src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp b/src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp
+index 38102c4..479ff10 100644
+--- a/src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp
++++ b/src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp
+@@ -586,7 +586,12 @@ std::shared_ptr<const ToolCallOutputContract>
+ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+     if (!enabled) { return {}; }
+     auto contract                    = std::make_shared<ToolCallOutputContract>();
+-    contract->enforce_declared_names = true;
++    // q27 agentic-campaign 2026-09-07 (local, unsubmitted): do NOT reject a whole
++    // <tool_call> batch because one name is undeclared -- Claude Code 2.1.170
++    // defers Grep/Glob and Qwen still names them; the client answers an
++    // unknown tool_use with an error result and the agent continues, which is
++    // what q27 does. Keeps the comparison about decode speed, not parser policy.
++    contract->enforce_declared_names = false;
+     contract->tools.reserve(tool_jsons.size());
+     for (const std::string& tool_json : tool_jsons) {
+         const Json definition = Json::parse(tool_json, nullptr, false);

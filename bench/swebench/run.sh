@@ -22,8 +22,17 @@ RES="$SP/results.$ENGINE.jsonl"
 : >"$RES"
 
 case "$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://$HOST:$PORT/health)" in 200|401) ;; *) echo "engine $HOST:$PORT not up" >&2; exit 1;; esac
-echo "=== SWE-bench agentic bench | engine=$ENGINE (:8081, journal $UNIT) | img=$IMG ==="
+# Telemetry family (2026-09-07): q27 [req] journal lines, llama-server eval
+# lines, or ninfer's --request-log-jsonl (SWEBENCH_REQLOG=<file>). Defaults by
+# label prefix so q27lad / q27d2q8 / ninferd2 pick the right parser.
+case "${SWEBENCH_TELEMETRY:-}" in
+  q27|llama|ninfer) TELEM=$SWEBENCH_TELEMETRY ;;
+  *) case "$ENGINE" in q27*) TELEM=q27 ;; ninfer*) TELEM=ninfer ;; *) TELEM=llama ;; esac ;;
+esac
+REQLOG=${SWEBENCH_REQLOG:-}
+echo "=== SWE-bench agentic bench | engine=$ENGINE (:8081, journal $UNIT, telemetry $TELEM) | img=$IMG ==="
 RUN_START="$(date '+%Y-%m-%d %H:%M:%S')"
+RUN_EPOCH_MS=$(( $(date +%s) * 1000 ))
 
 mapfile -t IDS < <(python3 -c "import json;print('\n'.join(m['instance_id'] for m in json.load(open('$MAN'))))")
 for IID in "${IDS[@]}"; do
@@ -55,6 +64,7 @@ open('$WS/task.txt','w').write(
     -v "$WS/logs:/logs" -e HOME=/home/node \
     -e ANTHROPIC_BASE_URL=http://host.docker.internal:$PORT \
     -e ANTHROPIC_API_KEY=local -e ANTHROPIC_AUTH_TOKEN=local \
+    -e CLAUDE_CODE_EFFORT_LEVEL=${SWEBENCH_EFFORT:-medium} \
     --entrypoint bash "$IMG" \
     -c 'P=$(cat /task.txt); timeout 700 claude -p --output-format stream-json --verbose --dangerously-skip-permissions -- "$P" >/logs/out.jsonl 2>/logs/err.log; echo $? >/logs/exit' \
     >/dev/null 2>&1
@@ -92,15 +102,29 @@ done
 # ---- engine decode telemetry for the run window ----
 echo ""; echo "=== ENGINE DECODE ($ENGINE) over run window ==="
 journalctl --user -u "$UNIT" --since "$RUN_START" --no-pager -o cat 2>/dev/null >"$SP/swebench_$ENGINE.journal"
-python3 - "$ENGINE" "$SP/swebench_$ENGINE.journal" "$RES" <<'PY'
+python3 - "$TELEM" "$SP/swebench_$ENGINE.journal" "$RES" "$REQLOG" "$RUN_EPOCH_MS" <<'PY'
 import sys,re,json,statistics as st
-eng,jf,res=sys.argv[1:4]
-tps=[]; tok=0; ms=0.0; a=g=0
-for ln in open(jf):
+eng,jf,res,reqlog,t0ms=sys.argv[1:6]; t0ms=int(t0ms)
+tps=[]; tok=0; ms=0.0; a=g=0; rounds=0; hit=prompt=0
+if eng=='ninfer':
+    # ninfer --request-log-jsonl: one request_done row per request; decode
+    # seconds + completion tokens are the same split q27's [req] line carries.
+    for ln in open(reqlog):
+        try: d=json.loads(ln)
+        except Exception: continue
+        if d.get('event')!='request_done' or d.get('timestamp_unix_ms',0) < t0ms: continue
+        r=d.get('result',{}); t=d.get('timings_seconds',{}); sp=d.get('speculative',{})
+        n=r.get('completion_tokens',0); dec=t.get('decode',0.0)
+        if n>=8 and dec>0:
+            tps.append(n/dec); tok+=n; ms+=dec*1000.0; rounds+=sp.get('rounds',0)
+            hit+=r.get('prefix_cache_hit_tokens',0); prompt+=r.get('prompt_tokens',0)
+else:
+  for ln in open(jf):
     if eng=='q27':
-        m=re.search(r'^\[req\].* dec=(\d+) dec_ms=([0-9.]+) .* tps=([0-9.]+)', ln)
-        if m and int(m.group(1))>=8:
-            tps.append(float(m.group(3))); tok+=int(m.group(1)); ms+=float(m.group(2))
+        m=re.search(r'^\[req\].* prompt=(\d+) hit=(\d+) .* dec=(\d+) dec_ms=([0-9.]+) .* rounds=(\d+) tps=([0-9.]+)', ln)
+        if m and int(m.group(3))>=8:
+            tps.append(float(m.group(6))); tok+=int(m.group(3)); ms+=float(m.group(4))
+            rounds+=int(m.group(5)); prompt+=int(m.group(1)); hit+=int(m.group(2))
         s=re.search(r'sfx=(\d+),(\d+)', ln)
         if s: a+=int(s.group(1)); g+=int(s.group(2))
     else:
@@ -116,7 +140,9 @@ wall=sum(r['wall_s'] for r in rows)
 print(f"  instances: {done}  nonempty-diff: {ne}/{done}  edited-gold-file: {gh}/{done}")
 print(f"  total wall: {wall}s ({wall/done:.0f}s/inst avg)" if done else "  no instances")
 print(f"  decode: {agg:.1f} t/s agg / {st.median(tps) if tps else 0:.1f} med  ({len(tps)} reqs, {tok} tok)")
+if rounds: print(f"  tok/round: {tok/rounds:.3f} ({rounds} rounds)")
+if prompt: print(f"  prefix reuse: {hit/prompt*100:.1f}% of prompt tokens served from cache ({hit}/{prompt})")
 if eng=='q27': print(f"  suffix drafter: {a} fires / {g} tok")
-else: print(f"  ngram-mod accept: {(a/g*100) if g else 0:.0f}% ({a}/{g})")
+elif eng=='llama': print(f"  ngram-mod accept: {(a/g*100) if g else 0:.0f}% ({a}/{g})")
 PY
 echo "=== END ($ENGINE) ==="
