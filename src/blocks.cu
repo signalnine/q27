@@ -29,6 +29,33 @@ void rmsnorm_heads(const float* x, const float* w, float* y, int n_heads, int he
     k_rmsnorm_heads<<<n_heads, 256, 0, st>>>(x, w, y, head_dim, stride, eps);
     CUDA_CHECK(cudaGetLastError());
 }
+// Lane-packed twin (2026-09-08): block (head, lane) runs k_rmsnorm_heads'
+// body verbatim on lane blockIdx.y's buffers, so one launch replaces the
+// per-lane loop the verify ran (2 x vw launches per attention layer: 256 of
+// the width-8 round's 1723 graph nodes). Bitwise identical per (head, lane).
+__global__ void k_rmsnorm_heads3(__grid_constant__ const CP3 xp, const float* __restrict__ w,
+                                 __grid_constant__ const P3 yp, int head_dim, int stride,
+                                 float eps) {
+    const float* xh = xp.p[blockIdx.y] + (size_t)blockIdx.x * stride;
+    float* yh = yp.p[blockIdx.y] + (size_t)blockIdx.x * stride;
+    __shared__ float sh[256];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) acc += xh[i] * xh[i];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) yh[i] = xh[i] * inv * w[i];
+}
+void rmsnorm_heads3(CP3 x, const float* w, P3 y, int n_heads, int head_dim, int stride, float eps,
+                    cudaStream_t st, int ntok) {
+    dim3 g((unsigned)n_heads, (unsigned)ntok);
+    k_rmsnorm_heads3<<<g, 256, 0, st>>>(x, w, y, head_dim, stride, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 __global__ void k_l2norm_heads(float* __restrict__ x, int head_dim, float eps) {
     float* xh = x + (size_t)blockIdx.x * head_dim;

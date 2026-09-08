@@ -15710,6 +15710,41 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (a): width-8 verify, batch 1 -- three bitwise launch/tiling wins, verify 17.6 -> 16.8 ms
+
+The width-8 verify graph decomposed (serving nsys, 59 rounds): span 17.81 ms
+= kernels 17.06 + inter-node gaps 0.75 over 1723 nodes. k_gemv_q4_n<8>
+11.49 ms (67%, 353 launches, ~1.23 TB/s effective), k_gdn_delta_all 1.17
+(48 x 24 us), fdmma attention 0.71 + combine 0.20, gemv_q8_n<8> 0.70,
+k_nucleus_multi 0.62 (ONE launch: 8 blocks doing the top-p/top-k search
+over 248K logits per lane -- sampled path only), rmsnorm3 0.47 (129),
+gemv_f16_3 0.39 (96), rmsnorm_heads 0.33 (256 per-lane launches),
+quantize_x3 0.30 (257), add3 0.13, the rest < 0.1 each. Tiny kernels plus
+gaps are ~2.9 ms of the graph.
+
+Shipped, all bitwise by construction:
+- k_rmsnorm_heads3: lane-packed twin of k_rmsnorm_heads (block = (head,
+  lane), body verbatim); attn_pre's two per-lane loops become two launches
+  -> 224 fewer nodes per round.
+- k_gemv_f16_3x2: the GDN alpha and beta gate projections (same activation)
+  in one launch via blockIdx.z; 48 fewer nodes.
+- k_gdn_delta_all column-tile split (the k_delta_scan_T pattern): a block
+  owns one head's 32-column slice over all 128 rows, grid 48 -> 192 CTAs,
+  128 threads; per-element expressions and the part[0..3] sum order
+  unchanged. Gates: gdn_fuse_eq BITWISE IDENTICAL at vw 2/3/5/8/12/16 (on a
+  FRESH build -- the first run silently reused a stale binary because nvcc
+  was not on the background shell's PATH: exit 127 + a PASS from this
+  morning's binary; always check the binary's timestamp), ninv_test all
+  families PASS.
+
+Paired A/B (worktree incumbent at 937f5c1, vox stopped, 12.5K seeded think):
+streams IDENTICAL (842 rounds / 3.648 both), verify 17.41/17.80 -> 16.79 ms,
+round 19.63/20.03 -> 19.01 ms, t/s 191.1/187.3 -> 197.3 (+4%). Greedy CLI
+--dflash2 == --spec on code-edit and prose, and faster (190 -> 202 t/s).
+
+Left in the verify (16.8): gemv 11.5 + 0.7, GDN ~0.9, attention 0.9,
+nucleus 0.62 (sampled), rmsnorm3+quantize 0.77 (fusable), gaps ~0.6.
+
 ## 2026-09-07 (k): DFlash2 commit-fold on a side stream -- bitwise, -0.3 ms/round
 
 The GDN commit-fold (post_round, ~0.38 ms of k_delta_scan_T + conv-ring

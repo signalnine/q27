@@ -185,6 +185,19 @@ t/s seeded think (+14%). Left in the drafter: Q8 gemvs 1.3 (floor), head
 (17.8 vs ninfer ~16.5): adaptive verify width or verify-kernel work, not
 the drafter.
 
+## Width-8 verify attack (2026-09-08, BUILDLOG (a))
+
+Verify graph budget (17.8 ms): gemv_q4_n<8> 11.5 (67%), gdn_delta_all 1.2,
+attention 0.9, gemv_q8_n 0.7, nucleus 0.62 (sampled), rmsnorm3 0.47,
+gemv_f16_3 0.39, rmsnorm_heads 0.33, quantize_x3 0.30, add3 0.13, gaps 0.75.
+Batch 1 shipped (bitwise): lane-packed rmsnorm_heads (-224 nodes), fused
+alpha+beta f16 gemv (-48), gdn_delta_all column-tile split (48 -> 192
+CTAs): verify 17.6 -> 16.8, round 19.8 -> 19.0, +4% t/s. Next: (2) route
+the d2 verify's big tensors through the deterministic MMA path (vgemm,
+flat in width; today only at width >= 9) -- a numerics-family change for
+the d2 serving path, measure first; (3) rmsnorm3+quantize fusion (~0.25),
+nucleus rewrite (~0.5, sampled only).
+
 ## Agentic standings 2026-09-07 late (bench/crossengine/agentic-2026-09-07)
 
 Claude Code on the 12 SWE-bench instances, effort medium on both engines:

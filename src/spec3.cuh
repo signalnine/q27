@@ -23,6 +23,9 @@ void l2norm3(P3 x, int n_heads, int head_dim, float eps, cudaStream_t st = 0, in
 // f16 GEMV, one weight, ntok activation columns.
 void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaStream_t st = 0,
                 int ntok = 3);
+// Two weights sharing x, one launch (blockIdx.z picks): bitwise per output vs two calls.
+void gemv_f16_3x2(const __half* Wa, const __half* Wb, CP3 x, P3 ya, P3 yb, int64_t rows,
+                  int64_t cols, cudaStream_t st = 0, int ntok = 1);
 
 // gdn gate math for ntok tokens.
 void gdn_gates3(CP3 ar, CP3 br, const float* a, const float* dt, P3 g, P3 b, int n,

@@ -185,10 +185,17 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
                                 __grid_constant__ const CP3 beta3,
                                 __grid_constant__ const P3 o3, int nsp) {
     constexpr int SK = 128;
-    __shared__ float sq[SK], sk[SK], part[4][SK], dj[SK];
+    __shared__ float sq[SK], sk[SK], part[4][32], dj[32];
     const int h = blockIdx.x;
-    const int j = threadIdx.x & (SK - 1);
-    const int it = threadIdx.x >> 7;
+    // 2026-09-08 column-tile split (the k_delta_scan_T pattern): a block owns
+    // one head's 32-column slice over all 128 rows (4 row-tiles x 32 cols =
+    // 128 threads), grid (48 heads, 4 tiles) = 192 CTAs instead of 48. Every
+    // per-(row, column) expression and the part[0..3] sum order are unchanged
+    // -> bitwise (gdn_fuse_eq + ninv CHUNK+FOLD). sq/sk are loaded in full by
+    // the 128 threads (was: the 128 it==0 threads).
+    const int jj = threadIdx.x & 31;
+    const int j = blockIdx.y * 32 + jj;
+    const int it = threadIdx.x >> 5;
     const int i0 = it * 32;
 #if Q27_GDN_HEAD_TILE
     const int qk = h % 16;
@@ -204,10 +211,8 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
     // ---- lane 0: k_delta_step, register-resident, committed rows written out ----
     {
         const float* conv = conv3.p[0];
-        if (it == 0) {
-            sq[j] = conv[qk * SK + j] * scale;
-            sk[j] = conv[2048 + qk * SK + j];
-        }
+        sq[threadIdx.x] = conv[qk * SK + threadIdx.x] * scale;
+        sk[threadIdx.x] = conv[2048 + qk * SK + threadIdx.x];
         __syncthreads();
         const float decay = expf(g3.p[0][h]);
         float pred = 0.f;
@@ -217,15 +222,15 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
             sreg[k] = s;
             pred += sk[i0 + k] * s;
         }
-        part[it][j] = pred;
+        part[it][jj] = pred;
         __syncthreads();
         if (it == 0) {
-            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float p = part[0][jj] + part[1][jj] + part[2][jj] + part[3][jj];
             float vj = conv[4096 + h * SK + j];
-            dj[j] = beta3.p[0][h] * (vj - p);
+            dj[jj] = beta3.p[0][h] * (vj - p);
         }
         __syncthreads();
-        float d = dj[j];
+        float d = dj[jj];
         float acc = 0.f;
 #pragma unroll 8
         for (int k = 0; k < 32; k++) {
@@ -234,19 +239,17 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
             Soh[(size_t)(i0 + k) * SK + j] = s;
             acc += sq[i0 + k] * s;
         }
-        part[it][j] = acc;
+        part[it][jj] = acc;
         __syncthreads();
         if (it == 0)
-            o3.p[0][h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            o3.p[0][h * SK + j] = part[0][jj] + part[1][jj] + part[2][jj] + part[3][jj];
         __syncthreads();
     }
     // ---- lanes 1..nsp: k_gdn_delta_chunk3's loop, verbatim (register form) ----
     for (int t = 0; t < nsp; t++) {
         const float* conv = conv3.p[t + 1];
-        if (it == 0) {
-            sq[j] = conv[qk * SK + j] * scale;
-            sk[j] = conv[2048 + qk * SK + j];
-        }
+        sq[threadIdx.x] = conv[qk * SK + threadIdx.x] * scale;
+        sk[threadIdx.x] = conv[2048 + qk * SK + threadIdx.x];
         __syncthreads();
         const float decay = expf(g3.p[t + 1][h]);
         float pred = 0.f;
@@ -256,15 +259,15 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
             sreg[k] = s;
             pred += sk[i0 + k] * s;
         }
-        part[it][j] = pred;
+        part[it][jj] = pred;
         __syncthreads();
         if (it == 0) {
-            float p = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            float p = part[0][jj] + part[1][jj] + part[2][jj] + part[3][jj];
             float vj = conv[4096 + h * SK + j];
-            dj[j] = beta3.p[t + 1][h] * (vj - p);
+            dj[jj] = beta3.p[t + 1][h] * (vj - p);
         }
         __syncthreads();
-        float d = dj[j];
+        float d = dj[jj];
         float acc = 0.f;
 #pragma unroll 8
         for (int k = 0; k < 32; k++) {
@@ -272,10 +275,10 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
             sreg[k] = s;
             acc += sq[i0 + k] * s;
         }
-        part[it][j] = acc;
+        part[it][jj] = acc;
         __syncthreads();
         if (it == 0)
-            o3.p[t + 1][h * SK + j] = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+            o3.p[t + 1][h * SK + j] = part[0][jj] + part[1][jj] + part[2][jj] + part[3][jj];
         __syncthreads();
     }
 }
@@ -283,7 +286,7 @@ __global__ void k_gdn_delta_all(const float* __restrict__ Ssrc, float* __restric
 void gdn_delta_all(const float* Ssrc, float* Sdst, CP3 conv, CP3 g, CP3 beta, P3 o, int nsp,
                    cudaStream_t st) {
     // register-resident state: only the static sq/sk/part/dj smem now.
-    k_gdn_delta_all<<<48, 512, 0, st>>>(Ssrc, Sdst, conv, g, beta, o, nsp);
+    k_gdn_delta_all<<<dim3(48, 4), 128, 0, st>>>(Ssrc, Sdst, conv, g, beta, o, nsp);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -423,6 +426,34 @@ void gemv_f16_3(const __half* W, CP3 x, P3 y, int64_t rows, int64_t cols, cudaSt
                 int ntok) {
     dim3 g((unsigned)rows, ntok);
     k_gemv_f16_3<<<g, 256, 0, st>>>(W, x, y, cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+// Two weights, one launch (2026-09-08): blockIdx.z picks (W, y); the body is
+// k_gemv_f16_3's verbatim, so every output is bitwise the same as two
+// launches. The GDN alpha/beta gate projections share the activation x and
+// were 96 of the width-8 round's graph nodes at ~4 us each.
+__global__ void k_gemv_f16_3x2(const __half* __restrict__ Wa, const __half* __restrict__ Wb,
+                               __grid_constant__ const CP3 xp, __grid_constant__ const P3 ya,
+                               __grid_constant__ const P3 yb, int64_t cols) {
+    const __half* W = blockIdx.z ? Wb : Wa;
+    const float* x = xp.p[blockIdx.y];
+    const __half* wr = W + (size_t)blockIdx.x * cols;
+    float acc = 0.f;
+    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x)
+        acc += __half2float(wr[c]) * x[c];
+    __shared__ float sh[256];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) (blockIdx.z ? yb : ya).p[blockIdx.y][blockIdx.x] = sh[0];
+}
+void gemv_f16_3x2(const __half* Wa, const __half* Wb, CP3 x, P3 ya, P3 yb, int64_t rows,
+                  int64_t cols, cudaStream_t st, int ntok) {
+    dim3 g((unsigned)rows, ntok, 2);
+    k_gemv_f16_3x2<<<g, 256, 0, st>>>(Wa, Wb, x, ya, yb, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 

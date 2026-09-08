@@ -2022,14 +2022,13 @@ struct Engine {
         qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_qkv.weight"), v.qkv);
         mm5(v, T(il, "attn_gate.weight"), v.z);
-        q27k::gemv_f16_3((const __half*)T(il, "ssm_alpha.weight").data,
-                         LANESV(v, x1),
-                         LANESV(v, alpha), GDN_HEADS,
-                         N_EMBD, v.stm, v.vw);
-        q27k::gemv_f16_3((const __half*)T(il, "ssm_beta.weight").data,
-                         LANESV(v, x1),
-                         LANESV(v, betar), GDN_HEADS,
-                         N_EMBD, v.stm, v.vw);
+        // alpha + beta gate projections in ONE launch (2026-09-08): same body
+        // per output as two gemv_f16_3 launches -> bitwise; 48 fewer nodes
+        q27k::gemv_f16_3x2((const __half*)T(il, "ssm_alpha.weight").data,
+                           (const __half*)T(il, "ssm_beta.weight").data,
+                           LANESV(v, x1),
+                           LANESV(v, alpha), LANESV(v, betar), GDN_HEADS,
+                           N_EMBD, v.stm, v.vw);
         const float* sa = (const float*)T(il, "ssm_a").data;
         const float* sdt = (const float*)T(il, "ssm_dt.bias").data;
         q27k::gdn_gates3(LANESV(v, alpha),
@@ -2129,11 +2128,13 @@ struct Engine {
         mm5(v, T(il, "attn_q.weight"), v.qg);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
-        for (int L = 0; L < v.vw; L++)
-            q27k::rmsnorm_heads(v.qg[L], qn, v.qg[L], N_HEAD, HEAD_DIM, 2 * HEAD_DIM, EPS, v.stm);
+        // lane-packed norms (2026-09-08): one launch per norm instead of vw
+        // -- bitwise per (head, lane), 224 fewer graph nodes at width 8
+        q27k::rmsnorm_heads3(LANESV(v, qg), qn, LANESV(v, qg), N_HEAD, HEAD_DIM, 2 * HEAD_DIM,
+                             EPS, v.stm, v.vw);
         mm5(v, T(il, "attn_k.weight"), v.kbuf);
-        for (int L = 0; L < v.vw; L++)
-            q27k::rmsnorm_heads(v.kbuf[L], kn, v.kbuf[L], N_KV, HEAD_DIM, HEAD_DIM, EPS, v.stm);
+        q27k::rmsnorm_heads3(LANESV(v, kbuf), kn, LANESV(v, kbuf), N_KV, HEAD_DIM, HEAD_DIM, EPS,
+                             v.stm, v.vw);
         mm5(v, T(il, "attn_v.weight"), v.vbuf);
         // rope reads the view's per-lane positions (WIP3 -> IP3: same
         // pointers, const-qualified for the kernel wrapper)

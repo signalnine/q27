@@ -21,6 +21,9 @@ namespace q27k {
 // x/y: base + h*stride; in-place OK (y==x).
 void rmsnorm_heads(const float* x, const float* w, float* y, int n_heads, int head_dim,
                    int stride, float eps, cudaStream_t st = 0);
+// Lane-packed twin: one launch for ntok lanes (bitwise per (head, lane)).
+void rmsnorm_heads3(CP3 x, const float* w, P3 y, int n_heads, int head_dim, int stride, float eps,
+                    cudaStream_t st, int ntok);
 
 // Per-head L2 norm, in place, contiguous heads.
 void l2norm_heads(float* x, int n_heads, int head_dim, float eps, cudaStream_t st = 0);
