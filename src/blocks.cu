@@ -770,23 +770,24 @@ void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
 static constexpr unsigned KIND_SPEC_ACCEPT = 2u;
 static constexpr unsigned KIND_SPEC_STOP = 3u;
 
-// Serial accept walk (1 thread, like k_prep_round). For lane k (0..3), the draft
-// dr_{k+1} is accepted with prob p_served(dr) = softmax_full(dr)/mass restricted
-// to the nucleus (0 if the draft fell outside it). q is a delta at the greedy
-// draft, so min(1,p/q) = p (rejection sampling, Leviathan/Chen 2023). First
-// reject stops the chain; all-accept leaves stop_lane=4 for the free bonus draw.
-// out[3] = {n, stop_lane, exclude_token}. *cap forces n=1 (in-grammar; Phase-3
-// hook, never set on the sampled path today since tools are off under sampling).
+// Serial accept walk (1 thread, like k_prep_round). For lane k (0..max_draft-1),
+// the draft dr_{k+1} is accepted with prob p_served(dr) = softmax_full(dr)/mass
+// restricted to the nucleus (0 if the draft fell outside it). q is a delta at
+// the greedy draft, so min(1,p/q) = p (rejection sampling, Leviathan/Chen 2023).
+// First reject stops the chain; all-accept leaves stop_lane=max_draft for the
+// free bonus draw. out[3] = {n, stop_lane, exclude_token}. *cap forces n=1
+// (in-grammar; Phase-3 hook, never set on the sampled path today since tools
+// are off under sampling). Drafts ride an IP3 pack (sampled-ladder widening:
+// max_draft ran 1..4 as four named pointers; now 1..W_PLUMB-1, values and
+// Philox counters identical at the old depths -- counter word = lane k).
 __global__ void k_spec_accept(const float* __restrict__ logits2,
-                              const float* __restrict__ nuc5, const int* __restrict__ dr1p,
-                              const int* __restrict__ dr2p, const int* __restrict__ dr3p,
-                              const int* __restrict__ dr4p, const SampleParams* __restrict__ sp,
+                              const float* __restrict__ nuc, IP3 drafts,
+                              const SampleParams* __restrict__ sp,
                               const int* __restrict__ dP, const int* __restrict__ cap,
                               int max_draft, int vocab, int* __restrict__ out) {
     const float inv_temp = sp->inv_temp;
     const unsigned long long seed = sp->seed;
     const unsigned pos = (unsigned)*dP;
-    const int dr[4] = {*dr1p, *dr2p, *dr3p, *dr4p};
     // P14 gate: width-W verify walks max_draft = W-1 drafts. stop_lane inits to
     // max_draft so all-accept commits max_draft drafts + the bonus lane (n=max_draft+1).
     int stop_lane = max_draft, exclude = -1;
@@ -794,9 +795,9 @@ __global__ void k_spec_accept(const float* __restrict__ logits2,
         stop_lane = 0; // n=1: commit only the pending, resample lane 0 fresh
     } else {
         for (int k = 0; k < max_draft; k++) {
-            const float* nl = nuc5 + (size_t)k * 4;
+            const float* nl = nuc + (size_t)k * 4;
             const float thr = nl[0], M = nl[1], logZ = nl[2], mass = nl[3];
-            const int d = dr[k];
+            const int d = *drafts.p[k];
             const float xd = logits2[(size_t)k * vocab + d];
             const float p = (xd >= thr) ? expf(inv_temp * (xd - M) - logZ) / mass : 0.f;
             const float u = philox_uniform(seed, pos, KIND_SPEC_ACCEPT, (unsigned)k);
@@ -809,10 +810,10 @@ __global__ void k_spec_accept(const float* __restrict__ logits2,
     out[1] = stop_lane;
     out[2] = exclude;
 }
-void spec_accept(const float* logits2, const float* nuc5, const int* dr1, const int* dr2,
-                 const int* dr3, const int* dr4, const SampleParams* d_sp, const int* d_P,
+void spec_accept(const float* logits2, const float* d_nuc, IP3 drafts,
+                 const SampleParams* d_sp, const int* d_P,
                  const int* cap, int max_draft, int vocab, int* d_spec, cudaStream_t st) {
-    k_spec_accept<<<1, 1, 0, st>>>(logits2, nuc5, dr1, dr2, dr3, dr4, d_sp, d_P, cap, max_draft,
+    k_spec_accept<<<1, 1, 0, st>>>(logits2, d_nuc, drafts, d_sp, d_P, cap, max_draft,
                                    vocab, d_spec);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -864,38 +865,32 @@ void sample_stop(const float* logits2, const float* nuc5, const int* d_spec,
 }
 
 // Finish bookkeeping keyed on n from k_spec_accept (mirror of k_finish_round,
-// which keys on the equality chain). h_next = the stop lane's hidden x1[n-1]
-// (the position that predicted the new pending nt); *dP += n; outcome carries
-// n, the drafts, and nt (already in dtok from k_sample_stop). outcome[1] (the
-// pre-round pending t1) was snapshotted by k_prep_round.
+// which keys on the equality chain). h_next = the stop lane's hidden
+// x1s.p[n-1] (the position that predicted the new pending nt); *dP += n;
+// outcome uses the GREEDY layout since the sampled-ladder widening
+// ({n, t1, dr1..dr15, pending}): [1] (the pre-round pending t1) was
+// snapshotted by k_prep_round, all W_PLUMB-1 draft slots are written like
+// k_finish_round (slots past the verified width hold stale device values,
+// never read -- emit stops at n), nt lands at [OUTCOME_INTS-1].
 __global__ void k_finish_sampled(int* __restrict__ dP, const int* __restrict__ dtok,
-                                 const int* __restrict__ spec, const int* __restrict__ dr1p,
-                                 const int* __restrict__ dr2p, const int* __restrict__ dr3p,
-                                 const int* __restrict__ dr4p, const float* __restrict__ x1a,
-                                 const float* __restrict__ x1b, const float* __restrict__ x1c,
-                                 const float* __restrict__ x1d, const float* __restrict__ x1e,
+                                 const int* __restrict__ spec, IP3 drafts, CP3 x1s,
                                  float* __restrict__ h_next, int* __restrict__ outcome,
                                  int n_embd) {
     int n = spec[0];
-    const float* src = n == 5 ? x1e : n == 4 ? x1d : n == 3 ? x1c : n == 2 ? x1b : x1a;
+    const float* src = x1s.p[n - 1];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         h_next[i] = src[i];
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         *dP += n;
         outcome[0] = n;
-        outcome[6] = *dtok; // new pending token nt
-        outcome[2] = *dr1p;
-        outcome[3] = *dr2p;
-        outcome[4] = *dr3p;
-        outcome[5] = *dr4p;
+        outcome[OUTCOME_INTS - 1] = *dtok; // new pending token nt
+        for (int k = 0; k + 1 < W_PLUMB; k++) outcome[2 + k] = *drafts.p[k];
     }
 }
-void finish_sampled(int* d_P, const int* d_token, const int* d_spec, const int* dr1,
-                    const int* dr2, const int* dr3, const int* dr4, const float* x1a,
-                    const float* x1b, const float* x1c, const float* x1d, const float* x1e,
+void finish_sampled(int* d_P, const int* d_token, const int* d_spec, IP3 drafts, CP3 x1s,
                     float* h_next, int* outcome, int n_embd, cudaStream_t st) {
-    k_finish_sampled<<<4, 256, 0, st>>>(d_P, d_token, d_spec, dr1, dr2, dr3, dr4, x1a, x1b, x1c,
-                                        x1d, x1e, h_next, outcome, n_embd);
+    k_finish_sampled<<<4, 256, 0, st>>>(d_P, d_token, d_spec, drafts, x1s, h_next, outcome,
+                                        n_embd);
     CUDA_CHECK(cudaGetLastError());
 }
 

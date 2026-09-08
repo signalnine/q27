@@ -386,7 +386,7 @@ struct Engine {
     // per-step {thresh,M,logZ}. All idle for greedy requests.
     q27k::SampleParams samp{0.f, 1.f, 0ull};
     q27k::SampleParams* d_samp = nullptr;
-    float* d_nuc = nullptr;  // [5][4]: {thresh,M,logZ,mass} per verify lane
+    float* d_nuc = nullptr;  // [W_PLUMB][4]: {thresh,M,logZ,mass} per verify lane
     int* d_spec = nullptr;   // [3]: {n, stop_lane, exclude_token} (Phase-2 verdict)
     bool samp_first = false; // first sampled token comes from the retained prefill logits
     // MTP draft head state (stage 1: host-driven acceptance measurement)
@@ -484,7 +484,7 @@ struct Engine {
     bool fast_head = false; // opt-in: Q4 head for verify too (output may differ)
     // Graph-zoo capture gates (2026-07-17, issue #1 small-VRAM work):
     //   sampled_graphs (Q27_SAMPLED, default on): the sampled set --
-    //   sample_graph + spec_sample_graph + verify_sample_graph_w[2..5]
+    //   sample_graph + spec_sample_graph + verify_sample_graph_w[2..gate_maxd+1]
     //   -- serves ONLY temperature>0 requests. =0 skips capture; the server
     //   refuses temp>0 with a 400 and generate() refuses as the belt.
     //   capture_constrained (default true; the server clears it when booted
@@ -561,7 +561,8 @@ struct Engine {
     //                              -> gated greedy round (spec_round), both
     //                                 Q27_DEXIT on and off. Widths 9..12 are
     //                                 suffix-only (captured in P1).
-    //   verify_sample_graph_w[6]   per-width SAMPLED verify, [W=2..5].
+    //   verify_sample_graph_w[]    per-width SAMPLED verify, [W=2..gate_maxd+1]
+    //                              (widened with the sampled ladder 2026-09-07).
     //                              -> gated sampled round (spec_sample_round),
     //                                 both Q27_DEXIT on and off.
     //   draft_step_graph[7]        per-draft-STEP graphs, [step=0..gate_maxd-1].
@@ -700,9 +701,10 @@ struct Engine {
     // (rejection) verify tail. Captured only when the sampler kernels are warm.
     cudaGraphExec_t spec_sample_graph = nullptr;
     // P14: per-width sampled verify graphs (sampled analog of verify_graph_w).
-    // [W=2..5]; the sampled+gated round drafts depth-4, reads the 4
-    // draft margins, caps the accept walk at W-1, and launches this at width W.
-    cudaGraphExec_t verify_sample_graph_w[6] = {}; // [W<=5] (sampled ceiling stays 4)
+    // [W=2..gate_maxd+1] since the sampled-ladder widening; the sampled+gated
+    // round drafts to gate_maxd under the theta gate, caps the accept walk at
+    // W-1, and launches this at width W.
+    cudaGraphExec_t verify_sample_graph_w[W_MAX + 1] = {}; // [W=2..gate_maxd+1] (sampled ladder)
     // P14 draft early-exit: one graph per draft STEP (k=0..gate_maxd-1), so the
     // gated rounds can stop drafting at the first sub-theta margin (llama's
     // p_min stops DRAFTING; the P12 gate only narrowed verify). Steps 0..k
@@ -993,10 +995,11 @@ struct Engine {
         A((void**)&d_gen, (size_t)max_ctx * 4);
         A((void**)&d_amax, 8);
         A((void**)&d_samp, sizeof(q27k::SampleParams));
-        // d_nuc: 5 lanes x {thresh,M,logZ,mass}. Plain path uses lane 0; the
-        // sampled spec round (Phase 2) fills all 5 verify lanes. d_spec holds the
+        // d_nuc: W_PLUMB lanes x {thresh,M,logZ,mass} (plumb-wide per the lane
+        // rule; sampled verify fills vw lanes, up to gate_maxd+1 since the
+        // sampled-ladder widening). Plain path uses lane 0. d_spec holds the
         // rejection-sampling verdict {n, stop_lane, exclude_token}.
-        A((void**)&d_nuc, 5 * 4 * 4);
+        A((void**)&d_nuc, W_PLUMB * 4 * 4);
         A((void**)&d_spec, 3 * 4);
         A((void**)&d_draft_margin, 7 * 4); // maxd7: up to 7 draft margins
         A((void**)&d_am_blk1, 128 * 8);    // P14: fused draft argmax+margin scratch
@@ -2356,8 +2359,10 @@ struct Engine {
         // P14: width-vw sampled verify -- nucleus stats + accept walk over the
         // first vw lanes only (vw=5 monolithic; vw=cap+1 under the gate). The
         // accept walk caps at vw-1 drafts so finish never commits an uncomputed
-        // lane. vw=5 => max_draft=4 (the pre-P14 behavior). k_finish_sampled is
-        // unchanged: it keys on n<=vw and its src select covers n in 1..5.
+        // lane. Sampled-ladder widening: vw now runs 2..gate_maxd+1 (was <=5);
+        // drafts/x1 ride the same lane packs the greedy tail passes, so the
+        // launch sequence at the old widths is value-identical (gate: seeded
+        // depth-4 runs match the pre-widening binary token-for-token).
         // One launch, one block per lane (2026-08-18): bitwise identical per
         // lane, but the lanes no longer serialize as vw single-block kernels
         // each occupying one SM of 170.
@@ -2366,12 +2371,13 @@ struct Engine {
             for (int k = 0; k < v.vw; k++) lgs.p[k] = v.lg[k];
             q27k::nucleus_multi(lgs, VOCAB, d_samp, d_nuc, v.vw, v.stm);
         }
-        q27k::spec_accept(logits2, d_nuc, d_draft, d_draft2, d_draft3, d_draft4, d_samp, d_P,
+        q27k::IP3 drafts{};
+        for (int k = 0; k + 1 < W_PLUMB; k++) drafts.p[k] = d_draft_L[k];
+        q27k::spec_accept(logits2, d_nuc, drafts, d_samp, d_P,
                           d_accept_cap, v.vw - 1, VOCAB, d_spec, v.stm);
         q27k::sample_stop(logits2, d_nuc, d_spec, d_samp, d_P, VOCAB, d_token, d_amax, v.stm);
-        q27k::finish_sampled(d_P, d_token, d_spec, d_draft, d_draft2, d_draft3, d_draft4, x1,
-                             x1_L[1], x1_L[2], x1_L[3], x1_L[4], h_next, d_outcome, N_EMBD,
-                             v.stm);
+        q27k::finish_sampled(d_P, d_token, d_spec, drafts, LANESW(x1), h_next, d_outcome,
+                             N_EMBD, v.stm);
     }
     void spec_verify_launches_sampled(const LaneView& v) {
         spec_verify_forward(v);
@@ -2649,23 +2655,29 @@ struct Engine {
         } else {
         q27k::SampleParams warm{1.f, 1.f, 0ull};
         CUDA_CHECK(cudaMemcpyAsync(d_samp, &warm, sizeof warm, cudaMemcpyHostToDevice, stm));
-        dmax = 4; vw = 5; // sampling stays depth-4 (5-lane) in this phase
+        // Sampled-ladder widening: warm at the WIDEST sampled shapes (depth
+        // gate_maxd, width gate_maxd+1) so the wide sampled-tail launches
+        // never lazy-load inside capture; the ungated monolithic round stays
+        // depth-4/width-5 below (its capture resets dmax/vw first).
+        dmax = gate_maxd; vw = gate_maxd + 1;
         seed_positions();
         spec_sample_round_launches();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         reset_gdn_mtp();
         { // M1b: one sampled capture (see the greedy set's note)
+            dmax = 4; vw = 5; // ungated sampled round: unchanged depth-4/width-5
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
             spec_sample_round_launches();
             CUDA_CHECK(cudaStreamEndCapture(stm, &gr));
             inst_or_advise(&spec_sample_graph, gr, "sampled round");
             CUDA_CHECK(cudaGraphDestroy(gr));
-            // P14: per-width sampled verify graphs (W=2..5), mirroring the greedy
-            // verify_graph_w loop. The sampled tail is always depth-4, so the
-            // widest sampled verify is width-5 (W<=5) regardless of gate_maxd.
-            // Same buffers as the monolithic sampled verify; only vw shrinks.
-            for (int W = 2; W <= 5; W++) {
+            dmax = gate_maxd;
+            // P14: per-width sampled verify graphs, mirroring the greedy
+            // verify_graph_w loop. Widened with the sampled ladder: the gated
+            // sampled round drafts to gate_maxd, so W runs 2..gate_maxd+1
+            // (was 2..5). Same buffers as the monolithic sampled verify.
+            for (int W = 2; W <= gate_maxd + 1; W++) {
                 vw = W;
                 cudaGraph_t gw;
                 CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
@@ -2735,7 +2747,7 @@ struct Engine {
                 gate_maxd + 1,
                 (maxd_auto && (!dexit_on || capture_constrained)) ? "; +P13 depth-4 draft"
                                                                   : "",
-                sampled_graphs ? "; +P14 sampled per-width verify 2..5"
+                sampled_graphs ? "; +sampled per-width verify 2..maxd+1"
                                : "; sampled set SKIPPED (Q27_SAMPLED=0)",
                 gate_maxd - 1,
                 pmin_theta, pmin_theta > 0 ? "gated" : "off", gate_maxd,
@@ -3172,7 +3184,11 @@ struct Engine {
     // loop; also carries draft_and_gate's gated-config precondition.
     int draft_md_used(bool sampled) const {
         assert(pmin_theta > 0.f && dexit_on && !tool_split_active);
-        return sampled ? 4 : (maxd_auto ? dctl.cur : gate_maxd);
+        // Sampled-ladder widening: sampled rounds ride the SAME P13 adaptive
+        // ceiling as greedy (they feed dctl too -- see spec_sample_round's
+        // gated branch for why fixed gate_maxd lost).
+        (void)sampled;
+        return maxd_auto ? dctl.cur : gate_maxd;
     }
     // why: the conductor launches step k on EVERY active member's stm before
     // syncing any of them -- graph launch + margin D2H only, deliberately NO
@@ -3208,7 +3224,7 @@ struct Engine {
     // gated dexit config (pmin_theta > 0, dexit_on, no tool split).
     // sampled=true mirrors spec_sample_round's gated dexit branch instead:
     // first-token bootstrap from the retained prefill logits (samp_first) and
-    // the FIXED sampled ceiling 4 (the sampled tail is 4-draft this phase),
+    // the shared P13 adaptive ceiling (sampled rounds feed dctl too),
     // so a sampled member's fused round consumes the identical drafts +
     // Philox keys its solo round would.
     // out_cap/out_md (Task 9): this round's margin-run depth and drafting
@@ -3264,9 +3280,9 @@ struct Engine {
     // gate_cap/gate_n/lane histograms, and the dctl ladder update (Task 9:
     // Q27_MAXD=auto members MUST feed dctl exactly like spec_round or the
     // adaptive ceiling drifts between solo and fused serving). Sampled
-    // (spec_sample_round): the sampled outcome layout differs -- pending at
-    // oc[6], no suffix arming, and NO dctl/histogram updates (the sampled
-    // ceiling is fixed at 4; spec_sample_round updates nothing either).
+    // (spec_sample_round): same outcome layout since the sampled-ladder
+    // widening -- pending at oc[OUTCOME_INTS-1]; no suffix arming, and NO
+    // dctl updates (the sampled ceiling is the fixed gate_maxd).
     // oc = this engine's d_outcome, already on host (the conductor does one
     // D2H + sync per round for the whole batch). gate_cap/md_used come from
     // draft_and_gate's out-params (-1 = suffix/none, skips the gated block).
@@ -3300,9 +3316,11 @@ struct Engine {
         }
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
         if (sampled) {
-            last_pending = oc[6]; // sampled outcome: {n, t1..t5, pending}
-            // Accept-gate telemetry for FUSED sampled rounds (monitoring
-            // only; sampled rounds never feed dctl/EMA -- fixed ceiling 4).
+            // Sampled outcome uses the greedy layout since the widening.
+            last_pending = oc[OUTCOME_INTS - 1];
+            // Accept-gate telemetry + P13 dctl feed for FUSED sampled rounds
+            // (sampled-ladder widening: sampled rounds ride the same adaptive
+            // ceiling as greedy; same trim clamp as the greedy branch above).
             if (gate_cap >= 0) {
                 int cap = gate_cap < vw - 1 ? gate_cap : vw - 1; // trim clamp
                 gate_cap_hist[cap]++;
@@ -3312,6 +3330,7 @@ struct Engine {
                     gate_lane_fired[j]++;
                     if (n >= j + 1) gate_lane_acc[j]++;
                 }
+                if (maxd_auto) dctl.update(md_used, cap, n);
             }
         } else {
             last_pending = oc[OUTCOME_INTS - 1];
@@ -3365,18 +3384,25 @@ struct Engine {
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
         }
         int gated_cap = -1; // accept-gate telemetry: set in the gated branches below
+        int md_used_r = -1; // this round's drafting ceiling (gated branches; feeds dctl)
         if (pmin_theta > 0.f) {
             // P14 confidence-gated sampled round -- mirror spec_round's gated
-            // branch. The sampled tail is 4-draft this phase, so ALWAYS draft
-            // depth-4: draft_graph is depth-4 when gate_maxd==4; under
-            // gate_maxd==5 (auto or fixed) draft_graph_lo is the depth-4
-            // draft (captured whenever gate_maxd==5). Cap the accept walk at 4.
+            // branch. Sampled-ladder widening (2026-09-07): the ceiling floats
+            // over the SAME P13 dctl ladder as greedy (4..gate_maxd on
+            // saturation evidence; sampled rounds feed dctl below). A fixed
+            // gate_maxd ceiling was tried first and LOST 5-10% on think
+            // traffic (xe sweep 2026-09-07): our draft steps are SEQUENTIAL
+            // (~0.45 ms each), so unconditional deep drafting burns more than
+            // the ~0.14/0.07/0.05-accept tail lanes pay -- ninfer affords
+            // fixed-7 only because its DFlash2 forward drafts all 7 at once.
+            // Q27_MAXD=4 restores the old sampled behavior exactly.
             // Tools are off under sampling, so no split path.
-            const int md_used = 4; // sampled ceiling is 4; cap <= 4 by construction
+            const int md_used = maxd_auto ? dctl.cur : gate_maxd;
+            md_used_r = md_used;
             if (dexit_on) {
                 // P14 draft early-exit, sampled flavor: per-step draft graphs
-                // are depth-independent (steps 0..3 here), margins and caps are
-                // value-identical to the monolithic depth-4 draft, and the
+                // are depth-independent (steps 0..md_used-1), margins and caps
+                // are value-identical to the monolithic gated draft, and the
                 // accept walk consumes the identical drafts + Philox keys -- so
                 // emitted bytes and round counts match Q27_DEXIT=0 exactly.
                 int cap = 0, launched = 0;
@@ -3389,7 +3415,7 @@ struct Engine {
                     if (h_draft_margin[k] < pmin_theta) break;
                     cap++;
                 }
-                assert(cap <= 4);
+                assert(cap <= md_used);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 // Width-floor top-up (see spec_round): a width-W sampled verify
                 // walks max_draft=W-1 drafts, so W draft rows must exist. Only
@@ -3399,44 +3425,52 @@ struct Engine {
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
                 gated_cap = cap;
             } else {
-                // Q27_DEXIT=0: monolithic depth-4 gated draft (A/B baseline).
-                cudaGraphExec_t dg = (gate_maxd >= 5) ? draft_graph_lo : draft_graph;
+                // Q27_DEXIT=0: monolithic gated draft (A/B baseline) -- the
+                // same graph choice as greedy's mono branch since the
+                // sampled-ladder widening (was always the depth-4
+                // draft_graph_lo).
+                cudaGraphExec_t dg =
+                    (maxd_auto && md_used == 4) ? draft_graph_lo : draft_graph;
                 CUDA_CHECK(cudaGraphLaunch(dg, stm));
                 CUDA_CHECK(cudaMemcpyAsync(h_draft_margin, d_draft_margin, md_used * 4,
                                            cudaMemcpyDeviceToHost, stm));
                 CUDA_CHECK(cudaStreamSynchronize(stm));
                 int cap = 0;
                 while (cap < md_used && h_draft_margin[cap] >= pmin_theta) cap++;
-                assert(cap <= 4);
+                assert(cap <= md_used);
                 int W = cap + 1 < 2 ? 2 : cap + 1; // no width-1 gemv; floor at 2
                 CUDA_CHECK(cudaGraphLaunch(verify_sample_graph_w[W], stm));
                 gated_cap = cap;
             }
-            // P13 EMA (sat/yield) is NOT updated from sampled rounds this phase
-            // (sampled ceiling is fixed at 4); adaptive-maxd applies to greedy only.
         } else {
             CUDA_CHECK(cudaGraphLaunch(spec_sample_graph, stm));
         }
-        int oc[7];
-        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, 28, cudaMemcpyDeviceToHost, stm));
+        // Sampled outcome uses the greedy layout since the widening:
+        // [0]=n, [1..W_PLUMB]=emitted, [OUTCOME_INTS-1]=new pending.
+        int oc[OUTCOME_INTS];
+        CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         int n = oc[0];
         for (int k = 0; k < n; k++) emit[k] = oc[1 + k];
-        last_pending = oc[6];
+        last_pending = oc[OUTCOME_INTS - 1];
         fold_pending = n - 1; // M1: folded in post_round (after on_round truncation)
-        // Accept-gate telemetry for sampled rounds (monitoring only; sampled
-        // rounds never feed dctl/EMA -- the sampled ceiling is fixed at 4).
-        // Mirrors the greedy block in spec_round/commit_outcome so the
-        // /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
+        // Accept-gate telemetry + P13 dctl feed for sampled rounds. Since the
+        // sampled-ladder widening, sampled gated rounds update the adaptive
+        // ceiling exactly like greedy (same (md, cap, n) semantics; realized
+        // sampled acceptance is what the ladder should ride on sampled
+        // traffic). Mirrors the greedy block in spec_round/commit_outcome so
+        // the /metrics spec counters (and the [req] gch/gnh/glf/gla) populate
         // under sampled traffic too.
         if (gated_cap >= 0) {
             gate_cap_hist[gated_cap]++;
             gate_n_hist[n]++;
             if (n <= W_MAX) gate_joint[gated_cap][n]++;
+            mprobe_log(gated_cap, n, md_used_r);
             for (int j = 1; j <= gated_cap; j++) {
                 gate_lane_fired[j]++;
                 if (n >= j + 1) gate_lane_acc[j]++;
             }
+            if (maxd_auto) dctl.update(md_used_r, gated_cap, n);
         }
         return n;
     }

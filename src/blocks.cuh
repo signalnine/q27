@@ -156,22 +156,24 @@ void nucleus(const float* logits, int n, const SampleParams* d_sp, float* d_nuc,
 void nucleus_multi(CP3 xs, int n, const SampleParams* d_sp, float* d_nuc, int L,
                    cudaStream_t st = 0);
 // Rejection-sampling accept walk over up to max_draft greedy drafts vs logits2.
-// d_nuc5 = [5][4], d_P = committed position (Philox key), cap forces n=1.
+// d_nuc = [W_PLUMB][4], d_P = committed position (Philox key), cap forces n=1.
 // max_draft = accept-walk depth (P14 confidence gate: width-W verify walks W-1
 // drafts; stop_lane inits to max_draft so all-accept commits the bonus lane).
+// drafts = IP3 lane pack (slot k = draft k+1; slots >= max_draft never read) --
+// was 4 named pointers until the sampled ladder widened past depth 4.
 // Writes d_spec[3] = {n, stop_lane, exclude_token}.
-void spec_accept(const float* logits2, const float* d_nuc5, const int* dr1, const int* dr2,
-                 const int* dr3, const int* dr4, const SampleParams* d_sp, const int* d_P,
+void spec_accept(const float* logits2, const float* d_nuc, IP3 drafts,
+                 const SampleParams* d_sp, const int* d_P,
                  const int* cap, int max_draft, int vocab, int* d_spec, cudaStream_t st = 0);
 // Resample the new pending token from the stop lane's nucleus (exclude the
 // rejected draft) via device-indirected Gumbel-max; writes it into d_out.
 void sample_stop(const float* logits2, const float* d_nuc5, const int* d_spec,
                  const SampleParams* d_sp, const int* d_P, int vocab, int* d_out,
                  unsigned long long* d_scratch, cudaStream_t st = 0);
-// Finish bookkeeping keyed on n from d_spec: h_next = x1[n-1], *d_P += n, outcome.
-void finish_sampled(int* d_P, const int* d_token, const int* d_spec, const int* dr1,
-                    const int* dr2, const int* dr3, const int* dr4, const float* x1a,
-                    const float* x1b, const float* x1c, const float* x1d, const float* x1e,
+// Finish bookkeeping keyed on n from d_spec: h_next = x1s.p[n-1], *d_P += n,
+// outcome in the GREEDY layout ({n, t1, dr1..dr15, pending}, pending at
+// [OUTCOME_INTS-1]) -- unified when the sampled ladder widened past depth 4.
+void finish_sampled(int* d_P, const int* d_token, const int* d_spec, IP3 drafts, CP3 x1s,
                     float* h_next, int* outcome, int n_embd, cudaStream_t st = 0);
 
 } // namespace q27k

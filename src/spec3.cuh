@@ -10,7 +10,8 @@
 
 namespace q27k {
 
-struct IP3 { const int* p[16]; }; // width-12: 12 live lanes max, 16 slots (see P3/CP3)
+// IP3 (the const-int lane pack) moved to kernels.cuh next to P3/CP3 -- the
+// sampled tail in blocks.cuh takes it too.
 // Writable-int lane bundle (positions, verdict slots): prep/finish hit the
 // 17/25-param wall at width 8, so wide-verify pointer args ride these
 // by-value structs instead of growing the signatures (width-12 P0).

@@ -2756,21 +2756,24 @@ static void test_sample() {
 }
 
 // Phase 2: spec rejection sampling (k_spec_accept + k_sample_stop). Synthetic
-// 5-lane logits + greedy drafts, no model. The token committed at lane 0's
-// position is dr1 when accepted, else the exclude-masked resample -- and the
-// rejection-sampling theorem says that composition reproduces p_served(lane0)
-// EXACTLY, with P(accept dr1) = p_served(dr1) = softmax_full(dr1)/nucleus_mass.
-// So this gates: the mass-correct accept prob, the served-target distribution,
-// determinism, and that a rejected draft is never re-emitted.
+// 8-lane logits + greedy drafts, no model (widened from 5 with the sampled
+// ladder -- the accept walk now runs to max_draft 7). The token committed at
+// lane 0's position is dr1 when accepted, else the exclude-masked resample --
+// and the rejection-sampling theorem says that composition reproduces
+// p_served(lane0) EXACTLY, with P(accept dr1) = p_served(dr1) =
+// softmax_full(dr1)/nucleus_mass. So this gates: the mass-correct accept prob,
+// the served-target distribution, determinism, that a rejected draft is never
+// re-emitted, and (new) the depth-7 chain: P(n >= m) = prod_{j<m-1} p_served(dr_j).
 static void test_spec_sample() {
     const int V = 64;
+    const int LANES = 8;                  // sampled ladder: up to 7 drafts + bonus
     const float invT = 1.0f / 0.85f;      // T=0.85
     const float topp = 0.9f;              // <1 -> nucleus mass < 1 exercises the accept path
     const unsigned long long seed = 20260705ull;
 
-    std::vector<float> flat(5 * V);
-    std::vector<std::vector<float>> L(5);
-    for (int k = 0; k < 5; k++) {
+    std::vector<float> flat(LANES * V);
+    std::vector<std::vector<float>> L(LANES);
+    for (int k = 0; k < LANES; k++) {
         L[k] = rand_vec(V, 100 + k * 7);
         for (auto& v : L[k]) v *= 2.2f;
         for (int i = 0; i < V; i++) flat[k * V + i] = L[k][i];
@@ -2778,50 +2781,59 @@ static void test_spec_sample() {
     auto argmax = [&](int k) {
         int b = 0; for (int i = 1; i < V; i++) if (L[k][i] > L[k][b]) b = i; return b;
     };
-    int drafts[4] = {argmax(0), argmax(1), argmax(2), argmax(3)};
+    int drafts[LANES - 1];
+    for (int k = 0; k + 1 < LANES; k++) drafts[k] = argmax(k);
 
     float *d_logits2, *d_nuc5; int *d_spec, *d_out, *d_P, *d_drafts, *d_cap;
     unsigned long long* d_scr; q27k::SampleParams* d_sp;
-    CUDA_CHECK(cudaMalloc(&d_logits2, 5 * V * 4));
-    CUDA_CHECK(cudaMalloc(&d_nuc5, 5 * 4 * 4));
+    CUDA_CHECK(cudaMalloc(&d_logits2, LANES * V * 4));
+    CUDA_CHECK(cudaMalloc(&d_nuc5, LANES * 4 * 4));
     CUDA_CHECK(cudaMalloc(&d_spec, 3 * 4));
     CUDA_CHECK(cudaMalloc(&d_out, 4));
     CUDA_CHECK(cudaMalloc(&d_P, 4));
-    CUDA_CHECK(cudaMalloc(&d_drafts, 4 * 4));
+    CUDA_CHECK(cudaMalloc(&d_drafts, (LANES - 1) * 4));
     CUDA_CHECK(cudaMalloc(&d_cap, 4));
     CUDA_CHECK(cudaMalloc(&d_scr, 8));
     CUDA_CHECK(cudaMalloc(&d_sp, sizeof(q27k::SampleParams)));
-    CUDA_CHECK(cudaMemcpy(d_logits2, flat.data(), 5 * V * 4, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_drafts, drafts, 4 * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_logits2, flat.data(), LANES * V * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_drafts, drafts, (LANES - 1) * 4, cudaMemcpyHostToDevice));
     int zero = 0; CUDA_CHECK(cudaMemcpy(d_cap, &zero, 4, cudaMemcpyHostToDevice));
     q27k::SampleParams sp{invT, topp, seed};
     CUDA_CHECK(cudaMemcpy(d_sp, &sp, sizeof sp, cudaMemcpyHostToDevice));
 
-    for (int k = 0; k < 5; k++)
+    for (int k = 0; k < LANES; k++)
         q27k::nucleus(d_logits2 + k * V, V, d_sp, d_nuc5 + k * 4, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
-    float nuc[5 * 4]; CUDA_CHECK(cudaMemcpy(nuc, d_nuc5, 5 * 4 * 4, cudaMemcpyDeviceToHost));
+    float nuc[LANES * 4];
+    CUDA_CHECK(cudaMemcpy(nuc, d_nuc5, LANES * 4 * 4, cudaMemcpyDeviceToHost));
 
-    // (a) nucleus mass for lane 0 vs a CPU sum over the GPU threshold.
+    // (a) per-lane served distributions on CPU (lane 0 gates the mass; every
+    // lane's p_served(draft) feeds the depth-7 chain check below).
     const float thr0 = nuc[0], mass0 = nuc[3];
-    std::vector<double> ps(V, 0.0); double cpu_mass = 0;
-    {
-        double Mx = L[0][0]; for (int i = 1; i < V; i++) Mx = std::max(Mx, (double)L[0][i]);
+    std::vector<std::vector<double>> psl(LANES, std::vector<double>(V, 0.0));
+    double cpu_mass0 = 0;
+    for (int k = 0; k < LANES; k++) {
+        const float thr = nuc[k * 4];
+        double Mx = L[k][0]; for (int i = 1; i < V; i++) Mx = std::max(Mx, (double)L[k][i]);
         double Z = 0; std::vector<double> sf(V);
-        for (int i = 0; i < V; i++) { sf[i] = std::exp((double)invT * (L[0][i] - Mx)); Z += sf[i]; }
+        for (int i = 0; i < V; i++) { sf[i] = std::exp((double)invT * (L[k][i] - Mx)); Z += sf[i]; }
         for (int i = 0; i < V; i++) sf[i] /= Z;
-        for (int i = 0; i < V; i++) if (L[0][i] >= thr0) cpu_mass += sf[i];
-        for (int i = 0; i < V; i++) if (L[0][i] >= thr0) ps[i] = sf[i] / cpu_mass;
+        double mass = 0;
+        for (int i = 0; i < V; i++) if (L[k][i] >= thr) mass += sf[i];
+        for (int i = 0; i < V; i++) if (L[k][i] >= thr) psl[k][i] = sf[i] / mass;
+        if (k == 0) cpu_mass0 = mass;
     }
-    printf("    [lane0 thr=%.3f mass_gpu=%.4f mass_cpu=%.4f]\n", thr0, mass0, cpu_mass);
-    check("spec nucleus mass vs CPU", std::fabs(mass0 - cpu_mass), 2e-3);
+    const std::vector<double>& ps = psl[0];
+    printf("    [lane0 thr=%.3f mass_gpu=%.4f mass_cpu=%.4f]\n", thr0, mass0, cpu_mass0);
+    check("spec nucleus mass vs CPU", std::fabs(mass0 - cpu_mass0), 2e-3);
 
     // P14: round() takes max_draft (the accept-walk cap). max_draft==4 reproduces
-    // the pre-P14 width-5 behavior (stop_lane init 4, loop k<4).
+    // the pre-P14 width-5 behavior; the sampled ladder runs it to 7.
     auto round = [&](int P, int md, int& n_out, int& nt_out) {
         CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
-        q27k::spec_accept(d_logits2, d_nuc5, d_drafts, d_drafts + 1, d_drafts + 2, d_drafts + 3,
-                          d_sp, d_P, d_cap, md, V, d_spec, 0);
+        q27k::IP3 dpk{};
+        for (int k = 0; k + 1 < LANES; k++) dpk.p[k] = d_drafts + k;
+        q27k::spec_accept(d_logits2, d_nuc5, dpk, d_sp, d_P, d_cap, md, V, d_spec, 0);
         q27k::sample_stop(d_logits2, d_nuc5, d_spec, d_sp, d_P, V, d_out, d_scr, 0);
         int spec[3], nt;
         CUDA_CHECK(cudaMemcpy(spec, d_spec, 3 * 4, cudaMemcpyDeviceToHost));
@@ -2829,11 +2841,14 @@ static void test_spec_sample() {
         n_out = spec[0]; nt_out = nt;
     };
 
-    // (b) seeded identity: same (seed, P) -> identical n and nt.
+    // (b) seeded identity: same (seed, P) -> identical n and nt, at both the
+    // legacy depth and the widened depth.
     {
         int n1, nt1, n2, nt2;
         round(555, 4, n1, nt1); round(555, 4, n2, nt2);
         check("spec seeded identity", (double)((n1 != n2) || (nt1 != nt2)), 0.5);
+        round(556, 7, n1, nt1); round(556, 7, n2, nt2);
+        check("spec seeded identity md=7", (double)((n1 != n2) || (nt1 != nt2)), 0.5);
     }
 
     // (c,d,e) committed@lane0 distribution + accept rate + exclude respected.
@@ -2863,6 +2878,29 @@ static void test_spec_sample() {
     double bound = df + 8.0 * std::sqrt(2.0 * (df > 0 ? df : 1)) + 40.0;
     printf("    [spec chi2=%.2f df=%d bound=%.1f]\n", chi2, df, bound);
     check("spec rejection-sampling vs served target", chi2 < bound ? 0.0 : 1.0, 0.5);
+
+    // (f) depth-7 chain (sampled ladder): P(n >= m) = prod_{j=0}^{m-2}
+    // p_served_j(dr_j) -- the walk accepts lane j with exactly its served
+    // probability, independently per lane (disjoint Philox counters). Checked
+    // for every m at max_draft=7 against the CPU chain, binomial tolerance.
+    {
+        const int N7 = 8192;
+        std::vector<int> ge(LANES + 1, 0);
+        for (int t = 0; t < N7; t++) {
+            int n, nt; round(200000 + t, 7, n, nt);
+            for (int m = 2; m <= LANES; m++) if (n >= m) ge[m]++;
+        }
+        double chain = 1.0, worst = 0.0;
+        for (int m = 2; m <= LANES; m++) {
+            chain *= psl[m - 2][drafts[m - 2]];
+            double emp = (double)ge[m] / N7;
+            double tol = 5.0 * std::sqrt(std::max(chain * (1 - chain), 1e-6) / N7) + 2e-3;
+            worst = std::max(worst, std::fabs(emp - chain) - tol);
+            if (m == LANES)
+                printf("    [chain md=7: P(n>=8) emp=%.4f cpu=%.4f]\n", emp, chain);
+        }
+        check("spec depth-7 accept chain", worst, 0.0 + 1e-9);
+    }
 
     // Reasoning-boundary cap: sampled speculation commits exactly the pending
     // token, matching greedy k_finish_round before a forced decoder transition.
@@ -2931,20 +2969,54 @@ static void test_spec_sample() {
     // (g) all-accept -> stop_lane==max_draft (bonus lane). Dominant drafts
     // (p_served==1) force every lane to accept under any seed, for md 1..4.
     {
-        std::vector<float> dom(5 * V, 0.f);
-        for (int k = 0; k < 4; k++) dom[k * V + drafts[k]] = 50.f; // drafts[k] dominates lane k
-        CUDA_CHECK(cudaMemcpy(d_logits2, dom.data(), 5 * V * 4, cudaMemcpyHostToDevice));
-        for (int k = 0; k < 5; k++)
+        std::vector<float> dom(LANES * V, 0.f);
+        for (int k = 0; k + 1 < LANES; k++) dom[k * V + drafts[k]] = 50.f; // drafts[k] dominates lane k
+        CUDA_CHECK(cudaMemcpy(d_logits2, dom.data(), LANES * V * 4, cudaMemcpyHostToDevice));
+        for (int k = 0; k < LANES; k++)
             q27k::nucleus(d_logits2 + k * V, V, d_sp, d_nuc5 + k * 4, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
         int viol = 0;
-        for (int md = 1; md <= 4; md++)
+        for (int md = 1; md < LANES; md++)       // sampled ladder: walk depths 1..7
             for (int t = 0; t < 256; t++) {
                 int n, nt; round(4000000 + md * 100000 + t, md, n, nt);
                 if (n != md + 1) viol++;              // all-accept => stop_lane==md
             }
         printf("    [all-accept viol=%d (want 0)]\n", viol);
         check("spec all-accept stop_lane==max_draft", (double)viol, 0.5);
+    }
+
+    // (h) deep-lane conditional accept (gpt-6-astra review: the random chain
+    // test has ~1.55 expected n>=8 observations in 8192 trials -- zero passes
+    // its tolerance, so lanes 5-6 were effectively ungated). Dominant drafts
+    // on lanes 0..4 force every walk to reach lane 5; lanes 5..7 keep the
+    // ORIGINAL random logits, so lane 5/6 accept rates are measured with full
+    // and ~p5*N samples against the CPU served probabilities.
+    {
+        std::vector<float> mix(LANES * V, 0.f);
+        for (int k = 0; k < 5; k++) mix[k * V + drafts[k]] = 50.f;
+        for (int k = 5; k < LANES; k++)
+            for (int i = 0; i < V; i++) mix[k * V + i] = flat[k * V + i];
+        CUDA_CHECK(cudaMemcpy(d_logits2, mix.data(), LANES * V * 4, cudaMemcpyHostToDevice));
+        for (int k = 0; k < LANES; k++)
+            q27k::nucleus(d_logits2 + k * V, V, d_sp, d_nuc5 + k * 4, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const int NH = 8192;
+        int reach5 = 0, acc5 = 0, reach6 = 0, acc6 = 0;
+        for (int t = 0; t < NH; t++) {
+            int n, nt; round(6000000 + t, 7, n, nt);
+            // lanes 0..4 always accept => n >= 6 always; stop_lane = n-1
+            reach5++;
+            if (n >= 7) { acc5++; reach6++; }
+            if (n >= 8) acc6++;
+        }
+        double r5 = (double)acc5 / reach5;
+        double r6 = reach6 ? (double)acc6 / reach6 : 0.0;
+        double p5 = psl[5][drafts[5]], p6 = psl[6][drafts[6]];
+        printf("    [lane5 cond-accept=%.4f p_served=%.4f | lane6 %.4f vs %.4f (reached %d)]\n",
+               r5, p5, r6, p6, reach6);
+        check("spec lane5 accept == p_served (md=7)", std::fabs(r5 - p5), 0.03);
+        if (reach6 >= 500)
+            check("spec lane6 accept == p_served (md=7)", std::fabs(r6 - p6), 0.05);
     }
 
     CUDA_CHECK(cudaFree(d_logits2)); CUDA_CHECK(cudaFree(d_nuc5)); CUDA_CHECK(cudaFree(d_spec));
