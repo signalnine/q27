@@ -568,6 +568,72 @@ void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st, int ntok) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Fused rmsnorm3 + quantize_x3 (2026-09-08): one block per lane runs
+// k_rmsnorm3's body verbatim (y = x * inv * w), then, after a block barrier,
+// k_quantize_x3's per-32-group body over the y it just wrote (warp w takes
+// groups w, w+32, ...). Every value is computed by the same expressions on
+// the same inputs, so y / nat / eo / scale / isum are bitwise those of the
+// two-launch sequence (test_rmsnorm3q). Every rmsnorm3 in the verify forward
+// is followed by a quantize of the same buffer -- 129 node pairs at width 8.
+__global__ void k_rmsnorm3q(__grid_constant__ const CP3 xp, const float* __restrict__ w,
+                            __grid_constant__ const P3 yp, __grid_constant__ const XQ3 xq, int n,
+                            float eps) {
+    const int t = blockIdx.x;
+    const float* x = xp.p[t];
+    float* y = yp.p[t];
+    __shared__ float sh[32];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
+    acc = warp_reduce(acc);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? sh[threadIdx.x] : 0.f;
+        v = warp_reduce(v);
+        if (threadIdx.x == 0) sh[0] = v;
+    }
+    __syncthreads();
+    float inv = rsqrtf(sh[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+    __syncthreads(); // y complete and visible block-wide before the quantize reads it
+    // ---- k_quantize_x3 body, group b, lane = threadIdx.x & 31 ----
+    int8_t* nat = xq.q[t].nat;
+    uint2* eo = xq.q[t].eo;
+    float* scale = xq.q[t].scale;
+    int* isum = xq.q[t].isum;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    const int nblocks = n / 32;
+    for (int b = warp; b < nblocks; b += nwarp) {
+        float v = y[b * 32 + lane];
+        float amax = fabsf(v);
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        float s = amax / 127.f;
+        float inv_s = s > 0.f ? 1.f / s : 0.f;
+        int q = __float2int_rn(v * inv_s);
+        q = max(-127, min(127, q));
+        nat[b * 32 + lane] = (int8_t)q;
+        int bsum = q;
+        for (int off = 16; off > 0; off >>= 1) bsum += __shfl_xor_sync(0xffffffff, bsum, off);
+        if (lane == 0) { scale[b] = s; isum[b] = bsum; }
+        int base = (lane & 3) * 8;
+        uint32_t e = 0, o = 0;
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            int qe = __shfl_sync(0xffffffff, q, base + 2 * kk);
+            int qo = __shfl_sync(0xffffffff, q, base + 2 * kk + 1);
+            e |= (uint32_t)(uint8_t)(int8_t)qe << (8 * kk);
+            o |= (uint32_t)(uint8_t)(int8_t)qo << (8 * kk);
+        }
+        if (lane < 4) eo[b * 4 + lane] = make_uint2(e, o);
+    }
+}
+void rmsnorm3q(CP3 x, const float* w, P3 y, const XQ3& xq, int n, float eps, cudaStream_t st,
+               int ntok) {
+    k_rmsnorm3q<<<ntok, 1024, 0, st>>>(x, w, y, xq, n, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ---------------- elementwise ----------------
 
 __global__ void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w,

@@ -3543,6 +3543,56 @@ static void test_d2_attn() {
     CUDA_CHECK(cudaFree(d_rpos)); CUDA_CHECK(cudaFree(d_npos)); CUDA_CHECK(cudaFree(d_ctx));
 }
 
+// Fused rmsnorm3 + quantize (k_rmsnorm3q) vs the two-launch sequence: every
+// output buffer (y, nat, eo, scale, isum) bitwise identical, 3 lanes, n=5120.
+static void test_rmsnorm3q() {
+    const int n = 5120, L = 3, nb = n / 32;
+    std::vector<float> w = rand_vec(n, 9101);
+    float* d_w; CUDA_CHECK(cudaMalloc(&d_w, n * 4));
+    CUDA_CHECK(cudaMemcpy(d_w, w.data(), n * 4, cudaMemcpyHostToDevice));
+    float *d_x[L], *d_y1[L], *d_y2[L];
+    q27k::XQuant q1[L], q2[L];
+    q27k::CP3 xs{}; q27k::P3 y1{}, y2{}; q27k::XQ3 X1{}, X2{};
+    for (int t = 0; t < L; t++) {
+        std::vector<float> x = rand_vec(n, 7000 + t);
+        for (auto& v : x) v *= (1.5f + t);
+        CUDA_CHECK(cudaMalloc(&d_x[t], n * 4)); CUDA_CHECK(cudaMalloc(&d_y1[t], n * 4)); CUDA_CHECK(cudaMalloc(&d_y2[t], n * 4));
+        CUDA_CHECK(cudaMemcpy(d_x[t], x.data(), n * 4, cudaMemcpyHostToDevice));
+        q1[t] = q27k::xquant_alloc(n); q2[t] = q27k::xquant_alloc(n);
+        xs.p[t] = d_x[t]; y1.p[t] = d_y1[t]; y2.p[t] = d_y2[t]; X1.q[t] = q1[t]; X2.q[t] = q2[t];
+    }
+    for (int t = L; t < 16; t++) { xs.p[t] = d_x[0]; y1.p[t] = d_y1[0]; y2.p[t] = d_y2[0]; X1.q[t] = q1[0]; X2.q[t] = q2[0]; }
+    q27k::rmsnorm3(xs, d_w, y1, n, 1e-6f, 0, L);
+    q27k::CP3 y1c{};
+    for (int t = 0; t < 16; t++) y1c.p[t] = y1.p[t];
+    q27k::quantize3(y1c, n, X1, 0, L);
+    q27k::rmsnorm3q(xs, d_w, y2, X2, n, 1e-6f, 0, L);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    long bad = 0;
+    std::vector<float> a(n), b(n); std::vector<int8_t> na(n), nb_(n); std::vector<uint2> ea(nb * 4), eb(nb * 4);
+    std::vector<float> sa(nb), sb(nb); std::vector<int> ia(nb), ib(nb);
+    for (int t = 0; t < L; t++) {
+        CUDA_CHECK(cudaMemcpy(a.data(), d_y1[t], n * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b.data(), d_y2[t], n * 4, cudaMemcpyDeviceToHost));
+        bad += memcmp(a.data(), b.data(), n * 4) != 0;
+        CUDA_CHECK(cudaMemcpy(na.data(), q1[t].nat, n, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(nb_.data(), q2[t].nat, n, cudaMemcpyDeviceToHost));
+        bad += memcmp(na.data(), nb_.data(), n) != 0;
+        CUDA_CHECK(cudaMemcpy(ea.data(), q1[t].eo, nb * 4 * sizeof(uint2), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(eb.data(), q2[t].eo, nb * 4 * sizeof(uint2), cudaMemcpyDeviceToHost));
+        bad += memcmp(ea.data(), eb.data(), nb * 4 * sizeof(uint2)) != 0;
+        CUDA_CHECK(cudaMemcpy(sa.data(), q1[t].scale, nb * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(sb.data(), q2[t].scale, nb * 4, cudaMemcpyDeviceToHost));
+        bad += memcmp(sa.data(), sb.data(), nb * 4) != 0;
+        CUDA_CHECK(cudaMemcpy(ia.data(), q1[t].isum, nb * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ib.data(), q2[t].isum, nb * 4, cudaMemcpyDeviceToHost));
+        bad += memcmp(ia.data(), ib.data(), nb * 4) != 0;
+    }
+    check("rmsnorm3q == rmsnorm3 + quantize3 (bitwise)", (double)bad, 0.5);
+    for (int t = 0; t < L; t++) { CUDA_CHECK(cudaFree(d_x[t])); CUDA_CHECK(cudaFree(d_y1[t])); CUDA_CHECK(cudaFree(d_y2[t])); }
+    CUDA_CHECK(cudaFree(d_w));
+}
+
 int main(int argc, char** argv) {
     // The sampler kernels are synthetic (no weights). --sampling-only runs just
     // them, skipping the 17.7GB model load, so they can be validated while a
@@ -3558,6 +3608,7 @@ int main(int argc, char** argv) {
         test_d2_walk_reject();
         test_d2_top16();
         test_d2_attn();
+        test_rmsnorm3q();
         printf("%s\n", g_fail ? "FAILED" : "ALL PASS");
         return g_fail ? 1 : 0;
     }
@@ -3594,6 +3645,7 @@ int main(int argc, char** argv) {
     test_d2_walk_reject();
     test_d2_top16();
     test_d2_attn();
+    test_rmsnorm3q();
     test_gemv10_scaling(dm, m);
     test_kv_fp8_store();
     test_attn_fp8();

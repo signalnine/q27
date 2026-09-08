@@ -73,5 +73,9 @@ void rmsnorm3(CP3 x, const float* w, P3 y, int n, float eps, cudaStream_t st = 0
 void add3(P3 x, CP3 y, int n, cudaStream_t st = 0, int ntok = 3);
 void silu_mul3(P3 g, CP3 u, int n, cudaStream_t st = 0, int ntok = 3);
 void quantize3(CP3 x, int64_t cols, const XQ3& xq, cudaStream_t st = 0, int ntok = 3);
+// Fused rmsnorm3 + quantize3 of the result (bitwise those two launches; the
+// verify forward quantizes every normed activation it produces).
+void rmsnorm3q(CP3 x, const float* w, P3 y, const XQ3& xq, int n, float eps, cudaStream_t st = 0,
+               int ntok = 3);
 
 } // namespace q27k

@@ -1956,6 +1956,16 @@ struct Engine {
     // P0 batching: qx5/mm5 read per-lane state through the view (solo:
     // pointer-identical to the members), so the fused round can hand them a
     // union view without touching the weight-sweep code again.
+    // Fused norm + quantize of the normed x1 (2026-09-08): the verify forward's
+    // rmsnorm3 -> qx5(x1) pairs collapse to one launch each (bitwise:
+    // test_rmsnorm3q). Callers pass x1q=true to the pre functions so they
+    // skip their own qx5(x1); the conductor's fused driver keeps the default.
+    void rmsnorm3q5(const LaneView& v, const q27k::CP3& x, const float* w, const q27k::P3& y,
+                    int cols) {
+        q27k::XQ3 q{};
+        for (int i = 0; i < W_PLUMB; i++) q.q[i] = v.xq[i];
+        q27k::rmsnorm3q(x, w, y, q, cols, EPS, v.stm, v.vw);
+    }
     void qx5(const LaneView& v, const std::array<float*, W_PLUMB>& x, int cols) {
         q27k::XQ3 q{};
         q27k::CP3 xs{};
@@ -2018,8 +2028,8 @@ struct Engine {
     // (addendum A8). The fused driver never calls the composed pairs, only
     // pre/mix/post individually (P1 Task 8: mix takes an explicit stream --
     // the conductor's -- while width stays member vw, the granted width).
-    void gdn_pre(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void gdn_pre(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_qkv.weight"), v.qkv);
         mm5(v, T(il, "attn_gate.weight"), v.z);
         // alpha + beta gate projections in ONE launch (2026-09-08): same body
@@ -2117,14 +2127,14 @@ struct Engine {
         qx5(v, v.og, GDN_V);
         mm5(v, T(il, "ssm_out.weight"), v.y);
     }
-    void gdn_pair(int il, const LaneView& v) {
-        gdn_pre(il, v);
+    void gdn_pair(int il, const LaneView& v, bool x1q = false) {
+        gdn_pre(il, v, x1q);
         gdn_mix(il, stm);
         gdn_post(il, v);
     }
 
-    void attn_pre(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void attn_pre(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "attn_q.weight"), v.qg);
         const float* qn = (const float*)T(il, "attn_q_norm.weight").data;
         const float* kn = (const float*)T(il, "attn_k_norm.weight").data;
@@ -2184,8 +2194,8 @@ struct Engine {
         qx5(v, v.attnout, N_HEAD * HEAD_DIM);
         mm5(v, T(il, "attn_output.weight"), v.y);
     }
-    void attn_pair(int il, const LaneView& v) {
-        attn_pre(il, v);
+    void attn_pair(int il, const LaneView& v, bool x1q = false) {
+        attn_pre(il, v, x1q);
         attn_mix(il, stm);
         attn_post(il, v);
     }
@@ -2193,8 +2203,8 @@ struct Engine {
     // ffn_pair is all-"pre" (design 2026-07-14): every op is a per-lane
     // weight/elementwise sweep on the view, no sequence state, so it needs no
     // mix seam -- the P1 fused round calls it whole on the union view.
-    void ffn_pair(int il, const LaneView& v) {
-        qx5(v, v.x1, N_EMBD);
+    void ffn_pair(int il, const LaneView& v, bool x1q = false) {
+        if (!x1q) qx5(v, v.x1, N_EMBD);
         mm5(v, T(il, "ffn_gate.weight"), v.ffn_g);
         mm5(v, T(il, "ffn_up.weight"), v.ffn_u);
         q27k::silu_mul3(LANESV(v, ffn_g),
@@ -2292,13 +2302,13 @@ struct Engine {
         int tap_k = 0;
         for (int il = 0; il < N_LAYER; il++) {
             const float* an = (const float*)T(il, "attn_norm.weight").data;
-            q27k::rmsnorm3(Hc, an, X1m, N_EMBD, EPS, v.stm, v.vw);
-            if (attn_layer[il]) attn_pair(il, v);
-            else gdn_pair(il, v);
+            rmsnorm3q5(v, Hc, an, X1m, N_EMBD); // norm + quantize x1, one launch
+            if (attn_layer[il]) attn_pair(il, v, true);
+            else gdn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             const float* pn = (const float*)T(il, "post_attention_norm.weight").data;
-            q27k::rmsnorm3(Hc, pn, X1m, N_EMBD, EPS, v.stm, v.vw);
-            ffn_pair(il, v);
+            rmsnorm3q5(v, Hc, pn, X1m, N_EMBD);
+            ffn_pair(il, v, true);
             q27k::add3(Hm, Yc, N_EMBD, v.stm, v.vw);
             if (taps && tap_k < 5 && il == DFLASH_TAPS[tap_k]) {
                 for (int t = 0; t < v.vw; t++)
@@ -2309,8 +2319,7 @@ struct Engine {
             }
         }
         const float* on = (const float*)dm.get("output_norm.weight").data;
-        q27k::rmsnorm3(Hc, on, X1m, N_EMBD, EPS, v.stm, v.vw);
-        qx5(v, v.x1, N_EMBD);
+        rmsnorm3q5(v, Hc, on, X1m, N_EMBD);
         const char* vhead = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                              : "output.weight";
         // lane t's logits live at v.lg[t] (solo: logits2 + t*VOCAB, alloc is
@@ -2841,6 +2850,14 @@ struct Engine {
         CUDA_CHECK(cudaMalloc((void**)&d2_pf_taps, (size_t)PF_T * 5 * N_EMBD * 4));
         LaneView v = solo_view();
         v.vw = d2_w;
+        // Q27_D2_VGEMM=1 (2026-09-08): route the d2 verify's big tensors
+        // through the deterministic MMA path (k_vgemm, flat in width; see
+        // vgemm.cuh) instead of the register-bound gemv_q4_n<8>. View-local
+        // override: the ladder, the CLI and the canonical bitwise gates keep
+        // gemm_min = 9. A numerics-FAMILY change for the d2 serving path
+        // (still run-to-run deterministic: no atomics), so it is an A/B
+        // lever until measured, not a default.
+        if (const char* vg = getenv("Q27_D2_VGEMM"); vg && atoi(vg)) v.gemm_min = d2_w;
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
         spec_verify_forward(v, d2_vtaps);
