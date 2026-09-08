@@ -15710,6 +15710,25 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (d): agentic campaign rerun on d4947fd -- q27 DFlash2 at parity with ninfer's arm on Claude Code traffic
+
+bench/crossengine/agentic-2026-09-08/ (same harness/legs/controls as the
+09-07 campaign; ninfer legs rerun unchanged in the same session):
+
+    q27 ladder+suffix   162.8 t/s (was 162.1)   3.08 tok/round
+    q27 DFlash2 Q4      215.1     (was 173.3)   3.91   +24%
+    q27 DFlash2 Q8      216.2     (was 176.3)   4.03   +23%
+    ninfer DFlash2      218.5     (was 228.5)   4.10   unchanged binary, -4% drift
+    ninfer MTP3         150.2     (was 148.3)   2.90
+
+q27's DFlash2 arm went from -23% to -1% against ninfer's on real agentic
+traffic (216 vs 219, drift bounded at ~+-4% by the two control legs), and
+is +33% over the production ladder. The night's levers (ring retention,
+drafter attention, side-stream fold, verify launch batch, fused norm, and
+the MMA-path verify) transferred to Claude Code traffic at about the size
+the seeded instrument predicted for the d2 legs. One pass, effort medium,
+quality signals inside n=1 noise (gold hits 7-11/12 across q27 legs).
+
 ## 2026-09-08 (c): the d2 verify on the MMA path -- verify 16.8 -> 15.1 ms, +11% t/s, round now under ninfer's
 
 mm5 switches from gemv_q4_n<W> to k_vgemm (vgemm.cuh: the flat-in-width int8

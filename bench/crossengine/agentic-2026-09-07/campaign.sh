@@ -10,7 +10,7 @@
 #   systemd-run --user --unit agentic-campaign bash campaign.sh    # full
 set -u
 Q=/mnt/ai/projects/q27
-DIR=$Q/bench/crossengine/agentic-2026-09-07
+DIR=${CAMPAIGN_DIR:-$Q/bench/crossengine/agentic-2026-09-07}
 MODEL=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.q27
 TOK=/mnt/ai/models/qwen38-27b-mtp/qwen38-27b-mtp.tok
 Q27=$Q/build/q27-server

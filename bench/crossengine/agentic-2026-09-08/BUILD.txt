@@ -1,0 +1,1 @@
+d4947fd dflash2 serving: verify on the deterministic MMA path by default -- verify 16.8 -> 15.1 ms, round 17.35 ms, +11% t/s
