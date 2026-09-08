@@ -238,6 +238,20 @@ static void test_shared_prefix_across_sessions() {
     CHECK(pc.shared_prefix(seq(100, 300000), 60) == 0);
     q27::PrefixCache off;                               // disabled cache answers 0
     CHECK(off.shared_prefix(s4, 60) == 0);
+
+    // Entries longer than the 256-token head: the second read stage must
+    // continue the comparison past the head, and a head mismatch must stop
+    // at the right place without it.
+    const std::vector<int> big = seq(2000, 70000);
+    CHECK(pc.write(big, 1000, "g", 1, "k", 1));
+    std::vector<int> p1 = big; p1[700] = 5;             // diverges after the head
+    CHECK(pc.shared_prefix(p1, 900) == 700);
+    CHECK(pc.shared_prefix(p1, 1500) == 700);           // upto past the entry: capped at L
+    std::vector<int> p2 = big; p2[100] = 5;             // diverges inside the head
+    CHECK(pc.shared_prefix(p2, 900) == 100);
+    std::vector<int> p3 = big; p3[256] = 5;             // exactly at the head boundary
+    CHECK(pc.shared_prefix(p3, 900) == 256);
+    CHECK(pc.shared_prefix(big, 900) == 900);           // full agreement through upto
 }
 
 static void test_bad_root_disables() {

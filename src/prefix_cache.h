@@ -206,8 +206,14 @@ class PrefixCache {
     // exactly 22460 tokens of a 22544-22578-token system block (the per-repo
     // gitStatus tail differs), so an entry cut at sys_len was hit by nobody and
     // every first turn wrote its own 0.94 GB entry. Cut at the shared length
-    // and the next session restores it. Reads token vectors only (L*4 bytes
-    // per entry, never the state); the engine calls this once per cold prefill.
+    // and the next session restores it. Reads token vectors only (never the
+    // state), in two stages so a root full of unrelated entries costs 1 KB
+    // per entry: a 256-token head first, the full vector only when the head
+    // matches completely and the entry could still beat the current best.
+    // The engine calls this once per cold prefill that carries a system
+    // block. I/O runs OUTSIDE the index lock on purpose (a persist or an
+    // eviction must not wait on it); an entry evicted between the index copy
+    // and the open just fails the open and is skipped.
     int shared_prefix(const std::vector<int>& prompt, int upto) const {
         if (!enabled_ || upto <= 0 || prompt.empty()) return 0;
         upto = std::min(upto, (int)prompt.size());
@@ -218,20 +224,32 @@ class PrefixCache {
         }
         std::sort(cands.begin(), cands.end(),
                   [](const Entry& a, const Entry& b) { return a.L > b.L; });
+        constexpr int HEAD = 256;
         int best = 0;
         std::vector<int> toks;
+        auto lcp_from = [&](int from, int n) {
+            int l = from;
+            while (l < n && toks[(size_t)l] == prompt[(size_t)l]) l++;
+            return l;
+        };
         for (const auto& e : cands) {
             if (e.L < cfg_.min_tokens) continue;
             const int n = std::min(e.L, upto);
             if (n <= best) continue;  // cannot beat the current best
-            toks.resize((size_t)n);
             int fd = ::open(e.path.c_str(), O_RDONLY);
             if (fd < 0) continue;
-            const bool ok = read_full(fd, toks.data(), (size_t)n * sizeof(int), sizeof(PfxHdr));
+            const int h = std::min(n, HEAD);
+            toks.resize((size_t)h);
+            bool ok = read_full(fd, toks.data(), (size_t)h * sizeof(int), sizeof(PfxHdr));
+            int l = ok ? lcp_from(0, h) : 0;
+            if (ok && l == h && n > h) {  // head matched: read the rest
+                toks.resize((size_t)n);
+                ok = read_full(fd, toks.data() + h, (size_t)(n - h) * sizeof(int),
+                               sizeof(PfxHdr) + (off_t)h * sizeof(int));
+                if (ok) l = lcp_from(h, n);
+            }
             ::close(fd);
             if (!ok) continue;
-            int l = 0;
-            while (l < n && toks[(size_t)l] == prompt[(size_t)l]) l++;
             best = std::max(best, l);
         }
         return best;

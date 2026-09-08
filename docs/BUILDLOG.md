@@ -15738,7 +15738,11 @@ another's entry and each first turn wrote its own 0.94 GB entry.
 
 Fix: PrefixCache::shared_prefix(prompt, upto) = longest prefix an indexed
 entry shares with the prompt (reads token vectors only, longest entries
-first, skips entries that cannot beat the current best); generate() computes
+first, skips entries that cannot beat the current best; two-stage read after
+the consensus review -- a 256-token head per entry, the full vector only
+when the head matches, so a root of unrelated entries costs 1 KB each; I/O
+outside the index lock, an entry evicted mid-scan just fails its open);
+generate() computes
 it once per cold prefill with a system block >= min_tokens and cuts the
 system entry at that length when shorter than sys_len (pfx_sys_cut;
 pfx_sys_cut_here reads it instead of pfx_sys_len). Session 1 cuts at
