@@ -123,3 +123,31 @@ E2E (Q27_DFLASH2 serve pack, single-slot, think-on):
   live-CC finding (dflash2's margin lives on echo/code traffic, thinking is
   the ladder's home turf). tok/round 2.77-3.37 at 12.5K; round ~21.9 ms
   (drafter + width-8 verify) vs ladder ~19.3.
+
+## Lever 3 (same session): depthctl bar retune -- NO RESOLVABLE WIN, bars stay default
+
+Economics said the bars look conservative (a promoted lane pays at conditional
+accept >~0.10: draft step ~0.45 ms vs ~5.6 ms/token; but cost compounds
+linearly with depth while acceptance decays geometrically -- promote 4->5
+aggressively, 6->7 carefully). Measured V1 (HI=0.25/HI6=0.35/HI7=0.45) vs
+default (0.50/0.55/0.60):
+
+- Sampled echo, paired seeds, 6 x {12.5K, 50K}: +3.0% mean at 12.5K, +-0.0%
+  at 50K -- inside the trajectory-divergence noise (a promotion changes the
+  sampled path; pairing only controls the prompt).
+- Greedy echo (intended as the exact instrument): V1 mean 186.0 vs base
+  187.9 t/s -- FLAT, and per-trial deltas swing +-20% BOTH ways, which is
+  impossible on an identical token stream. CAUSE (instrument finding, not a
+  bug in the levers): serving verifies at width>=3 through the batch GEMM
+  (`batch-gemm=auto(k>=3)`), and a lane's logits inside a width-5 vs width-6
+  GEMM take different reduction shapes -- greedy argmax flips on near-ties,
+  so greedy serving streams DIVERGE across depth configs. The engine's
+  gemm_min guardrail comment documents exactly this numeric-path class; the
+  CLI's canonical gates hold because the CLI keeps the GEMV path below
+  gemm_min. There is NO noise-free serving instrument for bar tuning.
+- V1 did engage depth 6-7 (md6 up to 40, md7 19 rounds/request on echo) --
+  the machinery works; the net is just ~flat on this traffic.
+
+VERDICT: defaults stand (HI 0.50/0.55/0.60). A few-percent effect, if any,
+needs the live-CC agentic campaign (long runs, aggregate stats) -- queued as
+future work, not tonight's instrument.
