@@ -15710,6 +15710,42 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (i): agentic cross-engine campaign -- DFlash2 is now a serving win on q27; ninfer's arm leads on the round wall
+
+bench/crossengine/agentic-2026-09-07/ (README has the table, method,
+confounds). Claude Code 2.1.170 on the 12 pinned SWE-bench instances, five
+legs back to back, vox transcribers stopped, one pass each:
+
+    q27 ladder+suffix (production)  162.1 t/s   3.13 tok/round
+    q27 DFlash2 Q4 serving pack     173.3 (+7%) 3.94
+    q27 DFlash2 Q8 serving pack     176.3 (+9%) 4.03
+    ninfer DFlash2 k=7              228.5       4.28
+    ninfer MTP3 (control)           148.3       2.90
+
+DFlash2 on q27 flipped from -7% (09-06 live-CC trial) to +9% on the same
+harness -- the day's three changes (sampled walk, ring retention, last-token
+row) were exactly the agentic ones. Engine vs engine at equal drafter class
+q27 leads ninfer +9% (ladder vs MTP3); their DFlash2 arm leads ours +30% on
++6% tok/round, so the residual is the round wall (per-lane: lane 1 at parity
+0.83/0.82, lanes 2-7 trail 2-3 points each). Confound in their favour: the
+model thinks 2.5x less per message on ninfer with the same rendered prompt
+(nvfp4/int8 vs q4s/fp8 is the only difference the model sees), so their
+traffic is easier to draft; decode t/s and tok/round are per-engine
+metrics on each engine's own trajectories, wall/turns are not comparable.
+
+Harness fixes on the way (commit 342c379): ninfer telemetry branch in
+run.sh (its --request-log-jsonl), CLAUDE_CODE_EFFORT_LEVEL pinned to medium
+on both engines (Claude Code sends effort 'high', which the Qwen3.8 template
+cannot render, and ninfer 400s on it; q27 ignores the field and renders
+xhigh -- medium is the only effort reachable on both; follow-up: honour
+output_config.effort in q27's /v1/messages), and a one-line LOCAL ninfer
+parser patch: their master rejects a whole tool-call batch as text when any
+name is undeclared, and Claude Code 2.1.170 defers Grep/Glob while its
+prompt still names them, so every ninfer turn ended after one request
+(smoke: 1 request / 6 s / no diff -> 18 requests / gold file edited after
+the patch). Also observed: the q27 suffix drafter fired 0 times in 220
+agentic requests.
+
 ## 2026-09-07 (h): DFlash2 round premium -- measured, one small lever shipped, one negative
 
 Item 1 of docs/plans/2026-09-08-dflash2-close-the-arm-gap.md, measurement

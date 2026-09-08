@@ -63,6 +63,50 @@ summarize.py prints the table.
 - The MTP3 control separates content mix from the DFlash2 arm, as in the
   09-07 rebench.
 
-## Results
+## Results (2026-09-07 21:23-22:40, one pass over the 12 instances per leg)
 
-(appended by the session that ran the campaign)
+| leg | decode t/s agg | median | tok/round | prefix reuse | wall/inst | turns | out tok | nonempty | gold |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| q27lad (ladder+suffix, production) | 162.1 | 174.5 | 3.132 | 91.2% | 131 s | 12.7 | 111520 | 10/12 | 9/12 |
+| q27d2q4 (DFlash2 Q4 pack) | 173.3 | 186.3 | 3.941 | 91.6% | 79 s | 17.5 | 119002 | 11/12 | 9/12 |
+| q27d2q8 (DFlash2 Q8 pack) | 176.3 | 185.9 | 4.033 | 90.6% | 86 s | 17.2 | 124522 | 10/12 | 9/12 |
+| ninferd2 (DFlash2 k=7) | 228.5 | 252.9 | 4.276 | 96.6% | 28 s | 13.8 | 54875 | 12/12 | 10/12 |
+| ninfermtp (MTP3 control) | 148.3 | 165.4 | 2.898 | 94.0% | 54 s | 13.6 | 78071 | 12/12 | 10/12 |
+
+Per-lane acceptance on this traffic (P(accept >= lane j), DFlash2 legs):
+
+    q27d2q8   0.820 0.641 0.494 0.380 0.294 0.231 0.182   cond 0.820 0.782 0.770 0.770 0.772 0.787 0.786
+    ninferd2  0.830 0.665 0.526 0.419 0.338 0.274 0.228   cond 0.830 0.801 0.791 0.796 0.807 0.812 0.832
+
+Reads:
+
+1. DFlash2 on q27 is now an agentic serving WIN: +7% (Q4) / +9% (Q8) decode
+   t/s over the production ladder, tok/round 3.13 -> 3.94 / 4.03. On 09-06
+   the same harness had it at -7% (greedy-only drafter, ring cold every turn,
+   last prompt row missing). Q8 is the better serving pack here too.
+2. Engine vs engine at the same drafter class: q27 ladder 162.1 vs ninfer
+   MTP3 148.3 = q27 +9% t/s (tok/round 3.13 vs 2.90), consistent with the
+   seeded rebench (+13%).
+3. ninfer's DFlash2 arm leads q27's by +30% t/s (228.5 vs 176.3) on +6%
+   tok/round (4.28 vs 4.03): the remaining gap is the round wall, as the
+   seeded instrument said (their ~18 vs our ~22 ms). Lane 1 is at parity
+   (0.83 vs 0.82); lanes 2-7 trail by 2-3 points each.
+4. CONFOUND, in ninfer's favour: with the same rendered prompt (both engines
+   emit no effort line at medium) the model thinks 2.5x LESS per assistant
+   message on ninfer (327 chars/msg vs 572-803 on q27, from Claude Code's
+   own logs), takes fewer turns (13.8 vs 17) and emits half the output
+   tokens. Less thinking = easier-to-draft traffic and shorter decode
+   stretches; nvfp4 + int8 KV vs q4s + fp8 KV is the only difference in
+   what the model sees. Trajectory-level metrics (wall, turns, out tokens)
+   are therefore not comparable across engines; decode t/s and tok/round
+   are engine metrics on each engine's own trajectories.
+5. Prefix reuse is real on both (91% q27, 94-97% ninfer -- their
+   agent-prefix-reuse fix works). The q27 suffix drafter fired 0 times on
+   the ladder leg: on this traffic it contributes nothing.
+6. Quality signals are flat across legs (gold file 9-10/12, nonempty
+   10-12/12), as expected for one base model.
+
+Standing caveats: one pass (the 07-17 seal used 3 x 12); reasoning effort
+medium on both (not production's xhigh); ninfer runs with the one-line
+parser patch above. Reproduce: `systemd-run --user --unit agentic-campaign
+bash bench/crossengine/agentic-2026-09-07/campaign.sh`, then summarize.py.

@@ -166,6 +166,16 @@ Honest ceiling for the drafter: ~1.5 ms (from 3.55) = -2 ms/round = +10%
 t/s; the verify (17.7 vs ninfer ~16.5) and post_round (~1 ms) are separate
 engine work.
 
+## Agentic standings 2026-09-07 late (bench/crossengine/agentic-2026-09-07)
+
+Claude Code on the 12 SWE-bench instances, effort medium on both engines:
+q27 ladder 162.1 t/s (3.13 tok/round) | q27 DFlash2 Q4 173.3 (3.94) | q27
+DFlash2 Q8 176.3 (4.03) | ninfer DFlash2 228.5 (4.28) | ninfer MTP3 148.3
+(2.90). DFlash2 is now a +9% serving win on q27 (was -7%); q27 leads ninfer
++9% at equal drafter class; their DFlash2 arm leads ours +30% on +6%
+tok/round -> the round wall is the whole remaining gap on agentic traffic
+too. Confound: the model thinks 2.5x less per message on ninfer's quant.
+
 ## Standing cautions
 
 - Round truncation/forced-transition d2 state sync + ctx reserve fixes are
