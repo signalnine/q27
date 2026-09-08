@@ -1,0 +1,12 @@
+RB-lad-think tgt=8000 seed=1 prompt=12366 gen=512 dec=3.58s dtps=142.8
+RB-lad-think tgt=8000 seed=2 prompt=12366 gen=512 dec=3.58s dtps=142.8
+RB-lad-think tgt=8000 seed=3 prompt=12366 gen=512 dec=2.95s dtps=173.4
+RB-lad-think tgt=8000 seed=4 prompt=12366 gen=512 dec=3.53s dtps=144.6
+RB-lad-think tgt=8000 seed=5 prompt=12366 gen=512 dec=3.39s dtps=150.9
+RB-lad-think tgt=8000 seed=6 prompt=12366 gen=512 dec=3.69s dtps=138.4
+RB-lad-think tgt=32000 seed=1 prompt=49494 gen=512 dec=4.15s dtps=123.2
+RB-lad-think tgt=32000 seed=2 prompt=49494 gen=512 dec=4.03s dtps=126.9
+RB-lad-think tgt=32000 seed=3 prompt=49494 gen=512 dec=3.98s dtps=128.4
+RB-lad-think tgt=32000 seed=4 prompt=49494 gen=512 dec=3.62s dtps=141.1
+RB-lad-think tgt=32000 seed=5 prompt=49494 gen=512 dec=3.86s dtps=132.5
+RB-lad-think tgt=32000 seed=6 prompt=49494 gen=512 dec=4.16s dtps=123.0

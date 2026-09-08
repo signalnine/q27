@@ -1,0 +1,12 @@
+RB-d2-echo tgt=8000 seed=1 prompt=12366 gen=512 dec=3.33s dtps=153.5
+RB-d2-echo tgt=8000 seed=2 prompt=12366 gen=512 dec=3.29s dtps=155.3
+RB-d2-echo tgt=8000 seed=3 prompt=12366 gen=512 dec=3.07s dtps=166.4
+RB-d2-echo tgt=8000 seed=4 prompt=12366 gen=512 dec=3.66s dtps=139.4
+RB-d2-echo tgt=8000 seed=5 prompt=12366 gen=512 dec=2.45s dtps=208.5
+RB-d2-echo tgt=8000 seed=6 prompt=12366 gen=512 dec=3.49s dtps=146.3
+RB-d2-echo tgt=32000 seed=1 prompt=49494 gen=512 dec=2.98s dtps=171.6
+RB-d2-echo tgt=32000 seed=2 prompt=49494 gen=512 dec=3.11s dtps=164.2
+RB-d2-echo tgt=32000 seed=3 prompt=49494 gen=512 dec=3.18s dtps=160.7
+RB-d2-echo tgt=32000 seed=4 prompt=49494 gen=512 dec=3.53s dtps=144.7
+RB-d2-echo tgt=32000 seed=5 prompt=49494 gen=512 dec=2.77s dtps=184.4
+RB-d2-echo tgt=32000 seed=6 prompt=49494 gen=512 dec=3.39s dtps=150.5

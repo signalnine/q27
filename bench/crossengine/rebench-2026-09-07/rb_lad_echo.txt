@@ -1,0 +1,12 @@
+RB-lad-echo tgt=8000 seed=1 prompt=12366 gen=512 dec=3.27s dtps=156.5
+RB-lad-echo tgt=8000 seed=2 prompt=12366 gen=512 dec=3.37s dtps=151.4
+RB-lad-echo tgt=8000 seed=3 prompt=12366 gen=512 dec=2.86s dtps=178.9
+RB-lad-echo tgt=8000 seed=4 prompt=12366 gen=512 dec=3.05s dtps=167.6
+RB-lad-echo tgt=8000 seed=5 prompt=12366 gen=512 dec=3.03s dtps=168.8
+RB-lad-echo tgt=8000 seed=6 prompt=12366 gen=512 dec=3.28s dtps=155.6
+RB-lad-echo tgt=32000 seed=1 prompt=49494 gen=512 dec=3.41s dtps=150.0
+RB-lad-echo tgt=32000 seed=2 prompt=49494 gen=512 dec=3.51s dtps=145.5
+RB-lad-echo tgt=32000 seed=3 prompt=49494 gen=512 dec=3.67s dtps=139.4
+RB-lad-echo tgt=32000 seed=4 prompt=49494 gen=512 dec=3.44s dtps=148.6
+RB-lad-echo tgt=32000 seed=5 prompt=49494 gen=512 dec=3.44s dtps=148.5
+RB-lad-echo tgt=32000 seed=6 prompt=49494 gen=512 dec=3.35s dtps=152.3

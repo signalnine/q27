@@ -1,0 +1,12 @@
+RB-d2-think tgt=8000 seed=1 prompt=12366 gen=512 dec=3.56s dtps=143.4
+RB-d2-think tgt=8000 seed=2 prompt=12366 gen=512 dec=3.37s dtps=151.6
+RB-d2-think tgt=8000 seed=3 prompt=12366 gen=512 dec=3.99s dtps=128.2
+RB-d2-think tgt=8000 seed=4 prompt=12366 gen=512 dec=3.72s dtps=137.3
+RB-d2-think tgt=8000 seed=5 prompt=12366 gen=512 dec=3.79s dtps=134.9
+RB-d2-think tgt=8000 seed=6 prompt=12366 gen=512 dec=3.70s dtps=138.1
+RB-d2-think tgt=32000 seed=1 prompt=49494 gen=512 dec=4.10s dtps=124.6
+RB-d2-think tgt=32000 seed=2 prompt=49494 gen=512 dec=3.82s dtps=133.6
+RB-d2-think tgt=32000 seed=3 prompt=49494 gen=512 dec=3.67s dtps=139.3
+RB-d2-think tgt=32000 seed=4 prompt=49494 gen=512 dec=4.28s dtps=119.3
+RB-d2-think tgt=32000 seed=5 prompt=49494 gen=512 dec=3.99s dtps=128.2
+RB-d2-think tgt=32000 seed=6 prompt=49494 gen=512 dec=3.60s dtps=142.0

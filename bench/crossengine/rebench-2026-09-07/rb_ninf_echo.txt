@@ -1,0 +1,12 @@
+RB-ninf-echo tgt=8000 seed=1 prompt=12359 gen=512 dec=2.25s dtps=227.2
+RB-ninf-echo tgt=8000 seed=2 prompt=12359 gen=512 dec=2.12s dtps=240.8
+RB-ninf-echo tgt=8000 seed=3 prompt=12359 gen=512 dec=2.29s dtps=223.4
+RB-ninf-echo tgt=8000 seed=4 prompt=12359 gen=512 dec=1.90s dtps=268.5
+RB-ninf-echo tgt=8000 seed=5 prompt=12359 gen=512 dec=2.07s dtps=247.1
+RB-ninf-echo tgt=8000 seed=6 prompt=12359 gen=512 dec=2.42s dtps=211.5
+RB-ninf-echo tgt=32000 seed=1 prompt=49487 gen=512 dec=2.26s dtps=226.2
+RB-ninf-echo tgt=32000 seed=2 prompt=49487 gen=512 dec=2.22s dtps=230.3
+RB-ninf-echo tgt=32000 seed=3 prompt=49487 gen=512 dec=2.70s dtps=189.4
+RB-ninf-echo tgt=32000 seed=4 prompt=49487 gen=512 dec=2.10s dtps=243.4
+RB-ninf-echo tgt=32000 seed=5 prompt=49487 gen=512 dec=2.20s dtps=232.7
+RB-ninf-echo tgt=32000 seed=6 prompt=49487 gen=512 dec=2.52s dtps=202.5

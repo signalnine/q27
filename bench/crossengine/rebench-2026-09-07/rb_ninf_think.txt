@@ -1,0 +1,12 @@
+RB-ninf-think tgt=8000 seed=1 prompt=12359 gen=512 dec=2.81s dtps=181.6
+RB-ninf-think tgt=8000 seed=2 prompt=12359 gen=512 dec=2.53s dtps=202.2
+RB-ninf-think tgt=8000 seed=3 prompt=12359 gen=512 dec=2.44s dtps=209.6
+RB-ninf-think tgt=8000 seed=4 prompt=12359 gen=512 dec=2.51s dtps=203.3
+RB-ninf-think tgt=8000 seed=5 prompt=12359 gen=512 dec=2.35s dtps=217.3
+RB-ninf-think tgt=8000 seed=6 prompt=12359 gen=512 dec=2.50s dtps=204.4
+RB-ninf-think tgt=32000 seed=1 prompt=49487 gen=512 dec=2.97s dtps=172.3
+RB-ninf-think tgt=32000 seed=2 prompt=49487 gen=512 dec=2.52s dtps=202.5
+RB-ninf-think tgt=32000 seed=3 prompt=49487 gen=512 dec=2.81s dtps=181.9
+RB-ninf-think tgt=32000 seed=4 prompt=49487 gen=512 dec=3.02s dtps=169.2
+RB-ninf-think tgt=32000 seed=5 prompt=49487 gen=512 dec=2.67s dtps=191.2
+RB-ninf-think tgt=32000 seed=6 prompt=49487 gen=512 dec=2.50s dtps=204.4

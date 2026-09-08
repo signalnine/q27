@@ -1,0 +1,12 @@
+RB-ninfmtp-think tgt=8000 seed=1 prompt=12359 gen=512 dec=3.45s dtps=148.2
+RB-ninfmtp-think tgt=8000 seed=2 prompt=12359 gen=512 dec=4.13s dtps=123.6
+RB-ninfmtp-think tgt=8000 seed=3 prompt=12359 gen=512 dec=3.95s dtps=129.5
+RB-ninfmtp-think tgt=8000 seed=4 prompt=12359 gen=512 dec=3.81s dtps=134.1
+RB-ninfmtp-think tgt=8000 seed=5 prompt=12359 gen=512 dec=3.64s dtps=140.4
+RB-ninfmtp-think tgt=8000 seed=6 prompt=12359 gen=512 dec=3.45s dtps=148.3
+RB-ninfmtp-think tgt=32000 seed=1 prompt=49487 gen=512 dec=4.23s dtps=120.9
+RB-ninfmtp-think tgt=32000 seed=2 prompt=49487 gen=512 dec=3.64s dtps=140.6
+RB-ninfmtp-think tgt=32000 seed=3 prompt=49487 gen=512 dec=4.46s dtps=114.5
+RB-ninfmtp-think tgt=32000 seed=4 prompt=49487 gen=512 dec=4.35s dtps=117.5
+RB-ninfmtp-think tgt=32000 seed=5 prompt=49487 gen=512 dec=3.95s dtps=129.2
+RB-ninfmtp-think tgt=32000 seed=6 prompt=49487 gen=512 dec=3.97s dtps=128.6
