@@ -251,6 +251,11 @@ build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu sr
                        src/prefill.cuh src/kernels.cuh src/vgemm.cuh src/device_model.h src/loader.h src/cuda_common.h | build
 	$(NVCC) $(MXF4FLAGS) tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu src/vgemm.cu src/device_model.cu src/loader.cpp -o $@
 
+# Vendor-ceiling probe for the prefill GEMM shapes (cuBLASLt int8/fp8/fp16);
+# docs/perf-attribution-prefill-2026-09-08.md section 4. Run: build/cublaslt_peak 0
+build/cublaslt_peak: tools/cublaslt_peak.cu | build
+	$(NVCC) -O2 -arch=sm_120a tools/cublaslt_peak.cu -lcublasLt -lcublas -o $@
+
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
 
