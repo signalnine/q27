@@ -42,3 +42,24 @@ Reads:
 
 Standing caveats as before: one pass, effort medium on both engines, ninfer
 patched for undeclared tool names.
+
+## Production at xhigh: DFlash2 vs ladder on the same instances (12:14 finish)
+
+Production q27-38 on the DFlash2 config (Q8 pack) vs the ladder config, both
+at Claude Code's default effort (q27 renders xhigh), 12 instances each.
+Aggregates via lanes_agg.py over the [req] journals (prodd2-xhigh.req.txt,
+prodlad-xhigh.req.txt):
+
+| config | reqs | dec tok | t/s agg | t/s med | tok/round | round ms | reuse | nonempty | gold |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| DFlash2 (Q8) | 299 | 329672 | 201.0 | 218.3 | 3.738 | 18.60 | 93.3% | 9/12 | 8/12 |
+| ladder+suffix | 271 | 212254 | 164.2 | 177.2 | 3.134 | 19.08 | 92.4% | 11/12 | 10/12 |
+
+DFlash2 +22% agg / +23% median at xhigh (vs +33% at the medium pin): xhigh
+makes 80% of decoded tokens long thinking turns (3.78 vs 3.12 tok/round
+there; 4.36 vs 3.78 on short tool-call turns). Rounds within 0.5 ms; the
+lead is acceptance. Quality is one sampled pass per config on different
+trajectories (the DFlash2 run had one 700 s-capped instance): not a signal.
+Note: run.sh's own decode line read 0 for these runs -- the labels do not
+start with q27, so its telemetry fell to the llama parser; use
+SWEBENCH_TELEMETRY=q27 for such labels.

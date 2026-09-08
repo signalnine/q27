@@ -15710,6 +15710,41 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (e): production on DFlash2 -- Claude Code traffic at xhigh, DFlash2 vs ladder on the same instances
+
+Production q27-38 moved to the DFlash2 config (Q8 serving pack, sampled
+walk, MMA-path verify, Q27_BATCH=0, reserve 3 GB) with its normal xhigh
+effort. The 12 SWE-bench instances were then run through the harness at
+Claude Code's default effort ('high' -> q27 renders xhigh) against
+production, first on DFlash2, then on the ladder, then DFlash2 restored.
+Aggregates from the [req] journal (file-based; run.sh's own decode line
+read 0 because the labels prodd2/prodlad do not start with q27 -- set
+SWEBENCH_TELEMETRY=q27 for non-q27* labels):
+
+                          DFlash2 (Q8)      ladder+suffix
+    requests / dec tok    299 / 329,672     271 / 212,254
+    decode t/s agg / med  201.0 / 218.3     164.2 / 177.2      (+22% / +23%)
+    tok/round             3.74              3.13
+    round wall            18.6 ms           19.1 ms            (vox running)
+    long thinking turns   3.78 tok/rnd, 203 t/s (80% of tokens)   3.12, 165 (70%)
+    short tool-call turns 4.36, 231                             3.78, 191
+    prefix reuse          93.3%             92.4%
+    quality (one pass)    9/12 nonempty, 8/12 gold   11/12, 10/12
+
+At production's xhigh the DFlash2 lead is +22%, vs +33% at the campaign's
+medium pin: xhigh pushes the traffic to 80% long thinking turns, where the
+drafter's edge is smallest. The rounds differ by 0.5 ms; the entire lead is
+acceptance. Quality columns are single sampled passes on different
+trajectories (the DFlash2 run had one instance hit the 700 s cap after 11
+minutes of thinking); not an engine signal at n=1. Per-lane on this traffic
+(DFlash2): 0.800 0.601 0.446 0.330 0.244 0.183 0.137, conditional flat at
+~0.75 from lane 2 (the ladder's lanes 5-7 fire only in promoted rounds, so
+its per-lane profile is not comparable).
+
+Production stays on DFlash2 (launch recipe: scratch launch_d2.sh prod-d2;
+env Q27_KV=fp8 Q27_PRINT_WSUM=1 Q27_BATCH=0 Q27_DFLASH2=<q8-serve pack>
+Q27_DFLASH2_RESERVE_GB=3 Q27_D2_TIMING=1, same CLI args as before).
+
 ## 2026-09-08 (d): agentic campaign rerun on d4947fd -- q27 DFlash2 at parity with ninfer's arm on Claude Code traffic
 
 bench/crossengine/agentic-2026-09-08/ (same harness/legs/controls as the
