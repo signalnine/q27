@@ -2,9 +2,14 @@
 # Production launch recipe for the q27-38 serving unit (Qwen3.8-27B-MTP on the
 # 5090). q27-38 is a TRANSIENT systemd-run --user unit: `systemctl --user stop
 # q27-38` deletes it, this script recreates it. Modes:
-#   d2       production since 2026-09-08: DFlash2 Q8 pack, sampled walk, MMA verify
-#   d2-pfx   d2 + the shipped prefix-cache tiers ON (tmpfs-backed disk tier +
-#            host-RAM tier); docs/plans/2026-09-08-prefill-attack.md phase 0
+#   d2-pfx   PRODUCTION since 2026-09-08 evening: d2 + the prefix-cache tiers ON
+#            (tmpfs-backed disk tier, RAM tier off) with the P16b shared cut;
+#            docs/plans/2026-09-08-prefill-attack.md phase 0 (prefill wall
+#            255 -> 110 s on the 12-instance Claude Code run). Pass
+#            -E Q27_SYSBLK=1 to log system-block geometry per request.
+#   d2       the 2026-09-08 daytime config: DFlash2 Q8 pack, sampled walk, MMA
+#            verify, NO prefix cache (every first turn and every returning turn
+#            after a side request re-prefills cold)
 #   ladder   the pre-09-08 production config (MTP ladder + suffix drafter)
 # Extra `-E K=V` after the mode are passed to systemd-run (e.g. -E Q27_SYSBLK=1).
 set -euo pipefail

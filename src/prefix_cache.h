@@ -200,6 +200,43 @@ class PrefixCache {
         return false;
     }
 
+    // P16b shared cut: the longest prefix of prompt[0,upto) that some indexed
+    // entry's stored tokens also begin with (0 when nothing qualifies).
+    // Measured 2026-09-08 on Claude Code traffic: five sessions agreed on
+    // exactly 22460 tokens of a 22544-22578-token system block (the per-repo
+    // gitStatus tail differs), so an entry cut at sys_len was hit by nobody and
+    // every first turn wrote its own 0.94 GB entry. Cut at the shared length
+    // and the next session restores it. Reads token vectors only (L*4 bytes
+    // per entry, never the state); the engine calls this once per cold prefill.
+    int shared_prefix(const std::vector<int>& prompt, int upto) const {
+        if (!enabled_ || upto <= 0 || prompt.empty()) return 0;
+        upto = std::min(upto, (int)prompt.size());
+        std::vector<Entry> cands;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            cands = index_;
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Entry& a, const Entry& b) { return a.L > b.L; });
+        int best = 0;
+        std::vector<int> toks;
+        for (const auto& e : cands) {
+            if (e.L < cfg_.min_tokens) continue;
+            const int n = std::min(e.L, upto);
+            if (n <= best) continue;  // cannot beat the current best
+            toks.resize((size_t)n);
+            int fd = ::open(e.path.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            const bool ok = read_full(fd, toks.data(), (size_t)n * sizeof(int), sizeof(PfxHdr));
+            ::close(fd);
+            if (!ok) continue;
+            int l = 0;
+            while (l < n && toks[(size_t)l] == prompt[(size_t)l]) l++;
+            best = std::max(best, l);
+        }
+        return best;
+    }
+
     // Read the state region (gdn then kv, contiguous) into `dst`.
     bool read_state(const Entry& e, void* dst, size_t dst_n) const {
         int fd = ::open(e.path.c_str(), O_RDONLY);

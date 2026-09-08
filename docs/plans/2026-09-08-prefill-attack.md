@@ -1,19 +1,23 @@
 # Prefill attack plan (2026-09-08)
 
-Status: PLAN, ready to execute from a fresh context. Evidence and numbers
-are in docs/perf-attribution-prefill-2026-09-08.md (the recon); this file is
-the executable part. Written so a session with no memory of the recon can
-run it: every phase has the launch command, the instrument, the bar, and
-the traps.
+Status: phase 0 DONE (2026-09-08 evening, see "Phase 0 result" below);
+phases 2-4 remain PLAN, ready to execute from a fresh context. Evidence and
+numbers are in docs/perf-attribution-prefill-2026-09-08.md (the recon); this
+file is the executable part. Written so a session with no memory of the
+recon can run it: every phase has the launch command, the instrument, the
+bar, and the traps.
 
-## 0. State at hand-off (2026-09-08 evening)
+## 0. State at hand-off (2026-09-08 evening; updated after phase 0)
 
-- Production q27-38 runs the DFlash2 Q8 config with NO prefix-cache flags
-  (tools/launch_q27_38.sh mode `d2`). Baseline on the 12 pinned SWE-bench
-  instances at Claude Code's default effort (q27 renders xhigh):
-  bench/crossengine/agentic-2026-09-08/prodd2-xhigh.req.txt -- 299 requests,
-  prefill wall 255 s, decode wall 1640 s, 201.0 t/s decode aggregate,
-  6 eviction full misses (80 s), 12 cold first turns of 20-25 K (80 s).
+- Production q27-38 runs `tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1`
+  (DFlash2 Q8 + prefix-cache tiers on tmpfs, P16b shared cut) since the
+  phase 0 rerun. The pre-phase-0 baseline (mode `d2`, no cache) on the 12
+  pinned SWE-bench instances at Claude Code's default effort (q27 renders
+  xhigh): bench/crossengine/agentic-2026-09-08/prodd2-xhigh.req.txt -- 299
+  requests, prefill wall 255 s, decode wall 1640 s, 201.0 t/s decode
+  aggregate, 6 eviction full misses (80 s), 12 cold first turns of 20-25 K
+  (80 s). After phase 0 (prodpfx2-xhigh.req.txt): prefill wall 110 s, 0
+  full misses, round wall unchanged.
 - Everything committed on master (recon 3a67fc5, this plan + launch
   script + pf_misses.py in the following commit). No branch, no worktree.
 - Instruments in the repo: bench/crossengine/agentic-2026-09-08/pf_agg.py
@@ -149,6 +153,45 @@ current groups are completion-length buckets) and compare tok/round. If
 it costs, persisting the 2048 tap rows with the blob is 200 MiB per
 entry (5 taps x 5120 floats x 2048 rows), so a cheaper fix would be to
 recompute the last 2048 tokens' taps on restore.
+
+### Phase 0 result (2026-09-08, 14:36)
+
+Run: bench/crossengine/agentic-2026-09-08/README.md "Prefill attack phase
+0". Controlled case passed every bar (restore of a 48,852-token entry in
+254 ms after a foreign 369-token request, re-prefill 44 tokens; system-block
+entry restored for a new conversation in 44 ms). 12 instances: the
+after-other-conversation class went 6 full misses (80 s) -> 2 restores (0.2 s
+each, 0 misses); same-conversation turns all hit; no read failures; persist
+exports median 74 ms, four at 202-217 ms. Decode +12% on different
+trajectories (traffic). `d2-pfx` is production.
+
+First turns: 0 of 26 hit. Root cause from the entry token vectors: all
+sessions share EXACTLY 22460 tokens and diverge inside Claude Code's
+gitStatus section (per-repo "Recent commits:" hashes), and the P16b cut at
+the last chunk boundary <= sys_len (22528) lies 68 tokens past that. Fix
+(same day): `PrefixCache::shared_prefix(prompt, sys_len)` = longest prefix an
+indexed entry shares with the prompt (token vectors only); the engine cuts
+the system entry at that length when it is shorter than sys_len (cut lands
+at 21504 here). Session 1 cuts at sys_len, session 2 at the shared length,
+session 3 onward restores. Gates: tools/test_prefix_cache.cpp
+(test_shared_prefix_across_sessions), the three-session live probe
+(bench/ladder/pfx_shared_probe.py: shared body ending just under a chunk
+boundary, sys_len just over it, so old and new cuts differ), then the
+12-instance rerun on a fresh root (prodpfx2): bar = first turns 3..26 hit
+>= 20000 with a `[pfx] restore L=21504` under 0.3 s, first-turn prefill wall
+-70% or better.
+
+Rerun result (14:41): shipped and measured. Session 2 cut at 21504; 12 of
+the 13 later first turns that carry a system block restored L=21504 in
+79 + 45 ms and re-prefilled 2.3-4.5K tokens (1.0-1.7 s vs 7.0-8.4 s cold);
+the three cold ones after bootstrap had no system block (Claude Code side
+calls). Both miss classes 0; prefill wall 255 -> 110 s at matched turn
+counts; first-turn wall 85.5 -> 44.3 s (-48%, of which two cold bootstrap
+turns are 14 s -- the -70% bar assumed hits from session 2, the mechanism
+needs one extra session); round wall 18.63 = baseline; quality unchanged.
+Live probes are in bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py.
+Phase 0 is CLOSED; `d2-pfx` is production (launch script, campaign.sh
+relaunch line, BUILDLOG 2026-09-08 (g)).
 
 ## Phase 1 -- slot routing (multi-slot configs only, defer)
 

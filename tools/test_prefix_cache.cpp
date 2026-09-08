@@ -213,6 +213,33 @@ static void test_eviction_respects_budget() {
     CHECK(pc.size() >= 1);
 }
 
+// P16b shared cut (2026-09-08): Claude Code sessions agree on the system block
+// up to a per-session gitStatus tail (five sessions shared exactly 22460 of a
+// 22544-22578-token block), so an entry cut at sys_len is hit by nobody. The
+// cut has to land at the longest prefix an indexed entry shares with THIS
+// prompt; this is the primitive that finds it.
+static void test_shared_prefix_across_sessions() {
+    const std::string root = tmproot("shared");
+    q27::PrefixCache pc;
+    CHECK(pc.init(cfg_for(root, /*min_tokens=*/16), COMPAT_A));
+    CHECK(pc.shared_prefix(seq(100), 60) == 0);        // empty cache: nothing to share
+    std::vector<int> s1 = seq(100); s1[50] = 777;      // session 1: tail differs from 50
+    CHECK(pc.write(s1, 64, "g", 1, "k", 1));           // its system entry, cut at 64
+    std::vector<int> s2 = seq(100); s2[50] = 888;      // session 2: same block, own tail
+    CHECK(pc.shared_prefix(s2, 60) == 50);             // agrees through token 49
+    CHECK(pc.shared_prefix(s2, 40) == 40);             // capped at upto
+    CHECK(pc.shared_prefix(s2, 200) == 50);            // upto past the prompt/entry is fine
+    CHECK(pc.shared_prefix(seq(100, 500000), 60) == 0); // foreign prompt shares nothing
+    std::vector<int> s3 = seq(100); s3[58] = 999;      // an entry that agrees further wins
+    CHECK(pc.write(s3, 64, "g", 1, "k", 1));
+    std::vector<int> s4 = seq(100); s4[58] = 1111;
+    CHECK(pc.shared_prefix(s4, 60) == 58);
+    CHECK(pc.write(seq(100, 300000), 8, "g", 1, "k", 1)); // below min_tokens: ignored
+    CHECK(pc.shared_prefix(seq(100, 300000), 60) == 0);
+    q27::PrefixCache off;                               // disabled cache answers 0
+    CHECK(off.shared_prefix(s4, 60) == 0);
+}
+
 static void test_bad_root_disables() {
     q27::PrefixCache pc;
     q27::PrefixCacheCfg c = cfg_for("/proc/definitely/not/writable/q27");
@@ -233,6 +260,7 @@ int main() {
     test_truncated_file_is_not_indexed();
     test_rescan_survives_restart();
     test_eviction_respects_budget();
+    test_shared_prefix_across_sessions();
     test_bad_root_disables();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }
     fprintf(stderr, "all prefix-cache tests passed\n");

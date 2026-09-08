@@ -4126,6 +4126,10 @@ struct Engine {
     // can hit -- the stable prefix ends inside the first user message, which is
     // exactly what differs between conversations.
     int pfx_sys_len = 0;
+    // P16b shared cut: the length the system-block entry is actually cut
+    // against this request -- sys_len, or the longest prefix an indexed entry
+    // shares with this prompt when that is shorter (engine-set per prefill).
+    int pfx_sys_cut = 0;
     double pfx_read_ms = 0;  // last disk-read cost, logged with the import split
     double pfx_alloc_ms = 0; // pinned-staging allocation, counted separately
     q27::PrefixRam* pram = nullptr;   // P16c host-RAM tier (null/off = disk only)
@@ -4283,8 +4287,8 @@ struct Engine {
     // results). At most PF_T-1 tokens of the block get re-prefilled on a hit,
     // which costs ~0.3 s against the ~6 s the entry saves.
     bool pfx_sys_cut_here(int base, int boundary) const {
-        return base == 0 && pfx_sys_len > 0 && boundary <= pfx_sys_len &&
-               boundary + (int)PF_T > pfx_sys_len;
+        return base == 0 && pfx_sys_cut > 0 && boundary <= pfx_sys_cut &&
+               boundary + (int)PF_T > pfx_sys_cut;
     }
 
     // Stage the state for [0,L) and hand it to a background writer. The D2H
@@ -4938,6 +4942,26 @@ struct Engine {
                 }
             }
             if (base == 0) pfx_last_persist = 0; // new chain: allow a fresh persist
+            // P16b shared cut (2026-09-08): cut the system-block entry at the
+            // longest prefix an indexed entry shares with this prompt, not at
+            // sys_len. Sessions of one client agree on the block up to a
+            // per-session tail (Claude Code's gitStatus: five sessions shared
+            // exactly 22460 of 22544-22578 tokens), so the sys_len cut was hit
+            // by nobody -- every first turn re-persisted its own entry. The
+            // first session ever still cuts at sys_len (nothing to share
+            // with), the second cuts where it agrees with the first, the third
+            // hits. Cold prefills only; a restored or snapshotted base never
+            // writes a system entry (pfx_sys_cut_here requires base == 0).
+            pfx_sys_cut = pfx_sys_len;
+            if (base == 0 && pcache && pcache->enabled() &&
+                pfx_sys_len >= pcache->cfg().min_tokens) {
+                const int shared = pcache->shared_prefix(prompt, pfx_sys_len);
+                if (shared >= pcache->cfg().min_tokens && shared < pfx_sys_len)
+                    pfx_sys_cut = shared;
+                if (shared > 0)
+                    fprintf(stderr, "[pfx] system block %d tokens, shares %d with an indexed entry"
+                            " -> cut at %d\n", pfx_sys_len, shared, (pfx_sys_cut / (int)PF_T) * (int)PF_T);
+            }
             gs.pfx = pfx_hit ? base : 0;
             fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d pfx=%d\n", NP, base,
                     snap_toks.size(), ck, gs.pfx);

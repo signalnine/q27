@@ -15710,6 +15710,71 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (g): prefix-cache tiers ON in production + the P16b shared cut -- prefill wall 255 -> 110 s on Claude Code traffic
+
+Phase 0 of docs/plans/2026-09-08-prefill-attack.md, plus the first-turn fix
+it uncovered. Results: bench/crossengine/agentic-2026-09-08/README.md (two
+new sections), instruments pf_restore_agg.py (joins [gen] pfx with [req]),
+bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py (the live gates).
+
+Tiers on (tools/launch_q27_38.sh d2-pfx: P16 disk tier on tmpfs /dev/shm,
+40 GB, min 4096, max 65536, step 8192, RAM tier off, Q27_SYSBLK=1). The
+controlled eviction case passed every bar: a 48,852-token conversation entry
+restored in 254 ms after a foreign 369-token request (re-prefill 44 tokens,
+pf_ms 342 vs ~14 s cold); a new conversation with the same system block
+restored the system entry in 44 ms. The first probe overshot to 69.7K tokens
+and showed the max-tokens trap live: that boundary was silently never
+persisted and the returning turn re-prefilled 29K. 12 instances at xhigh
+(prodpfx): the after-side-request class went 6 full misses (80 s) -> 2
+restores (0.2 s each), no read failures, persist exports median 74 ms.
+
+But first turns still never hit (0 of 26; 60% of the remaining prefill
+wall). Diagnosed from the entries themselves -- the .q27pc files carry the
+token vectors, so no request dump was needed: five sessions shared EXACTLY
+22460 tokens and diverged inside Claude Code's gitStatus section ("Recent
+commits:" then per-repo hashes). The P16b cut sat at the last chunk boundary
+<= sys_len (22528), 68 tokens past the divergence, so no session could hit
+another's entry and each first turn wrote its own 0.94 GB entry.
+
+Fix: PrefixCache::shared_prefix(prompt, upto) = longest prefix an indexed
+entry shares with the prompt (reads token vectors only, longest entries
+first, skips entries that cannot beat the current best); generate() computes
+it once per cold prefill with a system block >= min_tokens and cuts the
+system entry at that length when shorter than sys_len (pfx_sys_cut;
+pfx_sys_cut_here reads it instead of pfx_sys_len). Session 1 cuts at
+sys_len, session 2 at the shared length, session 3 onward restores. Not a
+numerics change: the entry is still a chunk-boundary state and the chunked
+continuation is the same path a P16b hit already took.
+
+Gates: tools/test_prefix_cache.cpp test_shared_prefix_across_sessions
+(empty cache, shared length, upto cap, foreign prompt, longest sharing entry
+wins, below-min entries ignored, disabled cache) PASS; make test-tools PASS;
+live three-session probe (shared body ending just under a chunk boundary,
+sys_len just over it, a foreign request between sessions -- WITHOUT it the
+P9 checkpoint ring serves session 2 at 4096 and the cut logic never runs):
+S1 cut 7168, S2 "shares 7084 -> cut at 6144", S3 restored 6144 in 49 ms.
+
+12-instance rerun on a fresh root (prodpfx2): session 2 logged "system
+block 22574 tokens, shares 22460 -> cut at 21504"; 12 of the 13 later
+first turns with a system block restored L=21504 (79 + 45 ms) and
+re-prefilled 2.3-4.5K tokens -- 1.0-1.7 s instead of 7.0-8.4 s cold (the
+three cold ones after bootstrap had no system block at all). Both miss
+classes at 0 full misses; 16 restores median 124 ms; prefill wall 255 -> 110
+s with turn counts matched (221 vs 219); round wall 18.63 ms = baseline
+18.60 (the 19.05 in prodpfx was jitter); restored turns draft at 3.88
+tok/round vs 3.96 VRAM-hit; prefix reuse 96.2%; quality 9/12 nonempty, 8/12
+gold = baseline. The harness wall halving (2168 -> 840 s) is mostly fewer
+decoded tokens this pass; the attributable part is the 145 s of prefill.
+
+Production is d2-pfx with the shared cut (binary built 14:24 from this
+tree). campaign.sh's relaunch line now calls the launch script instead of
+an inline systemd-run that had reverted production to no cache. Remaining
+prefill cost on this traffic: two bootstrap cold prefills per fresh root,
+the ~2.3-4.5K re-prefill after each system restore (shared prefix ends 956
+tokens past the chunk boundary + gitStatus tail + first user message), and
+the step-gate remainder after conversation restores. Next: phase 2 (the
+int8 GEMM to the vendor shape) makes the remaining cold prefills cheaper.
+
 ## 2026-09-08 (f): prefill recon -- two thirds of the prefill wall is cache policy; the int8 GEMM has 2x vendor headroom
 
 Recon only, no engine code. Full write-up: docs/perf-attribution-prefill-2026-09-08.md;
