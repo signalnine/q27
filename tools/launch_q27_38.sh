@@ -16,10 +16,15 @@ PACK8=/mnt/ai/models/qwen38-27b-dflash2-bf16/qwen38-dflash2-q8-serve.d2w
 ARGS="--host 172.17.0.1 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0"
 D2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_D2_TIMING=1"
 # P16 disk tier on tmpfs (zero SSD wear; /dev/shm had 62 GB free on 09-08),
-# P16c RAM tier, max_tokens raised so 48K+ conversations persist (default
-# 32768 would silently never persist them), step left at the 8192 default.
+# max_tokens raised so 48K+ conversations persist (default 32768 would
+# silently never persist them), step left at the 8192 default. The P16c RAM
+# tier is OFF by default: tmpfs alone restored in 0.47 s on 07-24 vs 0.53 s
+# with the tier, and each RAM slot pins pfx_bytes(max_tokens) ~2.44 GB on top
+# of the engine's two pinned staging buffers (~4.9 GB). PFX_RAM_GB=16 gives
+# six slots. Use a DIFFERENT PFX_DIR per numerical variant (kernel changes,
+# ladder vs d2): the blob format does not encode kernel numerics.
 PFX_DIR=${PFX_DIR:-/dev/shm/q27-pfx}
-PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-16} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
+PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
 mode=${1:-}; shift || true
 systemctl --user stop q27-38 2>/dev/null || true
 systemctl --user reset-failed q27-38 2>/dev/null || true

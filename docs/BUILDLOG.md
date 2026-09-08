@@ -15710,6 +15710,35 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (f): prefill recon -- two thirds of the prefill wall is cache policy; the int8 GEMM has 2x vendor headroom
+
+Recon only, no engine code. Full write-up: docs/perf-attribution-prefill-2026-09-08.md;
+executable plan: docs/plans/2026-09-08-prefill-attack.md; gpt-6-astra review of
+the plan: docs/reviews/2026-09-08-gpt6astra-prefill-plan.md.
+
+From the four 12-instance Claude Code runs of (d)/(e): prefill is 13-16% of
+the engine wall at xhigh, 28% at medium, ~2.9-3.1K tok/s aggregate, with the
+16-65K cold prefills (~3250 tok/s) at 62-73% of the prefill wall. The miss
+anatomy is exact: a returning turn hit iff the previous request was the same
+conversation. Every interleaved ~350-token Claude Code side request landed on
+slot 0 and invalidated the P8 snapshot + P9 ring (engine.cuh:4960-4966), so
+the next main turn re-prefilled 28-48K from zero (0/6 hits, 31-36% of the
+prefill wall in every config); first turns never reused the ~22K system block
+(33-42%). The P16/P16b/P16c tiers that handle both are shipped, measured on
+real CC on 07-24, and opt-in flags absent from the production command. ninfer
+on the same instances: 95.9% reuse (8 host state slots; shared_stable_prefix
+hits of 22,449 tokens).
+
+Kernel side: ninfer nvfp4 is 2.2x at 16-65K cold (25K: 3.5 vs 7.2 s), 1.6-1.8x
+at 256-4K; its published int tier equals q27 (3,275/1,610 vs our 3,201@16K /
+1,834@128K) and its prefill skeleton is the same as ours (eager, per-chunk
+sync, single lane, no split-K). The 08-17 plan's P0 finally ran:
+cuBLASLt int8 = 648-897 TOPS at M=1024 on our projection shapes
+(tools/cublaslt_peak.cu), gemm_q4_T = 310-322 -> 36-48% of the vendor
+ceiling; the plan's "~25% headroom" is retracted, it is ~2x with no format
+change. Plan order: cache tiers on (tmpfs-backed, tools/launch_q27_38.sh
+d2-pfx) -> GEMM to the vendor shape -> trims -> attention/delta at 128K.
+
 ## 2026-09-08 (e): production on DFlash2 -- Claude Code traffic at xhigh, DFlash2 vs ladder on the same instances
 
 Production q27-38 moved to the DFlash2 config (Q8 serving pack, sampled

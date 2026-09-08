@@ -38,19 +38,68 @@ Why: two thirds of the prefill wall is misses the P16/P16b/P16c tiers
 already handle. Every returning turn after an interleaved side request
 missed fully (0/6), and first turns never reuse the ~22 K system block.
 
+How the tiers actually persist and restore (reviewer-verified, read this
+before judging a miss):
+- Persist fires only at two prefill boundaries, never "on eviction":
+  the P16b system-block cut (last chunk boundary <= sys_len, only when
+  base == 0, at most once per cold prefill) and the P8 stable boundary
+  (stable_len < NP always holds on /v1/messages: server.cu:2752 splits
+  the encode at the assistant-open). Both go through pfx_should_persist
+  (engine.cuh:4273): cache enabled AND writer not busy AND
+  4096 <= L <= max_tokens AND (last_persist == 0 OR L - last_persist >=
+  step 8192) AND !has(prompt, L). A busy writer skips the boundary with
+  no retry; a failed disk write still advances pfx_last_persist.
+- The step gate is SHARED with the system save: a system cut at 21,504
+  makes a 28,000-token stable boundary ineligible (growth 6,496) until
+  the conversation reaches 29,696. So after an eviction the restored
+  entry can be up to one step (8192) plus the growth since behind, and
+  the returning turn re-prefills that much -- expected, not a bug. Step
+  4096 halves it at the cost of more saves (D2H ~50 ms/GB each).
+- Tier resolution (engine.cuh:4873) is P8 -> P9 -> RAM -> disk, first
+  match wins, NOT longest match: a shorter RAM system-block entry can
+  hide a longer disk conversation entry. Diagnose the selected tier and
+  restored length (`[pfx] restore L=`, `[gen] ... pfx=`) before blaming
+  persistence. `hit` is the reuse length whatever the tier; `pfx` > 0
+  only for RAM/disk restores (a P9 hit has pfx=0).
+- The ~350-token foreign request cannot persist (below min 4096); it
+  destroys the slot's P8/P9 entries but leaves RAM/disk entries intact.
+  That is exactly the case phase 0 fixes.
+- Memory: pfx_bytes(65536) is ~2.44 GB (fp8 KV + GDN state); each engine
+  pins TWO staging buffers of that size (~4.9 GB pinned) and the RAM tier
+  adds budget/2.44 GB slots on top. The launch script defaults the RAM
+  tier OFF (tmpfs alone restored in 0.47 s on 07-24; RAM ON was 0.53 s
+  first-restore) -- PFX_RAM_GB=16 turns it on (6 slots, ~15 GB more
+  pinned). tmpfs budget 40 GB on a 62 GB-free /dev/shm. Disk eviction is
+  by write mtime, not access LRU. The flags do not change GPU context
+  (pool-clamped, server.cu:1080).
+
 1. Relaunch production with the tiers:
    `bash tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1`
-   (tmpfs disk tier at /dev/shm/q27-pfx, 40 GB budget, RAM tier 16 GB,
-   max-tokens 65536, step 8192 default). Q27_SYSBLK=1 logs
+   (tmpfs disk tier at /dev/shm/q27-pfx, 40 GB budget, max-tokens 65536,
+   step 8192 default, RAM tier off). Q27_SYSBLK=1 logs
    sys_off/sys_len/stable_off per request -- the tool for "why did a
-   cross-conversation hit miss".
-   Check the boot log: `[pfx]` line reporting the root and budget; no
-   pinned-allocation failure (staging is pfx_bytes(65536) ~2.2 GB host
-   per slot; 128 GB box).
-2. Run the identical traffic (vox ON, as the baseline had it):
+   cross-conversation hit miss" (logging only; it enables nothing).
+   Check the boot log: the `prefix-cache:` line (server.cu:878) reporting
+   root, entries, budget, min/max/step; the cache must be ENABLED there
+   or sys_len is never computed and the RAM tier never inits.
+2. Run the same harness and settings as the baseline (vox ON as the
+   baseline had it; the traffic itself is fresh Claude Code sessions, so
+   turn counts and trajectories differ -- compare miss CLASSES, not
+   request counts). Record the image identity first:
+   `docker image inspect thunderdome/claude-code:latest --format '{{.Id}}'`.
    `SWEBENCH_UNIT=q27-38 SWEBENCH_HOST=172.17.0.1 SWEBENCH_EFFORT=high SWEBENCH_TELEMETRY=q27 bash bench/swebench/run.sh prodpfx 2>&1 | tee bench/crossengine/agentic-2026-09-08/prodpfx.log`
-   then capture the journal for that invocation:
-   `journalctl --user _SYSTEMD_INVOCATION_ID=$(systemctl --user show q27-38 -p InvocationID --value) -o cat --no-pager | grep -E "^\[(req|pfx|gen)\]" > bench/crossengine/agentic-2026-09-08/prodpfx-xhigh.req.txt`
+   then capture the FULL journal for that invocation (keep `[sysblk]`,
+   `[d2]`, `prefix-cache:` write-failure and eviction lines; filter later):
+   `journalctl --user _SYSTEMD_INVOCATION_ID=$(systemctl --user show q27-38 -p InvocationID --value) -o cat --no-pager > bench/crossengine/agentic-2026-09-08/prodpfx-xhigh.journal`
+   and derive `grep "^\[req\]" ... > prodpfx-xhigh.req.txt` for the
+   aggregators.
+2b. Controlled eviction case (deterministic, 5 min, do it BEFORE the full
+   run): drive conversation A to ~28 K and again to ~48 K with
+   bench/ladder/drive_warm_turn.py or captured requests, send one ~350-
+   token request from a different conversation, then extend A by one
+   turn. Record the last persisted boundary and the returned hit/pfx.
+   This is the acceptance test for the mechanism; the 12-instance run is
+   the traffic-level confirmation.
 3. Read it:
    `python3 bench/crossengine/agentic-2026-09-08/pf_misses.py prodd2 .../prodd2-xhigh.req.txt prodpfx .../prodpfx-xhigh.req.txt`
    `python3 bench/crossengine/agentic-2026-09-08/pf_agg.py ...` and
@@ -58,16 +107,23 @@ missed fully (0/6), and first turns never reuse the ~22 K system block.
    `grep "\[pfx\]" prodpfx-xhigh.req.txt` for every restore (alloc/read/
    import ms) and persist.
 
-Bars (against prodd2-xhigh):
+Bars (against prodd2-xhigh; measured acceptance targets, not code
+guarantees -- see the predicate above):
 - returning turns after another conversation: full misses 6 -> 0; each
-  such turn shows hit >= prompt - 8192 - new content (one step of
-  re-prefill at most) and a `[pfx] restore` line under 1 s.
-- first turns 2..12: `pfx=` >= 20000 (the system-block entry). If they
-  still read 0, Q27_SYSBLK=1 tells whether sys_len differs between
-  conversations (07-24 saw a 2,144-token drift between sessions; ninfer's
-  22,449-token shared hits on this harness say it is stable here) or the
-  billing-header normalizer missed CC 2.1.170's format (api_common.h
-  normalize_cc_billing_header).
+  such turn shows hit >= (last persisted boundary) with a `[pfx] restore`
+  line under 1 s, and the re-prefilled remainder explained by the step
+  gate + growth since that boundary.
+- first turns 2..12: `hit` >= 20000 (the system-block entry, via RAM/disk
+  `pfx` > 0 or a surviving P9 entry). A hit needs identical tokens
+  THROUGH the saved cut: effort, tool set and declaration order, system
+  text and the billing header all matter (server.cu:2681,
+  api_common.h:744; normalizer at api_common.h:233 handles `cch=` and the
+  4th+ cc_version component). If first turns miss, Q27_SYSBLK=1 gives
+  sys_len per request -- equal sys_len does not prove equal tokens and
+  unequal does not prove a miss (the difference may sit past the cut);
+  dump two first-turn prompts and compute the token LCP against the saved
+  cut. ninfer's 22,449-token shared hits on this harness are supporting
+  evidence under ITS rendering, not proof under ours.
 - prefill wall <= 150 s (from 255); decode t/s within +-5% of 201 agg;
   no `[pfx] read FAILED`; no persist on the critical path above 0.2 s
   (persist D2H is ~50 ms/GB; the 07-25 `alloc 7016 ms` was a restore
@@ -81,13 +137,18 @@ BUILDLOG, memory). If restores are slow, try RAM tier off (tmpfs alone,
 that is a separate P16b/normalizer fix, not a reason to hold the
 eviction win.
 
-Known interaction: after a pfx restore the DFlash2 ring has no rows for
-the restored prefix (d2_prefill_align keeps only VRAM-resident rows), so
-the first rounds of that turn draft from a shallow ring -- the same
-cold-start the warm-turn fix removed for same-slot turns. Measure, don't
-guess: compare tok/round on restored turns vs same-conv turns in
-lanes_agg.py. If it costs, persisting the last 2048 tap rows with the
-blob is the fix (~40 MB per entry).
+Known interaction (reviewer-checked: the flags do not break the
+Q27_BATCH=0 DFlash2 config; the fold event is waited before restore/
+reset, and reset() leaves the drafter ring alone): a RAM/disk restore
+carries no drafter rows, but the re-prefilled suffix re-seeds the ring
+through the normal tap capture, so any restore whose suffix is >= 2048
+tokens (D2_SEED_WINDOW) rebuilds the FULL seed window; only shorter
+suffixes draft from a shallow ring. Measure, don't guess: add a grouping
+to lanes_agg.py for restored turns (pfx > 0) vs same-conv turns (its
+current groups are completion-length buckets) and compare tok/round. If
+it costs, persisting the 2048 tap rows with the blob is 200 MiB per
+entry (5 taps x 5120 floats x 2048 rows), so a cheaper fix would be to
+recompute the last 2048 tokens' taps on restore.
 
 ## Phase 1 -- slot routing (multi-slot configs only, defer)
 
@@ -106,54 +167,81 @@ prefill, so 2x on the GEMM is ~1.4x on the cold wall. ninfer's fp4 GEMM
 (the whole of its 2.2x) runs at exactly the level a vendor-class int8
 kernel reaches on our existing weights.
 
-Facts a fresh context needs (prefill.cu:232-262):
+Facts a fresh context needs (prefill.cu:232-262, 442-488, 502, 874):
 - Weights: Q4_G64 nibble-packed, fp16 scale per 64 (Q4IN), unpacked to s8
-  at the reg->smem store. Activations: int8 per-64 (XG64 nat64/s64) so two
-  K=32 MMAs chain in int32 before ONE fp32 dequant step per 64-group; the
-  fp32 sum over groups is sequential in K.
-- Current tile: MR=64 rows x NT=128 tokens x KS=128 K-stage, 8 warps
-  (4 row x 2 token), single-buffered smem with a register-staged next
-  stage. The comment says double-buffering and __launch_bounds__ both
-  measured SLOWER in THIS shape -- that is the local optimum the vendor
-  shape escapes, not a reason to stop.
-- Split-K (`gemm_splitk_nsp`, prefill.cu:735) fires only when
-  blocks*2 <= nsm, i.e. small T or small rows; it regroups the fp32 sum and
-  is tolerance-gated already. The XG64 path itself is NOT serial-vs-batched
-  identical and is gated by tolerance + PPL + canonical (policy 2026-07-04).
-  So the gate for a new kernel is bitwise vs the CURRENT g64 nsp==1 kernel
-  where achievable (same per-64 int32 partials, same sequential fp32 group
-  order -> bit-identical regardless of tile shape), else the same
-  tolerance battery.
+  at the reg->smem store. Activations: int8 per-64 (XG64 nat64/s64).
+  Numerics per 64-group: a FRESH int32 accumulator, two K=32 MMAs chained,
+  then one fp32 update `acc += (wscale*xscale) * int_sum` into the
+  persistent fp32 accumulator; groups are visited in increasing global
+  order (gg=0 then gg=1 inside each 128-K stage). The epilogue only
+  stores. So bitwise equivalence across tile shapes IS achievable: keep
+  separate int32 accumulation per 64-group (summing two differently
+  scaled groups into one stage accumulator is WRONG, not merely
+  non-bitwise), the increasing group order, the same scale product and
+  rounding, and the same FMA contraction behaviour.
+- LIVE dispatch on sm_120 at saturated large T (the production case) is
+  NOT `k_gemm_mma_T<..,128>` but `k_gemm_mma_ntx<..,96>`: MR=128 rows x
+  NT=96 tokens, two row minitiles per warp (prefill.cu:502, 874; the +3.4%
+  ntx route). `k_gemm_mma_T` MR=64 x NT=128 x KS=128 is the numerical
+  reference and the small-T route. Activation ldmatrix is already on by
+  default in both (prefill.cu:36). Both are single-buffered smem with a
+  register-staged next stage; the "double-buffering measured slower"
+  comment is about THIS shape -- the vendor shape escapes it, not a
+  reason to stop. build/microbench_mxf4 measures live dispatch
+  (microbench_mxf4.cu:1133), so its 310-322 IS the ntx number.
+- Split-K (`gemm_splitk_nsp`, prefill.cu:735, 797) auto-fires only when
+  blocks*2 <= nsm AND g64 AND scratch is present; forced mode bypasses the
+  occupancy threshold. It regroups the fp32 sum and is tolerance-gated.
+  The XG64 path itself is NOT serial-vs-batched identical and is gated by
+  tolerance + PPL + canonical (policy 2026-07-04). Gate for a new kernel:
+  bitwise vs the current g64 nsp==1 kernels (both MR=64 and ntx must
+  agree with it today -- confirm first) via a direct old/new GEMM
+  comparison across tile boundaries and partial tiles (T not a multiple
+  of the tile, rows not a multiple of MR); `tools/ninv_test.cu` covers the
+  decode/verify families, NOT gemm_q4_T, so this comparison has to be
+  written (into the spike or microbench_mxf4). If not bitwise: state the
+  thresholds up front (deep logit A/B at 131072: cosine >= 0.99998,
+  argmax MATCH, top-5 5/5, as the fp8q gate had) plus the agentic
+  long-context quality battery, AND a separate prefix-cache root per
+  numerical variant -- cache compatibility (prefix_cache.h:57) does not
+  encode kernel numerics, so a restored blob from the old kernel would
+  silently mix numerics with the new one.
 - pf4.cu already carries the modern structure for this codebase (BM/BN/BK
   128/128/256, 8 warps, 2-stage cp.async, swizzled smem, ldmatrix) and
   ninfer's TMA kernel is BlockM 256 x N 128 x K 128, 3-stage mbarrier,
   8 consumer warps + 128 producer threads.
 
 Tasks:
-1. Baseline, same session: `make build/microbench_mxf4` and record
-   gemm_q4_T TOPS on the four shapes at M=1024 (expect 280-322); run
-   `build/cublaslt_peak 0` alongside for the ceiling. Stop vox first.
+1. Baseline, same session: `make build/microbench_mxf4` and record the
+   live-dispatch TOPS on the four shapes at M=1024 (expect 280-322; that
+   is the ntx kernel at T=1024); run `build/cublaslt_peak 0` alongside
+   for the ceiling. Stop vox first. Also record the MR=64 reference
+   kernel's output on the same inputs -- it is the bitwise reference.
 2. Spike (tools/gemm_w4a8_spike.cu, standalone, synthetic Q4_G64 data):
    a W4A8 kernel with BM=128 tokens x BN=128 rows x BK=128 (two g64
    groups) per stage, 3-stage cp.async pipeline for packed q4 + int8
    activations + scales, ldmatrix for the activation fragments, nibble
-   unpack to s8 in registers (lop3/prmt) on the B side, int32 accumulate
-   per stage, fp32 fold per 64-group in the SAME order as the incumbent.
-   Bitwise check against a straight port of the incumbent's math on the
-   same synthetic inputs. Bar to continue: >= 1.6x the incumbent's TOPS
-   at M=1024 on ffn_gate (17408x5120) and attn_out (5120x8192).
+   unpack to s8 in registers (lop3/prmt) on the B side, a SEPARATE int32
+   accumulator per 64-group (two per 128-K stage), fp32 fold per group in
+   the incumbent's increasing order with the incumbent's scale product.
+   Bitwise check against the MR=64 reference on the same synthetic inputs,
+   including partial tiles. Bar to continue: >= 1.6x the live-dispatch
+   TOPS at M=1024 on ffn_gate (17408x5120) and attn_out (5120x8192).
 3. Port into prefill.cu as a new template instantiation behind
    `Q27_PF_GEMM=w4a8v2` (default off), keep the split-K route for the
-   small-T shapes untouched. Gates: `--pf 200 seq+32` identity pattern
-   (docs/plans/2026-08-17-prefill-performance.md P1 bar), N-invariance
-   `tools/ninv_test.cu`, canonical md5 unchanged (NP=5 takes serial
-   prefill so it must not move), deep logit A/B at 131072 via
-   `--dump-logits` if not bitwise (repro line in
-   docs/perf-attribution-prefill-attn.md).
+   small-T shapes untouched. Gates: (a) the direct old/new GEMM
+   comparison from task 2 on real weights; (b) `--pf N` serial-vs-batched
+   identity is a LEGACY-PATH gate only (`Q27_PF_XG=32`; on the default g64
+   route a mismatch exits successfully, engine.cu:1374 -- it does not
+   enforce new-kernel correctness); (c) canonical md5 unchanged (NP=5
+   takes serial prefill so it must not move); (d) deep logit A/B at
+   131072 via `--dump-logits --ctx 133120` if not bitwise (repro line in
+   docs/perf-attribution-prefill-attn.md), thresholds as stated above.
 4. End-to-end: `Q27_KV=fp8 Q27_PF_NOSERIAL=1 ./build/q27 <model> --tokens-file
-   <toks> --pf 25600` old vs new, and the 12-instance run at xhigh with
-   phase 0 on. Bar: cold 25 K first turn 7.2 s -> <= 5.5 s in [req]
-   pf_ms; 128 K --pf wall -20% or better.
+   <toks> --pf 25600 --ctx 27648` old vs new (the CLI --ctx default is
+   2048 and the run refuses without it), and the 12-instance run at xhigh
+   with phase 0 on and a FRESH cache root. Bar: cold 25 K first turn
+   7.2 s -> <= 5.5 s in [req] pf_ms; 128 K --pf wall -20% or better.
 5. Default on; then the follow-on fusions ninfer has and we do not:
    gate/up in one launch with SwiGLU in the epilogue, residual add in the
    down-proj epilogue. Each bitwise-gated separately.
@@ -161,14 +249,20 @@ Tasks:
 ## Phase 3 -- trims (bitwise, half a session)
 
 - `qxT` (engine.cuh:3772-3780) launches quantize_x (g32) AND quantize_x_g64
-  on every projection group; the g32 output is unused when the g64 route
-  is taken (default; `Q27_PF_XG=32` is the exact legacy leg). Guard the g32
-  launch on the route flag. 2.3-4.3% of prefill. Gate: `--pf` output
-  byte-identical on both routes.
+  on every projection group; the g32 output is unused when the g64 MMA
+  route is taken (default). Guard the g32 launch on the route flag, but
+  the guard must keep g32 alive for `Q27_PF_XG=32` (exact legacy leg) AND
+  for `Q27_PREFILL=dp4a` (prefill.cu:900 consumes the g32 buffers
+  regardless of the g64 preference). 2.3-4.3% of prefill. Gate: `--pf`
+  output byte-identical on all three routes.
 - `mtp_warm_T` (engine.cuh:5013, 5042) runs per chunk even when DFlash2 is
   the drafter and the MTP head is never consulted (eh_proj 5120x10240 +
   k/v GEMMs, ~1.5%). Guard on `d2_on`. Gate: seeded DFlash2 output
-  byte-identical with and without (bench/ladder/drive_seeded.py).
+  byte-identical with and without (bench/ladder/drive_seeded.py). Side
+  effect: the persisted prefix blobs carry the MTP KV (engine.cuh:4101);
+  a blob written with the warm pass skipped would restore stale MTP state
+  into a LADDER config later. Use a separate cache root for d2 production
+  (or version the entry) before the ladder ever reads that root.
 - Skip the dead work in the 64-256-token turns (20% of requests, 137 ms
   mean, ~1400 tok/s): measure the floor first with a 128-token `--pf`
   under nsys before touching anything -- it may be launch overhead (1600
@@ -196,14 +290,34 @@ Tasks:
 A native fp4 tier remains dead on the 08-15/08-18 quality verdicts; phase
 2 captures most of the fp4 GEMM advantage on the existing weights.
 
-## Order and expected outcome on the prodd2 traffic mix
+## Order and expected outcome on the prodd2 traffic mix (conditional estimates)
 
 | after phase | prefill wall (255 s baseline) | first-turn TTFT | mid-conv stalls |
 |---|--:|--:|--:|
-| 0 | ~130 s | ~2 s (from 7) | gone (restores) |
+| 0 | ~130 s | ~2 s (from 7) | restores + <= one step of re-prefill |
 | 0+2 | ~95 s | ~1.5 s | -- |
 | 0+2+3 | ~90 s | -- | -- |
 
-Prefill is 13.5% of the engine wall at xhigh, so the whole plan is worth
-~8-9% of total wall at production effort and ~15% at medium; the
-user-visible part (the 7 s and 15.7 s stalls) is what phase 0 removes.
+Assumptions behind the table: phase 0's hits land as the predicate above
+allows (first turns share the system block through the cut); phase 2
+delivers 2x on a 55-60% GEMM share, which is 1.38-1.43x on the cold
+prefill wall -- it closes most, not all, of ninfer's 2.2x (the rest is the
+fp4 operand and their fused epilogues). Prefill is 13.5% of the engine
+wall at xhigh, so the whole plan is worth ~8-9% of total wall at
+production effort and ~15% at medium; the user-visible part (the 7 s and
+15.7 s stalls) is what phase 0 removes.
+
+## Review
+
+gpt-6-astra reviewed this plan statically before hand-off
+(docs/reviews/2026-09-08-gpt6astra-prefill-plan.md); its eleven items are
+folded in above: the persist predicate and shared step gate, first-match
+tier resolution, memory accounting (RAM tier defaulted off), the P16b
+hit conditions, the DFlash2 seed-window correction (>= 2048-token
+suffixes re-seed fully; taps are 200 MiB not 40 MB), the stale kernel
+shape (live dispatch is ntx MR=128 x NT=96), separate int32 accumulators
+per 64-group, `--ctx` on the --pf command, the legacy-only nature of the
+`--pf` identity gate on g64, ninv_test not covering gemm_q4_T, separate
+cache roots per numerical variant, the dp4a consumer of g32, the MTP
+contents of persisted blobs, and "same harness" instead of "identical
+traffic".
