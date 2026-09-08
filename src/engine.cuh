@@ -630,7 +630,17 @@ struct Engine {
     // widest LAUNCHABLE verify: the gated width, or the suffix width when
     // the drafter is armed wider (Q27_SUFFIX_W; sfx_width() is declared
     // further down -- in-class bodies see the complete class).
-    int verify_w_max() const { return suffix_on ? sfx_width() : gate_maxd + 1; }
+    // DFlash2 rounds verify at width d2_k+1 regardless of the ladder config
+    // (gpt-6-astra completion review 2026-09-07, P1: with Q27_MAXD=4 +
+    // Q27_SUFFIX=0 + K=7 the reserve was 6 while d2 verify writes 8 KV
+    // lanes -- a prompt admitted at max_ctx-6 overran the caches; the exact
+    // depth-5-era bug class, pre-existing on greedy d2 and newly reachable
+    // by sampled requests).
+    int verify_w_max() const {
+        int w = suffix_on ? sfx_width() : gate_maxd + 1;
+        if (d2_on && d2_k + 1 > w) w = d2_k + 1;
+        return w;
+    }
     int ctx_round_reserve() const { return std::max(gate_maxd, verify_w_max() - 1) + 2; }
     // P13 adaptive maxd (Q27_MAXD=auto): float the draft-depth ceiling per stream
     // between 4 and 5 from realized acceptance, so agentic streaks get depth-5

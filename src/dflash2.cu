@@ -514,6 +514,12 @@ void Dflash2::draft(int anchor_token, int anchor_pos, int K, cudaStream_t st, in
     assert(K >= 1 && K < D2_WMAX);
     const int W = K + 1;
     // per-round H2D (NEVER inside the captured graph): anchor token + positions
+    // + the ring-count mirror. The count was only uploaded by ingest(), so a
+    // host-side rollback() (round truncation) left the NEXT draft attending
+    // discarded rows until the following ingest (gpt-6-astra completion
+    // review 2026-09-07, P2). Refreshing here makes every draft see the
+    // current host count unconditionally -- 4 bytes/round.
+    D2CHECK(cudaMemcpyAsync(d_ctx_n, &ctx_n, 4, cudaMemcpyHostToDevice, st));
     D2CHECK(cudaMemcpyAsync(d_anchor_tok, &anchor_token, 4, cudaMemcpyHostToDevice, st));
     int hpos[D2_WMAX];
     for (int i = 0; i < W; i++) hpos[i] = anchor_pos + i;
