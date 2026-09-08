@@ -256,6 +256,12 @@ build/microbench_mxf4: tools/microbench_mxf4.cu src/prefill.cu src/kernels.cu sr
 build/cublaslt_peak: tools/cublaslt_peak.cu | build
 	$(NVCC) -O2 -arch=sm_120a tools/cublaslt_peak.cu -lcublasLt -lcublas -o $@
 
+# W4A8 prefill GEMM spike (prefill plan phase 2, BUILDLOG 2026-09-08 (h)):
+# bitwise gate vs gemm_q4_T on the projection shapes + timing of the variants.
+# Run: build/gemm_w4a8_spike [--time] [--shape ffn_gate] [--only VARIANT] [--notest]
+build/gemm_w4a8_spike: tools/gemm_w4a8_spike.cu src/prefill.cu src/kernels.cu src/prefill.cuh src/kernels.cuh | build
+	$(NVCC) $(MXF4FLAGS) -lineinfo -I src tools/gemm_w4a8_spike.cu src/prefill.cu src/kernels.cu -o $@
+
 VGEMM_SRC = src/vgemm.cu src/kernels.cu src/spec3.cu src/blocks.cu src/prefill.cu \
             src/device_model.cu src/loader.cpp
 

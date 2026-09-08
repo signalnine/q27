@@ -15710,6 +15710,67 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (h): W4A8 prefill GEMM spike -- bitwise at 1.26-1.41x, the 1.6x bar NOT met; ceilings measured
+
+Phase 2 task 2 of docs/plans/2026-09-08-prefill-attack.md. Spike
+tools/gemm_w4a8_spike.cu (links the incumbent gemm_q4_T as the bitwise
+reference; `--time`, `--shape`, `--only`, `--notest`), probes in
+tools/probes/ (README there). Numbers: RTX 5090, production idle on the GPU.
+
+THE DESIGN IS PROVEN BITWISE: every variant (8+ tile/pipeline shapes) is
+byte-identical to gemm_q4_T on all four projection shapes at T in {1024,
+1000, 512, 257, 96, 37, 1, 4096}. The pieces: weights stay nibble-packed in
+smem (cp.async 16 B, swizzled), one ldmatrix.x4 per 16-row tile per 64-group
+hands each lane 8 consecutive packed K; unpack is SHL+LOP3 / LOP3 with the
+nibble in the HIGH half of the byte XOR 0x80 (= s8 16*(u-8)), so the IMMA
+yields exactly 16d; K inside each 32-block is consumed in even/odd order and
+the activations are stored that way per 32-block (k_permute_x; the port puts
+it in quantize_x_g64 as a second output), so the standard B ldmatrix matches;
+f = fma(int_as_float(16d + 0x4B400000), 1/16, -786432) == (float)d exactly;
+the fold is the incumbent's `acc += wsc*xs*f` in the incumbent's group order.
+
+MEASURED (T=1024 / T=4096, TOPS, incumbent live dispatch = 313-330):
+  ffn_gate 17408x5120: best 416 / 443 (1.30x / 1.34x)
+  attn_out  5120x8192: best 442 / 444 (1.41x / 1.42x); 256-row tile 461 once
+Best shapes: 128x128x128, 2-stage cp.async, 8 warps (255 regs) or 16 warps
+(4x4, 128 regs, no spills) -- all configurations land in a 400-460 band.
+
+CEILINGS (probes): IMMA pipe 1020 (dependent chains; a register-only loop
+with loop-invariant inputs reports 2-4x that because ptxas hoists the mma --
+PTX has no volatile). Register-only IMMA + the exact 4-op fold 817-827; a
+3-op cvt fold 889-896 (I2F is NOT slow on sm_120 -- the spike's opening
+comment about it was wrong and is corrected). Kernel with the stage fill and
+barrier removed: 609 (16 warps), 616 (256-row tile); with the fold also
+removed 807. Stage fill alone streams at 6.8 TB/s = 74 of the 201 us.
+
+WHAT DID NOT MOVE IT (each within +-3%): lagging the fold by one tile (the
+compiler re-hoists the IMMA bursts; an asm-ordered interleave that the SASS
+confirms changes nothing -- stall profile identical: wait 24%, tensor
+throttle 20%, barrier 11%, 0.57 eligible warps, CPI 4.7); 2 blocks/SM at
+128 regs; 12 or 16 warps; pipeline depth 3/4/6 (once the slot index is
+static -- kt%3 as a runtime slot cost 6%); the 3-op fold (+3%); group-major
+token scales with 8-B pair loads (-4%: the compiler's LDS.128 path was
+better); a producer-warp + mbarrier design (326-350: one cp.async warp
+cannot issue 60 copies per lane per stage fast enough and the consumers
+dropped to 168 regs).
+
+READ: the tensor pipe is 46% active because the fill and the math do not
+overlap (609 without the fill vs 428 with it), not because of the fold or
+occupancy. The vendor shape that fixes this on sm_120 is TMA bulk-tensor
+copies (one instruction per tile, expect_tx on the full mbarrier, no per-lane
+issue cost) feeding 8-16 consumer warps -- ninfer's kernel is exactly that.
+Prerequisites: transposed scale sidecars (W scales [ngrp][rows] fp16 on
+device at load; xs [ngrp][T] from the quantizer) so the scale tiles are TMA
+boxes with a >= 16-B inner dim, which also removes the 20% excessive global
+sectors ncu attributes to the per-row 4/8-byte scale copies. ncu also flags
+92% of the cp.async smem-write wavefronts as conflicts; the staging-only
+probe reaches L2 speed regardless, so that is not the wall.
+
+Verdict: spike bar (>= 1.6x at M=1024 on ffn_gate and attn_out) NOT met;
+1.30x / 1.41x bitwise stands ready to port if a 1.3x is wanted as-is. Not
+ported (no engine code changed). Next session: the TMA producer, then the
+scale sidecars, then re-measure against the same spike table.
+
 ## 2026-09-08 (g): prefix-cache tiers ON in production + the P16b shared cut -- prefill wall 255 -> 110 s on Claude Code traffic
 
 Phase 0 of docs/plans/2026-09-08-prefill-attack.md, plus the first-turn fix

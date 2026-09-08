@@ -289,6 +289,23 @@ Tasks:
    gate/up in one launch with SwiGLU in the epilogue, residual add in the
    down-proj epilogue. Each bitwise-gated separately.
 
+### Phase 2 status (2026-09-08 evening, task 2 spike done, bar not met)
+
+BUILDLOG 2026-09-08 (h). tools/gemm_w4a8_spike.cu is a bitwise W4A8 kernel
+(all shapes, all T incl. tails) at 1.30x (ffn_gate) / 1.41x (attn_out) at
+M=1024 -- short of the 1.6x bar. Measured ceilings: IMMA pipe 1020 TOPS,
+register-only exact fold 827, kernel without the stage fill 609, fill alone
+6.8 TB/s; the gap is fill/compute non-overlap, not the fold or occupancy.
+Task 2 continues with a TMA producer (cp.async.bulk.tensor + expect_tx
+mbarriers; the cp.async producer-warp attempt regressed to 326-350) and
+transposed scale sidecars (W [ngrp][rows] fp16 at load, xs [ngrp][T] from
+the quantizer) so scale tiles are TMA boxes. Probes and traps in
+tools/probes/README.md (ptxas hoists loop-invariant mma: register-only
+IMMA loops must perturb an input per iteration). Task 3 (the port behind
+Q27_PF_GEMM=w4a8v2) is unchanged; the activation permute goes into
+quantize_x_g64 as a second output buffer (nat64p) so the Q8 path keeps its
+layout.
+
 ## Phase 3 -- trims (bitwise, half a session)
 
 - `qxT` (engine.cuh:3772-3780) launches quantize_x (g32) AND quantize_x_g64
