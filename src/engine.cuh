@@ -2885,11 +2885,20 @@ struct Engine {
         }
         d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
         d2_timing = getenv("Q27_D2_TIMING") != nullptr;
+        // side stream for the commit-fold (post_round) so it overlaps the next
+        // draft graph; Q27_D2_FOLD=sync keeps the fold on stm for A/B.
+        if (const char* fs = getenv("Q27_D2_FOLD"); !fs || strcmp(fs, "sync") != 0) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&d2_fold_stm, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&d2_fold_ev, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(d2_fold_ev, d2_fold_stm)); // valid to wait on from the start
+        }
         d2_on = true;
         fprintf(stderr, "dflash2 serving ON: K=%d (width %d), ring 4096, head %s, walk %s\n",
                 d2_k, d2_w, vh, d2_walk_sampled ? "sampled" : "greedy");
     }
     bool d2_walk_sampled = true; // sampled rounds draw the selector path (Q27_D2_WALK)
+    cudaStream_t d2_fold_stm = nullptr; // side stream for post_round's fold (nullptr = on stm)
+    cudaEvent_t d2_fold_ev = nullptr;   // fold done; the next verify / prefill wait on it
     // Called once the prefix hit is known (before the prefill loops): align
     // the drafter ring with this turn. d2_seq is the token sequence the ring's
     // rows were built from (positions 0..ctx_end); rows for positions below
@@ -2979,6 +2988,10 @@ struct Engine {
         // Sampled rounds verify through the rejection tail (accept walk over
         // the same d_draft_L lanes; distribution-preserving per the sampled
         // ladder's gates); greedy rounds keep the equality-chain tail.
+        // The previous round's fold may still be running on the side stream
+        // (post_round); the verify reads committed GDN state, so wait here
+        // -- after the draft graph, which is what the overlap buys.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0));
         CUDA_CHECK(cudaGraphLaunch(sampling ? d2_verify_sample_exec : d2_verify_exec, stm));
         if (d2_timing) cudaEventRecord(d2_ev[3], stm);
         int oc[OUTCOME_INTS];
@@ -3031,6 +3044,7 @@ struct Engine {
         // rigs (CLI spec loop, smoke harnesses) drive spec_round without
         // post_round -- fold the previous round's commit before this round's
         // verify reads committed state. No-op when already folded.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         flush_fold(stm);
         int md_used = -1;  // P13: draft-depth ceiling actually used this round
         int gate_cap = -1; // this round's margin-run depth (gated branches only)
@@ -3479,6 +3493,7 @@ struct Engine {
     // next. No MTP, no spec: correctness-first per the design (Phase 2 adds spec
     // rejection sampling for speed).
     int sample_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         if (samp_first) {
             samp_first = false;
             q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
@@ -3499,6 +3514,7 @@ struct Engine {
     // no forward) -- symmetric with the greedy bootstrap (step_with's argmax);
     // h_next is the prefill hidden. Tools are off under sampling, so no split path.
     int spec_sample_round(int* emit) {
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0)); // side-stream fold
         flush_fold(stm); // M1 belt: see spec_round
         // First token from the retained prefill logits (kind 0, no forward) --
         // BEFORE any spec round, on both the gated and ungated branches, so the
@@ -4690,7 +4706,20 @@ struct Engine {
         // here after the conductor's one host sync, so the cstm-side arena
         // writes have landed; the fold on stm is ordered before the next
         // round's draft on stm, and cstm waits on draft_done.)
-        flush_fold(stm);
+        if (d2_fold_stm) {
+            // DFlash2 serving (2026-09-07): fold on a SIDE stream so it
+            // overlaps the next round's draft graph, which never touches
+            // the GDN state or the record arena. The host synced stm at the
+            // outcome read, so every arena write of this verify has landed;
+            // the next verify (the only reader of committed S) waits on
+            // d2_fold_ev before it launches (dflash2_round), and prefill
+            // waits on it too. ~0.38 ms/round of fold kernels leave the
+            // critical path.
+            flush_fold(d2_fold_stm);
+            CUDA_CHECK(cudaEventRecord(d2_fold_ev, d2_fold_stm));
+        } else {
+            flush_fold(stm);
+        }
         // suffix index tracks the committed stream (post-truncation n);
         // the pending token rides along virtually in propose_with.
         if (suffix_on)
@@ -4786,7 +4815,10 @@ struct Engine {
             sfx_valid = false;
         }
         // DFlash2 ring alignment happens once the prefix hit is known (both
-        // branches below call d2_prefill_align).
+        // branches below call d2_prefill_align). A side-stream fold from the
+        // previous request's last round must land before this prefill reads
+        // or resets the GDN state.
+        if (d2_fold_stm) CUDA_CHECK(cudaStreamWaitEvent(stm, d2_fold_ev, 0));
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly

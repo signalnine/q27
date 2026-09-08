@@ -177,6 +177,14 @@ unchanged (3.59 -> 3.65). Drafter budget now: Q8 gemvs 1.3 (floor), head
 18.0): verify 17.85 vs ~16.5, and fold 0.38 + host 0.58 + ingest 0.13 vs
 their 0.6 -- the fold can overlap the draft graph on a side stream (~0.4).
 
+## Fold on a side stream SHIPPED (BUILDLOG (k)): bitwise, round 20.4 -> 20.0
+
+Drafter attack closed at the floor: d2 round 22.4 -> 20.0 ms, 164 -> 187
+t/s seeded think (+14%). Left in the drafter: Q8 gemvs 1.3 (floor), head
+0.43, top-16 0.09, tiny 0.15. Remaining engine gap = the width-8 verify
+(17.8 vs ninfer ~16.5): adaptive verify width or verify-kernel work, not
+the drafter.
+
 ## Agentic standings 2026-09-07 late (bench/crossengine/agentic-2026-09-07)
 
 Claude Code on the 12 SWE-bench instances, effort medium on both engines:

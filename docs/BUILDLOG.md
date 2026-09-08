@@ -15710,6 +15710,32 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (k): DFlash2 commit-fold on a side stream -- bitwise, -0.3 ms/round
+
+The GDN commit-fold (post_round, ~0.38 ms of k_delta_scan_T + conv-ring
+kernels) ran on stm between the verify's outcome and the next draft graph,
+which never touches the GDN state or the record arena. With Q27_DFLASH2 the
+fold now runs on a non-blocking side stream (d2_fold_stm) and records
+d2_fold_ev; the d2 verify launch, the ladder/sample round entry points and
+generate_prefill wait on the event before reading committed S. The host had
+already synced stm at the outcome read, so every arena write of the verify
+has landed before the fold starts; the next verify is the only reader.
+Q27_D2_FOLD=sync keeps the old ordering.
+
+Paired A/B (worktree incumbent at the attention commit, vox stopped, 12.5K
+seeded think): streams IDENTICAL (842 rounds / 3.648 both), round
+20.30/20.44 -> 20.04 ms, t/s 184.6/183.4 -> 187.1 (+1.7%); Q27_D2_TIMING
+host 0.58 -> 0.18 (the fold left the window), draft 1.92 -> 2.02 (the fold
+now shares SMs with the draft graph). Greedy CLI identity holds.
+
+Drafter attack standing (this session): d2 round 22.4 -> 20.0 ms, seeded
+think 164 -> 187 t/s (+14%). What remains in the drafter is weight traffic
+at the floor: Q8 gemvs 1.3 ms (Q4 pack: -0.4 ms at -5.8% tok/round, still a
+net loss), Q4 head 0.43 (a 131072-row draft head would save ~0.2 at an
+unmeasured acceptance cost), top-16 0.09, tiny kernels ~0.15. The round is
+now verify 17.8 + draft 2.0 + host 0.2 vs ninfer 18.0 total: the verify
+(width 8, their ~16.5) is the remaining engine gap.
+
 ## 2026-09-07 (j): DFlash2 drafter attention -> flash-decoding: draft 3.57 -> 1.95 ms, +12% t/s
 
 Serving-side nsys node trace of the d2 unit (Q8 pack, 12.5K think, one warm
