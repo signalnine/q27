@@ -71,6 +71,7 @@ for leg in $LEGS; do
 done
 sudo -n systemctl start vox-transcriber vox-transcriber-gmrs 2>/dev/null
 systemctl --user reset-failed q27-38 2>/dev/null
-systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 $Q27 $MODEL $TOK --host 172.17.0.1 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
+# production config since 2026-09-08: DFlash2 Q8 pack (BUILDLOG 2026-09-08 (e))
+systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_D2_TIMING=1 $Q27 $MODEL $TOK --host 172.17.0.1 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
 log "done; production relaunched; vox: $(systemctl is-active vox-transcriber) $(systemctl is-active vox-transcriber-gmrs)"
 echo "CAMPAIGN DONE" > $DIR/DONE
