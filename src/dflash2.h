@@ -128,14 +128,31 @@ struct Dflash2 {
     // slides -- when it would overflow, the oldest rows past the sliding
     // window are dropped (lossless: the drafter attends only D2_WINDOW back).
     void ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st);
-    void reset_ctx() { ctx_n = 0; } // new conversation/turn: cold ring
+    // Host coverage bookkeeping: rows hold positions [ctx_end - ctx_n, ctx_end)
+    // whenever every ingest continued at ctx_end (ctx_contig). A gap makes
+    // the by-count rollback below meaningless, so rollback_to resets instead.
+    int ctx_end = 0;
+    bool ctx_contig = true;
+    void reset_ctx() { ctx_n = 0; ctx_end = 0; ctx_contig = true; } // cold ring
     // Drop the last `rows` ingested rows (round truncation: post_round's
     // on_round can shrink a committed round AFTER dflash2_round already
     // ingested its accepted lanes -- the ring is append-only, so phantom
     // rows would otherwise coexist with the re-committed positions and
     // pollute drafter attention). Host counter only; the device tail is
     // dead until the next ingest overwrites it.
-    void rollback(int rows) { ctx_n = rows >= ctx_n ? 0 : ctx_n - rows; }
+    void rollback(int rows) {
+        const int r = rows < ctx_n ? rows : ctx_n;
+        ctx_n -= r;
+        ctx_end -= r;
+    }
+    // Turn alignment (2026-09-07): keep the rows for positions < pos, drop
+    // the rest. A prefix-cache warm turn re-prefills only [base, NP), so the
+    // rows below the (verified) common prefix stay valid -- the ring no
+    // longer cold-starts every turn. Non-contiguous coverage => reset.
+    void rollback_to(int pos) {
+        if (!ctx_contig || pos <= ctx_end - ctx_n) { reset_ctx(); return; }
+        if (pos < ctx_end) rollback(ctx_end - pos);
+    }
 
     // one draft block of K proposals (width K+1): anchor (pending) token at
     // anchor_pos. Fully device-side; proposals land in d_prop[0..K-1]. No

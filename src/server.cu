@@ -532,6 +532,20 @@ int main(int argc, char** argv) {
         setenv("Q27_BATCH_GRAPH", "1", 0);
         setenv("Q27_BATCH_GRAPH_CAP", "64", 0);
     }
+    // DFlash2 serving is single-slot: the conductor's FUSED batch rounds
+    // commit through commit_outcome, which advances the target without the
+    // drafter's ring/position/sequence mirrors (dflash2_round owns those), so
+    // a later solo d2 round would label its taps with stale positions while
+    // every host invariant still looks intact (gpt-6-astra ring review).
+    // Refuse the contradiction at boot rather than degrade silently.
+    if (getenv("Q27_DFLASH2")) {
+        const char* b = getenv("Q27_BATCH");
+        if (!b || strcmp(b, "0") != 0) {
+            fprintf(stderr, "Q27_DFLASH2 requires Q27_BATCH=0 (single-slot solo rounds; fused "
+                            "batch rounds bypass the drafter ring)\n");
+            return 1;
+        }
+    }
     // Q27_SAMPLED=0 (issue #1, small-VRAM greedy boots): the engine skips the
     // sampled graph set; this server refuses temperature>0 requests with a
     // 400 up front. Contradiction guard (two-tier precedent): forcing

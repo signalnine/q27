@@ -113,16 +113,35 @@ in lanes 4..7 (cond 0.655/0.663/0.593/0.697 vs 0.783/0.699/0.658/0.805):
 deeper mask rows, i.e. drafter numerics (Q4-g64 vs their W8) and/or ring
 coverage, not the walk. Q8 serving pack A/B: see below.
 
-NEW LEVER FOUND (queue next): WARM-TURN RING STARVATION. d2_prefill_begin
-resets the ring every turn and prefill re-seeds only the UNCACHED tail, so a
-prefix-cache warm turn starts the drafter with 1-5 context rows. Measured on
-three identical seeded requests: tok/round 3.28 (cold, pf=3023) -> 3.16
-(warm, pf=5) -> 3.05 (warm, pf=1). Agentic traffic is almost all warm turns
--- this is a candidate for the live-CC -7%. Fix shape: on a same-lineage
-in-memory prefix hit, roll the ring back to the hit position instead of
-resetting (rows are keyed by absolute position; taps for positions < hit are
-unchanged), reset only on lineage change / disk restore. Needs the slot
-lineage signal claim_slot already has.
+WARM-TURN RING STARVATION -- FOUND AND SHIPPED (same night). d2_prefill_begin
+reset the ring every turn and prefill re-seeded only the UNCACHED tail, so a
+prefix-cache warm turn started the drafter with 1-5 context rows: tok/round
+3.28 (cold, pf=3023) -> 3.16 (warm, pf=5) -> 3.05 (warm, pf=1) on three
+identical seeded requests. Agentic traffic is almost all warm turns.
+
+Shipped: d2_prefill_align(prompt, base) keeps ring rows for positions below
+min(LCP(d2_seq, prompt), base) -- d2_seq is the host token sequence the ring
+was built from (maintained per accepted lane and at the truncation
+rollback), so the rule is lineage-agnostic and exact: a RAM/disk restore over
+a ring built from another conversation gets LCP ~ 0 -> reset. Dflash2 tracks
+ctx_end/ctx_contig; rollback_to(pos) resets on non-contiguous coverage.
+Q27_D2_RING=reset = old behaviour. That contiguity check exposed a
+PRE-EXISTING HOLE: the last prompt token (NP-1) went through step_with
+(graph_exec, no tap capture) and was never in the ring -- every turn's
+drafter lacked its most recent context row. Fixed with the eager
+token_launches(d2_vtaps) (graph_exec's own launch sequence plus the tap
+copies) + a one-row ingest.
+
+Measured (bench/ladder/drive_warm_turn.py, keep vs Q27_D2_RING=reset):
+  (A) identical request x3:  keep 3.82 / 3.82 / 3.82 tok/round (67 rounds each,
+      identical streams: warm == cold now) vs reset 3.56 / 3.12 / 3.12
+  (B) two-turn conversation, turn 2: keep 5.69, 4.92 vs reset 4.57, 3.88
+  Standard 12.5K seeded think (all cold): 3.383 -> 3.593 tok/round (+6%),
+  153.3 -> 162.9 t/s -- see BUILDLOG 2026-09-07 (g). Slide exercised (2400-
+  token generation, then a repeat + a follow-up turn): no fault; a prompt
+  that repeats a range the ring has slid past correctly keeps 0 rows.
+  gpt-6-astra review P2s (overlapping compaction copy, fused-batch bypass,
+  latched contiguity flag) fixed before commit.
 
 ## Standing cautions
 

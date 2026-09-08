@@ -507,14 +507,38 @@ void Dflash2::alloc(int cap) {
 
 void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st) {
     assert(T <= 4096);
-    // Slide the ring: keep only the most recent D2_WINDOW rows so a long
-    // conversation never overruns the fixed allocation. The drafter's
-    // attention masks anything older than D2_WINDOW anyway, so dropping the
-    // head is lossless. Compact by keeping the tail block contiguous.
+    if (T <= 0) return;
+    // Coverage bookkeeping (rollback_to relies on contiguous positions). A
+    // chunk that does not continue at ctx_end is a prefill seed window that
+    // starts past the retained rows (base < NP - D2_SEED_WINDOW): every
+    // retained row is then older than the window's start, i.e. > D2_WINDOW
+    // behind every position the drafter will ever query from here, so
+    // dropping them is lossless and keeps the ring contiguous (a latched
+    // "not contiguous" flag would reset a valid ring on the NEXT turn;
+    // gpt-6-astra ring review). A gap INSIDE the chunk never happens (all
+    // callers pass consecutive positions) and is treated the same way.
+    if (ctx_n > 0 && (h_pos[0] != ctx_end || h_pos[T - 1] - h_pos[0] != T - 1)) {
+        static const bool dbg = getenv("Q27_D2_DEBUG") != nullptr;
+        if (dbg)
+            fprintf(stderr, "[d2] ring ingest NOT contiguous: pos %d..%d (T=%d) after ctx_end %d "
+                            "(ctx_n %d) -> dropping retained rows\n", h_pos[0], h_pos[T - 1], T,
+                    ctx_end, ctx_n);
+        ctx_n = 0;
+    }
+    if (h_pos[T - 1] - h_pos[0] != T - 1) ctx_contig = false; // internal gap: never expected
+    // Slide the ring: keep only the rows that can still fall inside the
+    // drafter's window once this chunk lands -- D2_WINDOW - T of them (the
+    // attention masks anything older than D2_WINDOW behind the query, so
+    // dropping the rest is lossless). With ctx_cap == 2 * D2_WINDOW that
+    // bound also makes the compaction copy overlap-free: the slide fires at
+    // ctx_n > ctx_cap - T, so src0 = ctx_n - keep > D2_WINDOW >= keep (the
+    // old keep = D2_WINDOW could copy [2047,4095) onto [0,2048) -- an
+    // overlapping cudaMemcpyAsync, undefined; gpt-6-astra ring review).
     if (ctx_n + T > ctx_cap) {
-        const int keep = std::min(ctx_n, D2_WINDOW);
+        const int keep = std::min(ctx_n, std::max(0, D2_WINDOW - T));
         const int src0 = ctx_n - keep;
-        if (src0 > 0) {
+        assert(src0 >= keep); // no overlap between the copied tail and its destination
+        if (src0 > 0 && keep > 0) {
             for (int l = 0; l < D2_LAYERS; l++) {
                 D2CHECK(cudaMemcpyAsync(ringK[l], ringK[l] + (size_t)src0 * D2_KVD,
                                         (size_t)keep * D2_KVD * 4, cudaMemcpyDeviceToDevice,
@@ -558,6 +582,7 @@ void Dflash2::ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t 
         }
     }
     ctx_n += T;
+    ctx_end = h_pos[T - 1] + 1;
     D2CHECK(cudaMemcpyAsync(d_ctx_n, &ctx_n, 4, cudaMemcpyHostToDevice, st));
 }
 

@@ -2857,6 +2857,7 @@ struct Engine {
         // argmax walk + one-hot tail for A/B): the drafter draws its path from
         // softmax(E/T) and the verify tail rejects against that sparse q.
         if (const char* wm = getenv("Q27_D2_WALK")) d2_walk_sampled = strcmp(wm, "greedy") != 0;
+        if (const char* rk = getenv("Q27_D2_RING")) d2_ring_keep = strcmp(rk, "reset") != 0;
         if (sampled_graphs) {
             if (d2_walk_sampled) {
                 d2->set_sampler(d_samp); // before capture_draft (twin graph)
@@ -2889,13 +2890,34 @@ struct Engine {
                 d2_k, d2_w, vh, d2_walk_sampled ? "sampled" : "greedy");
     }
     bool d2_walk_sampled = true; // sampled rounds draw the selector path (Q27_D2_WALK)
-    // Called at prefill START: clear the drafter ring for this turn. The
-    // prefill loops then re-seed it with the prompt tail (d2_seed_chunk), so
-    // the drafter starts decode WARM instead of cold. Warm turns re-seed from
-    // whatever the prefix cache left to prefill, which always includes the
-    // prompt tail (older restored prefix is masked by the drafter's window).
-    void d2_prefill_begin() {
-        if (d2_on) d2->reset_ctx();
+    // Called once the prefix hit is known (before the prefill loops): align
+    // the drafter ring with this turn. d2_seq is the token sequence the ring's
+    // rows were built from (positions 0..ctx_end); rows for positions below
+    // the common prefix of d2_seq and the new prompt are still exact (a tap
+    // at position p depends only on tokens [0, p]), capped at `base` because
+    // prefill re-seeds [base, NP) and the ring must not hold those positions
+    // twice. Everything else is dropped. Until 2026-09-07 this was an
+    // unconditional reset, so a prefix-cache warm turn (pf = a few tokens)
+    // started the drafter with 1-5 context rows: tok/round 3.28 cold -> 3.05
+    // warm on identical requests. Q27_D2_RING=reset restores that for A/B.
+    // The rule is lineage-agnostic: a hit restored from the RAM/disk tiers
+    // over a ring built from another conversation gets LCP ~ 0 -> reset.
+    bool d2_ring_keep = true;
+    std::vector<int> d2_seq;
+    void d2_prefill_align(const std::vector<int>& prompt, int base) {
+        if (!d2_on) return;
+        int keep = 0;
+        if (d2_ring_keep) {
+            const size_t n = std::min(d2_seq.size(), prompt.size());
+            size_t L = 0;
+            while (L < n && d2_seq[L] == prompt[L]) L++;
+            keep = std::min((int)L, base);
+        }
+        d2->rollback_to(keep);
+        if (d2_timing)
+            fprintf(stderr, "[d2] ring align: keep %d rows (lcp-capped %d, base %d, seq %zu)\n",
+                    d2->ctx_n, keep, base, d2_seq.size());
+        d2_seq = prompt;
     }
     // Seed the ring from one prefill chunk's taps: ingest the tokens in this
     // chunk that fall inside the last-D2_SEED_WINDOW of the prompt. taps holds
@@ -2977,6 +2999,7 @@ struct Engine {
         int ipos[W_MAX];
         for (int k = 0; k < n; k++) ipos[k] = d2_pos + 1 + k;
         d2->ingest(d2_vtaps, ipos, n, stm);
+        for (int k = 0; k < n; k++) d2_seq.push_back(oc[1 + k]); // ring rows <-> tokens
         if (d2_timing) {
             float fo, dr, ve;
             cudaEventElapsedTime(&fo, d2_ev[0], d2_ev[1]);
@@ -4653,6 +4676,7 @@ struct Engine {
                 if (d2_on && m < n) {
                     d2->rollback(n - m);
                     d2_pos -= (n - m);
+                    d2_seq.resize(d2_seq.size() - std::min<size_t>(n - m, d2_seq.size()));
                 }
                 last_pending = refinish_round(m, n, t.Ph + m);
                 if (d2_on) d2_pending = last_pending;
@@ -4761,7 +4785,8 @@ struct Engine {
             sfx.reset(prompt);
             sfx_valid = false;
         }
-        d2_prefill_begin(); // DFlash2: clear the drafter ring; the loops re-seed the prompt tail
+        // DFlash2 ring alignment happens once the prefix hit is known (both
+        // branches below call d2_prefill_align).
         auto t_in = std::chrono::steady_clock::now();
         // prefill writes KV rows [0, NP); nothing downstream bounds NP against
         // the cache allocations (found by kernel review) -- refuse cleanly
@@ -4865,6 +4890,7 @@ struct Engine {
             gs.hit = base;
             gs.ckpt = ck;
             gs.pf = NP - base;
+            d2_prefill_align(prompt, base); // DFlash2: keep ring rows below the hit
             // P9 alias fix (audit, 2026-07-12): re-prefilling [base..NP)
             // overwrites those KV rows with THIS conversation. Any cached
             // state whose coverage extends past base and does not match the
@@ -4969,7 +4995,21 @@ struct Engine {
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));
-            step_with(prompt[NP - 1]);
+            if (d2_on) {
+                // DFlash2: the last prompt token's taps must reach the ring
+                // too. The batched loops stop at NP-1 and this single-token
+                // step produced no taps, so every turn's ring had a one-row
+                // hole at its most recent position (found 2026-09-07 by the
+                // ring contiguity check -- it also defeated warm-turn row
+                // retention). Eager token_launches is graph_exec's launch
+                // sequence plus the tap copies: same target numerics.
+                const int tok_last = prompt[NP - 1];
+                CUDA_CHECK(cudaMemcpy(d_token, &tok_last, 4, cudaMemcpyHostToDevice));
+                token_launches(d2_vtaps);
+                d2->ingest(d2_vtaps, &pos_last, 1, stm);
+            } else {
+                step_with(prompt[NP - 1]);
+            }
         } else {
             reset();
             // Serial path leaves no reusable cache: clear the snapshot AND the
@@ -4982,6 +5022,7 @@ struct Engine {
             snap_toks.clear();
             ckpt_clear();
             gs.pf = NP;
+            d2_prefill_align(prompt, 0); // serial path: cold ring
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
                 if (i + 1 < prompt.size()) {
@@ -5011,7 +5052,7 @@ struct Engine {
         live_prefill_computed.fetch_add((unsigned long long)gs.pf, std::memory_order_relaxed);
         live_prefill_cached.fetch_add((unsigned long long)gs.hit, std::memory_order_relaxed);
         *P_out = P;
-        d2_prefill_done(NP); // DFlash2: cold-reset the drafter ring for this turn
+        d2_prefill_done(NP); // DFlash2: snapshot pending + position for the decode loop
         return true;
     }
 

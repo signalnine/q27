@@ -15710,6 +15710,64 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (g): DFlash2 ring retention across turns + the missing last-token row
+
+The (f) probe exposed warm-turn ring starvation: generate_prefill reset the
+drafter ring on EVERY turn and prefill re-seeded only the uncached tail
+[base, NP), so a prefix-cache warm turn (pf = a few tokens) ran the drafter
+with 1-5 context rows -- tok/round 3.28 cold -> 3.16 -> 3.05 on identical
+requests. Agentic traffic is almost all warm turns.
+
+Shipped: d2_prefill_align(prompt, base), called once the hit is known (both
+prefill branches). It keeps ring rows for positions below
+min(LCP(d2_seq, prompt), base): d2_seq is the host token sequence the ring's
+rows were built from (appended per accepted lane in dflash2_round, truncated
+with the post_round rollback), so validity is decided by tokens, not lineage
+-- a RAM/disk restore over a ring built from another conversation gets
+LCP ~ 0 and resets; the cap at base keeps re-seeded positions from appearing
+twice. Dflash2 tracks ctx_end + ctx_contig; rollback_to(pos) resets on any
+non-contiguous coverage. Q27_D2_RING=reset restores the old behaviour.
+
+The contiguity check immediately found a PRE-EXISTING hole (Q27_D2_DEBUG=1:
+"ring ingest NOT contiguous: pos 3079..3081 after ctx_end 3078"): the last
+prompt token NP-1 goes through step_with (graph_exec) which captures no taps,
+so it was never in the ring -- since the prefill tap capture landed
+(e9a8f43) every turn's drafter lacked its most recent context row, and it
+silently defeated retention (every turn looked non-contiguous). Fixed: with
+d2_on the tail step runs token_launches(d2_vtaps) eagerly (graph_exec IS a
+capture of token_launches, so same target numerics plus the tap copies) and
+ingests that one row.
+
+Measured (bench/ladder/drive_warm_turn.py, keep vs Q27_D2_RING=reset, same
+binary, think-on sampled):
+  (A) identical request x3: keep 3.82 / 3.82 / 3.82 tok/round -- 67 rounds
+      each, IDENTICAL streams (warm == cold now); reset 3.56 / 3.12 / 3.12.
+  (B) two-turn conversation, turn 2 (hit=3074, pf=41): keep 5.69 and 4.92
+      tok/round (260 / 225 t/s) vs reset 4.57 and 3.88 (226 / 192 t/s).
+  Standard 12.5K seeded think leg (all cold; only the last-token row differs
+  from (f)): tok/round 3.383 -> 3.593 (+6.2%), t/s 153.3 -> 162.9, round
+  22.2 ms unchanged; lanes 0.749 0.593 0.470 0.336 0.219 0.139 0.103 (ninfer
+  0.754 0.609 0.444 0.347 0.243 0.160 0.129) -- the drafter's most recent
+  context row was worth 6% even on cold single-turn. Q4 pack now sits at
+  -2.6% tok/round vs ninfer's arm (3.593 vs 3.69).
+
+gpt-6-astra review (docs/reviews/2026-09-07-gpt6astra-d2-ring-retention.md):
+bookkeeping sound for solo serving; three P2s fixed before commit, two of
+them pre-existing -- (1) the slide's compaction copy could OVERLAP (keep =
+D2_WINDOW with ctx_n 4095: rows [2047,4095) onto [0,2048), undefined for
+cudaMemcpyAsync): keep is now D2_WINDOW - T rows (everything older cannot
+fall inside the window once the chunk lands; with ctx_cap = 2*D2_WINDOW the
+copied tail always starts past its destination, asserted); (2) fused batch
+rounds commit without the drafter's mirrors, so Q27_DFLASH2 now refuses to
+boot unless Q27_BATCH=0 (the only mode it was wired for); (3) a disconnected
+seed window (base < NP - 2048) latched ctx_contig off for good -> ingest now
+drops the retained rows on a disconnected chunk (all > D2_WINDOW behind any
+future query: lossless) and the ring stays contiguous by construction.
+
+Instrument note: readiness waits must key on the unit's InvocationID; a
+`--since` window matches the PREVIOUS unit's "serving ON" line and the probe
+then runs against a server that is not up yet (connection refused).
+
 ## 2026-09-07 (f): DFlash2 sampled selector walk + sparse-q rejection -- the sampled acceptance gap was the proposal law
 
 Where 09-07 left it (docs/plans/2026-09-08-dflash2-close-the-arm-gap.md):
