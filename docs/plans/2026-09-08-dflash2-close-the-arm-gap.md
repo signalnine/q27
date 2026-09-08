@@ -198,6 +198,18 @@ flat in width; today only at width >= 9) -- a numerics-family change for
 the d2 serving path, measure first; (3) rmsnorm3+quantize fusion (~0.25),
 nucleus rewrite (~0.5, sampled only).
 
+## Verify attack, batches 2-3 (2026-09-08, BUILDLOG (b), (c))
+
+- Fused rmsnorm3+quantize: bitwise, -129 nodes, wall gain inside drift.
+- THE MMA PATH FOR THE D2 VERIFY (default now, Q27_D2_VGEMM=0 opts out):
+  verify 16.8 -> 15.1 ms, round 18.9 -> 17.35, +11% t/s, tok/round 3.65 ->
+  3.75. d2 round = draft 2.0 + verify 15.1 + host 0.2 = 17.35 ms vs ninfer
+  18.0: q27 d2 219 t/s vs ninfer d2 203 on the seeded 12.5K think
+  instrument. Session total for the d2 round: 22.4 -> 17.35 ms (-23%),
+  164 -> 219.5 t/s (+34%).
+- Remaining in the verify (15.1): vgemm ~10.5, GDN ~0.9, attention 0.9,
+  nucleus 0.62 (sampled; a multi-block rewrite is ~0.5), gaps ~0.6.
+
 ## Agentic standings 2026-09-07 late (bench/crossengine/agentic-2026-09-07)
 
 Claude Code on the 12 SWE-bench instances, effort medium on both engines:

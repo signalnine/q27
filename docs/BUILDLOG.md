@@ -15710,6 +15710,55 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (c): the d2 verify on the MMA path -- verify 16.8 -> 15.1 ms, +11% t/s, round now under ninfer's
+
+mm5 switches from gemv_q4_n<W> to k_vgemm (vgemm.cuh: the flat-in-width int8
+MMA path, deterministic by construction -- fixed-order intra-CTA and
+cross-CTA K-splits, no atomics) at gemm_min = 9, and build_spec_graphs
+refuses to run if the ladder's widest verify reaches it: that is what makes
+the CLI canonical md5 gate structural. The DFlash2 serving verify is width 8
+-- one below the line -- and ran on the gemv, which vgemm.cuh had already
+measured as REGISTER-bound at width (1230 GB/s at W=5, collapsing above).
+
+d2_setup now sets the d2 view's gemm_min to d2_w (Q27_D2_VGEMM=0 restores
+the gemv). View-local: the ladder, the CLI (--dflash2 included: engine.cu
+captures its own verify at gemm_min 9) and the canonical gates are
+untouched, and greedy CLI --dflash2 == --spec still holds. This IS a
+numerics-family change for the d2 SERVING path (fp32 accumulation order of
+the int8 products differs from the gemv's), deterministic run-to-run, and
+outside the canonical contract by construction; serving greedy was already
+not width-invariant across depth configs.
+
+Paired A/B (worktree incumbent at 8e6a465, vox stopped, 12.5K seeded
+think): verify 16.70/16.84 -> 15.12 ms, round 18.92/19.07 -> 17.35 ms, t/s
+198.3/196.8 -> 219.5 (+11%); tok/round 3.648 -> 3.751 (different streams by
+design; lane profile 0.747 0.620 0.503 0.381 0.242 0.156 0.122 vs 0.739
+0.597 0.469 0.356 0.235 0.151 0.115 -- equivalent). ninv_test covers the
+vgemm families' N-invariance (PASS). The d2 round (draft 2.0 + verify 15.1
++ host 0.2 = 17.35) is now below ninfer's 18.0 on this instrument, with
+tok/round 3.75 vs their 3.69: q27 d2 219 t/s vs ninfer d2 203.
+
+The 08-19 gemv verdict ("near floor, register-trapped, NO-GO") was about
+rewriting the gemv kernel under the bitwise contract; the deterministic
+alternative already existed since 07-13 and was only fenced off below width
+9 to protect the canonical gate the d2 path never carried.
+
+## 2026-09-08 (b): fused rmsnorm3 + quantize in the verify forward -- bitwise, -129 nodes, gain inside drift
+
+k_rmsnorm3q runs k_rmsnorm3's body, a block barrier, then k_quantize_x3's
+per-32-group body over the y it just wrote; test_rmsnorm3q compares every
+output buffer (y, nat, eo, scale, isum) against the two-launch sequence:
+bitwise. spec_verify_forward uses it at all 129 norm sites (attention norm,
+post-attention norm, output norm); attn_pre / gdn_pre / ffn_pair take an
+x1q flag (default false) so the conductor's fused driver is untouched.
+
+Paired A/B: streams identical (842 / 3.648 on all three legs), but the wall
+effect is inside the run's drift -- the two incumbent legs read 18.92 and
+19.59 ms and the new binary 19.30 between them (the GPU warms across a
+three-leg run; interleave more legs when the expected effect is < 0.3 ms).
+Kept for the node count (1723 -> ~1300 with batch 1), reported as
+unmeasured. Lesson: for sub-1% levers the three-leg A/B is not enough.
+
 ## 2026-09-08 (a): width-8 verify, batch 1 -- three bitwise launch/tiling wins, verify 17.6 -> 16.8 ms
 
 The width-8 verify graph decomposed (serving nsys, 59 rounds): span 17.81 ms

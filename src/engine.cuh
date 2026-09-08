@@ -2850,14 +2850,18 @@ struct Engine {
         CUDA_CHECK(cudaMalloc((void**)&d2_pf_taps, (size_t)PF_T * 5 * N_EMBD * 4));
         LaneView v = solo_view();
         v.vw = d2_w;
-        // Q27_D2_VGEMM=1 (2026-09-08): route the d2 verify's big tensors
-        // through the deterministic MMA path (k_vgemm, flat in width; see
-        // vgemm.cuh) instead of the register-bound gemv_q4_n<8>. View-local
-        // override: the ladder, the CLI and the canonical bitwise gates keep
-        // gemm_min = 9. A numerics-FAMILY change for the d2 serving path
-        // (still run-to-run deterministic: no atomics), so it is an A/B
-        // lever until measured, not a default.
-        if (const char* vg = getenv("Q27_D2_VGEMM"); vg && atoi(vg)) v.gemm_min = d2_w;
+        // DEFAULT since 2026-09-08 (Q27_D2_VGEMM=0 restores the gemv): the d2
+        // verify's big tensors take the deterministic MMA path (k_vgemm, flat
+        // in width; see vgemm.cuh) instead of the register-bound
+        // gemv_q4_n<8>. Measured on the paired seeded instrument: verify 16.8
+        // -> 15.1 ms, round 18.9 -> 17.35, +11% t/s, tok/round unchanged.
+        // View-local: the ladder, the CLI (engine.cu captures its own d2
+        // verify at gemm_min 9) and the canonical bitwise gates keep gemm_min
+        // = 9. This IS a numerics-family change for the d2 SERVING path (fp32
+        // accumulation order of the int8 products), deterministic run-to-run
+        // (no atomics) and outside the canonical contract by construction --
+        // serving greedy was already not width-invariant across depth configs.
+        if (const char* vg = getenv("Q27_D2_VGEMM"); !vg || atoi(vg)) v.gemm_min = d2_w;
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
         spec_verify_forward(v, d2_vtaps);
