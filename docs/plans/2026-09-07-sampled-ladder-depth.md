@@ -92,3 +92,34 @@ only), toolgram (accept-cap path unchanged), dctl, DFlash2.
   accepts (dctl already is) plus a theta/economics pass. Structural fix for
   deep-draft economics (depth at zero marginal cost) = lever 2, sampled
   DFlash2 verify.
+
+## Lever 2 (same session): sampled DFlash2 verify
+
+The widened sampled tail is drafter-agnostic, and dflash2_round already stages
+its K proposals into d_draft_L and reads the unified outcome layout -- so
+sampled DFlash2 is a second captured graph (tap-capturing forward + the
+rejection tail at width d2_w) plus a samp_first bootstrap that syncs the
+drafter's host anchor, and a decode_step route. Q27_SAMPLE_PLAIN still forces
+the plain sampler. install_forced_pending now also syncs d2_pending (a
+pre-existing greedy-path staleness: forced installs left the drafter anchored
+on the stale pending -- acceptance loss only, verify reads d_token).
+
+Removes ninfer's last structural advantage on our books: DFlash2 was
+greedy-only (`d2_on && !t.sampling`), so q27 could not field its
+one-forward-drafts-all-7 drafter exactly where ninfer's headline numbers live
+(sampled serving).
+
+E2E (Q27_DFLASH2 serve pack, single-slot, think-on):
+- greedy smoke unchanged; sampled seeded requests: warm-vs-warm byte
+  identical (DETERMINISM per drafter state); cold-vs-warm DIVERGES at the
+  same seed because prefix-cache warmth changes the ring seeding and
+  rejection sampling is only stream-reproducible for matching drafter state
+  -- the SERVED DISTRIBUTION is unconditionally correct (the rejection
+  theorem is draft-source-agnostic). Behavioral caveat vs the ladder, whose
+  drafts are target-state-deterministic.
+- Paired-seed probe vs the ladder (same prompts/seeds, 6 x {12.5K, 50K},
+  think-on): d2-sampled mean 140.4 vs ladder 149.0 at 12.5K (-5.7%), 131.8
+  vs 129.2 at 50K (+2.0%) -- parity within variance, matching the greedy
+  live-CC finding (dflash2's margin lives on echo/code traffic, thinking is
+  the ladder's home turf). tok/round 2.77-3.37 at 12.5K; round ~21.9 ms
+  (drafter + width-8 verify) vs ladder ~19.3.

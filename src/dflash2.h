@@ -119,6 +119,13 @@ struct Dflash2 {
     // window are dropped (lossless: the drafter attends only D2_WINDOW back).
     void ingest(const float* d_taps, const int* h_pos, int T, cudaStream_t st);
     void reset_ctx() { ctx_n = 0; } // new conversation/turn: cold ring
+    // Drop the last `rows` ingested rows (round truncation: post_round's
+    // on_round can shrink a committed round AFTER dflash2_round already
+    // ingested its accepted lanes -- the ring is append-only, so phantom
+    // rows would otherwise coexist with the re-committed positions and
+    // pollute drafter attention). Host counter only; the device tail is
+    // dead until the next ingest overwrites it.
+    void rollback(int rows) { ctx_n = rows >= ctx_n ? 0 : ctx_n - rows; }
 
     // one draft block of K proposals (width K+1): anchor (pending) token at
     // anchor_pos. Fully device-side; proposals land in d_prop[0..K-1]. No

@@ -5,6 +5,7 @@
 import requests, time, json, sys
 
 base = sys.argv[1]; model = sys.argv[2]; tag = sys.argv[3]
+task = sys.argv[4] if len(sys.argv) > 4 else "think"  # think | echo
 SAMPLER = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.05)
 
 def filler(approx_tokens, nonce):
@@ -18,10 +19,15 @@ def filler(approx_tokens, nonce):
 
 GEN = ("Ignore the material above. Output a numbered list, one item per line, of 50 "
        "distinct two-word English noun phrases about weather. Nothing else.")
+# echo: reproduce prompt material verbatim -- the saturating-acceptance regime
+# (spec drafters feast on echo; this is where depth promotion should pay).
+GEN_ECHO = ("Reproduce the definitions of h_1 through h_12 from the material above, "
+            "verbatim, exactly as written, including comments. Nothing else.")
 
 for tgt in [8000, 32000]:
     for seed in range(1, 7):
-        content = filler(tgt, f"pair-{tgt}-{seed}") + "\n\n" + GEN
+        gen = GEN_ECHO if task == "echo" else GEN
+        content = filler(tgt, f"pair-{tgt}-{seed}") + "\n\n" + gen
         body = dict(model=model, messages=[{"role":"user","content":content}],
                     max_tokens=512, stream=True, stream_options={"include_usage":True},
                     seed=seed, **SAMPLER)

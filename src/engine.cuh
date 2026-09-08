@@ -2771,6 +2771,10 @@ struct Engine {
     float* d2_vtaps = nullptr;
     float* d2_pf_taps = nullptr; // [PF_T][5*N_EMBD] prefill-window tap scratch
     cudaGraphExec_t d2_verify_exec = nullptr;
+    // Sampled twin (2026-09-07 lever 2): same tap-capturing forward, the
+    // rejection-sampling tail the sampled ladder widened to width 8. Lets
+    // DFlash2 serve temperature>0 requests -- it was greedy-only before.
+    cudaGraphExec_t d2_verify_sample_exec = nullptr;
     bool d2_on = false;
     int d2_k = 7;
     int d2_pending = 0, d2_pos = 0;
@@ -2808,6 +2812,21 @@ struct Engine {
         CUDA_CHECK(cudaStreamEndCapture(stm, &g));
         CUDA_CHECK(cudaGraphInstantiate(&d2_verify_exec, g, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphDestroy(g));
+        // Sampled verify twin: capture only when the sampled kernel set was
+        // warmed (build_spec_graphs' sampled phase runs before d2_setup;
+        // Q27_SAMPLED=0 boots refuse temperature>0 requests, so no graph is
+        // needed there). The tail kernels are runtime-width, warmed at width
+        // gate_maxd+1 >= any d2_w <= 8; wider K reuses the greedy warm's
+        // forward widths.
+        if (sampled_graphs) {
+            cudaGraph_t gsmp;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            spec_verify_forward(v, d2_vtaps);
+            spec_verify_tail_sampled(v);
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gsmp));
+            CUDA_CHECK(cudaGraphInstantiate(&d2_verify_sample_exec, gsmp, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gsmp));
+        }
         d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
         d2_timing = getenv("Q27_D2_TIMING") != nullptr;
         d2_on = true;
@@ -2854,9 +2873,21 @@ struct Engine {
     double d2_t_draft = 0, d2_t_verify = 0, d2_t_ingest = 0;
     long d2_t_n = 0;
     double d2_t_fold = 0, d2_t_wall = 0;
-    int dflash2_round(int* emit) {
+    int dflash2_round(int* emit, bool sampling = false) {
         if (d2_timing && !d2_ev[0]) for (auto& e : d2_ev) cudaEventCreate(&e);
         auto wall0 = std::chrono::steady_clock::now();
+        // Sampled bootstrap (lever 2): mirror spec_sample_round's samp_first --
+        // the first sampled token is drawn from the retained prefill logits
+        // (kind 0, no forward). d2_prefill_done snapshotted the GREEDY argmax
+        // into d2_pending; the draw replaces both d_token and the host mirror
+        // the drafter anchors on.
+        if (sampling && samp_first) {
+            samp_first = false;
+            q27k::sample_g(logits, VOCAB, d_samp, d_nuc, d_pos, 0, d_token, d_amax, stm);
+            CUDA_CHECK(cudaMemcpyAsync(&d2_pending, d_token, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
+            last_pending = d2_pending;
+        }
         if (d2_timing) cudaEventRecord(d2_ev[0], stm);
         flush_fold(stm); // belt: fold the previous round before this verify reads state
         if (d2_timing) cudaEventRecord(d2_ev[1], stm);
@@ -2866,7 +2897,10 @@ struct Engine {
             CUDA_CHECK(cudaMemcpyAsync(d_draft_L[k], d2->d_prop + k, 4,
                                        cudaMemcpyDeviceToDevice, stm));
         if (d2_timing) cudaEventRecord(d2_ev[2], stm);
-        CUDA_CHECK(cudaGraphLaunch(d2_verify_exec, stm));
+        // Sampled rounds verify through the rejection tail (accept walk over
+        // the same d_draft_L lanes; distribution-preserving per the sampled
+        // ladder's gates); greedy rounds keep the equality-chain tail.
+        CUDA_CHECK(cudaGraphLaunch(sampling ? d2_verify_sample_exec : d2_verify_exec, stm));
         if (d2_timing) cudaEventRecord(d2_ev[3], stm);
         int oc[OUTCOME_INTS];
         CUDA_CHECK(cudaMemcpyAsync(oc, d_outcome, OUTCOME_INTS * 4, cudaMemcpyDeviceToHost, stm));
@@ -4345,6 +4379,11 @@ struct Engine {
                                    cudaMemcpyHostToDevice, stm));
         CUDA_CHECK(cudaStreamSynchronize(stm));
         last_pending = t.forced_id;
+        // Keep the DFlash2 drafter's host anchor in step (found during lever
+        // 2): d2 rounds draft from d2_pending, and a stale anchor after a
+        // forced install conditioned proposals on the wrong token (acceptance
+        // loss only -- verify reads d_token -- but real).
+        if (d2_on) d2_pending = t.forced_id;
     }
 
     // Replace the model-predicted pending token only at a coherent boundary.
@@ -4538,7 +4577,18 @@ struct Engine {
                     t.budget_cancelled = true;
                     t.cancel.store(true);
                 }
+                // DFlash2 mirrors ride the round outcome (dflash2_round already
+                // ingested n lanes' taps and advanced d2_pos): a truncation
+                // rolls the committed stream back to m, so drop the phantom
+                // ring rows, re-anchor the position, and re-sync the pending
+                // mirror (pre-existing greedy-path bug, found in the lever-2
+                // review pass 2026-09-07).
+                if (d2_on && m < n) {
+                    d2->rollback(n - m);
+                    d2_pos -= (n - m);
+                }
                 last_pending = refinish_round(m, n, t.Ph + m);
+                if (d2_on) d2_pending = last_pending;
                 n = m;
             }
         }
@@ -4603,8 +4653,11 @@ struct Engine {
             n = sample_round(em);
             install_forced_pending(t);
             em[0] = t.forced_id;
-        } else if (d2_on && !t.sampling) {
-            n = dflash2_round(em);
+        } else if (d2_on && !(t.sampling && t.force_plain_sample)) {
+            // Lever 2 (2026-09-07): DFlash2 serves sampled requests through the
+            // rejection-verify twin; Q27_SAMPLE_PLAIN still forces the plain
+            // sampler (the spec==non-spec distribution A/B lever).
+            n = dflash2_round(em, t.sampling);
         } else {
             n = t.sampling ? (t.force_plain_sample ? sample_round(em) : spec_sample_round(em))
                            : spec_round(em);
