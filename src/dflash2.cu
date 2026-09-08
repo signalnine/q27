@@ -73,82 +73,179 @@ __global__ void k_d2_dconv(const float* __restrict__ in, const float* __restrict
     }
 }
 
-// Bidirectional sliding-window attention: nrows noise queries vs [ctx ring +
-// nrows noise] keys. Block = (query row, q head); two-pass softmax in smem.
-// GQA: q head h reads kv head h/4. ctx_n is read through a device pointer so
-// a future graph capture stays shape-stable. Bring-up kernel -- clarity over
-// speed.
-__global__ void k_d2_attn(const float* __restrict__ q, const float* __restrict__ ringK,
-                          const float* __restrict__ ringV, const int* __restrict__ ring_pos,
-                          const int* __restrict__ d_ctx_n, const float* __restrict__ nk,
-                          const float* __restrict__ nv, const int* __restrict__ npos,
-                          float* __restrict__ out, int nrows) {
-    extern __shared__ float sc[]; // scores [nctx + nrows]
-    const int r = blockIdx.x, h = blockIdx.y, kh = h / (D2_NH / D2_NKV);
-    if (r >= nrows) return;
+// Bidirectional sliding-window attention, flash-decoding layout (2026-09-07
+// rewrite; the bring-up kernel -- one block per (query row, q head), a
+// per-thread key-row walk and a single-thread softmax -- measured 375 us per
+// launch at a 2.3K-row ring in serving, 1.87 ms of the 3.95 ms draft graph).
+// Grid = (D2_ASPLIT key splits) x (kv heads); a block serves ALL query
+// vectors of its kv head (nrows rows x 4 GQA heads, <= 48) against its key
+// range in 32-key tiles staged through smem with float4 loads (rows padded
+// to 132 floats so 8 consecutive rows land on disjoint bank quads). Online
+// softmax per query across tiles; each block writes a (max, sum, acc[128])
+// partial and k_d2_attn_combine merges the splits. Keys = the last
+// D2_WINDOW ring rows (older ones are outside every query's window) + the
+// nrows noise rows; the position mask stays authoritative. Numerics: fp32
+// throughout, order differs from the serial kernel (test_d2_attn vs CPU).
+constexpr int D2_ASPLIT = 32;              // key splits per kv head (graph-stable grid)
+constexpr int D2_ATILE = 32;               // keys per smem tile
+constexpr int D2_ATP = D2_HD + 4;          // padded row stride (floats)
+constexpr int D2_AQMAX = D2_WMAX * (D2_NH / D2_NKV); // query vectors per kv head at max width
+constexpr int D2_APART = D2_HD + 2;        // partial record: m, l, acc[D2_HD]
+constexpr size_t D2_ASMEM = (size_t)(32 * D2_ATP + D2_ATILE * D2_ATP + 32 * 33) * 4;
+
+__global__ void __launch_bounds__(256) k_d2_attn_split(
+    const float* __restrict__ q, const float* __restrict__ ringK, const float* __restrict__ ringV,
+    const int* __restrict__ ring_pos, const int* __restrict__ d_ctx_n, const float* __restrict__ nk,
+    const float* __restrict__ nv, const int* __restrict__ npos, float* __restrict__ part,
+    int nrows) {
+    extern __shared__ __align__(16) float smem[];
+    float* qs = smem;                   // [32][ATP] this query group
+    float* kt = qs + 32 * D2_ATP;       // [ATILE][ATP] K tile, then V tile
+    float* sc = kt + D2_ATILE * D2_ATP; // [32][33] probabilities
+    __shared__ float s_m[32], s_l[32];
+    const int split = blockIdx.x, kh = blockIdx.y;
     const int ctx_n = *d_ctx_n;
-    // 2026-09-07: only the last D2_WINDOW ring rows can be visible from any
-    // query (rows are position-contiguous; ingest drops disconnected
-    // history), so skip older rows instead of scoring and masking them --
-    // the ring holds up to 2 * D2_WINDOW rows between slides. Bitwise-neutral:
-    // a masked row contributes exp(-inf) = 0 to the sum and 0 * v to the
-    // output, and dropping exact zeros from a serial fp32 sum changes
-    // nothing. The position mask below stays authoritative. (A smem-tiled
-    // rewrite with a block-parallel softmax measured SLOWER -- draft
-    // 4.64 vs 3.76 ms/round, incumbent A/B 2026-09-07 -- this kernel's cost
-    // is the per-thread row walk, not the softmax; left as the bring-up
-    // kernel until a flash-decoding split is worth the effort.)
     const int j0 = ctx_n > D2_WINDOW ? ctx_n - D2_WINDOW : 0;
-    const int nctx = ctx_n - j0;
+    const int nctx = ctx_n - j0, total = nctx + nrows;
+    const int per = (total + D2_ASPLIT - 1) / D2_ASPLIT;
+    const int kb = split * per, ke = min(total, kb + per);
+    const int NQ = nrows * (D2_NH / D2_NKV);
     const float scale = rsqrtf((float)D2_HD);
-    const float* qv = q + (size_t)r * D2_QD + (size_t)h * D2_HD;
-    const int qpos = npos[r], total = nctx + nrows;
-    for (int j = threadIdx.x; j < total; j += blockDim.x) {
-        const float* kv;
-        int kpos;
-        if (j < nctx) {
-            kv = ringK + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD;
-            kpos = ring_pos[j0 + j];
-        } else {
-            kv = nk + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
-            kpos = npos[j - nctx];
+    const int t = threadIdx.x, ql = t >> 3, kk = t & 7, dd = kk * 16;
+    for (int g0 = 0; g0 < NQ; g0 += 32) {
+        const int gn = min(32, NQ - g0);
+        for (int i = t; i < gn * (D2_HD / 4); i += 256) {
+            const int l = i / (D2_HD / 4), c4 = i % (D2_HD / 4), qi = g0 + l;
+            const int r = qi >> 2, h = kh * (D2_NH / D2_NKV) + (qi & 3);
+            *reinterpret_cast<float4*>(qs + l * D2_ATP + c4 * 4) =
+                *reinterpret_cast<const float4*>(q + (size_t)r * D2_QD + (size_t)h * D2_HD + c4 * 4);
         }
-        bool vis = (qpos - kpos) < D2_WINDOW && (kpos - qpos) < D2_WINDOW;
-        float d = 0.f;
-        for (int c = 0; c < D2_HD; c++) d += qv[c] * kv[c];
-        sc[j] = vis ? d * scale : -INFINITY;
-    }
-    __syncthreads();
-    __shared__ float s_max, s_sum;
-    if (threadIdx.x == 0) {
-        float m = -INFINITY;
-        for (int j = 0; j < total; j++) m = fmaxf(m, sc[j]);
-        float sum = 0.f;
-        for (int j = 0; j < total; j++) sum += expf(sc[j] - m);
-        s_max = m;
-        s_sum = sum;
-    }
-    __syncthreads();
-    for (int j = threadIdx.x; j < total; j += blockDim.x) sc[j] = expf(sc[j] - s_max) / s_sum;
-    __syncthreads();
-    for (int c = threadIdx.x; c < D2_HD; c += blockDim.x) {
-        float acc = 0.f;
-        for (int j = 0; j < total; j++) {
-            const float* vv = j < nctx
-                                  ? ringV + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD
-                                  : nv + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
-            acc += sc[j] * vv[c];
+        if (t < 32) { s_m[t] = -INFINITY; s_l[t] = 0.f; }
+        __syncthreads();
+        float acc[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) acc[i] = 0.f;
+        const bool live = ql < gn;
+        const int qpos = live ? npos[(g0 + ql) >> 2] : 0;
+        for (int tb = kb; tb < ke; tb += D2_ATILE) {
+            const int tn = min(D2_ATILE, ke - tb);
+            for (int i = t; i < tn * (D2_HD / 4); i += 256) {
+                const int row = i / (D2_HD / 4), c4 = i % (D2_HD / 4), j = tb + row;
+                const float* kv = j < nctx ? ringK + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD
+                                           : nk + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
+                *reinterpret_cast<float4*>(kt + row * D2_ATP + c4 * 4) =
+                    *reinterpret_cast<const float4*>(kv + c4 * 4);
+            }
+            __syncthreads();
+            float s4[4];
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                const int row = kk + 8 * m;
+                float d = -INFINITY;
+                if (live && row < tn) {
+                    const float* kr = kt + row * D2_ATP;
+                    const float* qr = qs + ql * D2_ATP;
+                    float acc_d = 0.f;
+#pragma unroll 8
+                    for (int c = 0; c < D2_HD; c += 4) {
+                        const float4 a = *reinterpret_cast<const float4*>(qr + c);
+                        const float4 b = *reinterpret_cast<const float4*>(kr + c);
+                        acc_d += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                    }
+                    const int j = tb + row;
+                    const int kpos = j < nctx ? ring_pos[j0 + j] : npos[j - nctx];
+                    const bool vis = (qpos - kpos) < D2_WINDOW && (kpos - qpos) < D2_WINDOW;
+                    d = vis ? acc_d * scale : -INFINITY;
+                }
+                s4[m] = d;
+            }
+            float tmax = fmaxf(fmaxf(s4[0], s4[1]), fmaxf(s4[2], s4[3]));
+            for (int o = 1; o < 8; o <<= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o));
+            const float m_old = s_m[ql];
+            const float m_new = fmaxf(m_old, tmax);
+            float psum = 0.f;
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                const float p = (s4[m] == -INFINITY) ? 0.f : expf(s4[m] - m_new);
+                sc[ql * 33 + kk + 8 * m] = p;
+                psum += p;
+            }
+            for (int o = 1; o < 8; o <<= 1) psum += __shfl_xor_sync(0xffffffffu, psum, o);
+            const float alpha = (m_old == -INFINITY) ? 0.f : expf(m_old - m_new);
+            __syncthreads(); // every lane has read s_m/s_l and finished with the K tile
+            if (kk == 0) { s_m[ql] = m_new; s_l[ql] = s_l[ql] * alpha + psum; }
+#pragma unroll
+            for (int i = 0; i < 16; i++) acc[i] *= alpha;
+            for (int i = t; i < tn * (D2_HD / 4); i += 256) {
+                const int row = i / (D2_HD / 4), c4 = i % (D2_HD / 4), j = tb + row;
+                const float* vv = j < nctx ? ringV + (size_t)(j0 + j) * D2_KVD + (size_t)kh * D2_HD
+                                           : nv + (size_t)(j - nctx) * D2_KVD + (size_t)kh * D2_HD;
+                *reinterpret_cast<float4*>(kt + row * D2_ATP + c4 * 4) =
+                    *reinterpret_cast<const float4*>(vv + c4 * 4);
+            }
+            __syncthreads();
+            if (live) {
+                for (int row = 0; row < tn; row++) {
+                    const float p = sc[ql * 33 + row];
+                    const float* vr = kt + row * D2_ATP + dd;
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; c4++) {
+                        const float4 v = *reinterpret_cast<const float4*>(vr + c4 * 4);
+                        acc[c4 * 4 + 0] += p * v.x;
+                        acc[c4 * 4 + 1] += p * v.y;
+                        acc[c4 * 4 + 2] += p * v.z;
+                        acc[c4 * 4 + 3] += p * v.w;
+                    }
+                }
+            }
+            __syncthreads(); // before the next tile overwrites kt / sc / s_m
         }
-        out[(size_t)r * D2_QD + (size_t)h * D2_HD + c] = acc;
+        if (live) {
+            float* pr = part + (((size_t)split * D2_NKV + kh) * D2_AQMAX + (g0 + ql)) * D2_APART;
+            if (kk == 0) { pr[0] = s_m[ql]; pr[1] = s_l[ql]; }
+#pragma unroll
+            for (int i = 0; i < 16; i++) pr[2 + dd + i] = acc[i];
+        }
+        __syncthreads();
     }
 }
-// Bare launchers for test_kernels (exactness vs CPU references).
+
+// Merge the D2_ASPLIT partials of one (query, kv head): block = (qi, kh),
+// thread = head dim. Neutral partials (m = -inf) contribute nothing.
+__global__ void k_d2_attn_combine(const float* __restrict__ part, float* __restrict__ out,
+                                  int nrows) {
+    const int qi = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
+    const int r = qi >> 2, h = kh * (D2_NH / D2_NKV) + (qi & 3);
+    if (r >= nrows) return;
+    const float* base = part + ((size_t)kh * D2_AQMAX + qi) * D2_APART;
+    const size_t stride = (size_t)D2_NKV * D2_AQMAX * D2_APART;
+    float M = -INFINITY;
+    for (int s = 0; s < D2_ASPLIT; s++) M = fmaxf(M, base[(size_t)s * stride]);
+    float L = 0.f, A = 0.f;
+    for (int s = 0; s < D2_ASPLIT; s++) {
+        const float* pr = base + (size_t)s * stride;
+        const float m = pr[0];
+        if (m == -INFINITY) continue;
+        const float w = expf(m - M);
+        L += pr[1] * w;
+        A += pr[2 + d] * w;
+    }
+    out[(size_t)r * D2_QD + (size_t)h * D2_HD + d] = A / L;
+}
+static void d2_attn_launches(const float* q, const float* ringK, const float* ringV,
+                             const int* ring_pos, const int* d_ctx_n, const float* nk,
+                             const float* nv, const int* npos, float* part, float* out, int nrows,
+                             cudaStream_t st) {
+    k_d2_attn_split<<<dim3(D2_ASPLIT, D2_NKV), 256, D2_ASMEM, st>>>(q, ringK, ringV, ring_pos,
+                                                                    d_ctx_n, nk, nv, npos, part,
+                                                                    nrows);
+    k_d2_attn_combine<<<dim3(nrows * (D2_NH / D2_NKV), D2_NKV), D2_HD, 0, st>>>(part, out, nrows);
+}
+// Bare launcher for test_kernels (exactness vs a CPU reference).
 void d2_attn_launch(const float* q, const float* ringK, const float* ringV, const int* ring_pos,
                     const int* d_ctx_n, const float* nk, const float* nv, const int* npos,
-                    float* out, int nrows, int smem_rows, cudaStream_t st) {
-    dim3 grid(nrows, D2_NH);
-    k_d2_attn<<<grid, 128, (size_t)smem_rows * 4, st>>>(q, ringK, ringV, ring_pos, d_ctx_n, nk,
-                                                        nv, npos, out, nrows);
+                    float* part, float* out, int nrows, cudaStream_t st) {
+    d2_attn_launches(q, ringK, ringV, ring_pos, d_ctx_n, nk, nv, npos, part, out, nrows, st);
     D2CHECK(cudaGetLastError());
 }
 
@@ -487,6 +584,7 @@ void Dflash2::alloc(int cap) {
     // the live count) attends over an EMPTY ring, not garbage.
     D2CHECK(cudaMalloc(&d_ctx_n, 4));
     D2CHECK(cudaMemset(d_ctx_n, 0, 4));
+    D2CHECK(cudaMalloc(&d_attn_part, (size_t)D2_ASPLIT * D2_NKV * D2_AQMAX * D2_APART * 4));
     for (int i = 0; i < D2_WMAX - 1; i++) hxq[i] = q27k::xquant_alloc(D2_H);
     // drafter activation-quant scratch, sized to the widest activation (the
     // fc input = concatenated taps, TAPD=25600)
@@ -698,15 +796,8 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
         q27k::rmsnorm_heads(nk, f32(nm), nk, W * D2_NKV, D2_HD, D2_HD, D2_EPS, st);
         q27k::rope3(mkP3(nq, D2_QD, W), D2_NH, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
         q27k::rope3(mkP3(nk, D2_KVD, W), D2_NKV, D2_HD, D2_HD, D2_HD, posW, D2_THETA, st, W);
-        {
-            dim3 grid(W, D2_NH);
-            // fixed max smem (ring cap + block) so the launch config is
-            // graph-stable across rounds; the kernel reads d_ctx_n for the
-            // live count and uses only that many score slots.
-            size_t smem = (size_t)(ctx_cap + D2_WMAX) * 4;
-            k_d2_attn<<<grid, 128, smem, st>>>(nq, ringK[l], ringV[l], d_ring_pos, d_ctx_n, nk,
-                                               nv, d_posW, natt, W);
-        }
+        d2_attn_launches(nq, ringK[l], ringV[l], d_ring_pos, d_ctx_n, nk, nv, d_posW, d_attn_part,
+                         natt, W, st);
         snprintf(nm, sizeof nm, "layers.%d.self_attn.o_proj.weight", l);
         mmq(nm, natt, no, W, st);
         k_d2_dconv<<<cgrid, 256, 0, st>>>(no, ndyn, baseA + D2_CONVK * D2_H, ny0, W, 1);

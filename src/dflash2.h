@@ -94,6 +94,7 @@ struct Dflash2 {
     const q27k::SampleParams* d_sp = nullptr; // engine's device sampler params (fixed ptr)
     void set_sampler(const q27k::SampleParams* sp) { d_sp = sp; }
     int* d_ctx_n = nullptr;  // device mirror of ctx_n (graph-stable attn)
+    float* d_attn_part = nullptr; // flash-decoding partials [ASPLIT][NKV][AQMAX][HD+2]
     unsigned long long* d_c1 = nullptr; // top-16 stage-1 (value,id) keys [WMAX-1][256*16]
     // Phase 2: engine quantized-head reuse for drafter logits (replaces the
     // 2.5 GB fp16 target.head gemv, ~10.4 -> ~1 ms/round). Numerics shift
@@ -178,9 +179,11 @@ struct Dflash2 {
 // (integrated device-walk + sparse-q verify gate on synthetic codebooks).
 void d2_top16_launch(const float* d_logits, unsigned long long* d_c1, int* d_cand, float* d_cval,
                      int K, cudaStream_t st);
+// part: caller-provided partials buffer, D2_ASPLIT * D2_NKV * D2_AQMAX * (D2_HD + 2) floats.
 void d2_attn_launch(const float* q, const float* ringK, const float* ringV, const int* ring_pos,
                     const int* d_ctx_n, const float* nk, const float* nv, const int* npos,
-                    float* out, int nrows, int smem_rows, cudaStream_t st);
+                    float* part, float* out, int nrows, cudaStream_t st);
+constexpr int D2_ATTN_PART_FLOATS = 32 * D2_NKV * (D2_WMAX * (D2_NH / D2_NKV)) * (D2_HD + 2);
 void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
                     const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
                     int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,

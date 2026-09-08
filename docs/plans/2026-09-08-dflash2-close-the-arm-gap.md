@@ -166,6 +166,17 @@ Honest ceiling for the drafter: ~1.5 ms (from 3.55) = -2 ms/round = +10%
 t/s; the verify (17.7 vs ninfer ~16.5) and post_round (~1 ms) are separate
 engine work.
 
+## Drafter attention SHIPPED (2026-09-07 late, BUILDLOG (j))
+
+Serving nsys: k_d2_attn was 1.87 ms of the 3.95 ms draft graph (375 us per
+launch at a 2.3K-row ring). Flash-decoding rewrite (32 key splits x 8 kv
+heads, K/V shared across the 4 GQA heads, online softmax, combine kernel):
+draft 3.57 -> 1.95 ms, round 22.0 -> 20.4 ms, +12% t/s, tok/round
+unchanged (3.59 -> 3.65). Drafter budget now: Q8 gemvs 1.3 (floor), head
+0.43, top-16 0.09, tiny ~0.15. Remaining round gap to ninfer (20.4 vs
+18.0): verify 17.85 vs ~16.5, and fold 0.38 + host 0.58 + ingest 0.13 vs
+their 0.6 -- the fold can overlap the draft graph on a side stream (~0.4).
+
 ## Agentic standings 2026-09-07 late (bench/crossengine/agentic-2026-09-07)
 
 Claude Code on the 12 SWE-bench instances, effort medium on both engines:

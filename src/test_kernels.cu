@@ -3497,9 +3497,11 @@ static void test_d2_attn() {
     CUDA_CHECK(cudaMemcpy(d_rpos, rpos.data(), R * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_npos, npos.data(), W * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_ctx, &R, 4, cudaMemcpyHostToDevice));
-    q27d2::d2_attn_launch(d_q, d_rk, d_rv, d_rpos, d_ctx, d_nk, d_nv, d_npos, d_out, W,
-                          R + D2_WMAX, 0);
+    float* d_part;
+    CUDA_CHECK(cudaMalloc(&d_part, (size_t)q27d2::D2_ATTN_PART_FLOATS * 4));
+    q27d2::d2_attn_launch(d_q, d_rk, d_rv, d_rpos, d_ctx, d_nk, d_nv, d_npos, d_part, d_out, W, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_part));
     std::vector<float> out((size_t)W * D2_QD);
     CUDA_CHECK(cudaMemcpy(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost));
     // CPU reference over ALL rows with the position mask (rows older than

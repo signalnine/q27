@@ -15710,6 +15710,42 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-07 (j): DFlash2 drafter attention -> flash-decoding: draft 3.57 -> 1.95 ms, +12% t/s
+
+Serving-side nsys node trace of the d2 unit (Q8 pack, 12.5K think, one warm
+request, per-round over 59 rounds): round 22.44 ms = verify graph 17.81 +
+[ingest + fold + host] 0.67 + draft graph 3.95 (gaps 0.07). Inside the
+draft graph: k_d2_attn 1874 us (5 x 375 us at a ~2.3K-row ring -- the
+bring-up kernel's per-thread key-row walk + single-thread softmax scales
+badly with rows), Q8 backbone gemvs 1304 us (45 x 29 us, near the 2.08 GB
+floor), Q4 head 434 us (near floor), top-16 94, tiny kernels ~170, walk 17.
+The attention was HALF the drafter and ~20x what its arithmetic warrants
+(1.35 GFLOP/round, 80 MB of L2-resident K/V).
+
+Rewrite (k_d2_attn_split + k_d2_attn_combine): grid = 32 key splits x 8 kv
+heads; a block serves all query vectors of its kv head (nrows x 4 GQA
+heads) against its key range in 32-key tiles staged with float4 loads (rows
+padded to 132 floats -> 8 consecutive rows on disjoint bank quads); thread
+(query, key-lane) computes 4 dots per tile from smem, online softmax per
+query (8-lane shuffles), PV with 16 accumulators per thread in registers;
+partials (m, l, acc[128]) merged by the combine kernel. fp32 throughout;
+test_d2_attn vs CPU err 3e-8 (the serial kernel was 2e-7). Window
+restriction kept (last D2_WINDOW rows + noise rows, position mask
+authoritative). Partials buffer 6.4 MB per drafter.
+
+Paired A/B (git worktree of HEAD as incumbent, vox stopped, 12.5K seeded
+think, incumbent reproduces 855 rounds / 3.593 both legs):
+    draft 3.57 -> 1.95 ms   round 22.0 -> 20.4 ms   t/s 164 -> 183.6 (+12%)
+    tok/round 3.593 -> 3.648 (drafter numerics differ slightly; lane profile
+    0.739 0.597 0.469 0.356 0.235 0.151 0.115 vs 0.749 0.593 0.470 0.336
+    0.219 0.139 0.103 -- equivalent). Greedy CLI --dflash2 == --spec on
+    code-edit and prose.
+
+Drafter now 1.95 ms: Q8 gemvs 1.3 (floor for the Q8 pack; Q4 pack would be
+~0.9 at -5.8% tok/round, still a net loss), head 0.43, top-16 0.09, tiny
+kernels ~0.15. d2 round 20.4 vs ninfer 18.0: the rest is verify (17.85 vs
+their ~16.5) and [fold 0.38 + host 0.58 + ingest 0.13] vs their 0.6.
+
 ## 2026-09-07 (i): agentic cross-engine campaign -- DFlash2 is now a serving win on q27; ninfer's arm leads on the round wall
 
 bench/crossengine/agentic-2026-09-07/ (README has the table, method,

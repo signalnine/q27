@@ -4,8 +4,9 @@
 # tokens and the diff isolates the feature under test.
 import requests, time, json, sys
 
-base = sys.argv[1]; model = sys.argv[2]; tag = sys.argv[3]
-task = sys.argv[4] if len(sys.argv) > 4 else "think"  # think | echo
+if __name__ == "__main__":
+    base = sys.argv[1]; model = sys.argv[2]; tag = sys.argv[3]
+    task = sys.argv[4] if len(sys.argv) > 4 else "think"  # think | echo
 SAMPLER = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.05)
 
 def filler(approx_tokens, nonce):
@@ -24,30 +25,31 @@ GEN = ("Ignore the material above. Output a numbered list, one item per line, of
 GEN_ECHO = ("Reproduce the definitions of h_1 through h_12 from the material above, "
             "verbatim, exactly as written, including comments. Nothing else.")
 
-for tgt in [8000, 32000]:
-    for seed in range(1, 7):
-        gen = GEN_ECHO if task == "echo" else GEN
-        content = filler(tgt, f"pair-{tgt}-{seed}") + "\n\n" + gen
-        body = dict(model=model, messages=[{"role":"user","content":content}],
-                    max_tokens=512, stream=True, stream_options={"include_usage":True},
-                    seed=seed, **SAMPLER)
-        t0 = time.time(); tf = None; comp = prompt = None
-        with requests.post(base+"/v1/chat/completions", json=body, stream=True, timeout=900) as r:
-            if r.status_code != 200:
-                print(tag, tgt, seed, "HTTP", r.status_code); continue
-            for line in r.iter_lines():
-                if not line or not line.startswith(b"data: "): continue
-                d = line[6:]
-                if d == b"[DONE]": break
-                try: j = json.loads(d)
-                except Exception: continue
-                chs = j.get("choices") or []
-                delta = (chs[0].get("delta") if chs else {}) or {}
-                if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
-                    if tf is None: tf = time.time()
-                if j.get("usage"):
-                    prompt = j["usage"].get("prompt_tokens"); comp = j["usage"].get("completion_tokens")
-        t1 = time.time()
-        if tf is None: tf = t1
-        dt = max(t1-tf, 1e-6)
-        print(f"{tag} tgt={tgt} seed={seed} prompt={prompt} gen={comp} dec={dt:.2f}s dtps={(comp-1)/dt:.1f}" if comp else f"{tag} {tgt} {seed} no usage", flush=True)
+if __name__ == "__main__":
+    for tgt in [8000, 32000]:
+        for seed in range(1, 7):
+            gen = GEN_ECHO if task == "echo" else GEN
+            content = filler(tgt, f"pair-{tgt}-{seed}") + "\n\n" + gen
+            body = dict(model=model, messages=[{"role":"user","content":content}],
+                        max_tokens=512, stream=True, stream_options={"include_usage":True},
+                        seed=seed, **SAMPLER)
+            t0 = time.time(); tf = None; comp = prompt = None
+            with requests.post(base+"/v1/chat/completions", json=body, stream=True, timeout=900) as r:
+                if r.status_code != 200:
+                    print(tag, tgt, seed, "HTTP", r.status_code); continue
+                for line in r.iter_lines():
+                    if not line or not line.startswith(b"data: "): continue
+                    d = line[6:]
+                    if d == b"[DONE]": break
+                    try: j = json.loads(d)
+                    except Exception: continue
+                    chs = j.get("choices") or []
+                    delta = (chs[0].get("delta") if chs else {}) or {}
+                    if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+                        if tf is None: tf = time.time()
+                    if j.get("usage"):
+                        prompt = j["usage"].get("prompt_tokens"); comp = j["usage"].get("completion_tokens")
+            t1 = time.time()
+            if tf is None: tf = t1
+            dt = max(t1-tf, 1e-6)
+            print(f"{tag} tgt={tgt} seed={seed} prompt={prompt} gen={comp} dec={dt:.2f}s dtps={(comp-1)/dt:.1f}" if comp else f"{tag} {tgt} {seed} no usage", flush=True)
