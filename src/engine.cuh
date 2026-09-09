@@ -2816,6 +2816,15 @@ struct Engine {
     // rejection-sampling tail the sampled ladder widened to width 8. Lets
     // DFlash2 serve temperature>0 requests -- it was greedy-only before.
     cudaGraphExec_t d2_verify_sample_exec = nullptr;
+    // The last prompt token's forward WITH tap capture, as a graph (2026-09-08,
+    // gpt-6-astra small-turn advisory item 1). Under the ladder that step is
+    // step_with -> graph_exec; under DFlash2 it ran token_launches(d2_vtaps)
+    // eagerly so the taps reach the ring -- 963 launches, ~5 ms of submission
+    // overhead on top of the 8.3 ms weight stream, on EVERY turn including
+    // pf=1 turns that have no batched work at all (nsys, BUILDLOG (k)). Same
+    // launch sequence, same numerics; the one-row ring ingest stays outside
+    // (host bookkeeping). Q27_D2_TOKGRAPH=0 keeps the eager path for A/B.
+    cudaGraphExec_t d2_token_exec = nullptr;
     bool d2_on = false;
     int d2_k = 7;
     int d2_pending = 0, d2_pos = 0;
@@ -2906,6 +2915,17 @@ struct Engine {
             CUDA_CHECK(cudaGraphDestroy(gsmp));
         }
         d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
+        if (const char* tg = getenv("Q27_D2_TOKGRAPH"); !tg || atoi(tg)) {
+            // token_launches' kernels were warmed by build_graph; the five tap
+            // copies are plain D2D memcpy nodes. Position/token come from
+            // device state (d_pos, d_token), so one graph serves every turn.
+            cudaGraph_t gt;
+            CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
+            token_launches(d2_vtaps);
+            CUDA_CHECK(cudaStreamEndCapture(stm, &gt));
+            CUDA_CHECK(cudaGraphInstantiate(&d2_token_exec, gt, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gt));
+        }
         d2_timing = getenv("Q27_D2_TIMING") != nullptr;
         // side stream for the commit-fold (post_round) so it overlaps the next
         // draft graph; Q27_D2_FOLD=sync keeps the fold on stm for A/B.
@@ -5102,7 +5122,8 @@ struct Engine {
                 // sequence plus the tap copies: same target numerics.
                 const int tok_last = prompt[NP - 1];
                 CUDA_CHECK(cudaMemcpy(d_token, &tok_last, 4, cudaMemcpyHostToDevice));
-                token_launches(d2_vtaps);
+                if (d2_token_exec) CUDA_CHECK(cudaGraphLaunch(d2_token_exec, stm));
+                else token_launches(d2_vtaps);
                 d2->ingest(d2_vtaps, &pos_last, 1, stm);
             } else {
                 step_with(prompt[NP - 1]);

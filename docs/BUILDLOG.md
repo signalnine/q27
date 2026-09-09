@@ -15710,6 +15710,29 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (m): DFlash2 last-token forward graphed -- bitwise, -2 ms per turn (advisory item 1)
+
+d2_setup now captures token_launches(d2_vtaps) into d2_token_exec (after
+capture_draft; token_launches' kernels were warmed by build_graph, the tap
+copies are D2D memcpy nodes, position/token come from d_pos/d_token so one
+graph serves every turn) and generate_prefill's DFlash2 branch launches it
+in place of the eager call; the one-row ring ingest stays outside (host
+bookkeeping). Q27_D2_TOKGRAPH=0 restores the eager path.
+
+Measured (old vs new server, same DFlash2 config, bench/ladder/
+drive_warm_turn.py + 8 seeded streams): SEEDED STREAMS IDENTICAL; pf_ms
+warm pf=1 15 -> 13, pf=5 39 -> 37, pf=41 73 -> 71, cold 3023-token 777-790
+-> 784-794 (noise band). So -2 ms per warm turn, not the advisory's 3-5:
+the eager step was 14.3 ms wall with 11.9 ms of GPU busy (nsys, entry (k)),
+i.e. only 2.4 ms of submission gaps to remove -- the rest is the 8.3 ms
+gemv weight stream plus launch-bound small kernels that a graph does not
+shorten. Bitwise and free, so it stays; it is the whole of what a graph
+can do for this step. The weight stream needs lever B (append the last
+token to a batched chunk), as the advisory ranked it.
+
+Side note from the same run: the (k) trims show up on the cold 3K prefill
+too, 887 -> 777-794 ms (-12%).
+
 ## 2026-09-08 (l): gpt-6-astra on the small-turn levers -- C, then B, then A; first a bitwise one nobody listed
 
 docs/reviews/2026-09-08-gpt6astra-small-turn-levers.md (static, xhigh).
