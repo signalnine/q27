@@ -15714,6 +15714,38 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (t): item 5 measured -- the empty-ring restore class is 1% of decode and drafts as well as a full ring; reseeding is a NO-GO
+
+Item 5 of (p): "restore drafter context -- measure the incidence before
+implementing; group by valid ring rows after alignment and suffix length,
+across the restore tiers". Every request already logs `[d2] ring align:
+keep N rows` (rows the ring retained for this prompt) next to its [gen]
+(restore tier) and [req] (dec/rounds), so the measurement is offline:
+bench/crossengine/agentic-2026-09-08/ring_attr.py. Rows available to the
+drafter at decode start = rows kept + the re-prefilled suffix (seeded from
+prefill taps), capped at the 2048-row window. prodpfx2 (production
+config, 228 decoding requests, 688 s of decode):
+  rows at start    n   decode s  share  tok/round
+  256-1023        18      71.0   10.3%    3.862
+  1024-2047       37     146.9   21.4%    3.990
+  2048 (full)    173     469.7   68.3%    3.972
+By tier: restored P16 with an EMPTY ring 4 requests / 5.3% / 3.852;
+restored P8 with an empty ring 5 / 3.2% / 3.967; the affected class as
+the reviewer defined it (restored, ring empty, suffix < 512 tokens) is 3
+requests, 7.1 s = 1.0% of decode, at 4.057 tok/round -- BETTER than the
+full-ring class. The only bin with a gap is 256-1023 rows at -3%
+tok/round over 10% of decode: a 0.3% run-wall ceiling if every one of
+them ran at full-ring acceptance. A reseed needs target taps for the
+window, i.e. a target forward over up to 2048 tokens (~0.5 s at the
+current chunk rate) or 80-200 MiB of saved drafter state per entry; the
+class it would help is worth ~50 ms per request. NO-GO, with the number.
+(prodpfx, the earlier run, shows a larger spread -- full 4.70 vs 256-1023
+3.75 -- but its full-ring class is dominated by long cold-prefill turns;
+completion-length mix, not ring rows, as the README already noted for the
+restore class.) The "+20% rounds" the advisory quoted was the 09-06/07
+cold-ring-per-turn finding that ring retention (g) fixed; on today's
+production traffic it is gone.
+
 ## 2026-09-08 (s): item 2 -- queue wait is 2% and never two deep; the quality table found three of twelve tasks dying on their FIRST TURN in every DFlash2 arm, and the parser now survives four of the seven shapes
 
 Item 2 of (p): "reproducible turn replay, quality and queue attribution --
