@@ -42,6 +42,14 @@ start_engine() { # $1 label
     q27lad)   systemd-run --user --unit $unit $Q27ENV $Q27 $MODEL $TOK $Q27ARGS ;;
     q27d2q4)  systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK4 $Q27 $MODEL $TOK $Q27ARGS ;;
     q27d2q8)  systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 $Q27 $MODEL $TOK $Q27ARGS ;;
+    # the production config (tools/launch_q27_38.sh d2-pfx: DFlash2 Q8 pack +
+    # prefix-cache tiers on a FRESH tmpfs root, so the run pays the cold
+    # bootstrap turns itself) at the campaign's effort pin (medium, the only
+    # level both engines render -- production serves xhigh; see the 09-08
+    # README for the xhigh numbers). Added 2026-09-08 for the v0.11.0 table.
+    q27prod)  rm -rf /dev/shm/q27-pfx-campaign; mkdir -p /dev/shm/q27-pfx-campaign
+              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 $Q27 $MODEL $TOK $Q27ARGS \
+                --prefix-cache /dev/shm/q27-pfx-campaign --prefix-cache-max-gb 40 --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     *) log "unknown leg $1"; return 1 ;;

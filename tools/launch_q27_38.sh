@@ -33,16 +33,21 @@ D2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E
 # A ladder config restoring from it would draft from garbage (correct output,
 # acceptance loss the bitwise gates cannot see). The ladder mode below has no
 # cache flags on purpose; give it its own root if that ever changes.
+# Request-body recording (2026-09-08, item 2): REQ_LOG=<file> appends one
+# JSONL line per request (seq, t_ms, api, path, raw body) so bench/replay/
+# replay.py can feed two binaries the identical sequence. Real session
+# content -- keep it local, delete when done.
+REQLOG_ENV=""; [ -n "${REQ_LOG:-}" ] && REQLOG_ENV="-E Q27_REQ_LOG=$REQ_LOG"
 PFX_DIR=${PFX_DIR:-/dev/shm/q27-pfx}
 PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
 mode=${1:-}; shift || true
 systemctl --user stop q27-38 2>/dev/null || true
 systemctl --user reset-failed q27-38 2>/dev/null || true
 case "$mode" in
-  d2)      systemd-run --user --unit q27-38 $D2ENV "$@" $BIN $MODEL $TOK $ARGS ;;
+  d2)      systemd-run --user --unit q27-38 $D2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS ;;
   d2-pfx)  mkdir -p "$PFX_DIR"
-           systemd-run --user --unit q27-38 $D2ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
-  ladder)  systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 "$@" $BIN $MODEL $TOK $ARGS ;;
+           systemd-run --user --unit q27-38 $D2ENV $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS $PFXARGS ;;
+  ladder)  systemd-run --user --unit q27-38 -E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 $REQLOG_ENV "$@" $BIN $MODEL $TOK $ARGS ;;
   *) echo "usage: $0 d2|d2-pfx|ladder [-E K=V ...]" >&2; exit 2 ;;
 esac
 # readiness: key on THIS invocation (a --since window can match the previous

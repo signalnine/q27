@@ -265,6 +265,35 @@ struct ReasoningBudgetObserver {
 
 };
 
+// Request-body recording (2026-09-08, item 2 of the (p) agenda): with
+// Q27_REQ_LOG=<file> every generation request is appended as one JSONL line
+// -- seq (arrival order), t_ms, api, path, body verbatim -- so
+// bench/replay/replay.py can feed two binaries the identical sequence.
+// Sampling is seed-0 when the client sends none, and the DFlash2 ring and
+// the cache tiers are history-dependent, so a turn is reproducible only
+// under the identical preceding sequence; this is what makes that
+// possible. Real session content: local, opt-in, never committed.
+static void req_log_body(const char* api, const char* path, const std::string& body) {
+    static FILE* f = [] {
+        const char* p = getenv("Q27_REQ_LOG");
+        FILE* h = p && *p ? fopen(p, "a") : nullptr;
+        if (p && *p && !h) fprintf(stderr, "Q27_REQ_LOG: cannot open %s\n", p);
+        return h;
+    }();
+    if (!f) return;
+    static std::mutex mu;
+    static long seq = 0;
+    const long long t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+    json rec = {{"seq", 0L}, {"t_ms", t_ms}, {"api", api}, {"path", path}, {"body", body}};
+    std::lock_guard<std::mutex> lk(mu);
+    rec["seq"] = seq++;
+    const std::string line = rec.dump(-1, ' ', false, json::error_handler_t::replace);
+    fwrite(line.data(), 1, line.size(), f);
+    fputc('\n', f);
+    fflush(f);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
@@ -1983,6 +2012,7 @@ int main(int argc, char** argv) {
     };
 
     auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
+        req_log_body("oai", chat ? "/v1/chat/completions" : "/v1/completions", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
@@ -2721,6 +2751,7 @@ int main(int argc, char** argv) {
     });
 
     srv.Post("/v1/messages", [&](const httplib::Request& req, httplib::Response& res) {
+        req_log_body("anth", "/v1/messages", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { anthropic_400(res, "invalid JSON body"); return; }
@@ -3223,6 +3254,7 @@ int main(int argc, char** argv) {
     // 400 is fatal to Codex, 500 retries -- so tolerate quirks, 500 on bugs.
 
     srv.Post("/v1/responses", [&](const httplib::Request& req, httplib::Response& res) {
+        req_log_body("resp", "/v1/responses", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }

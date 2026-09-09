@@ -15714,6 +15714,42 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (v): request-body recording + sequential replay -- the turn-replay instrument item 2 was missing; two fresh boots agree on 15 of 15 outputs
+
+The last piece of (p) item 2. `Q27_REQ_LOG=<file>` (server.cu
+req_log_body, at the head of the /v1/messages, /v1/responses and
+/v1/chat/completions + /v1/completions handlers; `REQ_LOG=<file>` on
+tools/launch_q27_38.sh) appends one JSONL line per request: seq (arrival
+order), t_ms, api, path, the body verbatim. bench/replay/replay.py posts
+the bodies in order, one at a time, streaming when the body says so, and
+records per request the sha256 of the delivered output in delivery order
+(text, thinking, tool_use names + JSON), output tokens, TTFT, wall;
+bench/replay/replay_diff.py compares two replays per request and reports
+the count of identical outputs and the FIRST divergent seq. README in
+bench/replay/.
+
+Why this shape: (s) showed sampling without a client seed is
+deterministic per prompt AND per preceding sequence (the drafter ring and
+the cache tiers are history-dependent), so a re-run of a task through the
+harness draws a different turn; only the identical sequence reproduces a
+campaign turn. Sequential replay is exactly that condition, and it is also
+the condition under which a numerics change localises to one request.
+
+Gate (scratchpad replay_gate.sh): production with REQ_LOG on served 8
+seeded streams + one SWE-bench instance through the harness (15 requests,
+748 KB of bodies); then three FRESH boots on a fresh cache root: A (the
+binary), A2 (the same binary again), B (same binary, Q27_D2_TOKGRAPH=0, a
+bitwise config change). A vs A2: 15/15 identical outputs, wall 39.5 vs
+39.6 s -- the determinism gate. A vs B: 15/15 identical, B/A wall 1.001.
+The recorded session's own outputs differ from the replays' on the seeded
+rows (production had history before them), which is the (s) fact again,
+now observable per request.
+
+Use: record a real session on production (`REQ_LOG=build/reqlog-DATE.jsonl
+bash tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1`), stop, boot arm A on a
+fresh root, replay, stop, boot arm B, replay, diff. Bodies are real session
+content: local, never committed. Item 2 of (p) is now complete.
+
 ## 2026-09-08 (u): item 4, the TMA spike -- bitwise, +10% over the cp.async fill, 1.33x/1.39x against the 1.6x bar; the W4A8 port stops here
 
 Exactly the intervention (h) proposed and (p) budgeted one spike for:
