@@ -15710,6 +15710,62 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (o): lever B built and gated -- -12 ms per warm turn, but the first token's numerics move 10-100x more than the g64 prefix class; OFF pending the corpus verdict
+
+Implementation (engine.cuh generate_prefill, Q27_PF_FOLDLAST=0 restores the
+old path): when the request has a P8 stable boundary and the post-snapshot
+span's final chunk would hold >= 2 tokens, the second chunk loop runs
+through NP, the last row's output_norm is copied into the decode-side x1
+BEFORE mtp_warm_T (which reuses x1T; the warm covers one row fewer since
+NP-1 has no successor), and the head runs on that row with token_launches'
+own tail (qx, mm(output.weight), argmax, advance) so logits / d_token /
+d_pos=d_step=NP / d_gen are what decode expects; DFlash2's NP-1 taps come
+from the chunk's seed (d2_seed_chunk's window ends at NP), the separate
+ingest is gone. Legacy tail snapshots (stable_len < 0: CLI, canonicals,
+pf=1 turns) and one-token spans keep the eager path (a one-token batched
+chunk streams the weights anyway). Instrument: Q27_DUMP_PF_LOGITS=<dir>
+dumps every request's post-prefill logits (pf_%06d.bin) for a first-token
+A/B; Q27_PF_DUMP_SERIAL=1 makes the CLI --pf leg dump the serial leg too.
+
+Timing (one binary, FOLDLAST=0 vs default, same 36 requests): warm +26
+tokens 64 -> 52 ms (3K), 69 -> 57 (25K), 75 -> 62 (45K); +41 71 -> 59;
++137 114 -> 102; +593 244 -> 231; chat/completions turns fold too (619 ->
+606); pf=1/5 unchanged by design. The -12 ms is the eager step's weight
+stream, as predicted.
+
+Numerics, first-token logits over the 36 requests: argmax 36/36, top-5
+4.53/5, but cosine min 0.881 / median 0.978 and KL(old||new) median 9.6e-3,
+max 0.175, with p(old argmax) moving by up to 0.3 (0.534 -> 0.642, 0.868
+-> 0.718). Calibration of the ACCEPTED class on the same instrument (CLI
+--pf serial vs batched prefix, eager last token in both): cosine 0.9985 @
+256 / 0.9952 @ 1024, KL 9.3e-5 / 3.3e-12. So B's direct perturbation of
+the emitted token is 10-100x the indirect prefix perturbation the g64
+policy was signed off on: the batched path's per-token output (WY scan,
+pv8 attention with e4m3 softmax weights, g64 activation groups) differs
+from the serial decode kernels far more than its downstream effect on
+later tokens does. Sampled first tokens at temperature 1 see a visibly
+different distribution on ~1/3 of turns.
+
+DFlash2 acceptance on 8 seeded 400-token streams: 802 -> 827 rounds (+3%),
+streams byte-identical (position-keyed draws). But the same server with
+the same seeds run twice gives 95/105/99/101/108/92/107/95 then
+95/105/99/101/131/106/112/102 rounds (streams identical): ring content
+after the first pass moves single requests by up to +23 rounds, so n=8
+cannot judge a 3% aggregate; the 12-instance run is the acceptance
+instrument if B goes forward.
+
+NLL gate (bench/flipgate/agentic38.i32, 20400 predictions, 256-token
+chunks, fp8 KV): serial mean NLL 0.842219 (PPL 2.3215) vs batched 0.853788
+(PPL 2.3485) = +1.37% NLL, +1.16% PPL. Inside the pre-registered +2%
+ceiling, so the rule PASSES B -- but it is a real cost paid on the first
+token of every turn, for 12 ms of a 60-130 ms warm turn (~1.3% of a
+12-instance run's wall, ~10-16% of a warm turn's TTFT). Verdict: SHIPPED
+OPT-IN (Q27_PF_FOLDLAST=1), default OFF; the launch script does not set
+it. Turn it on when the per-turn latency matters more than a +1.4%
+first-token NLL; the acceptance question (n=8 too noisy) would then need
+the 12-instance run. The instrument (Q27_DUMP_PF_LOGITS + bench/ladder/
+pf_logits_ab.py) is the gate for any future change to the last-token path.
+
 ## 2026-09-08 (n): lever C measured before building it -- the attention split is already at its cap at production depths; NO-GO
 
 Advisory item 2's precondition: sweep the existing Q27_PF_SPLIT override

@@ -402,7 +402,12 @@ only 2.4 ms of submission gaps, the rest is its weight stream); (1) C
 MEASURED AND PARKED, BUILDLOG (n): the Q27_PF_SPLIT sweep at 3K/25K/45K
 shows the depth rule already splits 6-8 ways at Claude Code depths, so an
 underfill rule is worth <= 3 ms per turn there (7-8 ms only below ~8K) --
-not worth a numerics-class change; (2) B narrow: append the last token to an
+not worth a numerics-class change; (2) B BUILT AND GATED, BUILDLOG (o):
+-12 ms per warm turn, but the batched per-token NLL is +1.37% over serial
+on the agentic corpus (inside the +2% rule) and the first-token logits
+move 10-100x more than the accepted prefix class (KL median 1e-2 vs 1e-4);
+shipped OPT-IN (Q27_PF_FOLDLAST=1), default off -- the user's call whether
+~1.3% of run wall is worth a +1.4% first-token NLL. Original item: append the last token to an
 existing post-snapshot chunk with room, existing head GEMV, MTP/DFlash2
 traps as listed; (3) A only after repricing, with explicit boundary-state
 export (snap/ckpt/pfx copy LIVE state today). Every numerics-class lever

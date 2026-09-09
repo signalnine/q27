@@ -1339,11 +1339,15 @@ int main(int argc, char** argv) {
                     // via step_with and never hits it. Enables an fp8q-vs-default
                     // logit A/B (cosine/maxdiff/KL) to quantify the fp8 QK^T delta
                     // at depth -- the default-on gate the greedy checks don't give.
-                    if (batched && !dump.empty()) {
+                    // Q27_PF_DUMP_SERIAL=1 also dumps the SERIAL leg's logits to
+                    // <dump>.serial (2026-09-08: calibrates the serial-vs-batched
+                    // perturbation class for the lever-B first-token gate).
+                    if (!dump.empty() && (batched || getenv("Q27_PF_DUMP_SERIAL"))) {
                         std::vector<float> lg(VOCAB);
                         CUDA_CHECK(cudaMemcpy(lg.data(), e.logits, (size_t)VOCAB * 4,
                                               cudaMemcpyDeviceToHost));
-                        FILE* df = fopen(dump.c_str(), "wb");
+                        const std::string path = batched ? dump : dump + ".serial";
+                        FILE* df = fopen(path.c_str(), "wb");
                         if (df) {
                             fwrite(lg.data(), 4, VOCAB, df);
                             fclose(df);

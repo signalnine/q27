@@ -2825,6 +2825,7 @@ struct Engine {
     // launch sequence, same numerics; the one-row ring ingest stays outside
     // (host bookkeeping). Q27_D2_TOKGRAPH=0 keeps the eager path for A/B.
     cudaGraphExec_t d2_token_exec = nullptr;
+    long gs_fold_last = 0; // lever B: prefills whose last token rode in a batched chunk
     bool d2_on = false;
     int d2_k = 7;
     int d2_pending = 0, d2_pos = 0;
@@ -5095,14 +5096,49 @@ struct Engine {
             const bool pfx_stable_boundary = stable_len > base && stable_len < NP;
             if (pfx_stable_boundary && pfx_should_persist(prompt, snap_upto))
                 pfx_persist(prompt, snap_upto);
-            for (int c0 = snap_upto; c0 < NP - 1; c0 += PF_T) {
-                int Tc = std::min((int)PF_T, (NP - 1) - c0);
+            // Lever B (2026-09-08, gpt-6-astra small-turn advisory item 3, the
+            // narrow case): when the post-snapshot span exists and its final
+            // chunk would hold >= 2 tokens, the LAST prompt token rides in that
+            // chunk instead of a separate single-token forward -- the eager
+            // step streamed the whole weight set once more (12 ms per warm
+            // turn after the graph capture, BUILDLOG (k)/(m)). The head then
+            // runs on that row's output_norm: same qx/mm/argmax/advance tail
+            // as token_launches, so every device-side handoff (logits,
+            // d_token, d_pos/d_step, d_gen) is the one decode expects. NOT
+            // bitwise: that token's hidden state now comes from the batched
+            // g64 kernels (WY scan, prefill attention) instead of the serial
+            // decode kernels -- the g64 tolerance class (policy 2026-07-04),
+            // gated by the first-token logits A/B + DFlash2 acceptance + the
+            // agentic run (BUILDLOG (o)). Legacy tail snapshots (stable_len <
+            // 0: CLI, canonicals) and one-token spans keep the old path: a
+            // one-token batched chunk streams the weights anyway, and the
+            // NP-1 snapshot must not include the last token's state.
+            // OPT-IN (Q27_PF_FOLDLAST=1): measured 2026-09-08 (BUILDLOG (o)),
+            // -12 ms per warm turn but the batched path's per-token NLL is
+            // +1.37% over serial on the agentic corpus (inside the +2% rule,
+            // not free) and the first-token distribution moves visibly on
+            // ~1/3 of sampled turns for ~1.3% of run wall. Off by default.
+            static const bool fold_env = [] { const char* e = getenv("Q27_PF_FOLDLAST"); return e && atoi(e); }();
+            const int span = NP - snap_upto;
+            const bool fold_last = fold_env && pfx_stable_boundary && span >= 2 && (span % PF_T) != 1;
+            const int span_end = fold_last ? NP : NP - 1;
+            for (int c0 = snap_upto; c0 < span_end; c0 += PF_T) {
+                int Tc = std::min((int)PF_T, span_end - c0);
                 if (pfarena) pfarena->claim(this, stm); // per CHUNK: see prefill_arena.h
                 float* d2t = (d2_on && c0 + Tc > NP - D2_SEED_WINDOW) ? d2_pf_taps : nullptr;
                 prefill_chunk(d_prompt + c0, c0, Tc, d2t);
-                if (d2t) d2_seed_chunk(c0, Tc, NP);
+                if (d2t) d2_seed_chunk(c0, Tc, NP); // includes NP-1 when folded: no separate ingest
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
-                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc); // see above
+                const bool has_last = fold_last && c0 + Tc == NP;
+                // the last row's output_norm becomes the decode-side x1 (the
+                // eager step left it there); copy BEFORE mtp_warm_T, which
+                // reuses x1T as scratch
+                if (has_last)
+                    CUDA_CHECK(cudaMemcpyAsync(x1, x1T + (size_t)(Tc - 1) * N_EMBD, (size_t)N_EMBD * 4,
+                                               cudaMemcpyDeviceToDevice, stm));
+                // MTP warm needs each row's successor token; NP-1 has none
+                if (!d2_on && Tc - (has_last ? 1 : 0) > 0)
+                    mtp_warm_T(d_prompt + c0 + 1, c0, Tc - (has_last ? 1 : 0)); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -5112,7 +5148,15 @@ struct Engine {
             int pos_last = NP - 1;
             CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos_last, 4, cudaMemcpyHostToDevice, stm));
             CUDA_CHECK(cudaMemcpyAsync(d_step, &pos_last, 4, cudaMemcpyHostToDevice, stm));
-            if (d2_on) {
+            if (fold_last) {
+                // token_launches' tail on the batched row: head, greedy next
+                // token, position/record advance (d_pos -> NP, d_gen[NP-1]).
+                qx(x1, N_EMBD);
+                mm(dm.get("output.weight"), x1, logits);
+                q27k::argmax(logits, VOCAB, d_token, d_amax, stm);
+                q27k::advance(d_pos, d_step, d_gen, d_token, stm);
+                gs_fold_last++;
+            } else if (d2_on) {
                 // DFlash2: the last prompt token's taps must reach the ring
                 // too. The batched loops stop at NP-1 and this single-token
                 // step produced no taps, so every turn's ring had a one-row
@@ -5159,6 +5203,20 @@ struct Engine {
         gs.pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                              t_in)
                        .count();
+        // Gate instrument (lever B): Q27_DUMP_PF_LOGITS=<dir> writes the
+        // post-prefill logits of every request as <dir>/pf_%06d.bin (VOCAB
+        // fp32, per-engine counter) for a first-token distribution A/B.
+        {
+            static const char* dump_dir = getenv("Q27_DUMP_PF_LOGITS");
+            if (dump_dir) {
+                static int n = 0;
+                std::vector<float> lg(VOCAB);
+                CUDA_CHECK(cudaMemcpy(lg.data(), logits, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
+                char path[512];
+                snprintf(path, sizeof path, "%s/pf_%06d.bin", dump_dir, n++);
+                if (FILE* f = fopen(path, "wb")) { fwrite(lg.data(), 4, VOCAB, f); fclose(f); }
+            }
+        }
         CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice, stm));
         int P = (int)prompt.size() - 1;
         CUDA_CHECK(cudaMemcpyAsync(d_P, &P, 4, cudaMemcpyHostToDevice, stm));
