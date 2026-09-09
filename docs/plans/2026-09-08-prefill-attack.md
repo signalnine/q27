@@ -5,8 +5,10 @@ phase 2 spike DONE, bar not met (TMA W/X-only is the one remaining spike);
 phase 3 DONE (trims shipped, A deferred, B opt-in off, C parked); phase 4
 remains PLAN. The ranked agenda after all of it is BUILDLOG 2026-09-08 (p)
 / docs/reviews/2026-09-08-gpt6astra-what-next.md: width>8 investigation
-first (bounded), turn-replay/quality/queue attribution alongside, then
-shared-cut promotion + cache failure paths, then one TMA spike. Evidence and
+first (bounded; DONE in (q): no engine bug, the wall was the gemm_min=9
+family switch, wider K loses on the round wall, K=7 stays), turn-replay/
+quality/queue attribution alongside, then shared-cut promotion + cache
+failure paths, then one TMA spike. Evidence and
 numbers are in docs/perf-attribution-prefill-2026-09-08.md (the recon); this
 file is the executable part. Written so a session with no memory of the
 recon can run it: every phase has the launch command, the instrument, the

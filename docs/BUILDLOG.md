@@ -15705,10 +15705,112 @@ are reached only by suffix rounds via captured graphs; the eager verify/GDN/fold
 at width>8 has a latent, pre-existing engine bug. K=7 is the default (Phase-0
 balanced point; wins echo +43% without the wider block). K>7 gains are gated on
 that engine-core fix, tracked separately.
+[RETRACTED 2026-09-08 (q): there is no engine bug at width>8. The divergence
+is gemm_min=9 switching the verify from the GEMV family to the MMA family at
+width 9; with the family matched (Q27_GEMM_MIN=99) widths 9..12 are
+byte-identical to the ladder on all four prompts, graph and eager.]
 
 Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
+
+## 2026-09-08 (q): the width-8 wall was the gemm_min=9 dispatch switch, not an engine bug -- widths 9-12 are bitwise on the matched family; wider K loses on the round wall at every depth; K=7 stays
+
+Item 1 of (p), run to the reviewer's recipe. Scripts and the trap list in
+bench/dflash2/width/ (README.md); raw runs in the session scratchpad.
+
+CLI matched-family gate (build/q27 --spec --dflash2 <full Q8 pack> --k K,
+fp8 KV, fast head, 512 generated tokens, four prompts, K in {6..11} =
+widths 7..12, verify graph AND eager, reference = the ladder stream):
+- gemv arm (Q27_GEMM_MIN=99, every width on gemv_q4_n<N>): 48 of 48 runs
+  byte-identical to the ladder. Widths 9, 10, 11, 12; graph and eager;
+  prose, code-write, code-edit, echo. There is nothing to fix in the
+  verify/GDN/fold at width>8.
+- default arm (gemm_min 9, widths >= 9 on k_vgemm): K=6,7 identical to the
+  ladder; K=8..11 diverge from it at ONE fixed token per prompt (prose 165,
+  code-write 81, code-edit 266, echo 266) -- the same token for every K
+  and for graph/eager. The (d) "hard width boundary at 8" was the mm5
+  family switch and nothing else. Retraction noted under (d).
+- the MMA family is width-invariant per lane too: the K=8..11 streams are
+  identical to EACH OTHER on every prompt, graph and eager (31 of 32 runs).
+  So on the serving path, which has been on k_vgemm at width 8 since (c),
+  a wider K changes no numerics -- K is a pure performance knob there.
+- the one outlier (code-write, K=10, graph: diverged at token 93 into a
+  genuinely different continuation, 413 differing positions, +31 rounds)
+  did NOT reproduce: 4 repeats plus 2 eager twins all match the other MMA
+  runs bit for bit. Every CLI run loads ~20 GB through the pageable path
+  and the sweep did not print the weight digest, so a corrupt load (the
+  ~1%-per-load fault in the 5090 memory: usually identical tokens, one
+  margin crossing when a flipped weight lands in a read tensor) is the
+  likely explanation and cannot be confirmed after the fact. The scripts
+  now print `wsum` per run; the serving boots below all loaded the modal
+  b743d26b1f0562a9.
+Traps met: (1) plain greedy is NOT the reference -- the plain decode graph
+uses k_gemv_q4, which is not k_gemv_q4_n<1> (engine.cuh:1709), so plain
+differs from every width-N stream (prose @32, code-write @52, code-edit
+@127; echo agrees by luck); the (d) gate compared against --spec, which is
+why it read "byte-identical to plain". (2) K=1 fails in the CLI: the
+drafter's own GEMV has no single-row kernel (`gemv_q4_n: bad nbatch 1`).
+(3) Q27_GEMM_MIN only bites with --spec (parsed in build_spec_graphs);
+the reviewer called this one in advance. (4) Round counts ARE reproducible
+for a fixed configuration and history: graph vs eager gave identical
+streams AND identical round counts on every gemv-arm run, and the serving
+boots below repeat every hash and every round count -- the (o) note about
+irreproducible round counts was ring-history drift between passes.
+
+The honest K budget, CLI gemv arm (identical streams, so tok/round is the
+same text under each K):
+  K              6     7     8     9    10    11    K10 vs K7
+  code-edit   3.30  3.37  3.44  3.53  3.63  3.56    +7.7%
+  prose       2.36  2.44  2.46  2.49  2.52  2.51    +3.3%
+  echo        2.31  2.30  2.25  2.27  2.32  2.38    +0.9%
+  code-write  2.72  2.86  2.89  2.89  2.88  2.88    +0.7%
+Inside the reviewer's +3-6% bracket on average, and the gain has to beat
+the round-wall cost of the wider block.
+
+Serving sweep (production config: Q8 serving pack, k_vgemm verify at width
+K+1, sampled walk, ring retention, fold overlap, Q27_DFLASH2_K=K, one boot
+per K, order 7 10 7 10 8 9 11; per boot 16 seeded 400-token streams at 2.3K
+and 6.6K prompts in two passes + 2 seeds each at 12.5K and 50K depth):
+  K      tok/round   dec t/s   round ms = draft + verify + host
+  7        4.012      223.3     17.82     2.46    15.13    0.23
+  8        3.906      210.5     18.51     2.72    15.56    0.23
+  9        4.139      221.7     18.57     2.67    15.66    0.23
+  10       4.004      211.2     18.82     2.68    15.92    0.23
+  11       4.134      214.5     19.17     2.79    16.15    0.23
+The repeated boots are exact: K=7 boots 1 and 3 and K=10 boots 2 and 4
+reproduce every stream hash, every round count and the round wall to
+0.04 ms. Widening costs 0.7-1.35 ms per round (17.82 -> 18.82 at K=10,
++5.6%): the drafter's attention goes from one 32-query group to two at
+W >= 9 (+0.2-0.3 ms, as the reviewer said it would) and the "flat" MMA
+verify is not flat (+0.4-1.0 ms). Acceptance moves 0..+3%. Net decode t/s:
+K=9 -0.7%, K=11 -3.9%, K=10 -5.4%, K=8 -5.7%. The n=2 depth probes in
+this sweep hinted K=10 +6-8% at 12.5K/50K; the follow-up (8 seeds each
+at 25K and 50K, K=7/10/9) says no:
+  K      tok/round   dec t/s   round ms
+  7        3.953      211.8     18.64
+  9        3.975      204.7     19.40
+  10       3.975      201.4     19.72
++0.6% acceptance, +1.1 ms round, -4.9% t/s at K=10. The bar was a
+repeatable >= 2% request-wall gain: NOT met by any K on any traffic class
+measured. K=7 stays, and the widening is parked with its price known: a
+wider block only pays if ~1 ms comes off the width-11 round (the drafter's
+second query group and the verify's width slope), i.e. it is the lanes
+6-7 / round-cost item, deferred in (p).
+
+Cross-K stream hashes differ by design: the sampled walk realises
+different tokens under different proposals even with identical target
+logits (position-keyed draws keep a stream identical only when the
+proposals are identical). Within-arm A/B repeatability is the instrument;
+the CLI greedy gate is where width-invariance was proven.
+
+Dispositions: no engine change; (d)'s "latent engine bug" retracted; K>7
+is a numerics-neutral serving knob that loses 1-6% t/s on this traffic;
+the reviewer's localisation stands in full (dispatch switch, two query
+groups, 3-6% budget, 0.5-1.1 ms tolerance -- the measured cost is
+1.0-1.35 ms). Session cost: one bounded session as budgeted. Next per (p):
+item 2 (turn replay / quality / queue attribution) and item 3 (shared-cut
+promotion + cache failure paths).
 
 ## 2026-09-08 (p): gpt-6-astra on what comes next -- a bounded width>8 investigation first, cache robustness and one TMA spike after; one static P2 fixed on the spot
 
