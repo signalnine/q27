@@ -15710,6 +15710,91 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (k): the small-turn prefill floor measured -- three weight streams per warm turn; three bitwise trims shipped
+
+Phase 3 of docs/plans/2026-09-08-prefill-attack.md. After phase 0 the
+prefill wall on Claude Code traffic is 110 s of an 800 s run and half of it
+is the 192 same-conversation turns re-prefilling 64-1000 tokens at 130-760
+ms each, so the per-turn floor, not GEMM throughput, is what remains.
+
+Instrument: nsys on a short production-config server run (systemd-run,
+--cuda-graph-trace=node, -d 120 --kill=sigterm; readiness must key on
+"listening on" -- "serving ON" is the DFlash2 line and prints before the
+listener is up) driving bench/ladder/drive_warm_turn.py; windows cut by
+kernel family (batched GEMM / prefill attention / WY scan = prefill, the
+eager single-token kernels = the last-token step, vgemm / gemv_q8_n = the
+decode graph). Scratch analysis in the session; the numbers:
+
+  cold 3079 tokens: 887 ms = 3 x 1024-chunks (515 + 265) + a 7-token tail
+    chunk (25) + a 5-token post-boundary chunk (25) + the eager last-token
+    step (14) + host.
+  warm pf=41 (76 ms): chunk A 36 tokens 35 ms | chunk B (the ~5 tokens
+    after the stable boundary, second prefill_chunk loop) 25 ms | eager
+    last-token step 14 ms.
+  warm pf=5 (40 ms): chunk B 25 + eager 14.   warm pf=1 (15 ms): eager only.
+  CLI cold --pf: 128 tok 79 ms, 256 109, 512 165, 1024 285 -> ~55 ms fixed
+    + 0.22 ms/token.
+
+Anatomy of a warm turn: the full 13.5 GB weight set is streamed THREE
+times -- chunk A (k_gemm_mma_T at T<=64: 400 launches, 13-20 ms, i.e. the
+GEMM is weight-bandwidth-bound at 0.7-1 TB/s in this regime), chunk B
+(the same for ~5 tokens: 25 ms), the eager last-token step (k_gemv_q4 352
+launches 8.3 ms at 1.6 TB/s + ~5 ms of launch overhead). Plus the prefill
+attention kernel at small T: k_attn_prefill_mma_pv8 runs 4 blocks on 170
+SMs for 320 us per layer whatever T is (16 layers = 5.1 ms per chunk; the
+P4 position split only engages at deep base_pos), and ~1700 launches per
+chunk at 88% GPU busy. Per-launch table: k_gemm_f16_T (ssm alpha/beta,
+48x5120 fp16) grid 48x1024 = 212 us each, 96 per 1024-chunk = 20 ms
+(7.5%!); k_delta_wy 260 us x 48 = 12.5 ms/chunk (4.7%); k_quantize_x (the
+g32 quantizer nothing reads on the g64 route) 9.7 ms/chunk (3.7%);
+k_silu_mul at its bandwidth floor.
+
+Bitwise trims shipped (this entry):
+1. k_gemm_f16_T retiled: block per 4 tokens walking all 48 rows with the
+   activations register-resident (the old block-per-(row, token) grid re-read
+   both operands per output: 1.5 GB of L2 traffic per launch). Same
+   per-thread strided FMA chain and the same block_reduce<256> tree, so
+   every output is bitwise the serial k_gemv_f16 -- the --pf identity gate
+   (Q27_PF_XG=32, serial vs batched IDENTICAL) checks exactly that.
+2. qxT skips the g32 quantize unless the route reads it
+   (prefill_g32_needed(): dp4a or Q27_PF_XG=32).
+3. mtp_warm_T skipped when d2_on (the DFlash2 decode never calls
+   mtp_forward: engine.cuh decode_step's d2 branch; the forced-close path
+   samples plainly). CONTRACT: blobs written by a DFlash2 engine carry
+   unwarmed MTP rows, so /dev/shm/q27-pfx is a DFlash2-only root (launch
+   script comment; the ladder mode has no cache flags).
+
+Results (CLI --pf, default route, old -> new binary; nsys per launch):
+  k_gemm_f16_T 212 -> 61.5 us (20.4 -> 5.9 ms per 1024-chunk); two
+  intermediate retiles were NOT faster (rows walked inside a block: 9
+  barriers per row, still 212 us; a lane-strided layout: 160 two-byte
+  loads per row + a 256-float register array that spilled, 323 us) -- the
+  win needed consecutive columns per lane (16-B weight loads) AND the
+  register tree; k_quantize_x gone from the g64 route (-9.7 ms/chunk).
+  1024 tokens 285 -> 261 ms (3597 -> 3926 tok/s, -8.4%); 128 tokens 79 ->
+  76; 37 tokens 60 -> 58.
+Gates: post-prefill logits byte-identical old vs new on default, XG=32 and
+dp4a routes at pf 1024 and 37; test_kernels ALL PASS; DFlash2 serving A/B
+(old vs new server, 8 seeded streams at 2.3K/6.6K prompts) byte-identical
+-- covers the mtp_warm and g32 skips; the f16 kernel is covered by the
+logits identity. NOTE: the serial-vs-batched --pf gate at Q27_PF_XG=32
+reports MISMATCH on the pre-trims binary too (fp8 and f16 KV): it has been
+stale since the WY scan replaced the sequential scan on the batched path,
+and is not a signal about this change.
+
+Structural levers NOT taken here (each is a numerics-class change, needs
+the tolerance/quality gates, and is the user's call): (A) fold chunk B into
+chunk A by snapshotting the GDN state mid-chunk at the stable boundary
+(-25 ms per warm turn, 33% of a 76 ms turn; WY block alignment moves,
+same class as the existing chunk-alignment dependence); (B) fold the last
+prompt token into the batched chunk and take its logits from the head GEMV
+on that row (-12 ms; the first decode token's logits move from the serial
+to the g64 batched numerics; the canonical NP=5 prompts stay on the serial
+path); (C) engage the attention position split whenever the grid underfills
+(blocks < SMs), not only at deep base_pos (-4.5 ms per chunk; the P4 split's
+tolerance class). Together ~76 -> ~35 ms per warm turn; the production
+64-256-token turns (137 ms mean) ~-30%.
+
 ## 2026-09-08 (j): gpt-6-astra review of the W4A8 spike -- design confirmed, cvt16 demoted to a probe, the port's gate list
 
 docs/reviews/2026-09-08-gpt6astra-w4a8-spike.md (static, xhigh, 15 items).

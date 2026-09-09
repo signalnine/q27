@@ -373,6 +373,28 @@ gain is explicitly accepted.
   eager launches per chunk), the per-chunk sync, or the DFlash2 tap
   copies on the tail.
 
+### Phase 3 status (2026-09-08 evening): trims SHIPPED, floor measured
+
+BUILDLOG 2026-09-08 (k). Shipped bitwise: qxT skips the g32 quantize on
+the g64 route (-9.7 ms per 1024-chunk); mtp_warm_T skipped under DFlash2
+(/dev/shm/q27-pfx is thereby a DFlash2-only root -- blobs carry unwarmed
+MTP rows); k_gemm_f16_T warp-per-token register-tree retile (212 -> 61.5
+us, -14.5 ms per chunk). CLI 1024-token prefill 285 -> 261 ms.
+
+The small-turn floor (nsys, production config): a warm 41-token turn is
+76 ms = chunk A 35 + a SECOND full chunk for the ~5 post-boundary tokens
+25 + the eager last-token step 14; each streams the whole 13.5 GB weight
+set (small-T GEMM at 0.7-1 TB/s), and the prefill attention kernel runs 4
+blocks for 320 us per layer at any T <= 64 (5 ms per chunk). Levers, all
+numerics-class (tolerance/quality gates, separate cache root, user's
+call): (A) mid-chunk GDN snapshot at the stable boundary so chunk B
+disappears (-25 ms per warm turn); (B) fold the last prompt token into the
+batched chunk, logits from the head GEMV on that row (-12 ms; first
+decode token moves to g64 numerics; canonical NP=5 prompts stay serial);
+(C) engage the attention position split when the grid underfills, not
+only at deep base_pos (-4.5 ms per chunk). Together 76 -> ~35 ms per warm
+turn; the production 64-256-token turns (137 ms mean) about -30%.
+
 ## Phase 4 -- attention and delta-scan (the 128 K levers, later)
 
 - Prefill attention (`k_attn_prefill_mma_pv8`, prefill.cu:1971): 13.5% of

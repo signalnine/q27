@@ -770,6 +770,13 @@ static bool prefill_xg64() {
     return !(e && !strcmp(e, "32"));
 }
 
+// The g32 activation quantization (nat/eo/scale/isum) is consumed only by the
+// dp4a prefill (Q27_PREFILL=dp4a) and the exact legacy MMA leg (Q27_PF_XG=32);
+// the default g64 MMA route reads nat64/s64 alone. qxT skips the g32 launch
+// when nothing will read it (2026-09-08: 9.7 ms of a 265 ms 1024-token chunk,
+// 3.7%, measured with nsys). Re-read per call like the route flags it mirrors.
+bool prefill_g32_needed() { return !(prefill_use_mma() && prefill_xg64()); }
+
 // Q27_PF_NT: force a fixed prefill GEMM token-tile width (16/32/64/128) for A/B;
 // 0/unset = auto-dispatch by T. Re-read per launch, same policy as prefill_xg64.
 static int prefill_nt() {
@@ -953,32 +960,97 @@ void splitk_scratch_reserve(SplitKScratch* sk) {
     sk->cap = cap;
 }
 
-// F16 weights (ssm alpha/beta: 48x5120). Block per (row, token) with the same
-// 256-thread strided walk + shared-memory tree as the serial k_gemv_f16, so
-// reductions are bitwise-identical to the single-token path.
-__global__ void k_gemm_f16_T(const __half* __restrict__ W, const float* __restrict__ xT,
-                             float* __restrict__ y, int64_t rows, int64_t cols) {
-    int64_t r = blockIdx.x;
-    int t = blockIdx.y;
-    const __half* wr = W + r * cols;
-    const float* x = xT + (size_t)t * cols;
-    float acc = 0.f;
-    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x)
-        acc += __half2float(wr[c]) * x[c];
-    __shared__ float sh[256];
-    sh[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
+// F16 weights (ssm alpha/beta: 48x5120). Every output is bitwise the serial
+// k_gemv_f16: 256 strided partial sums (thread t owns columns t, t+256, ...,
+// accumulated in increasing order) folded by block_reduce<256>'s tree
+// (sh[i] += sh[i+s] for s = 128, 64, ..., 1).
+//
+// 2026-09-08 retile: the old block-per-(row, token) grid re-read the 10 KB
+// weight row and the 20 KB activation row for every output (1.5 GB of L2
+// traffic per launch, 212 us x 96 per 1024-token chunk = 7.5% of prefill).
+// Two intermediate retiles were no faster: rows walked inside a block were
+// barrier-latency-bound (9 __syncthreads per row), and a lane-strided
+// layout needed 160 two-byte loads per row and spilled. Now ONE WARP owns
+// one token and the tree runs in registers with a layout chosen for the
+// loads: lane l holds the partials of threads 8l..8l+7, i.e. its 8 chains
+// read 8 CONSECUTIVE columns per 256-column step -- one 16-B weight load and
+// two float4 activation loads per step. Tree levels 128/64/32/16/8 pair
+// thread i with i+s = lanes l and l+16/8/4/2/1 (shuffle-downs, all 8 chains),
+// levels 4/2/1 pair chains j and j+4/2/1 inside the lane -- the same pairs in
+// the same level order as the smem tree, so the result is bit-identical.
+// The token's activation row stays in registers across all rows; the weight
+// row is read once per warp. blockIdx.y splits rows so small T fills SMs.
+constexpr int F16T_COLS = 5120;             // N_EMBD; 20 steps of 256 columns
+constexpr int F16T_NK = F16T_COLS / 256;
+__global__ void __launch_bounds__(256)
+k_gemm_f16_T(const __half* __restrict__ W, const float* __restrict__ xT, float* __restrict__ y,
+             int64_t rows, int64_t cols, int T, int rg) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int t = blockIdx.x * 8 + warp;
+    if (t >= T) return;
+    const int64_t r_lo = (int64_t)blockIdx.y * rg;
+    const int64_t r_hi = r_lo + rg < rows ? r_lo + rg : rows;
+    float xv[F16T_NK][8];  // xv[k][j] = x[8*lane + j + 256*k]
+    {
+        const float* x = xT + (size_t)t * cols + 8 * lane;
+#pragma unroll
+        for (int k = 0; k < F16T_NK; k++) {
+            const float4 a = *(const float4*)(x + 256 * k);
+            const float4 b = *(const float4*)(x + 256 * k + 4);
+            xv[k][0] = a.x; xv[k][1] = a.y; xv[k][2] = a.z; xv[k][3] = a.w;
+            xv[k][4] = b.x; xv[k][5] = b.y; xv[k][6] = b.z; xv[k][7] = b.w;
+        }
     }
-    if (threadIdx.x == 0) y[(size_t)t * rows + r] = sh[0];
+    for (int64_t r = r_lo; r < r_hi; r++) {
+        const __half* wr = W + r * cols + 8 * lane;
+        float p[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) p[j] = 0.f;
+#pragma unroll
+        for (int k = 0; k < F16T_NK; k++) {
+            const uint4 w = *(const uint4*)(wr + 256 * k);
+            const __half2* h2 = (const __half2*)&w;
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float2 wf = __half22float2(h2[q]);
+                p[2 * q] += wf.x * xv[k][2 * q];
+                p[2 * q + 1] += wf.y * xv[k][2 * q + 1];
+            }
+        }
+        // tree levels s = 128, 64, 32, 16, 8: thread i pairs with i+s -> lane
+        // l with l + s/8, for every chain j
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) p[j] += __shfl_down_sync(0xffffffffu, p[j], off);
+        }
+        // levels s = 4, 2, 1: chains j and j + s inside the lane
+#pragma unroll
+        for (int j = 0; j < 4; j++) p[j] += p[j + 4];
+#pragma unroll
+        for (int j = 0; j < 2; j++) p[j] += p[j + 2];
+        p[0] += p[1];
+        if (lane == 0) y[(size_t)t * rows + r] = p[0];
+    }
 }
 
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st) {
-    dim3 grid((unsigned)rows, (unsigned)T);
-    k_gemm_f16_T<<<grid, 256, 0, st>>>(W, xT, y, rows, cols);
+    if (cols != F16T_COLS) {
+        fprintf(stderr, "gemm_f16_T: cols %ld != %d\n", (long)cols, F16T_COLS);
+        exit(1);
+    }
+    const int nbt = (T + 7) / 8;
+    // enough blocks for ~2 waves: split rows across blocks when the token
+    // grid alone underfills (T=1024 -> 128 x 3 groups of 16 rows; T=37 ->
+    // 5 x 48 single-row groups)
+    int ngroups = (2 * cur_nsm() + nbt - 1) / nbt;
+    if (ngroups < 1) ngroups = 1;
+    if (ngroups > rows) ngroups = (int)rows;
+    const int rg = (int)((rows + ngroups - 1) / ngroups);
+    ngroups = (int)((rows + rg - 1) / rg);
+    dim3 grid((unsigned)nbt, (unsigned)ngroups);
+    k_gemm_f16_T<<<grid, 256, 0, st>>>(W, xT, y, rows, cols, T, rg);
     CUDA_CHECK(cudaGetLastError());
 }
 

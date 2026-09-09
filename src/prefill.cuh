@@ -35,6 +35,9 @@ void gemm_q8_T(const int8_t* W, const __half* S, const XQuant& xq, float* y, int
                int64_t cols, int T, cudaStream_t st, SplitKScratch* sk = nullptr);
 void gemm_f16_T(const __half* W, const float* xT, float* y, int64_t rows, int64_t cols, int T,
                 cudaStream_t st);
+// true when the current prefill route reads the g32 activation quantization
+// (dp4a, or the Q27_PF_XG=32 legacy MMA leg); the default g64 route does not.
+bool prefill_g32_needed();
 
 // Batched small ops. Layout everywhere: [T][dim] token-major contiguous.
 void embed_rows_q8_T(const int8_t* emb, const __half* scales, const int* toks, int cols, int T,

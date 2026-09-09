@@ -27,7 +27,12 @@ D2ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E
 # with the tier, and each RAM slot pins pfx_bytes(max_tokens) ~2.44 GB on top
 # of the engine's two pinned staging buffers (~4.9 GB). PFX_RAM_GB=16 gives
 # six slots. Use a DIFFERENT PFX_DIR per numerical variant (kernel changes,
-# ladder vs d2): the blob format does not encode kernel numerics.
+# ladder vs d2): the blob format does not encode kernel numerics. Since
+# 2026-09-08 (k) a DFlash2 engine skips the MTP KV warm during prefill, so
+# every blob under this root has UNWARMED MTP rows: it is a DFlash2-only root.
+# A ladder config restoring from it would draft from garbage (correct output,
+# acceptance loss the bitwise gates cannot see). The ladder mode below has no
+# cache flags on purpose; give it its own root if that ever changes.
 PFX_DIR=${PFX_DIR:-/dev/shm/q27-pfx}
 PFXARGS="--prefix-cache $PFX_DIR --prefix-cache-max-gb ${PFX_MAX_GB:-40} --prefix-cache-ram-gb ${PFX_RAM_GB:-0} --prefix-cache-max-tokens ${PFX_MAX_TOK:-65536}"
 mode=${1:-}; shift || true

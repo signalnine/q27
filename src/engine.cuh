@@ -3770,7 +3770,10 @@ struct Engine {
 
     // ---- batched prefill (M6): T-token chunk versions of the blocks ----
     void qxT(const float* x, int cols, int T) {
-        q27k::quantize_x(x, (int64_t)T * cols, xqT, stm);
+        // g32 only for the routes that read it (dp4a, Q27_PF_XG=32); the
+        // default g64 MMA route never does and the launch was 3.7% of a
+        // 1024-token chunk (2026-09-08).
+        if (q27k::prefill_g32_needed()) q27k::quantize_x(x, (int64_t)T * cols, xqT, stm);
         // g64 requant for the MMA GEMM (unconditional: the kernel is noise
         // next to the GEMMs and keeping nat64 always-fresh means every
         // dispatch choice downstream is safe)
@@ -5044,7 +5047,13 @@ struct Engine {
                 prefill_chunk(d_prompt + c0, c0, Tc, d2t);
                 if (d2t) d2_seed_chunk(c0, Tc, NP);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
-                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                // MTP KV warm only when the MTP head can be consulted: under
+                // DFlash2 the decode loop never runs mtp_forward (2026-09-08,
+                // ~1.5% of a chunk). CONTRACT: prefix-cache blobs written by a
+                // DFlash2 engine then carry unwarmed MTP rows -- a ladder
+                // config must never restore from a DFlash2 root (the launch
+                // script's ladder mode has no cache; keep it that way).
+                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
@@ -5073,7 +5082,7 @@ struct Engine {
                 prefill_chunk(d_prompt + c0, c0, Tc, d2t);
                 if (d2t) d2_seed_chunk(c0, Tc, NP);
                 q27k::rmsnorm_T(hT, (const float*)onw.data, x1T, N_EMBD, Tc, EPS, stm);
-                mtp_warm_T(d_prompt + c0 + 1, c0, Tc);
+                if (!d2_on) mtp_warm_T(d_prompt + c0 + 1, c0, Tc); // see above
                 if (ckpt_interval > 0 && (c0 + Tc) - last_ck >= ckpt_interval) {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
