@@ -15714,6 +15714,45 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-09 (y): v0.11.1 on thunderdome -- T14/T12 spot check, then the ninfer pair at medium: engines within 3% on every engine-side number, Claude Code emits the same output volume on both
+
+Thunderdome (claude-code-q27-haight, production :8081, effort unpinned =
+Claude Code's default): T14 Financial Ledger 1.00 / 1.00 (108 / 100 s),
+T12 Constraint Scheduler 0.947 / 0.934 (593 / 786 s; hidden tests 0.97 /
+0.95, agent tests 1.0, coverage 0.95-0.96). August baseline on the same
+orchestrator: T14 median 1.0 over 19 trials, T12 mean 0.71 / median 0.62
+over 49. Engine side over the window: 101 requests, 195 t/s aggregate,
+3.80 tok/round, 96.1% reuse. Runs 2026-09-09T17-41-34 / T17-45-14 in
+the thunderdome tree (uncommitted, as that tree is).
+
+Then the cross-engine pair at the medium pin (ninfer's template rejects
+Claude Code's default effort name; two new yaml entries
+claude-code-{q27,ninfer}-haight-medium share the :8081 adapter with
+CLAUDE_CODE_EFFORT_LEVEL=medium; scratchpad td/run_pair.sh swaps the
+engine behind the port). Two trials each:
+
+| leg | T14 | T12 | CC output tokens, 4 trials | turns | engine: t/s agg, tok/round, reuse, engine s |
+|---|--:|--:|--:|--:|---|
+| q27 v0.11.1 medium | 1.00, 1.00 (115, 105 s) | 0.605, 0.897 (309, 1034 s) | 223.5K | 174 | 186.5, 3.70, 97.6%, 1357 |
+| ninfer DFlash2 medium | 1.00, 1.00 (65, 35 s) | 0.953, 0.903 (1077, 676 s) | 227.8K | 190 | 191.8, 3.79, 96.2%, 1346 |
+
+Reads: (1) engine-side parity -- decode rate, tokens per round, reuse
+and total engine time within 3%, on the same harness and pin. (2) The
+SWE-bench trajectory gap does not reproduce here: Claude Code produced
+the same output volume on both engines (224K vs 228K tokens over the
+four trials) and ninfer took MORE turns (190 vs 174); at n=2 per task
+the 09-09 campaign's 1.7x is not a law of the engines. (3) T12 mean
+0.75 vs 0.93 is one q27 trial (0.605, 309 s) that stopped without
+writing tests -- hidden tests 0.974, the same as ninfer's best, agent
+tests absent, coverage 0.25; the other q27 trial 0.897. At xhigh (the
+production default) the morning run scored 0.947 / 0.934. (4) T14 wall:
+q27 110 s vs ninfer 50 s at equal turns because q27's trajectories
+emitted 2x the output tokens (40K vs 19K over two trials) -- the
+per-turn length difference of (x), visible on the short task where two
+trials cannot average it out. Nothing here changes (x)'s attribution;
+it bounds what the SWE-bench table means: same engine cost per token,
+trajectories that differ by task and seed more than by engine.
+
 ## 2026-09-09 (x): the trajectory gap attributed -- ninfer reasons 1.5x shorter than the model at 8 bits; two q27 defects fixed on the way (model-name echo, the compact tools block) without moving it
 
 bench/crossengine/agentic-2026-09-09-echo/. The question (w) left: why
