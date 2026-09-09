@@ -387,6 +387,18 @@ stripped (1.1 MB -> 5 KB each); the scores and per-pack breakdowns are intact.
 Captured request bodies are stripped from the tap logs: those are Claude Code's
 own system prompt and tool schemas.
 
+## 2026-09-09 addendum: the DFlash2-era standing (see agentic-2026-09-09/README.md)
+
+Both engines now run block drafters and ~97% prefix reuse. q27's
+production recipe decodes within 6% of ninfer's DFlash2 arm (207 vs 221
+t/s aggregate; 3.89 vs 4.19 tok/round) but takes 3x the wall per instance
+(108 vs 36 s) because its Claude Code sessions run 25 turns and 18K output
+tokens per instance against 15 and 6K -- the same pattern on 09-07 and
+09-08. Section 2's finding (reuse decides the agentic half) is now a tie;
+what decides it is trajectory length, and that is unattributed: quant
+tier (Q4_G64 vs NVFP4), the rendering of "medium" effort, or the parser.
+The 08-17 table below is the pre-fix ninfer; keep both.
+
 ## 2026-08-22 addendum: Qwen3.8 quality legs, q27 vs llama.cpp
 
 A `llama38` leg (Qwen3.8-27B-MTP as Q5_K_M, 19.5 GB, within 0.3 GB of q27's q6

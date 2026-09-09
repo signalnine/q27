@@ -21,7 +21,10 @@ Q27ARGS="--host 0.0.0.0 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 -
 # field and renders its boot default (xhigh). The only effort reachable on
 # BOTH engines is medium: run.sh pins CLAUDE_CODE_EFFORT_LEVEL=medium and the
 # q27 legs render medium too. This is NOT production's xhigh -- say so.
-Q27ENV="-E Q27_KV=fp8 -E Q27_REASONING_EFFORT=medium"
+# Q27_PRINT_WSUM so every leg's weight digest is in its journal: the 5090's
+# pageable-DMA load corruption (~1%/load) is otherwise invisible in a
+# campaign result. Added 2026-09-09; the 09-07/08/09 legs ran without it.
+Q27ENV="-E Q27_KV=fp8 -E Q27_PRINT_WSUM=1 -E Q27_REASONING_EFFORT=medium"
 PACK4=/mnt/ai/models/qwen38-27b-dflash2-bf16/qwen38-dflash2-q4-serve.d2w
 PACK8=/mnt/ai/models/qwen38-27b-dflash2-bf16/qwen38-dflash2-q8-serve.d2w
 NINFER=/mnt/ai/projects/ninfer-master/build/apps/ninfer-serve

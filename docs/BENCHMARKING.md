@@ -236,6 +236,15 @@ bash bench/swebench/run.sh vllm          # -> results.vllm.jsonl
 Long runs should be launched under `systemd-run --user` (a crashed shell
 otherwise tears the job's cgroup down).
 
+## Results
+
+The current cross-engine standing (2026-09-09, DFlash2 era, both engines
+at ~97% prefix reuse) is in
+[bench/crossengine/agentic-2026-09-09/README.md](../bench/crossengine/agentic-2026-09-09/README.md);
+the 08-17/08-19 four-engine runs in [bench/crossengine/FINDINGS.md](../bench/crossengine/FINDINGS.md).
+The 07-14 results below are the original Method A/B numbers and are kept
+as the baseline they were.
+
 ## Results (2026-07-14, RTX 5090)
 
 ### Method A — payload decode (decode-only t/s)

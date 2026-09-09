@@ -15714,6 +15714,24 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-09 (w): release campaign for v0.11.0 -- decode within 6% of ninfer's DFlash2 arm, reuse equal, wall 3x apart on trajectory length
+
+bench/crossengine/agentic-2026-09-09/ (campaign.sh, new `q27prod` leg =
+the production recipe on a fresh tmpfs root at the medium effort pin, vs
+ninferd2 unchanged since 09-07). q27prod 207.2 agg / 219.4 med t/s, 3.887
+tok/round, 96.9% reuse, 108 s per instance, 25.0 turns and 18.2K output
+tokens per instance, 12/12 non-empty, 9/12 gold; ninferd2 220.6 / 240.1,
+4.188, 96.8%, 36 s, 15.0 turns, 6.2K tokens, 12/12, 11/12. Prefill wall
+126 s over 305 requests with 4 cold >= 20K prompts (the fresh root's
+bootstrap); no parser recovery fired; no first-turn death. The reads and
+caveats are in the campaign README; the one that matters: with both
+engines at ~97% reuse the wall ordering of 08-17 has flipped, and the
+3x is trajectory length (turns and output tokens), not decode rate --
+consistent across 09-07/08/09 and unattributed (quant tier, effort
+rendering, parser). The q27 leg ran without Q27_PRINT_WSUM (now in the
+campaign env). README State/Benchmarks/Open items, FINDINGS.md and
+BENCHMARKING.md updated; v0.11.0 tagged on this commit.
+
 ## 2026-09-08 (v): request-body recording + sequential replay -- the turn-replay instrument item 2 was missing; two fresh boots agree on 15 of 15 outputs
 
 The last piece of (p) item 2. `Q27_REQ_LOG=<file>` (server.cu

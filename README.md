@@ -26,7 +26,12 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   concurrent streams (834 vs 531 t/s). Logged at the same rate as the wins.
   *(Dated 2026-09-06: ninfer shipped an agent prefix-reuse fix; on the same
   artifact and harness, current master measures 51 s/inst at 91.3% reuse --
-  [bench/crossengine/NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md).)*
+  [bench/crossengine/NINFER-REBENCH.md](bench/crossengine/NINFER-REBENCH.md).
+  Dated 2026-09-09: with both engines on DFlash2 drafters and ~97% reuse the
+  wall ordering has flipped -- ninfer 36 s/inst, q27 108 s -- at decode
+  rates within 6%; q27's sessions run 25 turns and 18K output tokens per
+  instance against ninfer's 15 and 6K, and why is the open question:
+  [bench/crossengine/agentic-2026-09-09/](bench/crossengine/agentic-2026-09-09/README.md).)*
 - **Self-speculation as the whole design**: trained-in MTP ladder + free
   suffix drafter through one shared-KV MMA verify -- 5.3-5.8 accepted tokens
   per weight read on live traffic (231-246 t/s aggregate on a 5090).
@@ -147,37 +152,52 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-08-28)
+## State of the engine (2026-09-09)
 
-One binary serves Claude Code, Codex, and OpenAI clients at 231-246 t/s
-aggregate live decode on a 5090 (90-116 t/s at 262K context on a 3090), with
-continuous batching on by default. Current release:
-[v0.10.0](https://github.com/signalnine/q27/releases).
+One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
+DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
+persistent prefix cache that hits on real agentic traffic, and a tool-call
+parser measured against a labelled corpus of the model's own drift. Current
+release: [v0.11.0](https://github.com/signalnine/q27/releases).
 
-Headline numbers, each dated in [BENCHMARKING.md](docs/BENCHMARKING.md) and
-the BUILDLOG:
+Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
+under [bench/crossengine/](bench/crossengine/):
 
-- Live Claude-Code traffic: **231.3 t/s aggregate** (9 scored trials, 430
-  requests); per-request median 225, p75 277, peak 378.
-- 2-slot continuous batching: **1.41x** aggregate over FIFO; zero-config spot
-  check 234-239 t/s.
-- Concurrency ladder at 8 slots / 16K: **530.6 t/s** aggregate (08-19).
-- Prefix reuse on real agentic traffic: 88.7-92.1% of prompt tokens,
-  effective prefill 24-31K tok/s against a cold ~3,300.
-- Restart TTFT with the persistent prefix cache: 8.15 s -> **1.20 s** on a
-  26,700-token prompt, bitwise-identical continuations.
+- Claude Code traffic, 12 SWE-bench instances, medium effort (the only
+  level both engines render): **q27 207 t/s** aggregate decode (219 median,
+  3.89 tok/round, 96.9% prefix reuse) vs ninfer's DFlash2 arm 221 (240,
+  4.19, 96.8%). Wall per instance 108 s vs 36 s: q27's sessions run 25 turns
+  and 18K output tokens per instance against 15 and 6K -- the open question
+  of this release (09-09).
+- Production at Claude Code's default effort (xhigh): DFlash2 is +22%
+  aggregate decode over the MTP ladder on the same instances; the
+  prefix-cache tiers with the shared system-block cut took the prefill wall
+  from 255 s to 110 s on a 12-instance run (09-08).
+- Decode round at K=7: 17.8 ms = draft 2.5 + verify 15.1 + host 0.2 ms;
+  wider K loses on the round wall at every depth measured (09-08).
+- Concurrency ladder at 8 slots / 16K: **530.6 t/s** aggregate (08-19, the
+  MTP ladder; DFlash2 serving is single-slot today).
 - 3090 (24GB): **102.2 t/s** median live CC decode at 131K context.
 - Cross-engine long-context (08-27, Qwen3.8, all four engines):
   decode does not erode with context on ANY engine -- q27 leads decode
   (~150-180 t/s), vLLM leads cold prefill ~2.5x. Tables and the vLLM
   spec-decode retest: [bench/crossengine/LONGCTX.md](bench/crossengine/LONGCTX.md).
 
+Speed parity is not task parity: a quality table over the 09-08 campaigns
+found three of twelve tasks per DFlash2 arm dying on their first turn from
+tool calls the streaming parser never saw. That is fixed in v0.11.0
+(undeclared-name pass-through, the wrapper-family openers; 12/12 non-empty
+on 09-09), and the table now ships with every campaign readout
+([bench/swebench/quality_table.py](bench/swebench/quality_table.py)).
+
 fp4 note, because the story inverted twice: block-scaled fp4 MMA does exist on
 consumer Blackwell (sm_120a only; under plain sm_120 the failure is
 indistinguishable from missing silicon), runs at 780-868 TFLOPS here
 (`tools/microbench_mxf4`), and still loses at decode -- nvfp4 moves 1.06x the
 bytes of Q4_G64 for the same weights, and decode is a byte count, not a FLOP
-count.
+count. TMA bulk-tensor copies exist there too (09-08) and lifted a bitwise
+W4A8 prefill GEMM to 1.33-1.39x of the incumbent, short of the 1.6x that
+would have justified the port.
 
 ## Why this model is a good target
 
@@ -398,7 +418,21 @@ is each engine's own defaults; n=1 per instance. Full methodology:
 [docs/BENCHMARKING.md](docs/BENCHMARKING.md); harness and raw data:
 [bench/swebench/](bench/swebench/) and [bench/crossengine/](bench/crossengine/).
 
-**Real agentic traffic** (2026-08-17):
+**Real agentic traffic, DFlash2 era** (2026-09-09, both engines on block
+drafters, effort pinned to medium, q27 on the production recipe with a
+fresh cache root; [readout](bench/crossengine/agentic-2026-09-09/README.md)):
+
+| engine | decode agg / median | tok/round | prefix reuse | wall/inst | turns, out tok /inst | gold |
+|---|--:|--:|--:|--:|--:|--:|
+| **q27** production (Q8 pack, K=7) | 207.2 / 219.4 t/s | 3.89 | 96.9% | 108 s | 25.0, 18.2K | 9/12 |
+| ninfer DFlash2 k=7 (NVFP4) | 220.6 / 240.1 t/s | 4.19 | 96.8% | **36 s** | 15.0, 6.2K | 11/12 |
+
+Decode within 6%, reuse equal, wall 3x apart because q27's sessions take
+1.7x the turns and 3x the output tokens -- consistent across the 09-07,
+09-08 and 09-09 runs, cause not yet attributed (quant tier, the effort
+rendering, or the parser). n=1 per instance.
+
+**Real agentic traffic** (2026-08-17, ninfer before its prefix-reuse fix):
 
 | engine | decode | wall/inst | prefix reuse | gold |
 |---|--:|--:|--:|--:|
@@ -451,6 +485,22 @@ real coding while MTP nearly doubled stock llama.cpp.
 
 ## Open items
 
+- **DFlash2 serving is single-slot.** The batched decode path (8 slots,
+  530 t/s aggregate) is the MTP ladder's; the drafter's fused commits
+  bypass the ring mirrors, so batching it is real integration work, and the
+  serial SWE-bench harness cannot show whether sustained concurrency exists
+  to pay for it (queue wait was 2.3% of a 12-instance run).
+- **Cache persistence stops at 65536 tokens.** A 69.7K-token conversation
+  re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
+  costs pinned staging memory per slot. Not yet measured against 128K
+  admission.
+- **The request replay has no corpus yet.** `Q27_REQ_LOG` and
+  `bench/replay/` are gated (two fresh boots agree on every output); a
+  recorded multi-session Claude Code log is the missing input for a
+  binary-vs-binary A/B that does not ride on the harness's trajectory noise.
+- **W4A8 prefill GEMM on the shelf**: bitwise at 1.33-1.39x of the incumbent
+  with TMA fills, short of the 1.6x bar; `tools/gemm_w4a8_spike.cu` holds
+  it if a 1.35x is ever wanted as-is.
 - **Graph-cache cap under churn**: live CC draws 44+ keys against the bench's
   28; cap 64 covers today, revisit `Q27_BATCH_GRAPH_CAP` if multi-tenant
   churn widens the alphabet.
@@ -471,7 +521,7 @@ measured-and-parked levers in [docs/notes.md](docs/notes.md).
 ## History
 
 The full chronological record -- every DONE block with its numbers, every
-negative result, the progress table (43.4 -> 177.4 t/s single-stream) --
+negative result, the progress table (43.4 -> 219.5 t/s single-stream) --
 lives in [docs/BUILDLOG.md](docs/BUILDLOG.md). The BUILDLOG is the ledger,
 not git history. Design docs and phase plans: [docs/plans/](docs/plans/).
 Standing risk register and parked levers: [docs/notes.md](docs/notes.md).
