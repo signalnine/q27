@@ -358,8 +358,10 @@ tier above it (`--prefix-cache-ram-gb`) is off by default on measured grounds.
 **DFlash2 drafter (the production decode path since 2026-09-08).** The
 drafter is z-lab's
 [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
-(3.8 GB bf16, its own licence on the card); q27 does not ship it. Pack it
-once for the engine's weight format:
+(3.8 GB bf16, Apache-2.0). Ready-made packs are in the
+[signalnine/Qwen3.8-27B-MTP-q27](https://huggingface.co/signalnine/Qwen3.8-27B-MTP-q27)
+model repo next to the tiers (`qwen38-dflash2-q8-serve.d2w`, 2.1 GB, and the
+Q4 pack, 1.2 GB; md5s in its CHECKSUMS.md5). To build one yourself:
 
 ```
 pip install torch safetensors numpy
