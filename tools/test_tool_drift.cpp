@@ -2397,6 +2397,39 @@ static void test_placeholder_name_on_next_line() {
                 tools).empty(),
            "undeclared pass-through: a non-identifier name is still refused");
     }
+    // ---- issue #41 (2026-09-08, VS Code + Claude Code extension, v0.10.0):
+    // the two shapes the reporter's log carries, verbatim in structure ----
+    {
+        // a trained-form BATCH naming a tool the client did not declare (the
+        // reporter's 31-tool list has no TaskCreate; the model emits it from
+        // training), CJK values: both calls pass through, values intact
+        json no_tc = json::array();
+        for (const auto& t : tools) if (t["function"]["name"] != "TaskCreate") no_tc.push_back(t);
+        auto v = call("<function=TaskCreate>\n<parameter=description>\n重构 backend/core/paths.py 为双根 "
+                      "Layout（workspace 8 目录 + project 2 目录）\n</parameter>\n<parameter=subject>\n"
+                      "重构 Layout 双根结构\n</parameter>\n</function>\n<function=TaskCreate>\n"
+                      "<parameter=description>\n新增 backend/api/workspace.py\n</parameter>\n"
+                      "<parameter=subject>\n工作区 API + 守卫\n</parameter>\n</function>", no_tc);
+        ok(q27::undeclared_passthrough()
+               ? (v.size() == 2 && v[0].name == "TaskCreate" && v[1].name == "TaskCreate" &&
+                  v[0].arguments.value("subject", std::string()) == "重构 Layout 双根结构" &&
+                  v[1].arguments.value("subject", std::string()) == "工作区 API + 守卫")
+               : v.empty(),
+           "issue #41: an undeclared trained-form batch with CJK values passes through whole");
+    }
+    {
+        // the unnamed <invoke> inside a <tool_calls> wrapper, closed by
+        // </invoke> AND </tool_calls>: mode 21 infers, nothing leaks as text
+        std::string pre, rest;
+        auto v = q27::parse_bare_tool_calls(
+            "Let me read it.\n\n<tool_calls>\n<invoke>\n<parameter=subject>\nx\n</parameter>\n"
+            "</invoke>\n</tool_calls>", &pre, &tools, true, true, &rest);
+        // remaining_text is everything outside the call spans, prefix
+        // included; the wrapper closers are absorbed into the span
+        ok(v.size() == 1 && v[0].name == "TaskCreate" && pre == "Let me read it.\n\n" &&
+               q27::strip_ws2(rest) == "Let me read it.",
+           "issue #41: <tool_calls><invoke> unnamed call closed by </invoke></tool_calls>");
+    }
     {
         // mode 18's same-line form must be untouched
         auto v = call("<name>Write\n</parameter>\n<parameter=file_path>\n/w/y\n</parameter>\n"

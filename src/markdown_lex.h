@@ -204,6 +204,19 @@ struct MarkdownFenceLexState {
         for(const char* candidate:names) if(name==candidate) return true;
         return false;
     }
+    // The tool dialect's wrapper tags are not HTML, and must not open a
+    // displayed container: `<tool_calls>\n<invoke>\n<parameter=...>\n...\n
+    // </tool_calls>` is a call, and reading it as a complete HTML element put
+    // every parameter inside "displayed" context, so the batch chain refused
+    // what the stream (which checks context AT the opener, before the
+    // container opens) recovered (issue #41, 2026-09-08). `<function=` and
+    // `<parameter=` never parsed as tag names anyway (the '=').
+    static bool dialect_wrapper_name(const std::string& name) {
+        static const char* names[]={"tool_call","tool_calls","tool_use","tool",
+                                    "function_calls","invoke","tool_name","parameter_name","name"};
+        for(const char* candidate:names) if(name==candidate) return true;
+        return false;
+    }
     bool displayed_html() const {
         return html_comment || html_cdata || html_container_depth!=0 ||
                html_tag_open;
@@ -435,7 +448,8 @@ struct MarkdownFenceLexState {
     }
     void finish_html_tag() {
         const bool container=!html_tag_declaration && !html_tag_name.empty() &&
-                             !html_void_name(html_tag_name);
+                             !html_void_name(html_tag_name) &&
+                             !dialect_wrapper_name(html_tag_name);
         if(container && html_tag_last_nonspace!='/') {
             if(html_container_depth==0) {
                 if(!html_tag_closing) {

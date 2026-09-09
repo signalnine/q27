@@ -15856,6 +15856,36 @@ only. Next for item 2: request-body recording (server-side or in
 tapproxy) + a sequential replayer, so two binaries can be fed the
 identical sequence.
 
+ISSUE #41 (same evening, VS Code + Claude Code extension, v0.10.0): the
+reporter's two shapes are the two classes above -- `<function=TaskCreate>`
+x2 refused because their 31-tool list declares no TaskCreate (v0.10.0
+recovers the text only when the tool is declared; master both ways), and
+the unnamed `<tool_calls>\n<invoke>` (dead on v0.10.0 and on master until
+today). Reproducing them found three more holes behind the first fix,
+all on the closer side:
+- a `</tool_calls>` split across chunks after a recovered call leaked as
+  text: IncrementalBareNativeEnd::advance waited for a possible
+  `</tool_call>` after the closer but not for the wrapper family; now it
+  takes the longest complete trailing wrapper closer and waits while the
+  tail could still become one.
+- the non-stream resolver (resolve_ordered_tool_segments) stripped
+  trailing dialect residue BEFORE parsing, which took a bare call's own
+  closers with it; the trained form survived on the EOF repair, an
+  unnamed `<invoke>...</invoke>` call did not. Residue is now dropped only
+  after the parser has said there is no call (both sites: ahead of a
+  wrapped segment, end of turn). The `<tool_calls><invoke>` corpus row is
+  back in the denominator: 165/165.
+- markdown_lex read a wrapper tag as an HTML container, so every
+  parameter of a `<tool_calls>...</tool_calls>` call sat in displayed
+  context for the batch chain while the stream (which checks context AT
+  the opener) recovered it. The dialect wrapper names no longer open a
+  container.
+Both reporter shapes verified on the stream path (chunk 4 and 64) and the
+batch path, with and without TaskCreate declared; the seven first-turn
+fixtures unchanged (4 recover, 3 refused); test-tools both legs, corpus
+165/165, fuzz clean. Unit tests pin both shapes (`issue #41` in
+test_tool_drift.cpp).
+
 Dispositions: queue attribution DONE (2.3%, never two deep, harness is
 serial -- batching stays deferred with the number); task-quality table is
 now part of the campaign readout (bench/swebench/quality_table.py, read it

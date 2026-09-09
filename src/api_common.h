@@ -3630,11 +3630,22 @@ struct IncrementalBareNativeEnd {
             while(q<text.size() && (text[q]==' ' || text[q]=='\t' ||
                                     text[q]=='\r' || text[q]=='\n')) q++;
             const size_t avail=text.size()-q;
-            if(avail>=TC.size()) {
-                if(text.compare(q,TC.size(),TC)==0) e=q+TC.size();
-            } else if(!final && text.compare(q,avail,TC,0,avail)==0) {
-                return std::string::npos;
+            // One trailing wrapper closer belongs to the call (`</tool_call>`
+            // always did; the wrapper family's closers since issue #41, where
+            // a `</tool_calls>` split across chunks leaked as text). Take the
+            // longest complete one; while the tail could still become one,
+            // wait for more bytes.
+            static const char* const kTrail[]={"</tool_call>","</tool_calls>","</function_calls>","</tool_use>"};
+            size_t taken=0;
+            bool could_grow=false;
+            for(const char* t:kTrail) {
+                const size_t n=std::char_traits<char>::length(t);
+                if(avail>=n) { if(text.compare(q,n,t)==0 && n>taken) taken=n; }
+                else if(avail>0 && text.compare(q,avail,t,0,avail)==0) could_grow=true;
             }
+            if(taken) e=q+taken;
+            else if(!final && (avail==0 || could_grow)) return std::string::npos;
+            (void)TC;
             return e;
         }
         // back off by the longest closer so a split one is re-scanned whole
@@ -3832,7 +3843,8 @@ inline size_t dialect_residue_token_at(const std::string& s, size_t i, size_t en
         if (q != std::string::npos && q < s.size() && s[q] == '{') return 13;
     }
     for (const char* tk : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
-                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>"}) {
+                           "<tool_use>", "</tool_use>", "<tool>", "</tool>", "<tool_calls>", "</tool_calls>",
+                           "<function_calls>", "</function_calls>", "<invoke>", "</invoke>"}) {
         const size_t n = strlen(tk);
         if (i + n <= end && s.compare(i, n, tk) == 0) return n;
         size_t l = 0;
@@ -3854,10 +3866,14 @@ inline DialectResidueSuffix dialect_residue_suffix(const std::string& s,
         if (isspace((unsigned char)s[i])) { i++; continue; }
         const size_t n = dialect_residue_token_at(s, i, s.size(), params_are_residue);
         if (!n) { i++; r.start = i; r.complete = false; r.partial = false; continue; }
-        // a truncated token only counts at the very end
-        const bool whole = i + n < s.size() || s.compare(i, n, "</function>") == 0 ||
-                           s.compare(i, n, "</parameter>") == 0 || s.compare(i, n, "</tool_call>") == 0 ||
-                           s.compare(i, n, "<tool_call>") == 0;
+        // a truncated token only counts at the very end. A complete closer of
+        // the wrapper family at the end is whole too (issue #41: `</tool_calls>`
+        // after a recovered unnamed <invoke> call was read as "possibly
+        // truncated" and shown as text).
+        bool whole = i + n < s.size();
+        for (const char* full : {"</function>", "</parameter>", "</tool_call>", "<tool_call>",
+                                 "</tool_calls>", "</tool_use>", "</function_calls>", "</invoke>", "</tool>"})
+            if (!whole && s.compare(i, n, full) == 0 && n == strlen(full)) whole = true;
         if (whole) r.complete = true; else r.partial = true;
         i += n;
     }
@@ -6968,13 +6984,27 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
     const std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
     const json* tools,bool allow_eof_repair,Eligible eligible) {
     OrderedToolOutput out;
-    auto append_text=[&](const std::string& raw,bool repair_eof) {
+    // `drop_residue`: trailing dialect residue (a stray closer at the end of
+    // the turn, or ahead of a wrapped segment) is garbage rather than text --
+    // but only once the parser has said there is no call in the text. It used
+    // to be stripped BEFORE parsing, which took a bare call's own closers with
+    // it; the trained form survived on the EOF repair, an unnamed
+    // `<invoke>...</invoke>` call did not (issue #41, 2026-09-08).
+    auto append_text=[&](const std::string& raw,bool repair_eof,bool drop_residue=false) {
         if(!tools) { out.append_visible_text(raw); return; }
         if(raw.empty()) return;
         std::string pre,residual;
         auto calls=parse_bare_tool_calls(raw,&pre,tools,true,
                                          repair_eof,&residual);
-        if(calls.empty()) { out.append_visible_text(raw); return; }
+        if(calls.empty()) {
+            std::string shown=raw;
+            if(drop_residue) {
+                const DialectResidueSuffix r=dialect_residue_suffix(shown);
+                if(r.complete) shown.erase(r.start);
+            }
+            out.append_visible_text(shown);
+            return;
+        }
         size_t cursor=0;
         for(auto& call:calls) {
             // defense-in-depth (review 2026-08-20): see recover_unclosed_tool_tail.
@@ -6998,25 +7028,18 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         out.append_visible_text(raw.substr(cursor));
     };
     std::string pending_text;
-    auto flush_pending_text=[&](bool final_segment) {
+    auto flush_pending_text=[&](bool final_segment,bool drop_residue=false) {
         if(pending_text.empty()) return;
-        append_text(pending_text,final_segment && allow_eof_repair);
+        append_text(pending_text,final_segment && allow_eof_repair,drop_residue);
         pending_text.clear();
-    };
-    // trailing dialect residue ahead of a wrapped segment, or at the end of
-    // the turn, is garbage rather than text (see absorb_dialect_residue)
-    auto drop_trailing_residue=[&]() {
-        if(!tools) return;
-        const DialectResidueSuffix r=dialect_residue_suffix(pending_text);
-        if(r.complete) pending_text.erase(r.start);
     };
     for(const auto& segment:segments) {
         if(segment.first==StreamSplitter::TEXT) {
             pending_text+=segment.second;
             continue;
         }
-        if(segment.first==StreamSplitter::TOOL) drop_trailing_residue();
-        flush_pending_text(false);
+        // residue ahead of a wrapped segment is garbage (see append_text)
+        flush_pending_text(false,segment.first==StreamSplitter::TOOL);
         if(segment.first==StreamSplitter::THINK) {
             // Issue #38: a complete tool call can arrive INSIDE reasoning, and
             // reasoning used to pass straight through to out.reasoning, so the
@@ -7078,8 +7101,8 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         }
         append_text(body,false);
     }
-    drop_trailing_residue();
-    flush_pending_text(true);
+    // end of the turn: residue after the last call is garbage (see append_text)
+    flush_pending_text(true,true);
     return out;
 }
 
