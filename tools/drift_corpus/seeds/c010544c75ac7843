@@ -1,0 +1,6 @@
+<tool_calls>
+<invoke>
+<parameter=file_path>
+PATH_1
+</parameter>
+</function>

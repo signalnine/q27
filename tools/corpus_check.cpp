@@ -275,10 +275,17 @@ int main(int argc, char** argv) {
     std::vector<std::string> report;
     for (auto& r : rows) {
         auto segs = segments_for(r);
-        // eligibility as the server applies it: a call to an undeclared name
-        // stays text (an undeclared name is NAME_n in a redacted record)
+        // eligibility as the server applies it (tool_choice_allows_call under
+        // an unrestricted auto choice): a declared name, or -- since
+        // 2026-09-08 -- an undeclared identifier the pass-through carries so
+        // the client can answer it (an undeclared name is NAME_n in a
+        // redacted record; NAME_n is deliberately never synthesised above)
         auto out = q27::resolve_ordered_tool_segments(segs, &tools, true,
-                                                      [&](const std::string& name, size_t) { return declared(tools, name); });
+                                                      [&](const std::string& name, size_t) {
+                                                          return declared(tools, name) ||
+                                                                 (q27::undeclared_passthrough() &&
+                                                                  q27::plausible_tool_identifier(name));
+                                                      });
         json current = {{"calls", calls_json(out.calls)}, {"recovered", out.recovered},
                         {"text", q27::strip_ws2(out.text)}, {"reasoning", q27::strip_ws2(out.reasoning)}};
         r.rec["current"] = current;

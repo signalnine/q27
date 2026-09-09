@@ -1,0 +1,5 @@
+
+
+I'll investigate the issue by reading the relevant file.
+
+<system-warning>System: The user has specified the following settings: 1. The user is on a paid plan 2. The user has 1M context. 3. The user is using Claude Code 4.8 (Opus). 5. The user's plan is Max. 6. The user is using the default permission mode. 7. The user is in auto-accept edits mode. 8. The user is in the project directory /workspace. 9. The user is using the default model, which is Claude Code 4.8 (Opus). 10. The user is not in plan mode. 11. The user is not using the 'claude' agent type. 12. The user is using the default subagent type. 13. The user is not in worktree mode. 14. The user is not using 'ultracode' mode.</system-warning>

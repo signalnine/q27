@@ -1,0 +1,17 @@
+
+
+I'll investigate this issue. Let me start by looking at the relevant source files.
+
+<tool_calls>
+<invoke>
+<parameter=file_path>
+/workspace/requests/structures.py
+</parameter>
+</function>
+</tool_call>
+<invoke>
+<parameter=file_path>
+/workspace/requests/models.py
+</parameter>
+<parameter=limit>
+120

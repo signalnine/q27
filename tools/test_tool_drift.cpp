@@ -1394,9 +1394,17 @@ static void test_named_opener_batch() {
         // something nobody requested. Key inference is for emissions with no
         // usable name at all (mode 21's whole premise), not for overriding one
         // that is present and wrong.
+        // 2026-09-08 (undeclared_passthrough): the call is EMITTED under the
+        // name the model wrote, so the client can answer "no such tool" and the
+        // model corrects itself (Claude Code 4.8 declares no Grep; 3 of 12
+        // first turns died on it). Still never inferred past. The strict leg
+        // keeps the refusal.
         auto v = call(named("NotATool", "x"), tools);
-        ok(v.empty(),
-           "explicit undeclared name: refused, not inferred past");
+        ok(q27::undeclared_passthrough()
+               ? (v.size() == 1 && v[0].name == "NotATool" &&
+                  v[0].arguments.value("subject", std::string()) == "x")
+               : v.empty(),
+           "explicit undeclared name: passed through as written (refused in strict), not inferred past");
         // ...but an emission with NO opener still infers, which is mode 21
         // working as designed.
         auto w = call("<parameter=subject>\nx\n</parameter>\n</function>", tools);
@@ -1405,9 +1413,13 @@ static void test_named_opener_batch() {
     }
     {
         // a declared first call followed by an undeclared second: keep what was
-        // read, do not invent the rest.
+        // read, do not invent the rest. With the pass-through the second call
+        // rides along under its own name; strict keeps only the first.
         auto v = call(named("TaskCreate", "A") + SEP + named("NotATool", "B"), tools);
-        ok(v.size() == 1 && v[0].arguments.value("subject", std::string()) == "A",
+        ok(!v.empty() && v[0].name == "TaskCreate" &&
+               v[0].arguments.value("subject", std::string()) == "A" &&
+               (q27::undeclared_passthrough() ? (v.size() == 2 && v[1].name == "NotATool")
+                                              : v.size() == 1),
            "named-opener batch: an undeclared later call does not poison the first");
     }
     {
@@ -2337,9 +2349,53 @@ static void test_placeholder_name_on_next_line() {
     }
     // ---- refusals ----
     {
+        // the opener carries the placeholder `name`, the next line an
+        // undeclared tool: the placeholder is never a tool (the pass-through
+        // excludes it) and the line is not inferred past -- refused.
         ok(call("<function=name>\nNotATool\n</parameter>\n<parameter=subject>\nx\n"
                 "</parameter>\n</function>", tools).empty(),
            "next-line name: an undeclared following line is refused");
+    }
+    // ---- 2026-09-08, item 2 of the (p) agenda: the first-turn shapes that
+    // ended 4 of 36 SWE-bench sessions in the production arms (transcripts in
+    // bench/crossengine/agentic-2026-09-08; replay with tools/stream_probe) ----
+    {
+        // `<parameter=function=Bash>`: the mode-22 opener with the name behind
+        // a `function=` prefix (prodlad, xarray-4094)
+        auto v = call("<parameter=function=Bash>\n<parameter=command>\ngrep -rn x /w\n"
+                      "</parameter>\n<parameter=description>\nFind x\n</parameter>\n</function>",
+                      tools);
+        ok(v.size() == 1 && v[0].name == "Bash" &&
+               v[0].arguments.value("command", std::string()) == "grep -rn x /w",
+           "mode 22: <parameter=function=NAME> opener resolves to NAME");
+    }
+    {
+        // the Anthropic-XML wrapper family around an UNNAMED call, closed by
+        // </invoke> and then EOS (prodpfx/prodpfx2, requests-1142): mode 21
+        // infers from the keys; the wrapper openers are absorbed into the span
+        std::string pre, rest;
+        auto v = q27::parse_bare_tool_calls(
+            "Let me look.\n\n<function_calls>\n<invoke>\n<parameter=subject>\nx\n"
+            "</parameter>\n</invoke>\n", &pre, &tools, true, true, &rest);
+        ok(v.size() == 1 && v[0].name == "TaskCreate" &&
+               v[0].arguments.value("subject", std::string()) == "x" &&
+               pre == "Let me look.\n\n" && rest.find("<invoke>") == std::string::npos,
+           "mode 21: unnamed <function_calls><invoke> closed by </invoke> infers, wrapper absorbed");
+    }
+    {
+        // the trained form with a name the client did not declare (Grep under
+        // Claude Code 4.8): emitted as written, never inferred to another tool
+        auto v = call("<function=Grep>\n<parameter=pattern>\nfoo\n</parameter>\n"
+                      "<parameter=-n>\ntrue\n</parameter>\n</function>", tools);
+        ok(q27::undeclared_passthrough()
+               ? (v.size() == 1 && v[0].name == "Grep" &&
+                  v[0].arguments.value("pattern", std::string()) == "foo")
+               : v.empty(),
+           "undeclared Grep: passed through as written (refused in strict)");
+        // ...but not a name that is not an identifier
+        ok(call("<function=not a tool>\n<parameter=pattern>\nfoo\n</parameter>\n</function>",
+                tools).empty(),
+           "undeclared pass-through: a non-identifier name is still refused");
     }
     {
         // mode 18's same-line form must be untouched

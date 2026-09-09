@@ -1,0 +1,12 @@
+
+
+I'll investigate the issue with `to_unstacked_dataset` for single-dim variables. Let me first locate the relevant source code.
+
+<parameter=function=Bash>
+<parameter=command>
+grep -rn "to_unstacked_dataset\|to_stacked_array\|to_unstacked_dataarray\|_to_stacked\|_to_unstacked" /workspace/xarray --include="*.py" | head -50
+</parameter>
+<parameter=description>
+Find stack/unstack method definitions
+</parameter>
+</function>

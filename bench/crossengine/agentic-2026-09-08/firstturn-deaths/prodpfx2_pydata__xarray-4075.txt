@@ -1,0 +1,26 @@
+
+
+I'll investigate this bug. Let me start by finding the weighted mean implementation in the codebase.
+
+<function=Grep>
+<parameter=-n>
+true
+</parameter>
+<parameter=output_mode>
+content
+</parameter>
+<parameter=pattern>
+sum_of_weights
+</parameter>
+</function>
+<function=Grep>
+<parameter=-n>
+true
+</parameter>
+<parameter=output_mode>
+content
+</parameter>
+<parameter=pattern>
+def weighted
+</parameter>
+</function>

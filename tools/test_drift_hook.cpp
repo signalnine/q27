@@ -281,7 +281,11 @@ static void test_streaming_text_miss_without_a_candidate_is_recorded() {
                 r.segment(ch, s, false, names, emit_text, emit_think, emit_tool, classify);
         for (auto& [ch, s] : sp.flush()) r.segment(ch, s, false, names, emit_text, emit_think, emit_tool, classify);
         r.finish(true, names, emit_text, emit_think, classify);
-        CHECK(calls.empty());   // the parser does not know this shape (yet)
+        // Since 2026-09-08 the holdback arms on the `<tool_use>` wrapper, so
+        // the stream recovers this shape (it used to leave it as text and
+        // record it unrescued at finish). The record now comes from the parse
+        // wrapper's success path; still exactly one, still redacted.
+        CHECK(calls.size() == 1);
     }
     unsetenv("Q27_DRIFT_CORPUS");
     std::vector<json> recs;
@@ -290,7 +294,7 @@ static void test_streaming_text_miss_without_a_candidate_is_recorded() {
     remove(kPath);
     CHECK(recs.size() == 1);
     if (recs.empty()) return;
-    CHECK(recs[0]["outcome"] == "unrescued");
+    CHECK(recs[0]["outcome"].get<std::string>().rfind("recovered:", 0) == 0);
     CHECK(has_tag(recs[0], "xml"));
     CHECK(no_secret(recs));
     CHECK(recs[0]["redacted"].get<std::string>().find("<parameter_name>") != std::string::npos);  // the shape survives

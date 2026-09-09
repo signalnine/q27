@@ -82,6 +82,10 @@ build/test_chat_completions_integration: tools/test_chat_completions_integration
 
 build/replay_missed_calls: tools/replay_missed_calls.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/replay_missed_calls.cpp -o $@
+# the same turn through the STREAMING path (holdback + splitter), which is
+# what a live client sees; a batch-recovered shape can still die here
+build/stream_probe: tools/stream_probe.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/stream_probe.cpp -o $@
 
 build/test_template_golden: tools/test_template_golden.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_template_golden.cpp -o $@

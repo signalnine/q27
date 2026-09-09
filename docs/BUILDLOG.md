@@ -15714,6 +15714,155 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (s): item 2 -- queue wait is 2% and never two deep; the quality table found three of twelve tasks dying on their FIRST TURN in every DFlash2 arm, and the parser now survives four of the seven shapes
+
+Item 2 of (p): "reproducible turn replay, quality and queue attribution --
+makes small gains distinguishable from ring/history drift; identifies
+larger serving opportunities". Three findings, one fix.
+
+QUEUE ATTRIBUTION (bench/crossengine/agentic-2026-09-08/queue_attr.py on
+the prodpfx2 [req] log; a request occupies [t - pf_ms - dec_ms - cb_ms, t],
+its arrival is start - qw_ms): 228 requests over 840 s, the single slot in
+service 95% of the span, queue wait 18.7 s in total = 2.3% of service +
+queue. 111 requests "queued" but 99 of those for ~1 ms (dispatch); 12 had
+a request in service when they arrived, 9 waited >= 1 s, the longest
+4.8 s (a 25K-prompt turn behind a 4.4 s decode). Never more than ONE
+request ahead. The harness runs its 12 instances SEQUENTIALLY
+(bench/swebench/run.sh is a for loop over docker run), so the only
+concurrency in the campaign is Claude Code's own side requests. Verdict:
+batching / scheduling has <= 2.3% of wall to recover on this instrument,
+and the instrument cannot show sustained concurrency at all -- DFlash2
+batching stays deferred, with the number attached. Service composition:
+prefill 110 s, decode 688 s.
+
+QUALITY TABLE (bench/swebench/quality_table.py over results.*.jsonl):
+  arm          nonempty  gold  turns  out_tok  wall_s
+  prodlad        11/12   10/12  22.5   17260    130
+  prodd2          9/12    8/12  18.4   17012    181
+  prodpfx         9/12    7/12  12.5   11477    114
+  prodpfx2        9/12    8/12  18.2   11064     70
+  ninferd2       12/12   10/12  12.9    4996     28
+  ninfermtp      12/12   10/12  14.0    4581     38
+Every DFlash2 production arm has THREE instances at "1 turn, ~0 tokens"
+(requests-1142, xarray-4075, pylint-6903), the same three in prodpfx and
+prodpfx2 with BYTE-IDENTICAL first turns -- and prodd2 two of them.
+Sampling without a client seed is deterministic per prompt (server.cu
+parse_sample: seed 0 unless the client sends one, and Claude Code never
+does), so a prompt that draws a bad first turn draws it every time. The
+"speed parity" of (d) was sitting on a 25% task-death rate that neither
+t/s nor tok/round can see -- exactly the reviewer's warning ("216 vs 219
+does not establish equivalent task quality").
+
+WHAT THE DEAD FIRST TURNS WERE. The transcripts are retained
+(/mnt/ai/swebench-work/<arm>/<iid>/logs/out.jsonl); all seven texts are
+in bench/crossengine/agentic-2026-09-08/firstturn-deaths/ with the 28-tool
+Claude Code 4.8 schema those requests carried. Every one is a tool call the
+server did not turn into a tool_use block, so Claude Code saw a final turn
+with text only and exited "success" after one turn:
+  1. `<function_calls>\n<invoke>\n<parameter=file_path>...</parameter>\n</invoke>`
+     then EOS -- the Anthropic-XML wrapper family around an UNNAMED call
+     (requests-1142, identical in prodpfx and prodpfx2).
+  2. `<function=Grep>` x2, trained form, with `<parameter=-n>` -- and
+     Claude Code 4.8 declares NO Grep tool (the model was trained on
+     transcripts full of it). Refused as undeclared (xarray-4075, three
+     arms). The ninfer arm passed the same call through; Claude Code
+     answered `<tool_use_error>Error: No such tool available: Grep
+     </tool_use_error>` and the model switched to Bash grep -- 12/12
+     non-empty diffs on that arm.
+  3. `<parameter=function=Bash>\n<parameter=command>...` -- the mode-22
+     opener with the name behind a `function=` prefix (prodlad, xarray-4094).
+  4. `<tool_calls>\n<invoke>` x2, the second truncated at EOS (q27lad).
+  5. a hallucinated `<system-warning>System: The user has specified the
+     following settings...` block and no call at all (pylint-6903, three
+     arms) -- nothing to recover.
+  6. nested `<parameter=client>proxy<parameter=calls><parameter=call>...`
+     junk (prodd2 xarray-4075) -- nothing to recover.
+  7. `<tool_use>` + parameters with the last value unterminated at EOS
+     (q27d2q8 pytest-5262) -- refused by policy (a truncated value is never
+     executed).
+None of them left an UN-RESCUED line in the journal: the streaming
+holdback decides whether the parser runs at all, and none of these
+openers armed it, so the text streamed out and nothing was ever parsed.
+The batch replay (replay_missed_calls) sees them; the live path did not.
+That gap is now an instrument: tools/stream_probe (make build/stream_probe)
+feeds a turn through the SAME StreamSplitter + StreamToolRouter + bare
+chain the /v1/messages handler uses, chunked like tokens, with the
+request's schema, and prints the blocks a client would have received. It
+reproduced all seven deaths with the 28-tool schema before any change.
+
+THE FIXES (src/api_common.h, all gated by the existing Q27_TOOL_STRICT):
+- undeclared_passthrough (Q27_TOOL_UNDECLARED=refuse restores the old
+  rule): a well-formed `<function=NAME>` call whose NAME the client did
+  not declare is emitted under that name -- the model wrote it, nothing is
+  inferred -- and the client decides. Only an identifier (no placeholders
+  like `name`/`function`), only with >= 1 parameter, only under an
+  unrestricted auto tool_choice (tool_choice_allows_call); a named, forced
+  or restricted choice still refuses. Name INFERENCE (modes 20/21) is
+  unchanged: an absent name is never invented, and the mode-21 guard
+  against inferring past an explicit wrong name stands.
+- mode 22 accepts `<parameter=function=NAME>` / `name=` / `tool=` openers
+  (mode22_opener_name), in the detector, the probe, the batch scanner and
+  the standalone pass.
+- the wrapper family `<function_calls>` `<invoke>` `<tool_use>`
+  `<tool_calls>` is in the bare native opener table (holdback arms, probe
+  holds a split tag, parse_native_xml_call skips them as junk, the batch
+  scanner claims a span at them only when a declared name follows -- for a
+  bare wrapper never, so the call reaches mode 21 whole); mode 21 accepts
+  `</invoke>` `</function_calls>` `</tool_use>` `</tool_call>` as the
+  closer of an openerless list and absorbs the wrapper openers into the
+  call's span so they are not shown as text; IncrementalBareNativeEnd
+  closes a candidate on those closers too.
+stream_probe after the change, same schema: requests-1142 -> Read;
+xarray-4075 -> 2x Grep passed through; xarray-4094 -> Bash; requests-1921
+-> Read (the truncated second call stays text); 5, 6, 7 still refused.
+
+GATES: make test-tools (both legs) and corpus-check pass. Three drift tests
+and one bridge test encoded the old refusal and were rewritten to the new
+policy (strict leg keeps the refusal); test_drift_hook's "miss without a
+candidate" shape (`<tool_use>...`) is now a recovery and the test says so;
+the bridge test that pinned "`<tool_use>` streams as text" is pinned the
+other way, deliberately. New unit tests for the three shapes. Six new
+corpus rows captured through the real Q27_DRIFT_CORPUS path and
+human-labelled (three recoveries, three refusals); the `<parameter=
+function=Bash>` and `-n` shapes lose their key under redaction and are
+pinned by the unit tests instead; one row (the `<tool_calls><invoke>`
+shape) is marked replay-unreliable: the stream recovers it, the
+non-stream replay reads a wrapper tag at the very start of the text as a
+displayed HTML block and never parses it -- a pre-existing stream/
+non-stream difference (220c72b4 is the mirror case), noted, not changed.
+corpus_check's eligibility callback mirrors tool_choice_allows_call.
+Fuzz: 180 s on the new parser, clean. Corpus 164/164 human-labelled shapes
+agree (176 shapes, 12 replay-unreliable).
+
+LIVE RERUN, and what it did and did not show. Production relaunched on the
+new binary; the three dead instances rerun through the harness
+(results.prodfix.*.jsonl): requests-1142 14 turns / gold, xarray-4075 37
+turns / gold, pylint-6903 13 turns / gold -- all three that were "1 turn,
+0 tokens" now finish. But the journal has no pass-through and no mode-21/22
+line for the run: the first turns were DIFFERENT draws. Same prompt length
+(23870, restored from the 21504 system entry), different drafter ring
+history (a title side-request preceded it instead of another instance's
+last turn), different proposals, different realized sampled tokens. So
+"deterministic per prompt" is really deterministic per (prompt, preceding
+sequence): prodpfx and prodpfx2 matched byte for byte because their whole
+request sequences matched. The rerun is evidence that the tasks pass today,
+not that the fixes fired live; the fixes are verified by stream_probe on
+the real texts, which is the server's own streaming code. This is the
+reviewer's item-2 point from the other direction, and it fixes the shape
+of the missing instrument: a turn REPLAY needs the recorded request bodies
+of the whole preceding sequence, not a re-run of the task. Not built
+today; the proxy records timings only and the server records [req] lines
+only. Next for item 2: request-body recording (server-side or in
+tapproxy) + a sequential replayer, so two binaries can be fed the
+identical sequence.
+
+Dispositions: queue attribution DONE (2.3%, never two deep, harness is
+serial -- batching stays deferred with the number); task-quality table is
+now part of the campaign readout (bench/swebench/quality_table.py, read it
+next to t/s); first-turn parser deaths: 4 of 7 shapes recovered on the
+stream path, 3 refused by design; turn replay: instrument gap named,
+recording is the next piece.
+
 ## 2026-09-08 (r): shared-cut PROMOTION + access-LRU -- a client's system entry can now move forward; the one entry every session hits no longer ages out first
 
 Item 3 of (p). Two defects in the P16b machinery, both structural, both

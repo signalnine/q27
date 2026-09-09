@@ -1,0 +1,13 @@
+
+
+I'll investigate the issue in the capture module.
+
+<tool_use>
+<parameter=file_path>
+/workspace/src/_pytest/capture.py
+</parameter>
+<parameter=offset>
+380
+</parameter>
+<parameter=limit>
+120

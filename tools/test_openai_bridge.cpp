@@ -486,7 +486,12 @@ static void test_anthropic_tool_choice_shapes() {
     CHECK(!q27::tool_choice_allows_call(none,declared,"get_weather",0));
     CHECK(q27::tool_choice_allows_call(automatic,declared,"get_weather",0));
     CHECK(!q27::tool_choice_allows_call(automatic,declared,"get_time",1));
-    CHECK(!q27::tool_choice_allows_call(automatic,declared,"undeclared",0));
+    // an undeclared name is eligible only under an unrestricted auto choice
+    // and only with the pass-through on (2026-09-08); never under a named one
+    CHECK(q27::tool_choice_allows_call(automatic,declared,"undeclared",0) ==
+          q27::undeclared_passthrough());
+    CHECK(!q27::tool_choice_allows_call(named,declared,"undeclared",0));
+    CHECK(!q27::tool_choice_allows_call(automatic,declared,"not a name",0));
     bool missing_threw=false;
     try {
         auto missing=q27::parse_anthropic_tool_choice(
@@ -3208,17 +3213,19 @@ static void test_stream_router_arms_on_every_opener_spelling() {
             CHECK(q27::strip_ws2(r.text).empty());
         }
     }
-    // The pylint-6903 shape opens with `<tool_use>`, which is a markdown HTML
-    // block, so the display-context rule (a fenced or HTML example must not
-    // fire) correctly refuses to arm mid-block: it streams as text. That is
-    // not a silent drop -- the router records it to the corpus at finish
-    // (test_drift_hook), and the OFFLINE chain, which has no display gate on
-    // the native scan, recovers it (test_tool_drift). Pinned here so a future
-    // change to displayed_html is a deliberate one.
+    // The pylint-6903 shape opens with `<tool_use>`. Until 2026-09-08 the
+    // holdback did not arm on the wrapper tag (only the OFFLINE chain
+    // recovered it, and this test pinned the stream leaving it as text).
+    // The wrapper family (`<tool_use>`, `<tool_calls>`, `<function_calls>`,
+    // `<invoke>`) is now in the native opener table, because two production
+    // first turns died on `<function_calls>\n<invoke>\n<parameter=...` with a
+    // silent journal: the stream recovers this shape too. Pinned the other
+    // way round, deliberately.
     const std::string html_block =
         "\n\n<tool_use>\n<tool>\n<parameter_name>\n<parameter_name>read\n</parameter>\n<parameter=path>\n/w/x.py\n";
     auto h = stream_turn(html_block, false, 7);
-    CHECK(h.calls.empty());
+    CHECK(h.calls.size() == 1);
+    if (!h.calls.empty()) CHECK(h.calls[0].name == "read");
     // the safety cases: a fenced example and <name> as prose stay text
     const std::string fenced =
         "example:\n```\n<name>read\n</parameter>\n<parameter=path>\n/w\n</parameter>\n</function>\n```\ndone";

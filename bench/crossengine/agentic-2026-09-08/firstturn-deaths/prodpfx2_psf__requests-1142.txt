@@ -1,0 +1,10 @@
+
+
+I'll investigate this issue about `requests.get` always sending a `content-length` header. Let me start by exploring the codebase.
+
+<function_calls>
+<invoke>
+<parameter=file_path>
+/workspace/requests/api.py
+</parameter>
+</invoke>
