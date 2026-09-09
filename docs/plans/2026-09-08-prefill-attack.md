@@ -395,6 +395,20 @@ decode token moves to g64 numerics; canonical NP=5 prompts stay serial);
 only at deep base_pos (-4.5 ms per chunk). Together 76 -> ~35 ms per warm
 turn; the production 64-256-token turns (137 ms mean) about -30%.
 
+Order after the gpt-6-astra advisory (docs/reviews/2026-09-08-gpt6astra-
+small-turn-levers.md, BUILDLOG (l)): (0) BITWISE first: graph-capture the
+DFlash2 last-token forward (token_launches(d2_vtaps) runs eagerly today;
+-3-5 ms per turn, also pf=1); (1) C after a Q27_PF_SPLIT 1/2/4/8 sweep at
+T 5/36/64/128 and warm-turn depths proves the win (unsplit grid is
+4 x ceil(T/16); keep the 8-split cap; pv8's e4m3 softmax rounding means
+P4's bound does not carry); (2) B narrow: append the last token to an
+existing post-snapshot chunk with room, existing head GEMV, MTP/DFlash2
+traps as listed; (3) A only after repricing, with explicit boundary-state
+export (snap/ckpt/pfx copy LIVE state today). Every numerics-class lever
+needs the teacher-forced turn-replay gate through generate_prefill (the
+batched NLL loop bypasses it), the +2% NLL rejection ceiling, DFlash2
+tok/round and request wall, and its own cache root.
+
 ## Phase 4 -- attention and delta-scan (the 128 K levers, later)
 
 - Prefill attention (`k_attn_prefill_mma_pv8`, prefill.cu:1971): 13.5% of

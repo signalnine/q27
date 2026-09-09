@@ -15710,6 +15710,74 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (l): gpt-6-astra on the small-turn levers -- C, then B, then A; first a bitwise one nobody listed
+
+docs/reviews/2026-09-08-gpt6astra-small-turn-levers.md (static, xhigh).
+The order it sets, adopted as the plan's phase 3 continuation:
+
+0. FIRST (bitwise, half to one session): graph-capture the DFlash2
+   last-token forward. Under the ladder the last prompt token goes through
+   step_with -> graph_exec (captured); under DFlash2 it runs
+   token_launches(d2_vtaps) EAGERLY so the taps reach the ring -- 963
+   launches, ~5 ms of submission overhead on top of the 8.3 ms gemv weight
+   stream. token_launches has no sync/alloc and already supports capturing
+   the five tap copies; capture a separate graph after d2_vtaps exists,
+   keep the one-row ingest outside (host bookkeeping), keep the synchronous
+   token upload and the fold-event dependency. Budget 3-5 ms per turn,
+   also helps pf=1 where A/B/C have nothing to batch. Gate: identical
+   logits, normalized hidden, recurrent state, KV/tap rows, position
+   counters and seeded warm-turn streams (the missing last ring row cost
+   acceptance before -- keeping it is what matters).
+1. C (attention split on underfill), 1-2 sessions incl. gates. Correction
+   to my sizing: the unsplit grid is 4 x ceil(T/16), so 4/8/12/16 blocks
+   through T=16/32/48/64, and eight splits give only 32 blocks for a
+   5-token tail: propose the split count from underfill but constrain it
+   by useful 32-position tiles and combine amortization; do not raise the
+   8-split cap just to reach 170 blocks. Run the existing Q27_PF_SPLIT
+   override at 1/2/4/8 for T 5/36/64/128 at warm-turn depths FIRST; only if
+   the win survives, add the guarded dispatch. Numerics: P4's class but
+   the pv8 path rounds softmax weights to e4m3, so changed local maxima
+   move those operands too -- P4's 1.9e-5 is not a bound. Gate the
+   production pv8 branch at shallow/deep, ragged queries, empty splits,
+   scattered pages, the scratch limit, plus turn replay and DFlash2
+   acceptance.
+2. B narrow (1-2 sessions for DFlash2): append the last token to an
+   EXISTING post-snapshot chunk that has room (never a new one-token chunk;
+   keep the old path when only one token remains, the chunk is full, or
+   it would cross the snapshot boundary); keep that row's output_norm in
+   engine-owned x1, run the existing qx + mm(output.weight) head, argmax
+   and advance; preserve logits/h_next/d_P=NP-1 and d_pos=d_step=NP.
+   Traps: MTP warm only rows with a known successor (save x1T first, the
+   warm overwrites it); DFlash2 seeds NP-1 through the batched taps exactly
+   once, no separate ingest, d2_prefill_done sees the pending token.
+   Numerics: g64 policy eligible, not pre-validated; first-token
+   distribution gate + continuations + restores; sampled bootstrap stays at
+   NP draw kind 0; CLI canonicals stay serial (pf_batch_min 32 vs the
+   server's 2).
+3. A (3-5 sessions): capture S[il] AND the three raw-QKV conv-history rows
+   per layer at the boundary (the ring is not rebuilt from normalized
+   convT; cuts under 3 tokens need incoming history); merge projections
+   but keep two conv/scan segments per GDN layer. Bitwise only for the
+   scan (two calls on the original subranges preserve the 64-token WY
+   grouping); the merged forward is NOT bitwise (split-K count depends on
+   T: 3 splits at T=36, 4 at T=5, 3 for both at 41; attention tile
+   endpoints move). Biggest trap: snap_save / ckpt_save / pfx_export copy
+   LIVE state -- after a merge the live state is past the boundary, so the
+   captured boundary state must be exported explicitly. Reprice after 0-2
+   land: a cheaper chunk B is worth less to remove.
+4. Not a shortcut: a tiny verify-style prefill (the verify GDN mixer
+   commits lane 0 only, the tail speculates, the head may be the fast one;
+   2-4 sessions if ever). Graph-capturing chunk B: baked base/T, shared
+   scratch -- no per-position graph cache.
+5. Gates that exercise the changed path: the batched NLL loop calls
+   prefill_chunk directly and bypasses generate_prefill / P8 / the
+   last-token handoff, so it cannot establish A or B; add a teacher-forced
+   turn-replay gate through generate_prefill (first-token NLL, warm suffix
+   lengths, restore tiers). Preregister the split-K trigger (+2% aggregate
+   or segment NLL) as the rejection ceiling; measure DFlash2 tok/round and
+   request wall, not just prefill wall; separate cache roots per
+   numerical experiment; DFlash2 keeps Q27_BATCH=0.
+
 ## 2026-09-08 (k): the small-turn prefill floor measured -- three weight streams per warm turn; three bitwise trims shipped
 
 Phase 3 of docs/plans/2026-09-08-prefill-attack.md. After phase 0 the
