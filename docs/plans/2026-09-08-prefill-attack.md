@@ -191,7 +191,16 @@ turns are 14 s -- the -70% bar assumed hits from session 2, the mechanism
 needs one extra session); round wall 18.63 = baseline; quality unchanged.
 Live probes are in bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py.
 Phase 0 is CLOSED; `d2-pfx` is production (launch script, campaign.sh
-relaunch line, BUILDLOG 2026-09-08 (g)).
+relaunch line, BUILDLOG 2026-09-08 (g)). gpt-6-astra reviewed the shared
+cut afterwards (docs/reviews/2026-09-08-gpt6astra-shared-cut.md, BUILDLOG
+(i)): the concurrent-writer race and the eviction/publish race are fixed;
+one item is DEFERRED as a follow-up: a restored prefill (base > 0) never
+runs the shared-cut discovery, so after a client change a short matching
+entry can pin every session to it. Fix = an explicit promotion policy (run
+shared_prefix on restored prefills too and persist a longer system cut when
+the restored base is a system-class entry shorter than the shared length;
+the 8192 step gate must not suppress it). Not urgent: today's worst case is
+a shorter hit, never a miss.
 
 ## Phase 1 -- slot routing (multi-slot configs only, defer)
 
@@ -296,15 +305,50 @@ BUILDLOG 2026-09-08 (h). tools/gemm_w4a8_spike.cu is a bitwise W4A8 kernel
 M=1024 -- short of the 1.6x bar. Measured ceilings: IMMA pipe 1020 TOPS,
 register-only exact fold 827, kernel without the stage fill 609, fill alone
 6.8 TB/s; the gap is fill/compute non-overlap, not the fold or occupancy.
-Task 2 continues with a TMA producer (cp.async.bulk.tensor + expect_tx
-mbarriers; the cp.async producer-warp attempt regressed to 326-350) and
-transposed scale sidecars (W [ngrp][rows] fp16 at load, xs [ngrp][T] from
-the quantizer) so scale tiles are TMA boxes. Probes and traps in
-tools/probes/README.md (ptxas hoists loop-invariant mma: register-only
-IMMA loops must perturb an input per iteration). Task 3 (the port behind
-Q27_PF_GEMM=w4a8v2) is unchanged; the activation permute goes into
-quantize_x_g64 as a second output buffer (nat64p) so the Q8 path keeps its
-layout.
+Task 2 continues, in the order gpt-6-astra set
+(docs/reviews/2026-09-08-gpt6astra-w4a8-spike.md, BUILDLOG (j)):
+(a) TMA (cp.async.bulk.tensor, single-CTA, expect_tx mbarriers) for the W
+and X tiles ONLY, issued by an elected thread inside the consumer CTA,
+scale loads unchanged -- isolates TMA's effect before any layout change
+(the cp.async producer-warp attempt regressed to 326-350 because it put 56
+copies per lane per stage on one warp and changed register allocation;
+not a verdict on specialization); (b) only then transposed scale sidecars
+(W [ngrp][rows] fp16 at load, xs [ngrp][T] from the quantizer; inner box
+a multiple of 16 B, strides 16-B aligned, hardware swizzle validated
+against the fragment layout); (c) the structural matrix: 128x192 (4x3) and
+192x128 (6x2), 64x128 / 128x64, 4x2 vs 2x4, grouped rasterization over
+2-8 row tiles, BK 64/128/256 on smaller tiles, the operand-role swap
+(tokens on the MMA's M side: a new fragment/permutation mapping, not a
+pointer swap), split-K only for underfilled grids. smem: 128x128x256/s2
+and 256x128x128/s3 are 102 KiB > the 99 KiB block limit. Probes and
+traps in tools/probes/README.md (ptxas hoists loop-invariant mma:
+register-only IMMA loops must perturb an input per iteration).
+
+Task 3 (the port behind Q27_PF_GEMM=w4a8v2) gate list, from the same
+review: the fold ported as explicit mul.rn/fma.rn asm (identical source
+expressions are a compiler-dependent contract), build flags recorded and
+the production SASS inspected; FOLD==2 (cvt16) never ships (conditionally
+exact below 16*FLT_MIN); nat64p is an ADDITIONAL quantizer output from
+the same rounded q0/q1 (never a replacement: Q8 and the fallbacks read
+nat64), with Q8 exercised on the same XQuant right after Q4 and
+Q27_PF_XG=32 / Q27_PREFILL=dp4a / missing-g64 routes covered; preserve
+the split-K DECISION (scratch capacity, forced counts, uneven partitions)
+and route w4a8v2 only where the incumbent would not have split; shape
+contract explicit (cols % 128, rows 1/7/8/15/16/17 and BN boundaries,
+every T 1..17 and the dispatch boundaries, pipelines shorter than the
+stage count); numerics gate against BOTH incumbent kernels on real
+projection weights and captured activations plus endpoint patterns (all
+nibble values, both activation signs, max dots, exact cancellation,
+one-hot K at every position, distinct adjacent-group scales, halfway
+rounding, tiny products, overflow, signed zero); exact-sized allocations
+with checked red zones (the spike does this now); buffers, sidecars and
+descriptors allocated on the existing init paths under the arena's
+per-chunk claim discipline, no process-global mutable state and no lazy
+allocation while another engine may be capturing; acceptance = unchanged
+legacy --pf identity, unchanged decode canonicals, direct g64 old/new,
+mixed Q4/Q8, short suffixes as well as 1024-token chunks, quantizer and
+sidecar cost included. Default off until the bar is met or the smaller
+gain is explicitly accepted.
 
 ## Phase 3 -- trims (bitwise, half a session)
 

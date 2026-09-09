@@ -4295,6 +4295,11 @@ struct Engine {
     // (~50 ms at 1 GB) is on the critical path; the file write is not.
     void pfx_persist(const std::vector<int>& prompt, int L) {
         pfx_wait_writer();  // never reassign a joinable std::thread
+        // Claim the key before the D2H export: another engine (slot) may have
+        // chosen the same boundary for the same tokens (the shared system cut
+        // makes that likely); only one of them exports and writes, the other
+        // skips this boundary. write() releases the claim.
+        if (!pcache->reserve(prompt, L)) return;
         // Export into a RAM-tier slot when the tier is on and one is free, so
         // the blob we just built is resident for the next restore at no extra
         // copy; the writer then streams it to disk from there. `slot` is
@@ -4956,7 +4961,12 @@ struct Engine {
             if (base == 0 && pcache && pcache->enabled() &&
                 pfx_sys_len >= pcache->cfg().min_tokens) {
                 const int shared = pcache->shared_prefix(prompt, pfx_sys_len);
-                if (shared >= pcache->cfg().min_tokens && shared < pfx_sys_len)
+                // the cut lands on the last chunk boundary <= shared; that
+                // boundary is what pfx_should_persist measures against
+                // min_tokens, so check IT (review P3: an unaligned min_tokens
+                // could otherwise trade a usable sys_len cut for an unusable one)
+                const int shared_b = (shared / (int)PF_T) * (int)PF_T;
+                if (shared_b >= pcache->cfg().min_tokens && shared < pfx_sys_len)
                     pfx_sys_cut = shared;
                 if (shared > 0)
                     fprintf(stderr, "[pfx] system block %d tokens, shares %d with an indexed entry"

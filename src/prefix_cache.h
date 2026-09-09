@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -275,17 +276,43 @@ class PrefixCache {
         return ok;
     }
 
+    // Indexed OR in flight (reserved by a writer that has not published yet):
+    // both mean "do not export this key again".
     bool has(const std::vector<int>& toks, int L) const {
         if (!enabled_ || L <= 0 || (size_t)L > toks.size()) return false;
         const uint64_t k = pfx_fnv1a64(toks.data(), (size_t)L * sizeof(int));
         std::lock_guard<std::mutex> lk(m_);
         for (const auto& e : index_)
             if (e.L == L && e.key == k) return true;
+        for (const auto& f : inflight_)
+            if (f.second == L && f.first == k) return true;
         return false;
     }
 
-    // Atomic write: full content to a .tmp in the same directory, then rename.
-    // A torn write can therefore never be indexed.
+    // Claim (key, L) for one writer. All engines of a server share one cache
+    // (server.cu) while the export/writer state is per engine, so two cold
+    // slots choosing the same cut could both pass has() and both write the
+    // same file (gpt-6-astra review 2026-09-08, P1: with a shared .tmp path
+    // and O_TRUNC one writer could publish the other's half-written state).
+    // Call before the D2H export; write() releases the claim when it is done
+    // (published or failed). Returns false when the key is indexed or already
+    // claimed -- the caller skips this boundary, exactly as for a has() hit.
+    bool reserve(const std::vector<int>& toks, int L) {
+        if (!enabled_ || L <= 0 || (size_t)L > toks.size()) return false;
+        const uint64_t k = pfx_fnv1a64(toks.data(), (size_t)L * sizeof(int));
+        std::lock_guard<std::mutex> lk(m_);
+        for (const auto& e : index_)
+            if (e.L == L && e.key == k) return false;
+        for (const auto& f : inflight_)
+            if (f.second == L && f.first == k) return false;
+        inflight_.emplace_back(k, L);
+        return true;
+    }
+
+    // Atomic write: full content to a per-writer .tmp in the same directory,
+    // then rename + index update under the lock (so an eviction can never
+    // interleave between a publication and its indexing: review P2). A torn
+    // write can therefore never be indexed. Releases the reserve() claim.
     bool write(const std::vector<int>& toks, int L, const void* gdn, size_t gdn_n, const void* kv,
                size_t kv_n) {
         if (!enabled_ || L <= 0 || (size_t)L > toks.size()) return false;
@@ -293,7 +320,13 @@ class PrefixCache {
         char name[64];
         snprintf(name, sizeof name, "%016llx-%d.q27pc", (unsigned long long)key, L);
         const std::string final_path = cfg_.root + "/" + name;
-        const std::string tmp_path = final_path + ".tmp";
+        char tsuf[48];
+        snprintf(tsuf, sizeof tsuf, ".tmp.%ld.%u", (long)::getpid(), tmp_seq_.fetch_add(1));
+        const std::string tmp_path = final_path + tsuf;
+        struct Release {  // the claim goes away on every exit path
+            PrefixCache* c; uint64_t k; int L;
+            ~Release() { c->release(k, L); }
+        } rel{this, key, L};
         int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) {
             fprintf(stderr, "prefix-cache: cannot write %s (%s)\n", tmp_path.c_str(),
@@ -313,7 +346,7 @@ class PrefixCache {
                   write_full(fd, gdn, gdn_n) && write_full(fd, kv, kv_n);
         if (ok) ok = ::fsync(fd) == 0;
         ::close(fd);
-        if (!ok || ::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        if (!ok) {
             ::unlink(tmp_path.c_str());
             fprintf(stderr, "prefix-cache: write failed for %s\n", final_path.c_str());
             return false;
@@ -326,6 +359,12 @@ class PrefixCache {
         e.mtime = (long)time(nullptr);
         {
             std::lock_guard<std::mutex> lk(m_);
+            if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+                ::unlink(tmp_path.c_str());
+                fprintf(stderr, "prefix-cache: publish failed for %s (%s)\n", final_path.c_str(),
+                        strerror(errno));
+                return false;
+            }
             index_.erase(std::remove_if(index_.begin(), index_.end(),
                                         [&](const Entry& x) { return x.path == final_path; }),
                          index_.end());
@@ -335,7 +374,9 @@ class PrefixCache {
         return true;
     }
 
-    // LRU by mtime down to the byte budget. Whole entries only.
+    // LRU by mtime down to the byte budget. Whole entries only. The unlink
+    // happens under the same lock as the index removal so it can never hit a
+    // replacement that a writer published to the same path in between.
     void evict_to_budget() {
         if (!enabled_) return;
         std::vector<Entry> doomed;
@@ -349,14 +390,22 @@ class PrefixCache {
             while (total > cfg_.max_bytes && !index_.empty()) {
                 total -= index_.front().bytes;
                 doomed.push_back(index_.front());
+                ::unlink(index_.front().path.c_str());
                 index_.erase(index_.begin());
             }
         }
-        for (const auto& e : doomed) {
-            ::unlink(e.path.c_str());
+        for (const auto& e : doomed)
             fprintf(stderr, "prefix-cache: evicted %s (%.2f GB budget)\n", e.path.c_str(),
                     cfg_.max_bytes / 1e9);
-        }
+    }
+
+    void release(uint64_t key, int L) {
+        std::lock_guard<std::mutex> lk(m_);
+        inflight_.erase(std::remove_if(inflight_.begin(), inflight_.end(),
+                                       [&](const std::pair<uint64_t, int>& f) {
+                                           return f.first == key && f.second == L;
+                                       }),
+                        inflight_.end());
     }
 
     // Index every well-formed, compat-matching entry in the directory.
@@ -372,7 +421,7 @@ class PrefixCache {
         if (!d) return;
         while (dirent* de = ::readdir(d)) {
             const std::string n = de->d_name;
-            if (n.size() > 10 && n.compare(n.size() - 10, 10, ".q27pc.tmp") == 0) {
+            if (n.find(".q27pc.tmp") != std::string::npos) {  // ".q27pc.tmp.<pid>.<n>"
                 const std::string stale = cfg_.root + "/" + n;
                 if (::unlink(stale.c_str()) == 0)
                     fprintf(stderr, "prefix-cache: swept incomplete write %s\n", stale.c_str());
@@ -442,6 +491,8 @@ class PrefixCache {
     bool enabled_ = false;
     mutable std::mutex m_;
     std::vector<Entry> index_;
+    std::vector<std::pair<uint64_t, int>> inflight_;  // reserve()d keys, under m_
+    std::atomic<unsigned> tmp_seq_{0};                 // per-writer .tmp suffix
 };
 
 }  // namespace q27

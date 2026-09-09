@@ -15710,6 +15710,102 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (j): gpt-6-astra review of the W4A8 spike -- design confirmed, cvt16 demoted to a probe, the port's gate list
+
+docs/reviews/2026-09-08-gpt6astra-w4a8-spike.md (static, xhigh, 15 items).
+Dispositions:
+
+- A1 P1 ACCEPTED: FOLD==2 (cvt16, the 3-op fold with 1/16 on wsc) is only
+  conditionally exact -- RN((wsc/16)*xs) loses bits while RN(wsc*xs) is still
+  normal below 16*FLT_MIN ~ 1.9e-37 (analytical counterexample in the
+  review: wsc=2^-24, xs=(1+2^-23)*2^-100, d=1), and overflow differs the
+  other way. It stays a probe; the shipped fold is the exact 4-op magic
+  path. An exact 3-op fold exists only if the unpack produces d directly.
+- A2 P1 ACCEPTED for the port: identical source expressions are a
+  compiler-dependent contract (contraction, FTZ, toolchain). The ported
+  fold will be explicit mul.rn/fma.rn asm (lag2 already showed it costs
+  nothing), the build flags recorded, the production SASS inspected, and
+  the gate extended with cancellation / halfway / tiny-product / overflow
+  / signed-zero inputs.
+- A3/A4 P2 CONFIRMED sound (|16d| <= 1,040,384 < 2^22; the permutation is
+  k -> floor(k/2) + 16*(k mod 2) within each 32-block on both operands;
+  packed-weight zero-fill unpacks to -128 but only into discarded rows).
+  Endpoint and one-hot-K tests are on the port's gate list.
+- B5 P2 ACCEPTED: "fill and math do not overlap" overstates the evidence
+  (609 -> 141 us + 74 us fill = 215 us, not 201; the fill-only probe omits
+  scales and swizzle; the no-fill ablation is not an initialized substitute).
+  Restated as "insufficient overlap plus copy-issue cost", fold still
+  material (609 vs 807).
+- B6/B7/B8 P2 ADOPTED as the next session's order: TMA for W and X only,
+  issued by an elected consumer thread with expect_tx mbarriers, scale
+  loads unchanged -- isolate TMA before any layout change; then the
+  structural matrix (rectangular tiles incl. 128x192 4x3, grouped
+  rasterization, BK, the operand-role swap, split-K for underfilled grids;
+  smem caps 128x128x256/s2 and 256x128x128/s3 at 102 KiB > 99 KiB). The
+  producer-warp regression was an unfavourable experiment (56 copies per
+  lane per stage on one warp, changed register allocation), not a verdict;
+  setmaxnreg exists on sm_120a but is warpgroup-wide.
+- B9 P3 FIXED: --notest printed "all bitwise"; now it reports untested,
+  zero selected tests is an error, and the summary counts comparisons.
+- C10 P1 FIXED in the spike: cols % BK gates added to the two launchers
+  that lacked them; the gate now covers 25 T values including every
+  incumbent dispatch boundary (15-17, 31-33, 63-65, 95-97, 127-129) and
+  tails. K tails and row tails 1/7/8/15/16/17 remain port gates.
+- C13 P1 FIXED in the spike: both incumbent references (ntx live dispatch
+  and Q27_PF_NTX=0 MR=64) on identical inputs, and the new kernel writes
+  into an exact-sized buffer with a 4096-float red zone that is checked.
+  800 comparisons pass. Real weights / captured activations remain a port
+  gate.
+- C11/C12/C14/C15 P1-P2 FOLDED into the plan's task 3: preserve the
+  split-K DECISION (scratch capacity, forced counts) not just the kernel;
+  nat64p as an additional quantizer output from the same rounded q0/q1
+  with Q8 exercised on the same XQuant right after Q4; buffers and
+  descriptors allocated on the existing init paths under the arena claim
+  discipline, no process-global mutable state, no lazy allocation during
+  another engine's capture; acceptance = legacy --pf identity + decode
+  canonicals + direct g64 old/new + mixed Q4/Q8 + short suffixes.
+
+## 2026-09-08 (i): gpt-6-astra review of the shared cut -- writer race closed, unlink under the lock, tests that test the caps
+
+docs/reviews/2026-09-08-gpt6astra-shared-cut.md (static, xhigh). Dispositions:
+
+- P1 FIXED: all slots share one PrefixCache while the export/writer state is
+  per engine, so two cold slots choosing the same cut could both pass has()
+  and both write the same `.tmp` with O_TRUNC -- one could publish the
+  other's half-written state (pre-existing; the shared cut makes different
+  sessions target the same key, so it became live). Now `reserve(toks, L)`
+  claims a (key, L) under the index lock before the D2H export (pfx_persist),
+  has() reports in-flight keys as present, `.tmp` names are per writer
+  (`.q27pc.tmp.<pid>.<n>`, the boot sweep matches the substring), and write()
+  releases the claim on every exit. Production is single-slot, so this was
+  not exposed today; the multi-slot ladder config was.
+- P2 FIXED: eviction unlinked its victims after releasing the lock, so a
+  writer's rename + index insert of a replacement at the same path could
+  land in between and the delayed unlink would delete the NEW file while
+  has() kept suppressing its repair. rename + index update now happen under
+  the lock in write(), and evict_to_budget() unlinks under the lock.
+- P2 DEFERRED (policy): a restored prefill (base > 0) never runs the
+  shared-cut discovery, so once a short entry (e.g. from an older client
+  version) matches, sessions restore it and never persist the longer shared
+  prefix. Real but an improvement over the pre-09-08 behaviour (no hit at
+  all); needs an explicit promotion policy (the 8192 step gate would also
+  suppress it after a restore). Noted in the plan.
+- P3 FIXED: the engine checked `shared >= min_tokens` but persistence is
+  measured at the chunk boundary <= shared; with an unaligned min_tokens the
+  shared cut could be chosen and then rejected. The boundary is checked now.
+- P3 FIXED: two unit assertions did not test the caps they claimed
+  (divergence came first); added full-agreement cases capped at the entry
+  length and at the prompt length, plus test_reserve_serialises_writers.
+- Reviewer-confirmed correct: index copy under the lock with I/O outside,
+  the two-stage read offsets, the down-rounded cut, `shared == sys_len`,
+  conversation entries as evidence, cold reset of pfx_last_persist, server
+  sys_len propagation; the `n <= best` prune (break would also be valid).
+  Cost bound: <= 100 KiB of head reads for a 40 GB root of unrelated
+  entries, ~9 MB if every head matches at sys_len 22.5K.
+
+Gates: test_prefix_cache PASS, make test-tools PASS, live probe on the
+rebuilt server (below).
+
 ## 2026-09-08 (h): W4A8 prefill GEMM spike -- bitwise at 1.26-1.41x, the 1.6x bar NOT met; ceilings measured
 
 Phase 2 task 2 of docs/plans/2026-09-08-prefill-attack.md. Spike

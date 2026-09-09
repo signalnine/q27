@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -131,7 +132,11 @@ __device__ __forceinline__ uint32_t unpack_odd(uint32_t p) {
 template <int FOLD>
 __device__ __forceinline__ float i2f16(int d16) {
     if constexpr (FOLD == 1) return fmaf(__int_as_float(d16 + 0x4B400000), 0.0625f, -786432.0f);
-    else if constexpr (FOLD == 2) return (float)d16;  // 16d: the 1/16 rides on wsc (3-op fold)
+    // FOLD==2: 16d converted directly, the 1/16 folded into wsc. PROBE ONLY:
+    // conditionally exact (gpt-6-astra 09-08): RN((wsc/16)*xs) loses bits while
+    // RN(wsc*xs) is still normal once the product is below 16*FLT_MIN ~ 1.9e-37,
+    // and overflow differs the other way. The shipped fold is FOLD==1.
+    else if constexpr (FOLD == 2) return (float)d16;
     else return (float)d16 * 0.0625f;  // I2F reference leg (also exact)
 }
 
@@ -787,6 +792,7 @@ void launch_lag2(const uint8_t* W, const __half* S, const int8_t* Xp, const floa
         CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
         attr = true;
     }
+    if (cols % BK) { fprintf(stderr, "cols %d %% BK %d\n", cols, BK); exit(1); }
     dim3 grid((T + BM - 1) / BM, (rows + BN - 1) / BN);
     kfn<<<grid, WARPS_M * WARPS_N * 32, SMEM, st>>>(W, S, Xp, xs, y, rows, cols, T);
     CK(cudaGetLastError());
@@ -1004,6 +1010,7 @@ void launch_ws(const uint8_t* W, const __half* S, const int8_t* Xp, const float*
         CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
         attr = true;
     }
+    if (cols % BK) { fprintf(stderr, "cols %d %% BK %d\n", cols, BK); exit(1); }
     dim3 grid((T + BM - 1) / BM, (rows + BN - 1) / BN);
     kfn<<<grid, (WARPS_M * WARPS_N + 1) * 32, SMEM, st>>>(W, S, Xp, xs, y, rows, cols, T);
     CK(cudaGetLastError());
@@ -1076,7 +1083,7 @@ int main(int argc, char** argv) {
            p.multiProcessorCount, p.sharedMemPerBlockOptin);
 
     const int Tmax = 4096;
-    int fails = 0;
+    int fails = 0, tested = 0;
     for (const Shape& sh : shapes) {
         if (!only.empty() && only != sh.name) continue;
         const int rows = sh.rows, cols = sh.cols;
@@ -1105,36 +1112,63 @@ int main(int argc, char** argv) {
         float *yref, *ynew;
         CK(cudaMalloc(&yref, (size_t)Tmax * rows * 4));
         CK(cudaMalloc(&ynew, (size_t)Tmax * rows * 4));
-        std::vector<float> href((size_t)Tmax * rows), hnew((size_t)Tmax * rows);
+        std::vector<float> href((size_t)Tmax * rows), hnew((size_t)Tmax * rows + 4096);
 
-        // correctness: T values covering full tiles, token tails, tiny T
-        const int Ts[] = {1024, 1000, 512, 257, 96, 37, 1, 4096};
+        // correctness: T values covering full tiles, token tails, tiny T, and
+        // the dispatch boundaries (16/32/64/96/128 pick the incumbent's tile).
+        // Both incumbent references on identical inputs: the ntx live dispatch
+        // and the MR=64 kernel forced with Q27_PF_NTX=0 (they are bitwise with
+        // each other by construction; the gate checks that too). The new
+        // kernel writes into an EXACT-sized buffer with a red zone after it.
+        const int Ts[] = {1024, 1000, 512, 257, 129, 128, 127, 97, 96, 95, 65, 64, 63, 37,
+                          33, 32, 31, 17, 16, 15, 8, 3, 2, 1, 4096};
+        constexpr size_t RED = 4096;  // floats of sentinel after the output
         for (int T : Ts) {
             if (!do_test) break;
-            CK(cudaMemset(yref, 0xff, (size_t)T * rows * 4));
-            q27k::gemm_q4_T(W, S, xq, yref, rows, cols, T, 0, nullptr);
-            CK(cudaDeviceSynchronize());
-            CK(cudaMemcpy(href.data(), yref, (size_t)T * rows * 4, cudaMemcpyDeviceToHost));
+            const size_t n = (size_t)T * rows;
+            for (int ref = 0; ref < 2; ref++) {
+                setenv("Q27_PF_NTX", ref == 0 ? "1" : "0", 1);
+                CK(cudaMemset(yref, 0xff, n * 4));
+                q27k::gemm_q4_T(W, S, xq, yref, rows, cols, T, 0, nullptr);
+                CK(cudaDeviceSynchronize());
+                CK(cudaMemcpy((ref == 0 ? href : hnew).data(), yref, n * 4, cudaMemcpyDeviceToHost));
+            }
+            unsetenv("Q27_PF_NTX");
+            if (memcmp(href.data(), hnew.data(), n * 4)) {
+                fails++;
+                printf("MISMATCH %-9s T=%-5d the two incumbent references (ntx vs MR64) differ\n", sh.name, T);
+            }
+            float* yx;  // exact size + red zone
+            CK(cudaMalloc(&yx, (n + RED) * 4));
             for (const Variant& v : variants) {
                 if (!onlyv.empty() && !strstr(v.name, onlyv.c_str())) continue;
                 if (!strncmp(v.name, "abl", 3)) continue;  // timing-only
-                CK(cudaMemset(ynew, 0xff, (size_t)T * rows * 4));
-                v.fn(W, S, xp, xq.s64, ynew, rows, cols, T, 0);
+                CK(cudaMemset(yx, 0xff, (n + RED) * 4));
+                v.fn(W, S, xp, xq.s64, yx, rows, cols, T, 0);
                 CK(cudaDeviceSynchronize());
-                CK(cudaMemcpy(hnew.data(), ynew, (size_t)T * rows * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(hnew.data(), yx, (n + RED) * 4, cudaMemcpyDeviceToHost));
+                tested++;
                 size_t nd = 0, first = (size_t)-1;
-                for (size_t i = 0; i < (size_t)T * rows; i++)
+                for (size_t i = 0; i < n; i++)
                     if (memcmp(&href[i], &hnew[i], 4)) { nd++; if (first == (size_t)-1) first = i; }
-                if (nd) {
+                size_t red = 0;
+                for (size_t i = n; i < n + RED; i++)
+                    if (((const uint32_t*)hnew.data())[i] != 0xffffffffu) red++;
+                if (nd || red) {
                     fails++;
-                    printf("MISMATCH %-9s T=%-5d %-28s %zu/%zu differ; first at tok %zu row %zu: ref %.9g new %.9g\n",
-                           sh.name, T, v.name, nd, (size_t)T * rows, first / rows, first % rows,
-                           href[first], hnew[first]);
+                    if (nd)
+                        printf("MISMATCH %-9s T=%-5d %-28s %zu/%zu differ; first at tok %zu row %zu: ref %.9g new %.9g\n",
+                               sh.name, T, v.name, nd, n, first / rows, first % rows, href[first], hnew[first]);
+                    if (red)
+                        printf("OVERRUN  %-9s T=%-5d %-28s %zu red-zone floats written past the output\n",
+                               sh.name, T, v.name, red);
                 }
             }
+            CK(cudaFree(yx));
         }
-        printf("%-9s (%d x %d): bitwise vs gemm_q4_T over T in {1024,1000,512,257,96,37,1,4096}: %s\n",
-               sh.name, rows, cols, fails ? "SEE ABOVE" : "ALL VARIANTS IDENTICAL");
+        if (do_test)
+            printf("%-9s (%d x %d): bitwise vs BOTH incumbent kernels over 25 T values incl. tails and dispatch boundaries: %s\n",
+                   sh.name, rows, cols, fails ? "SEE ABOVE" : "ALL VARIANTS IDENTICAL, red zones clean");
 
         if (do_time) {
             for (int T : {1024, 4096}) {
@@ -1159,6 +1193,8 @@ int main(int argc, char** argv) {
         CK(cudaFree(xq.nat64)); CK(cudaFree(xq.s64));
     }
     if (fails) { printf("%d MISMATCH(ES)\n", fails); return 1; }
-    printf("all bitwise\n");
+    if (!do_test) { printf("timing only: NOTHING was gated (--notest)\n"); return 0; }
+    if (tested == 0) { printf("no variant/shape selected: nothing was gated\n"); return 2; }
+    printf("all bitwise (%d variant-shape-T comparisons, both references)\n", tested);
     return 0;
 }

@@ -246,12 +246,39 @@ static void test_shared_prefix_across_sessions() {
     CHECK(pc.write(big, 1000, "g", 1, "k", 1));
     std::vector<int> p1 = big; p1[700] = 5;             // diverges after the head
     CHECK(pc.shared_prefix(p1, 900) == 700);
-    CHECK(pc.shared_prefix(p1, 1500) == 700);           // upto past the entry: capped at L
+    CHECK(pc.shared_prefix(p1, 1500) == 700);
     std::vector<int> p2 = big; p2[100] = 5;             // diverges inside the head
     CHECK(pc.shared_prefix(p2, 900) == 100);
     std::vector<int> p3 = big; p3[256] = 5;             // exactly at the head boundary
     CHECK(pc.shared_prefix(p3, 900) == 256);
     CHECK(pc.shared_prefix(big, 900) == 900);           // full agreement through upto
+    // the caps themselves, with FULL agreement so nothing else can stop early
+    CHECK(pc.shared_prefix(big, 1500) == 1000);         // capped at the entry length L
+    std::vector<int> short_p(big.begin(), big.begin() + 300);
+    CHECK(pc.shared_prefix(short_p, 1500) == 300);      // capped at the prompt length
+    std::vector<int> s5 = seq(100); s5.resize(50);      // agrees with s1/s3 through 49, then ends
+    CHECK(pc.shared_prefix(s5, 200) == 50);             // capped at the prompt, below the entries' L
+}
+
+// A key can be exported by only one writer at a time: reserve() claims it,
+// has() reports it as present meanwhile, write() releases it (gpt-6-astra
+// review 2026-09-08 P1: two slots choosing the same cut could both write).
+static void test_reserve_serialises_writers() {
+    const std::string root = tmproot("reserve");
+    q27::PrefixCache pc;
+    CHECK(pc.init(cfg_for(root), COMPAT_A));
+    const std::vector<int> toks = seq(100);
+    CHECK(!pc.has(toks, 64));
+    CHECK(pc.reserve(toks, 64));
+    CHECK(!pc.reserve(toks, 64));                       // second claimant is refused
+    CHECK(pc.has(toks, 64));                            // in flight reads as present
+    CHECK(pc.reserve(toks, 32));                        // a different L is a different key
+    CHECK(pc.write(toks, 64, "g", 1, "k", 1));          // publishes and releases
+    CHECK(pc.has(toks, 64));
+    CHECK(!pc.reserve(toks, 64));                       // indexed now: still refused
+    pc.release(q27::pfx_fnv1a64(toks.data(), 32 * sizeof(int)), 32);
+    CHECK(!pc.has(toks, 32));                           // released without a write: gone
+    CHECK(pc.reserve(toks, 32));
 }
 
 static void test_bad_root_disables() {
@@ -275,6 +302,7 @@ int main() {
     test_rescan_survives_restart();
     test_eviction_respects_budget();
     test_shared_prefix_across_sessions();
+    test_reserve_serialises_writers();
     test_bad_root_disables();
     if (failures) { fprintf(stderr, "%d FAILURE(S)\n", failures); return 1; }
     fprintf(stderr, "all prefix-cache tests passed\n");
