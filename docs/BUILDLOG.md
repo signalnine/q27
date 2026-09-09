@@ -15784,6 +15784,10 @@ Q8_0 -- not the cause either. Also mirrored the 09-08 req_log_body line
 into the harness's handle() copy (extract_check had been failing since
 (v)). README (headline note, State, benchmark table, Open items),
 FINDINGS.md addendum, 09-09 readout pointer updated; test-tools green.
+v0.11.1 tagged on the README pointer bump that follows this commit: the
+two prompt-fidelity fixes change what every Anthropic tools request
+prefills (+5% prompt tokens, one cold miss per cached system block on
+upgrade), so they ship as a release rather than sit on master.
 
 ## 2026-09-09 (w): release campaign for v0.11.0 -- decode within 6% of ninfer's DFlash2 arm, reuse equal, wall 3x apart on trajectory length
 
