@@ -1,7 +1,12 @@
 # Prefill attack plan (2026-09-08)
 
 Status: phase 0 DONE (2026-09-08 evening, see "Phase 0 result" below);
-phases 2-4 remain PLAN, ready to execute from a fresh context. Evidence and
+phase 2 spike DONE, bar not met (TMA W/X-only is the one remaining spike);
+phase 3 DONE (trims shipped, A deferred, B opt-in off, C parked); phase 4
+remains PLAN. The ranked agenda after all of it is BUILDLOG 2026-09-08 (p)
+/ docs/reviews/2026-09-08-gpt6astra-what-next.md: width>8 investigation
+first (bounded), turn-replay/quality/queue attribution alongside, then
+shared-cut promotion + cache failure paths, then one TMA spike. Evidence and
 numbers are in docs/perf-attribution-prefill-2026-09-08.md (the recon); this
 file is the executable part. Written so a session with no memory of the
 recon can run it: every phase has the launch command, the instrument, the
@@ -414,6 +419,16 @@ export (snap/ckpt/pfx copy LIVE state today). Every numerics-class lever
 needs the teacher-forced turn-replay gate through generate_prefill (the
 batched NLL loop bypasses it), the +2% NLL rejection ceiling, DFlash2
 tok/round and request wall, and its own cache root.
+
+After (p) (gpt-6-astra "what next"): A stays DEFERRED (192 eligible turns
+x 25 ms = 4.8 s = 0.6% of the run for 3-5 sessions + boundary-state export
+risk); B's run-wall fraction corrected to 0.3% (219 x 12 ms = 2.6 s); the
+prefill chunk graphs are deferred until the removable submission gaps are
+bounded (the trace was 88% GPU-busy; the 55 ms intercept is a fixed cost,
+not launch overhead). The next work on this plan is item 3 of (p): the
+shared-cut promotion with discovery + the cold-only save predicate + the
+8192 step gate handled, and the cache failure paths (the reservation leak
+is fixed in the (p) commit; eviction-by-mtime is to be measured first).
 
 ## Phase 4 -- attention and delta-scan (the 128 K levers, later)
 

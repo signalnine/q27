@@ -46,13 +46,14 @@ case "$mode" in
   *) echo "usage: $0 d2|d2-pfx|ladder [-E K=V ...]" >&2; exit 2 ;;
 esac
 # readiness: key on THIS invocation (a --since window can match the previous
-# unit's "serving ON" line)
+# unit's line) and on the listener ("listening on"); the DFlash2 "serving ON"
+# line prints during engine setup, before the socket is bound
 inv=$(systemctl --user show q27-38 -p InvocationID --value)
 for i in $(seq 1 240); do
-  if journalctl --user _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager 2>/dev/null | grep -q "serving ON"; then
+  if journalctl --user _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager 2>/dev/null | grep -q "listening on"; then
     echo "q27-38 ($mode) serving; invocation $inv"; exit 0
   fi
   systemctl --user is-active --quiet q27-38 || { echo "q27-38 died during startup" >&2; journalctl --user _SYSTEMD_INVOCATION_ID="$inv" -o cat --no-pager | tail -5; exit 1; }
   sleep 2
 done
-echo "q27-38 never reported serving ON" >&2; exit 1
+echo "q27-38 never reported 'listening on'" >&2; exit 1

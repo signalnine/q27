@@ -15710,6 +15710,165 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (p): gpt-6-astra on what comes next -- a bounded width>8 investigation first, cache robustness and one TMA spike after; one static P2 fixed on the spot
+
+Asked (docs/reviews/2026-09-08-gpt6astra-what-next.md, xhigh, read-only,
+static): rank the remaining agenda after (a)-(o) -- width>8 + K sweep, TMA
+W/X-only spike, lever A, prefill chunk graphs, shared-cut promotion, drafter
+context restore, lanes 6-7 numerics -- add what is missing, localise the
+width>8 divergence from the code, and name tomorrow's first experiment.
+
+Verdict, its words: "Spend tomorrow on a bounded width investigation, then
+prioritize cache robustness and one TMA spike ... Keep lever B off, defer A
+and chunk graphs, and stop tuning already-measured dead ends. The
+216-versus-219 t/s result establishes practical parity; it does not
+establish equivalent task quality or completion cost."
+
+Ranking (value on current traffic / sessions / decision):
+1. width wall + K=8..11 sweep -- +3-6% gross tok/round at K=10, net unknown;
+   1/2-1 diagnosis + 1-2 sweep; DO, bounded (one session to localise, else
+   keep K=7 and park).
+2. ADDED: reproducible turn replay + quality + queue attribution -- makes
+   small gains distinguishable from ring/history drift; 1-2; DO alongside.
+3. shared-cut promotion + persistence failure paths -- 1-2; DO next.
+4. TMA W/X-only spike -- 1-3% of wall if the 1.6x gate passes, more for
+   cold TTFT; 1 spike (+2-3 port); ONE spike, bar unchanged.
+5. restore drafter context (tiny-suffix warm turns) -- ~1/6 of the affected
+   requests' decode time before reseeding cost; MEASURE the incidence now,
+   implement selectively.
+6. lever A -- 192 eligible turns x 25 ms = 4.8 s = 0.6% of the 800 s run
+   for 3-5 sessions and boundary-state export risk; DEFER.
+7. prefill chunk graphs -- probably milliseconds per chunk, not the 55 ms
+   intercept (the trace was 88% GPU-busy); bound the gaps first; DEFER.
+8. lanes 6-7 drafter numerics -- sub-1% without new evidence; DEFER until
+   the wider-K experiment names a specific acceptance deficit.
+9. ADDED: DFlash2 batching -- unpriced, 4-8+ sessions, fused commits bypass
+   the ring mirrors; DEFER until queue attribution shows sustained
+   concurrency (prodpfx2 already has requests with 1-2 s queue waits).
+STOP: lever C (parked), B default-off, GEMV rewrites under the bitwise
+contract, exact-fold micro-tuning, fp4 revival, ladder/suffix retuning for
+this workload, reading 216 vs 219 as a remaining gap.
+
+The width>8 localisation (P1) is the part worth reading twice. The (l)-era
+attribution ("eager verify/GDN/fold has a latent bug at width>8") is not
+established by the experiment that produced it: gemm_min defaults to 9 and
+mm5 switches eligible projections from the GEMV family to the MMA family at
+exactly that width, and the two are documented as different numerical
+families. A divergence that appears at w=9 and sits at the same token for
+every K>=8 is what a dispatch switch looks like, not what a state bug looks
+like. The recipe it wants run before anyone touches the engine core:
+- CLI greedy identity-vs-plain (`--spec`) gate, prose reproducer first, then
+  code-write / code-edit / echo, >=512 generated tokens (the late failures),
+  W={2,7,8,9,10,11,12} i.e. K={1,6,7,8,9,10,11}, same model/head/prompt/fp8.
+- `Q27_KV=fp8 Q27_GEMM_MIN=99 Q27_SUFFIX=0 Q27_SAMPLED=0`, Q27_DFLASH2
+  unset, and `--spec` ALONGSIDE `--dflash2 <full CLI pack> --k K`:
+  Q27_GEMM_MIN is parsed inside build_spec_graphs, which the CLI only calls
+  with --spec, so a bare --dflash2 run keeps the default threshold and the
+  control is not a control. Full pack (with embedding), not the serving one.
+- each width with Q27_D2_NOGRAPH unset, then =1 (presence-based: =0 also
+  disables; it does not touch serving's verify graphs).
+- if matched-GEMV identity still fails: one temporary gate with fixed
+  proposal tokens and identical incoming state, committed n=1..W, compare
+  per-layer activations, lane-0 state, every recorded row, post-fold S/conv
+  history vs sequential; poison unused buffers; assert member vw == view.vw.
+  First mismatch before the fold = forward/plumbing, after = record/commit.
+  gdn_fuse_eq and ninv_test are the foundations but their width sets skip
+  the transition widths.
+- if GEMV passes: no core fix to manufacture; validate the production MMA
+  family at W=8..12 (Q27_DFLASH2_K=7..11, Q27_D2_VGEMM=1, Q27_BATCH=0, Q8
+  pack, reserve 3 GB, sampled walk, Q27_PF_FOLDLAST=0; Q27_D2_FOLD=sync
+  first, then overlap). A serving all-GEMV control needs BOTH
+  Q27_D2_VGEMM=0 and Q27_GEMM_MIN=99.
+- then interleaved K=7 vs K=10 on matched conversation histories at 12.5K
+  and 50K plus warm /v1/messages turns; judge on delivered tokens per round
+  wall; continuation bar >=2% request wall after the correctness gates.
+Do NOT widen W_PLUMB (16 already; engine and drafter capacities 12 cover
+K<=11; top-16 is candidates per position, not verified positions).
+
+K=10's honest budget (P1): dE[N] = S_8 + S_9 + S_10. From (f)'s S_7=0.076
+with conditionals 0.65-0.70: +0.10-0.12 tok/round (+3-3.5%); from the (d)
+production profile S_7=0.137 with conditionals ~0.75: S_8..10 ~ 0.103 /
+0.077 / 0.058 = +0.24 tok/round, 3.74 -> 3.98 (+6.4%). Not three extra
+tokens. And the drafter attention does 32 queries per group, so W>=9 is two
+groups where W=8 is one; the backbone/head stay GEMV; a 3-6% acceptance gain
+tolerates only 0.5-1.1 ms extra on a 17.35 ms round.
+
+Instrument discipline (P1): identical seeds and requests are not enough --
+(o) already logged identical streams with round counts that differ by up
+to 23 after earlier requests changed the ring. Reproduce the preceding
+conversation sequence and cache state in each arm; report first-round
+behaviour separately. Extend the sampled walk/rejection test (K=3 today,
+same for top-16) through K=11: late rejection, full acceptance, bonus/cap
+draws, empty residual, truncation, context-limit admission; different-K
+streams need not be byte-identical, require repeatability within an arm and
+the right target distribution. Keep first-token replay and task success in
+the quality battery; do not optimise toward ninfer's token count.
+
+Cache (P2): promotion must handle discovery, the cold-only save predicate
+and the shared 8192 step gate (calling shared_prefix on restored requests
+publishes nothing by itself); require a strictly longer verified shared
+prefix, save at a reached chunk boundary, bound promotion frequency; test
+an old short entry followed by several new-client sessions with a longer
+common prefix. Eviction is by write mtime, not access, so a hot old shared
+entry can age out -- measure before adding policy.
+
+TMA (P2): exactly the proposed intervention -- W/X bulk copies via an
+elected consumer thread, scale loading and arithmetic unchanged -- with
+the >=1.6x live-dispatch gate on both ffn_gate and attn_out at T=1024
+kept; price the quantizer/permutation into integration; the spike's inputs
+are synthetic, so real-weight/activation gates before any port. 1.6x on a
+60% GEMM share of a 14% prefill share is 3.15% of wall at most; the case
+for it is cold TTFT and boundedness. If it fails, stop the port and every
+further fold/occupancy/pipeline permutation.
+
+Reseeding (P2): group requests by valid ring rows after alignment and
+suffix length across P8/P9/RAM/disk, not by pfx>0 (every phase-0 restore
+re-prefilled >=2.3K tokens, so the tiny-suffix case is unmeasured). You
+cannot replay the preceding 2048 tokens from the restored state at L (the
+prefill mutates recurrent state forward); it needs an earlier compatible
+checkpoint, saved taps (200 MiB per 2048-row window) or saved drafter K/V
+(80 MiB + positions, compatibility includes drafter weights/numerics). With
++20% rounds in the affected class, a reseed costing C pays only when the
+affected decode time exceeds ~6C.
+
+Serving (P2): the 0.2 ms round host component is measured by a timer that
+stops before the callbacks and the rest of post_round -- profile the whole
+round before another host rewrite; the sampled nucleus kernel's 0.62 ms is
+the more concrete bounded target if a fresh profile still shows it. Audit
+the pool-clamped context and free VRAM after all graphs/drafter
+allocations, 128K admission, warm continuation, eviction and tool-call
+quality: cache persistence stops at 65536 and the 69.7K conversation in the
+campaign already showed the re-prefill cliff.
+
+Dispositions:
+- FIXED NOW (this commit): `pfx_persist` reserved the key and returned on a
+  staging-allocation failure without releasing it, so has() reported the
+  boundary as present for the rest of the process and it was never retried.
+  `PrefixCache::release(toks, L)` added, called on that path; unit test
+  covers reserve -> release-by-tokens -> reserve again and the no-op release
+  of an unclaimed key (all prefix-cache tests pass).
+- FIXED NOW: tools/launch_q27_38.sh keyed readiness on the DFlash2 "serving
+  ON" line, which prints during engine setup before the socket is bound
+  ((k) documented the trap for nsys; the helper had it too). Now keys on
+  "listening on".
+- FIXED NOW: the (o) B-estimate denominator -- 219 turns x 12 ms = 2.6 s =
+  0.3% of the 800 s run, not 1.3%. The verdict (opt-in, off) stands on the
+  numerics, not the fraction.
+- ACCEPTED, NOT CHANGED: `pfx_last_persist` advances before the write
+  succeeds. It is the step-spacing gate, reset to 0 on every new chain
+  (base == 0) and overwritten on restore; a failed write (the claim is
+  released by write()) is retried at the next step boundary and on the
+  next cold chain. Moving it behind the writer thread trades a bounded gap
+  for a cross-thread write racing the restore-path assignments.
+- ALREADY SO: output_config.effort is honoured (api_common.h:408); nothing
+  to implement, verify the rendering when the campaign harness next runs.
+- DEFERRED to their own sessions: promotion (item 3), the mtime-vs-access
+  measurement, the TMA spike (item 4), the reseeding attribution (item 5).
+
+Next session starts with item 1, the recipe above, ONE session bounded;
+items 2 and 3 follow whatever it finds. Commit chain: this entry + the
+review file + the two fixes.
+
 ## 2026-09-08 (o): lever B built and gated -- -12 ms per warm turn, but the first token's numerics move 10-100x more than the g64 prefix class; OFF pending the corpus verdict
 
 Implementation (engine.cuh generate_prefill, Q27_PF_FOLDLAST=0 restores the
@@ -15758,8 +15917,9 @@ NLL gate (bench/flipgate/agentic38.i32, 20400 predictions, 256-token
 chunks, fp8 KV): serial mean NLL 0.842219 (PPL 2.3215) vs batched 0.853788
 (PPL 2.3485) = +1.37% NLL, +1.16% PPL. Inside the pre-registered +2%
 ceiling, so the rule PASSES B -- but it is a real cost paid on the first
-token of every turn, for 12 ms of a 60-130 ms warm turn (~1.3% of a
-12-instance run's wall, ~10-16% of a warm turn's TTFT). Verdict: SHIPPED
+token of every turn, for 12 ms of a 60-130 ms warm turn (219 turns x 12
+ms = 2.6 s of an 800 s run, 0.3% -- the 1.3% first written here was
+wrong, caught by the (p) advisory; ~10-16% of a warm turn's TTFT). Verdict: SHIPPED
 OPT-IN (Q27_PF_FOLDLAST=1), default OFF; the launch script does not set
 it. Turn it on when the per-turn latency matters more than a +1.4%
 first-token NLL; the acceptance question (n=8 too noisy) would then need

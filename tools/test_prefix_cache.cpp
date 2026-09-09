@@ -279,6 +279,11 @@ static void test_reserve_serialises_writers() {
     pc.release(q27::pfx_fnv1a64(toks.data(), 32 * sizeof(int)), 32);
     CHECK(!pc.has(toks, 32));                           // released without a write: gone
     CHECK(pc.reserve(toks, 32));
+    pc.release(toks, 32);                               // the token-vector form (staging failure path)
+    CHECK(!pc.has(toks, 32));
+    CHECK(pc.reserve(toks, 32));                        // ...and the boundary can be retried
+    pc.release(toks, 96);                               // unclaimed key: a no-op, not a fault
+    CHECK(pc.has(toks, 32));
 }
 
 static void test_bad_root_disables() {

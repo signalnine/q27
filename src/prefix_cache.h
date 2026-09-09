@@ -399,6 +399,15 @@ class PrefixCache {
                     cfg_.max_bytes / 1e9);
     }
 
+    // Drop a reserve() claim without writing (the caller could not stage the
+    // export). Without this the claim outlives the process and has() keeps
+    // reporting the key as present, so the boundary is never retried
+    // (gpt-6-astra advisory 2026-09-08 (p), P2).
+    void release(const std::vector<int>& toks, int L) {
+        if (L <= 0 || (size_t)L > toks.size()) return;
+        release(pfx_fnv1a64(toks.data(), (size_t)L * sizeof(int)), L);
+    }
+
     void release(uint64_t key, int L) {
         std::lock_guard<std::mutex> lk(m_);
         inflight_.erase(std::remove_if(inflight_.begin(), inflight_.end(),

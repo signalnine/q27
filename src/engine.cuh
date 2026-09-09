@@ -4332,7 +4332,10 @@ struct Engine {
         q27::PrefixRam::BlobPtr slot;
         if (pram && pram->enabled()) slot = pram->acquire(pfx_bytes(L));
         char* dst = slot ? slot->p : (pfx_wstage_ensure(L) ? pfx_wstage : nullptr);
-        if (!dst) return;
+        if (!dst) {  // nothing to stage into: give the claim back so a later pass can retry
+            pcache->release(prompt, L);
+            return;
+        }
         auto t0 = std::chrono::steady_clock::now();
         pfx_export(L, dst);
         const double ms = std::chrono::duration<double, std::milli>(
