@@ -355,6 +355,35 @@ CLI binary keeps reference defaults so the bitwise canonicals are untouched.
 see [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). The pinned host-RAM
 tier above it (`--prefix-cache-ram-gb`) is off by default on measured grounds.
 
+**DFlash2 drafter (the production decode path since 2026-09-08).** The
+drafter is z-lab's
+[Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+(3.8 GB bf16, its own licence on the card); q27 does not ship it. Pack it
+once for the engine's weight format:
+
+```
+pip install torch safetensors numpy
+python3 tools/dflash2_pack.py /path/to/Qwen3.8-27B-DFlash2 qwen38-dflash2-q8-serve.d2w --q8
+```
+
+The serving pack carries only the drafter (about 2.1 GB): the engine
+supplies the embedding and the head from its own Q8 tensors. `--q8` is the
+production choice (bitwise with the fp16 pack on the acceptance gate);
+without it the matmuls go Q4 (1.2 GB, -1.5 to -3.6% tok/round measured).
+`--with-target <hf_dir>` adds the fp16 embed and head for the CLI's
+`q27 --dflash2` path and the numerics A/Bs; serving never needs it. Then:
+
+```
+Q27_DFLASH2=qwen38-dflash2-q8-serve.d2w Q27_BATCH=0 Q27_DFLASH2_RESERVE_GB=3 \
+  ./build/q27-server model.q27 model.tok --port 8080 --think --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --think-budget 0
+```
+
+`Q27_BATCH=0` because DFlash2 serving is single-slot today, and the reserve
+keeps the KV pool from taking the VRAM the drafter needs. K=7 is the
+measured default (`Q27_DFLASH2_K`; wider loses on the round wall).
+[tools/launch_q27_38.sh](tools/launch_q27_38.sh) is the exact production
+recipe, prefix-cache tiers included.
+
 **Auth**: off by default -- loopback-only binding is the safety net.
 `--api-key KEY`, `--api-key-file PATH`, or `Q27_API_KEY` (preferred in
 containers) all add keys; both `Authorization: Bearer` and `x-api-key` work.
