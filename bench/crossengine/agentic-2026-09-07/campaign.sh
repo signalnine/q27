@@ -53,6 +53,16 @@ start_engine() { # $1 label
     q27prod)  rm -rf /dev/shm/q27-pfx-campaign; mkdir -p /dev/shm/q27-pfx-campaign
               systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 $Q27 $MODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-campaign --prefix-cache-max-gb 40 --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
+    # 2026-09-09 model-echo A/B (turn-count investigation): the q27prod config
+    # with /v1/messages echoing the client's model name (server.cu resp_model)
+    # so Claude Code keeps prior thinking blocks in the history it sends back.
+    # q27noecho = the same binary with Q27_ECHO_MODEL=0 (the 09-09 q27prod
+    # leg's wire behaviour) as the same-day control. Own pfx root each.
+    q27echo|q27noecho)
+              rm -rf /dev/shm/q27-pfx-$1; mkdir -p /dev/shm/q27-pfx-$1
+              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+                -E Q27_ECHO_MODEL=$([ "$1" = q27echo ] && echo 1 || echo 0) $Q27 $MODEL $TOK $Q27ARGS \
+                --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb 40 --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     *) log "unknown leg $1"; return 1 ;;

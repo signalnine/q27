@@ -1,0 +1,24 @@
+{"seed": 1, "think": 201, "text": 0, "tools": ["Bash"], "out": 101, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 9.24}
+{"seed": 2, "think": 243, "text": 0, "tools": ["Bash", "Bash"], "out": 190, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 3.0}
+{"seed": 3, "think": 80, "text": 0, "tools": ["Bash"], "out": 84, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.38}
+{"seed": 4, "think": 258, "text": 0, "tools": ["Bash"], "out": 123, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.96}
+{"seed": 5, "think": 199, "text": 0, "tools": ["Bash"], "out": 107, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.73}
+{"seed": 6, "think": 145, "text": 0, "tools": ["Bash"], "out": 85, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.42}
+{"seed": 7, "think": 282, "text": 0, "tools": ["Bash"], "out": 125, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.01}
+{"seed": 8, "think": 248, "text": 0, "tools": ["Bash"], "out": 115, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.83}
+{"seed": 9, "think": 500, "text": 0, "tools": ["Bash"], "out": 190, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.97}
+{"seed": 10, "think": 210, "text": 0, "tools": ["Bash"], "out": 108, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.73}
+{"seed": 11, "think": 299, "text": 0, "tools": ["Bash"], "out": 142, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.25}
+{"seed": 12, "think": 220, "text": 0, "tools": ["Bash"], "out": 111, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.77}
+{"seed": 13, "think": 304, "text": 0, "tools": ["Bash", "Bash"], "out": 171, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.68}
+{"seed": 14, "think": 262, "text": 0, "tools": ["Bash", "Bash"], "out": 171, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.68}
+{"seed": 15, "think": 230, "text": 0, "tools": ["Bash"], "out": 107, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.73}
+{"seed": 16, "think": 701, "text": 0, "tools": ["Read"], "out": 202, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 3.17}
+{"seed": 17, "think": 350, "text": 0, "tools": ["Bash", "Bash"], "out": 186, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.92}
+{"seed": 18, "think": 248, "text": 0, "tools": ["Bash"], "out": 126, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.02}
+{"seed": 19, "think": 467, "text": 0, "tools": ["Bash", "Bash"], "out": 214, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 3.34}
+{"seed": 20, "think": 173, "text": 0, "tools": ["Bash", "Read"], "out": 111, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.78}
+{"seed": 21, "think": 186, "text": 0, "tools": ["Bash"], "out": 100, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.61}
+{"seed": 22, "think": 266, "text": 0, "tools": ["Bash", "Bash"], "out": 171, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 2.69}
+{"seed": 23, "think": 224, "text": 0, "tools": ["Bash"], "out": 119, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.9}
+{"seed": 24, "think": 222, "text": 0, "tools": ["Bash"], "out": 107, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q5_K_M.gguf", "secs": 1.72}

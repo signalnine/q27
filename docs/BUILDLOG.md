@@ -15714,6 +15714,77 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-09 (x): the trajectory gap attributed -- ninfer reasons 1.5x shorter than the model at 8 bits; two q27 defects fixed on the way (model-name echo, the compact tools block) without moving it
+
+bench/crossengine/agentic-2026-09-09-echo/. The question (w) left: why
+q27's Claude Code sessions ran 1.7x the turns and 3x the output tokens of
+ninfer's at equal decode rate and reuse.
+
+Transcript anatomy first (turns_cmp.py over the retained out.jsonl): turn
+structure identical on both engines (0.9 tool calls per turn, 4-7%
+text-only turns, same Bash-error shapes, every q27 request end=eos,
+sampler chains and the medium effort pin identical); the excess is 1.7x
+API turns AND 2x thinking chars per turn (2222 vs 1106 mean, 27% vs 14%
+of turns over 2K chars). Then the prompt-growth test: next prompt minus
+previous completion is never negative on ninfer (156 pairs, min +19) and
+negative on 45% of q27's (266 pairs; requests-1921 turn 17: completion
+5995, growth 615) -- q27's model never saw its own prior thinking.
+Recorded bodies confirmed it client-side (zero thinking blocks in
+assistant history). Neither engine implements context_management; both
+use placeholder signatures; the one difference Claude Code sees is the
+response `model`: q27 returned its served name, ninfer echoes the
+requested `claude-opus-4-8`, and Claude Code 2.1.265 drops prior thinking
+blocks when an assistant message's model tag differs from the requested
+model (inferred from behaviour, flipped by the fix). server.cu: `/v1/
+messages` now echoes the client's model (`resp_model`, `Q27_ECHO_MODEL=0`
+opts out); a live session against the patched binary carried 1, 2, 3
+thinking blocks back where the old one carried none.
+
+12-instance A/B, `q27echo` vs same-binary `q27noecho` control (campaign.sh
+legs): 20.2 vs 21.1 turns, 15.3K vs 14.5K tokens, thinking/turn 2078 vs
+1903 chars, gold 12/12 vs 10/12; the 09-09 q27prod row was 23.8 / 18.2K.
+The control reproduced the 09-09 run bit-for-bit on 6/12 instances (seed
+0 when the client sends none => a session is a deterministic function of
+its prompts) and the other six diverged on external nondeterminism, so
+the harness's aggregate noise is +-3 turns / +-4K tokens per instance.
+The fix is real and inside that noise; not the answer.
+
+Fixed-prompt probe (probe_think.py / probe_think_oai.py: one identical
+turn-0 body, 28 tools, medium effort, 24 seeds, same sampler chain on
+every arm; medians with bootstrap CI, Mann-Whitney): q27 production 317
+[279, 354], ladder 262, fp16 KV 337, q6 tier 340, llama.cpp Q8_0 (made
+from the BF16 GGUF today) 314 [266, 352], llama.cpp Q5_K_M 246, ninfer
+DFlash2 NVFP4 209 [175, 244]. Every q27 arm vs Q8_0: p 0.4-0.7; ninfer vs
+Q8_0: p=0.0003; ninfer vs q27 production: p<0.0001. q27 IS the reference;
+ninfer reasons 1.5x shorter than the model does at 8 bits, and that
+compounds into its shorter sessions. Drafter, KV dtype and tier excluded
+on q27. Which of NVFP4 weights, int8 KV or ninfer's sampler does it is
+ninfer's question (its top-p runs over the top-k cap set's mass, flatter
+if anything). Right cross-engine number: per-token cost at equal
+reasoning (within 6%), not wall per instance.
+
+Found on the way, by render bisect (render_bisect.py, max_tokens=1 with
+sections removed; HF template 24586 tokens for the probe body, ninfer
+24701, q27 server 23347): the serving path's `<tools>` block was 1236
+tokens short of the template. `prepare_anthropic_prompt` handed
+`anthropic_tools_decl` the moved-from `selected.names` as its keep-filter
+(two lines after `tool_names=std::move(selected.names)`), so since
+2026-08-22 (054aee3) the declaration came back empty and `tools_preamble`
+fell back to the compact key-sorted dump on every served Anthropic request
+-- `{"function":{"description",...,"name"},"type"}`, no spaces, 5% fewer
+tokens, keys in the wrong order. render_request builds the declaration
+before any move, so the golden test, the offline corpora and the flip
+gates all saw the trained-format prompt while production did not; the
+integration harness's byte-exact copy of the lambda passed raw_body as
+nullptr and never exercised the path. Fixed (`&tool_names`), integration
+test 16b added (declaration present with a raw body, sorted fallback
+without), count_tokens now 24593 (template 24586). Re-probed on the
+corrected prompt: median 276 [231, 350], p=0.32 vs before, p=0.66 vs
+Q8_0 -- not the cause either. Also mirrored the 09-08 req_log_body line
+into the harness's handle() copy (extract_check had been failing since
+(v)). README (headline note, State, benchmark table, Open items),
+FINDINGS.md addendum, 09-09 readout pointer updated; test-tools green.
+
 ## 2026-09-09 (w): release campaign for v0.11.0 -- decode within 6% of ninfer's DFlash2 arm, reuse equal, wall 3x apart on trajectory length
 
 bench/crossengine/agentic-2026-09-09/ (campaign.sh, new `q27prod` leg =

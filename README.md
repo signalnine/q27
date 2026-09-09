@@ -30,8 +30,16 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   Dated 2026-09-09: with both engines on DFlash2 drafters and ~97% reuse the
   wall ordering has flipped -- ninfer 36 s/inst, q27 108 s -- at decode
   rates within 6%; q27's sessions run 25 turns and 18K output tokens per
-  instance against ninfer's 15 and 6K, and why is the open question:
-  [bench/crossengine/agentic-2026-09-09/](bench/crossengine/agentic-2026-09-09/README.md).)*
+  instance against ninfer's 15 and 6K
+  ([bench/crossengine/agentic-2026-09-09/](bench/crossengine/agentic-2026-09-09/README.md)).
+  Attributed the same day: on one identical prompt with 24 seeds, q27's
+  per-turn reasoning matches llama.cpp serving a Q8_0 of the model, and
+  ninfer's NVFP4 arm is the one that reasons 1.5x shorter -- the shorter
+  sessions are ninfer's quant or sampler, not a q27 deficit. Two q27
+  defects were found and fixed on the way (the served model name made
+  Claude Code drop prior thinking blocks; the `<tools>` block had been
+  rendered compact and key-sorted since 08-22) without moving the gap:
+  [bench/crossengine/agentic-2026-09-09-echo/](bench/crossengine/agentic-2026-09-09-echo/README.md).)*
 - **Self-speculation as the whole design**: trained-in MTP ladder + free
   suffix drafter through one shared-KV MMA verify -- 5.3-5.8 accepted tokens
   per weight read on live traffic (231-246 t/s aggregate on a 5090).
@@ -167,8 +175,13 @@ under [bench/crossengine/](bench/crossengine/):
   level both engines render): **q27 207 t/s** aggregate decode (219 median,
   3.89 tok/round, 96.9% prefix reuse) vs ninfer's DFlash2 arm 221 (240,
   4.19, 96.8%). Wall per instance 108 s vs 36 s: q27's sessions run 25 turns
-  and 18K output tokens per instance against 15 and 6K -- the open question
-  of this release (09-09).
+  and 18K output tokens per instance against 15 and 6K. Attributed on
+  09-09: per-turn reasoning on an identical prompt puts every q27 arm on
+  the llama.cpp Q8_0 reference (median 276-340 chars vs 314) and ninfer
+  1.5x under it (209), so the trajectory length is ninfer's NVFP4 arm
+  reasoning less than the model, not q27 reasoning more; the model-name
+  echo and the tools-declaration fix that came out of the investigation are
+  on master.
 - Production at Claude Code's default effort (xhigh): DFlash2 is +22%
   aggregate decode over the MTP ladder on the same instances; the
   prefix-cache tiers with the shared system-block cut took the prefill wall
@@ -460,8 +473,22 @@ fresh cache root; [readout](bench/crossengine/agentic-2026-09-09/README.md)):
 
 Decode within 6%, reuse equal, wall 3x apart because q27's sessions take
 1.7x the turns and 3x the output tokens -- consistent across the 09-07,
-09-08 and 09-09 runs, cause not yet attributed (quant tier, the effort
-rendering, or the parser). n=1 per instance.
+09-08 and 09-09 runs. n=1 per instance, and a same-day control showed
+that n=1 swings the aggregate by +-3 turns. Attributed
+([readout](bench/crossengine/agentic-2026-09-09-echo/README.md)): on one
+identical turn-0 prompt, 24 seeds per arm, q27's per-turn thinking
+(production, ladder, fp16 KV, q6 tier: median 276-340 chars) is
+indistinguishable from llama.cpp serving a Q8_0 of the same model (314,
+p 0.3-0.7), while ninfer's NVFP4 arm reasons a median 209 (p=0.0003
+against the reference). The shorter sessions are ninfer's quant or
+sampler making the model terser than it is at 8 bits; per-token cost at
+equal reasoning is the comparable number, and there the engines are
+within 6%. Drafter, KV dtype, tier and the sampler chain are excluded on
+q27. Two q27 defects surfaced and were fixed without moving the gap: the
+served model name in responses made Claude Code drop prior thinking blocks
+(now echoes the requested model), and the serving path's `<tools>` block
+had been the compact key-sorted dump since 08-22 (now the template's
+client-ordered spaced form, +5% prompt tokens on a 28-tool request).
 
 **Real agentic traffic** (2026-08-17, ninfer before its prefix-reuse fix):
 
@@ -525,6 +552,11 @@ real coding while MTP nearly doubled stock llama.cpp.
   re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
   costs pinned staging memory per slot. Not yet measured against 128K
   admission.
+- **Wall per instance is not the cross-engine number.** The 09-09 turn
+  and token gap is ninfer reasoning less than the model at 8 bits (see the
+  09-09-echo readout); which of its NVFP4 weights, int8 KV or sampler does
+  it is unmeasured here. Compare per-token cost at equal reasoning, and
+  run a same-day control before reading a 12-instance turn count.
 - **The request replay has no corpus yet.** `Q27_REQ_LOG` and
   `bench/replay/` are gated (two fresh boots agree on every output); a
   recorded multi-session Claude Code log is the missing input for a

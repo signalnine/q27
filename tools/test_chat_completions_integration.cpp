@@ -383,6 +383,10 @@ struct Response {
 static std::string jdump(const json& j) {
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
+// server.cu's Q27_REQ_LOG recorder (2026-09-08); the handle() copy below
+// must stay byte-identical to the server's, so the call site is mirrored
+// and the recorder is a no-op here.
+static void req_log_body(const char*, const char*, const std::string&) {}
 
 // ---- global test scaffolding (populated fresh per test in main()) ------
 json g_last_response;
@@ -398,7 +402,7 @@ struct PreparedAnthropicPrompt {
 };
 
 static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
-        const json& body, bool no_think_srv) {
+        const json& body, bool no_think_srv, const std::string* raw_body_for_test = nullptr) {
     const bool req_think=true;
     auto prepare_anthropic_prompt = [&](const json& body,
                                          q27::ToolChoice& tchoice,
@@ -427,7 +431,14 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
         q27::TemplateOpts topts=q27::template_opts_from_body(body);
         // client key order survives only in the raw text (the parsed json is
         // sorted); restrict to the selected subset so decl matches `tools`.
-        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
+        // `tool_names`, not `selected.names`: the latter was moved-from two
+        // lines up, so from 2026-08-22 to 2026-09-09 the keep-filter saw an
+        // empty list, dropped every tool, and the preamble fell back to the
+        // compact key-sorted dump -- 5% fewer tokens than the trained
+        // template on a 28-tool Claude Code request, keys in the wrong order.
+        // render_request never moved, so the offline corpus was the right
+        // prompt and the server was not.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&tool_names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
             q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
@@ -437,7 +448,7 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
     PreparedAnthropicPrompt result;
     result.rendered=prepare_anthropic_prompt(
         body,result.tchoice,result.tools,result.tool_names,result.thinking,
-        result.tcfg,nullptr,nullptr,nullptr);
+        result.tcfg,nullptr,nullptr,raw_body_for_test);
     return result;
 }
 
@@ -591,6 +602,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
     };
 
 auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat) {
+        req_log_body("oai", chat ? "/v1/chat/completions" : "/v1/completions", req.body);
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content("{\"error\":\"bad json\"}", "application/json"); return; }
@@ -2769,6 +2781,33 @@ int main() {
             CHECK(!saw_error);
             CHECK(saw_length);
         }
+    }
+
+    // ---- Test 16b (2026-09-09): the raw-body tools declaration reaches the
+    // rendered prompt on the serving path. From 2026-08-22 the keep-filter
+    // was handed the moved-from selection names, matched nothing, and the
+    // <tools> block silently fell back to the compact key-sorted dump (5%
+    // fewer tokens than the trained template on a 28-tool Claude Code
+    // request, keys reordered). Template spacing and client key order
+    // (b before a) must survive; the compact form must be absent. ----
+    {
+        const std::string raw =
+            "{\"model\":\"m\",\"max_tokens\":8,"
+            "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+            "\"tools\":[{\"name\":\"zeta\",\"description\":\"Z\","
+            "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+            "\"b\":{\"type\":\"string\"},\"a\":{\"type\":\"integer\"}}}}]}";
+        auto p=prepare_anthropic_prompt_for_test(json::parse(raw),false,&raw);
+        CHECK(p.tool_names==std::vector<std::string>{"zeta"});
+        CHECK(p.rendered.find(
+            "{\"type\": \"function\", \"function\": {\"name\": \"zeta\", "
+            "\"description\": \"Z\", \"parameters\": {\"type\": \"object\", "
+            "\"properties\": {\"b\": {\"type\": \"string\"}, "
+            "\"a\": {\"type\": \"integer\"}}}}}")!=std::string::npos);
+        CHECK(p.rendered.find("{\"function\":{")==std::string::npos);
+        // without the raw body the sorted dump is the documented fallback
+        auto q=prepare_anthropic_prompt_for_test(json::parse(raw),false);
+        CHECK(q.rendered.find("{\"function\":{")!=std::string::npos);
     }
 
     // ---- Test 17: count_tokens and live Anthropic requests share the exact

@@ -45,6 +45,14 @@ tool-call turns 4.30. No parser recovery fired on this run (0 pass-through
    template), and different tool-call parsers. Which of those makes
    Claude Code loop longer on q27 is the open question this campaign
    leaves, and the first thing to run the request replay at.
+   *Answered the same day in
+   [agentic-2026-09-09-echo/](../agentic-2026-09-09-echo/README.md):
+   none of the three. q27's per-turn reasoning equals a Q8_0 reference
+   served by llama.cpp; ninfer's NVFP4 arm reasons 1.5x shorter than that
+   reference, and the harness's n=1 turn counts swing by +-3 on a same-day
+   control. Two q27 defects were fixed on the way (model-name echo so
+   Claude Code keeps thinking history; the compact `<tools>` rendering)
+   without moving the gap.*
 4. Task outcomes: 12/12 non-empty diffs on both; gold-file hits 9/12 vs
    11/12, single sampled trajectories, not a signal on their own but read
    next to (3).

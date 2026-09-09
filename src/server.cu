@@ -2711,7 +2711,14 @@ int main(int argc, char** argv) {
         q27::TemplateOpts topts=q27::template_opts_from_body(body);
         // client key order survives only in the raw text (the parsed json is
         // sorted); restrict to the selected subset so decl matches `tools`.
-        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&selected.names);
+        // `tool_names`, not `selected.names`: the latter was moved-from two
+        // lines up, so from 2026-08-22 to 2026-09-09 the keep-filter saw an
+        // empty list, dropped every tool, and the preamble fell back to the
+        // compact key-sorted dump -- 5% fewer tokens than the trained
+        // template on a 28-tool Claude Code request, keys in the wrong order.
+        // render_request never moved, so the offline corpus was the right
+        // prompt and the server was not.
+        if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&tool_names);
         std::string rendered=q27::chatml_prompt(
             q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
             q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
@@ -2758,6 +2765,22 @@ int main(int argc, char** argv) {
         int n_max = (int)q27::request_max_tokens(body, 8192, q27::CapApi::Messages); // unified default (see /v1/chat/completions)
         bool stream = q27::jbool(body, "stream", false);
         auto tk0 = std::chrono::steady_clock::now();
+        // Echo the client's requested model name in the response, as the
+        // Anthropic API (and ninfer) do. Claude Code tags every assistant
+        // message with the response's model and drops prior thinking blocks
+        // from the history it sends back when that tag differs from the model
+        // it is requesting; with the served name here the model never saw its
+        // own earlier reasoning and re-derived it every turn (2026-09-09
+        // turn-count investigation: 1.7x turns / 3x output tokens vs ninfer).
+        // Q27_ECHO_MODEL=0 restores the served name for A/Bs.
+        std::string resp_model = served_name;
+        {
+            static const bool echo_model =
+                !(getenv("Q27_ECHO_MODEL") && strcmp(getenv("Q27_ECHO_MODEL"), "0") == 0);
+            if (echo_model && body.contains("model") && body["model"].is_string() &&
+                !body["model"].get_ref<const std::string&>().empty())
+                resp_model = body["model"].get<std::string>();
+        }
         q27::ToolChoice tchoice;
         json tools;
         std::vector<std::string> tool_names_v;
@@ -2984,7 +3007,7 @@ int main(int argc, char** argv) {
             const char* sr=q27::anthropic_tool_stop_reason(
                 any_call,final_tool_incomplete,generation_truncated);
             json out = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                        {"model", served_name}, {"content", content},
+                        {"model", resp_model}, {"content", content},
                         {"stop_reason", sr}, {"stop_sequence", nullptr},
                         {"usage", {{"input_tokens", (int)prompt.size()},
                                    {"output_tokens", n},
@@ -3037,7 +3060,7 @@ int main(int argc, char** argv) {
                     return ok;
                 };
                 json msg = {{"id", mid}, {"type", "message"}, {"role", "assistant"},
-                            {"model", served_name}, {"content", json::array()},
+                            {"model", resp_model}, {"content", json::array()},
                             {"stop_reason", nullptr}, {"stop_sequence", nullptr},
                             {"usage", {{"input_tokens", (int)prompt.size()}, {"output_tokens", 0}}}};
                 ev("message_start", {{"type", "message_start"}, {"message", msg}});

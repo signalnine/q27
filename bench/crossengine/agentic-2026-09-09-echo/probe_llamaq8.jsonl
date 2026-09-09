@@ -1,0 +1,24 @@
+{"seed": 1, "think": 342, "text": 0, "tools": ["Bash"], "out": 171, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 10.71}
+{"seed": 2, "think": 340, "text": 0, "tools": ["Bash"], "out": 144, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.99}
+{"seed": 3, "think": 216, "text": 0, "tools": ["Bash", "Bash"], "out": 143, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.97}
+{"seed": 4, "think": 302, "text": 0, "tools": ["Bash"], "out": 132, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.75}
+{"seed": 5, "think": 277, "text": 0, "tools": ["Bash"], "out": 133, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.78}
+{"seed": 6, "think": 284, "text": 95, "tools": ["Bash"], "out": 158, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.28}
+{"seed": 7, "think": 357, "text": 0, "tools": ["Bash"], "out": 146, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.04}
+{"seed": 8, "think": 368, "text": 0, "tools": ["Bash", "Read"], "out": 174, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.6}
+{"seed": 9, "think": 236, "text": 0, "tools": ["Bash"], "out": 114, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.39}
+{"seed": 10, "think": 352, "text": 0, "tools": ["Bash"], "out": 136, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.83}
+{"seed": 11, "think": 446, "text": 0, "tools": ["Bash"], "out": 180, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.71}
+{"seed": 12, "think": 239, "text": 0, "tools": ["Read"], "out": 91, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 1.93}
+{"seed": 13, "think": 326, "text": 0, "tools": ["Bash"], "out": 135, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.81}
+{"seed": 14, "think": 176, "text": 0, "tools": ["Bash", "Bash"], "out": 157, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.26}
+{"seed": 15, "think": 225, "text": 0, "tools": ["Bash"], "out": 123, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.58}
+{"seed": 16, "think": 1194, "text": 0, "tools": ["Read"], "out": 325, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 6.65}
+{"seed": 17, "think": 276, "text": 0, "tools": ["Bash", "Bash"], "out": 171, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.53}
+{"seed": 18, "think": 393, "text": 0, "tools": ["Read"], "out": 130, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.71}
+{"seed": 19, "think": 477, "text": 0, "tools": ["Read"], "out": 146, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.03}
+{"seed": 20, "think": 195, "text": 0, "tools": ["Bash"], "out": 105, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.21}
+{"seed": 21, "think": 269, "text": 0, "tools": ["Bash"], "out": 126, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.63}
+{"seed": 22, "think": 338, "text": 0, "tools": ["Bash"], "out": 152, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 3.16}
+{"seed": 23, "think": 247, "text": 0, "tools": ["Bash"], "out": 107, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.25}
+{"seed": 24, "think": 360, "text": 76, "tools": ["Read"], "out": 132, "stop": "tool_calls", "model": "/mnt/ai/models/qwen38-27b-mtp-gguf/Qwen3.8-27B-MTP-Q8_0.gguf", "secs": 2.76}
