@@ -396,12 +396,13 @@ only at deep base_pos (-4.5 ms per chunk). Together 76 -> ~35 ms per warm
 turn; the production 64-256-token turns (137 ms mean) about -30%.
 
 Order after the gpt-6-astra advisory (docs/reviews/2026-09-08-gpt6astra-
-small-turn-levers.md, BUILDLOG (l)): (0) BITWISE first: graph-capture the
-DFlash2 last-token forward (token_launches(d2_vtaps) runs eagerly today;
--3-5 ms per turn, also pf=1); (1) C after a Q27_PF_SPLIT 1/2/4/8 sweep at
-T 5/36/64/128 and warm-turn depths proves the win (unsplit grid is
-4 x ceil(T/16); keep the 8-split cap; pv8's e4m3 softmax rounding means
-P4's bound does not carry); (2) B narrow: append the last token to an
+small-turn-levers.md, BUILDLOG (l)): (0) DONE, BUILDLOG (m): the DFlash2
+last-token forward is a graph (-2 ms per turn, bitwise; the eager step had
+only 2.4 ms of submission gaps, the rest is its weight stream); (1) C
+MEASURED AND PARKED, BUILDLOG (n): the Q27_PF_SPLIT sweep at 3K/25K/45K
+shows the depth rule already splits 6-8 ways at Claude Code depths, so an
+underfill rule is worth <= 3 ms per turn there (7-8 ms only below ~8K) --
+not worth a numerics-class change; (2) B narrow: append the last token to an
 existing post-snapshot chunk with room, existing head GEMV, MTP/DFlash2
 traps as listed; (3) A only after repricing, with explicit boundary-state
 export (snap/ckpt/pfx copy LIVE state today). Every numerics-class lever

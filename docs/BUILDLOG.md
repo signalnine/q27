@@ -15710,6 +15710,40 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (n): lever C measured before building it -- the attention split is already at its cap at production depths; NO-GO
+
+Advisory item 2's precondition: sweep the existing Q27_PF_SPLIT override
+before adding an underfill dispatch. Instrument: a scratch /v1/messages
+probe (one conversation per depth, then turns of ~26/137/251/593 new
+tokens), production DFlash2 config, one server per setting, pf_ms from
+[req]. The default rule is nsplit = (base_pos + SB)/4096 clamped to 1..8.
+
+  pf_ms            auto     2     4     8      (auto splits: 1 / 6 / 8)
+  3K   +26 tok       64    59    57    56
+  3K   +137         101    97    94    94
+  3K   +251         120   115   114   113
+  3K   +593         200   199   199   199
+  3K   cold 3334    837   872   878   887
+  25K  +26           69    99    77    66
+  25K  +137         114   137   115   110
+  25K  +251         140   155   145   140
+  25K  +593         243   260   250   240
+  45K  +26           75   135    95    76
+  45K  +137         123   172   133   124
+  45K  +593         273   315   295   276
+
+Read: at 3K depth (auto = 1 split) forcing 8 splits saves 7-8 ms on the
+small turns and nothing at +593; at 25K (auto = 6) the best case is 3-4 ms;
+at 45K (auto = 8) there is nothing left. Forcing 8 on every chunk costs
+the cold prefills 5% (combine on saturated grids). Claude Code turns live
+at 20-50K, where the depth rule already splits 5-8 ways, so lever C is
+worth <= 3 ms per turn there -- not a numerics-class change worth its
+gates (pv8's e4m3 softmax rounding moves under a new split geometry). An
+underfill rule would only pay for shallow (< 8K) conversations, ~7 ms per
+small turn; parked, with the sweep as the evidence. The advisory's order
+now points at lever B (append the last prompt token to a batched chunk),
+the 12 ms weight stream the token graph could not remove.
+
 ## 2026-09-08 (m): DFlash2 last-token forward graphed -- bitwise, -2 ms per turn (advisory item 1)
 
 d2_setup now captures token_launches(d2_vtaps) into d2_token_exec (after
