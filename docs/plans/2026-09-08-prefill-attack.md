@@ -310,6 +310,14 @@ Tasks:
 
 ### Phase 2 status (2026-09-08 evening, task 2 spike done, bar not met)
 
+CLOSED late 2026-09-08 (BUILDLOG (u)): the TMA W/X-only spike -- the one
+remaining intervention -- is bitwise and reaches 1.33x (ffn_gate) /
+1.39x (attn_out) at T=1024, +10% over the cp.async fill; deeper rings,
+16 warps and two-blocks-per-SM tiles are all slower. The 1.6x bar is not
+met; per the (p) rule the port stops and no further fold/occupancy/
+pipeline permutations are run. The remaining gap to the no-fill ceiling
+is the arrival of the stage bytes, not issue cost.
+
 BUILDLOG 2026-09-08 (h). tools/gemm_w4a8_spike.cu is a bitwise W4A8 kernel
 (all shapes, all T incl. tails) at 1.30x (ffn_gate) / 1.41x (attn_out) at
 M=1024 -- short of the 1.6x bar. Measured ceilings: IMMA pipe 1020 TOPS,

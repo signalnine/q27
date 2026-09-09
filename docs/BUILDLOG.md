@@ -15714,6 +15714,52 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (u): item 4, the TMA spike -- bitwise, +10% over the cp.async fill, 1.33x/1.39x against the 1.6x bar; the W4A8 port stops here
+
+Exactly the intervention (h) proposed and (p) budgeted one spike for:
+k_w4a8_tma in tools/gemm_w4a8_spike.cu. The W and X tiles of a stage
+arrive by two cp.async.bulk.tensor.2d instructions from one elected
+thread, completing on the slot's mbarrier with expect_tx(W_BYTES +
+X_BYTES); the TMA swizzle modes reproduce the kernel's own smem layout
+(SWIZZLE_64B on the 64-B weight pitch is chunk ^= (row >> 1) & 3 =
+swz<4>, SWIZZLE_128B on the 128-B activation pitch is chunk ^= row & 7 =
+swz<8>), so the ldmatrix side is the base kernel's untouched; out-of-range
+rows and tokens are zero-filled by the TMA unit; the scale loads stay on
+cp.async and the fold is the same expression in the same order. Tensor
+maps come through cudaGetDriverEntryPointByVersion (no -lcuda).
+
+Bitwise: every TMA configuration identical to BOTH incumbent references
+over the 25 T values on ffn_gate and attn_out (175 variant-shape-T
+comparisons per shape, red zones clean) -- the swizzle mapping above is
+right, which is the fact worth keeping.
+
+T=1024 TOPS (incumbent live dispatch 322 / 313 today):
+  ffn_gate: cp.async 128x128x128 s2 4x2 389 (1.21x) | tma s2 4x2 429
+    (1.33x) | tma s3 4x2 382 | tma s2 4x4 407 | tma 128x64 s2/s3/s4 403/
+    404/394 (two blocks per SM) | ws 326
+  attn_out: cp.async 403 (1.29x) | tma s2 4x2 437 (1.39x) | tma s3 4x2 421
+    | tma s2 4x4 425 | tma 128x64 376/375/383 | ws 345
+  T=4096: tma s2 4x2 459 (1.39x) / 432 (1.38x).
+So removing the per-lane issue cost of the fill is worth +10%, not the
++40% the no-fill ceiling (609) implied, and nothing that should hide the
+remaining wait does: a deeper ring is slower (s3 < s2 at every tile), 16
+consumer warps are slower, and a 64-token tile that fits two blocks per
+SM is slower. What is left between 430 and 609 is the arrival of the stage
+bytes themselves, which no issue mechanism, depth or occupancy in this
+kernel shape reaches. (h)'s reading "fill and math do not overlap" was
+right about the symptom and wrong about the cure.
+
+Verdict, by the rule set in (p) ("if it fails, stop the port and further
+fold/occupancy/pipeline permutations"): bar NOT met, the W4A8 port stops.
+1.33x/1.39x bitwise stays on the shelf in the spike; phase 2 of the
+prefill plan is CLOSED. Wall arithmetic for the record: 1.6x on the ~60%
+GEMM share of the 14% prefill share was 3.15% of a run; 1.35x is ~2.2%.
+Traps: the un-versioned cudaGetDriverEntryPoint returns invalid-argument
+on CUDA 13.2 -- ask for the 12.0 ABI by version; the swizzled TMA
+destinations need 512-B (64B mode) / 1024-B (128B mode) alignment, so
+the stage size is rounded to 1 KB and the dynamic smem base is aligned
+by hand with 1 KB of slack.
+
 ## 2026-09-08 (t): item 5 measured -- the empty-ring restore class is 1% of decode and drafts as well as a full ring; reseeding is a NO-GO
 
 Item 5 of (p): "restore drafter context -- measure the incidence before

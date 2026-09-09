@@ -37,6 +37,7 @@
 //     tools/gemm_w4a8_spike.cu src/prefill.cu src/kernels.cu -o build/gemm_w4a8_spike
 // Run: build/gemm_w4a8_spike [--time] [--shape NAME] [--only VARIANT-SUBSTR] [--notest]
 // exits 1 on any mismatch.
+#include <cuda.h>  // CUtensorMap (the encode call comes through cudaGetDriverEntryPoint, no -lcuda)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -1016,6 +1017,266 @@ void launch_ws(const uint8_t* W, const __half* S, const int8_t* Xp, const float*
     CK(cudaGetLastError());
 }
 
+// ---------------------------------------------------------------------------
+// TMA variant (item 4 of the 2026-09-08 (p) agenda; the intervention (h)
+// proposed): the W and X tiles of a stage arrive by cp.async.bulk.tensor.2d,
+// TWO instructions per stage issued by one elected thread, completing on the
+// slot's mbarrier with expect_tx(W_BYTES + X_BYTES). No per-lane cp.async
+// issue for the tiles, no per-thread address math. The hardware swizzle
+// modes reproduce the kernel's own smem layout exactly -- SWIZZLE_64B is
+// chunk ^= (row >> 1) & 3 on a 64-B pitch (= swz<4>), SWIZZLE_128B is
+// chunk ^= row & 7 on a 128-B pitch (= swz<8>) -- so the ldmatrix side is
+// the base kernel's, untouched. Out-of-range rows/tokens are zero-filled by
+// the TMA unit, which is what the cp.async src_size=0 did. Scale loads stay
+// on cp.async (as (h) asked: scale loading and arithmetic unchanged), so a
+// stage waits on both: cp.async.wait_group for the scales, the mbarrier for
+// the tiles. Slot reuse is ordered by the block barrier (every warp has
+// finished reading tile kt-1 before its slot is refilled) plus a proxy fence
+// by the issuing thread.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1;\n}\n"
+                 ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, int c0, int c1,
+                                            uint64_t* bar) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+        ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(smem_u32(bar))
+        : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
+template <int BN, int BM, int BK, int STAGES, int WARPS_M, int WARPS_N, int FOLD>
+__global__ void __launch_bounds__(WARPS_M* WARPS_N * 32, 1)
+k_w4a8_tma(const __grid_constant__ CUtensorMap tmW, const __grid_constant__ CUtensorMap tmX,
+           const __half* __restrict__ S, const float* __restrict__ xs, float* __restrict__ y,
+           int rows, int cols, int T) {
+    constexpr int NTHR = WARPS_M * WARPS_N * 32;
+    constexpr int WM = BN / WARPS_M, WN = BM / WARPS_N;
+    constexpr int MT = WM / 16, NTL = WN / 8;
+    constexpr int G = BK / 64;
+    static_assert(G >= 2, "tma variant: BK >= 128 (scales are cp.async'd as G*2 bytes)");
+    constexpr int WRB = BK / 2, XRB = BK;
+    constexpr int WCPR = WRB / 16, XCPR = XRB / 16;
+    static_assert(WCPR == 4 && XCPR == 8, "swizzle modes are matched for BK == 128 only");
+    constexpr int W_BYTES = BN * WRB, X_BYTES = BM * XRB;
+    constexpr int WS_BYTES = BN * G * 2, XS_BYTES = BM * G * 4;
+    // the TMA swizzle is computed from smem address bits: W tiles need 512-B,
+    // X tiles 1024-B alignment; round the stage up so every slot keeps it
+    constexpr int STAGE_BYTES = (W_BYTES + X_BYTES + WS_BYTES + XS_BYTES + 1023) / 1024 * 1024;
+    static_assert(W_BYTES % 1024 == 0 && X_BYTES % 1024 == 0, "tile alignment");
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    unsigned char* smem = (unsigned char*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint64_t* full = (uint64_t*)(smem + STAGES * STAGE_BYTES);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp % WARPS_M, wn = warp / WARPS_M;
+    const int gid = lane >> 2, tg = lane & 3;
+    const int r0 = blockIdx.y * BN, t0 = blockIdx.x * BM;
+    const int k_tiles = cols / BK;
+    const int ngrp = cols / 64;
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s_ = 0; s_ < STAGES; s_++) mbar_init(&full[s_], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    auto stage_tile = [&](int slot, int kt) {
+        unsigned char* sw = smem + slot * STAGE_BYTES;
+        unsigned char* sx = sw + W_BYTES;
+        unsigned char* sws = sx + X_BYTES;
+        unsigned char* sxs = sws + WS_BYTES;
+        const int k0 = kt * BK;
+        if (tid == 0) {
+            fence_proxy_async();
+            mbar_expect_tx(&full[slot], W_BYTES + X_BYTES);
+            tma_load_2d(sw, &tmW, k0 / 2, r0, &full[slot]);
+            tma_load_2d(sx, &tmX, k0, t0, &full[slot]);
+        }
+        for (int i = tid; i < BN; i += NTHR) {
+            const int gr = r0 + i;
+            const bool ok = gr < rows;
+            const __half* src = ok ? S + (size_t)gr * ngrp + k0 / 64 : S;
+            cpn<G * 2>(sws + i * G * 2, src, ok);
+        }
+        for (int i = tid; i < BM * G; i += NTHR) {  // group-major, as the base kernel
+            const int gg = i / BM, t = i % BM, gt = t0 + t;
+            const bool ok = gt < T;
+            const float* src = ok ? xs + (size_t)gt * ngrp + k0 / 64 + gg : xs;
+            cp4(sxs + (gg * BM + t) * 4, src, ok);
+        }
+        cp_commit();
+    };
+
+    float acc[MT][NTL][4];
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+#pragma unroll
+        for (int j = 0; j < NTL; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (s < k_tiles) stage_tile(s, s);
+        else cp_commit();
+    }
+
+    const int a_row = lane & 15, a_chunk_hi = lane >> 4;
+    const int b_row = lane & 7, b_chunk = lane >> 3;
+
+#pragma unroll 1
+    for (int kt0 = 0; kt0 < k_tiles; kt0 += STAGES) {
+        const unsigned parity = (unsigned)(kt0 / STAGES) & 1u;
+#pragma unroll
+        for (int s_ = 0; s_ < STAGES; s_++) {
+            const int kt = kt0 + s_;
+            if (kt >= k_tiles) break;
+            cp_wait<STAGES - 2>();          // this tile's scales
+            mbar_wait(&full[s_], parity);   // this tile's W/X bytes
+            __syncthreads();                // everyone is done with tile kt-1's slot
+            const int nxt = kt + STAGES - 1;
+            if (nxt < k_tiles) stage_tile((s_ + STAGES - 1) % STAGES, nxt);
+            else cp_commit();
+            const unsigned char* sw = smem + s_ * STAGE_BYTES;
+            const unsigned char* sx = sw + W_BYTES;
+            const __half* sws = (const __half*)(sx + X_BYTES);
+            const float* sxs = (const float*)(sx + X_BYTES + WS_BYTES);
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                uint32_t A[MT][2][4];
+                float wsc[MT][2];
+#pragma unroll
+                for (int i = 0; i < MT; i++) {
+                    const int row = wm * WM + i * 16 + a_row;
+                    const int chunk = g * 2 + a_chunk_hi;
+                    uint32_t p0, p1, p2, p3;
+                    ldsm_x4(p0, p1, p2, p3, smem_u32(sw + row * WRB + swz<WCPR>(row, chunk) * 16));
+                    A[i][0][0] = unpack_even(p0); A[i][0][1] = unpack_even(p1);
+                    A[i][0][2] = unpack_odd(p0);  A[i][0][3] = unpack_odd(p1);
+                    A[i][1][0] = unpack_even(p2); A[i][1][1] = unpack_even(p3);
+                    A[i][1][2] = unpack_odd(p2);  A[i][1][3] = unpack_odd(p3);
+                    const int rr = wm * WM + i * 16 + gid;
+                    wsc[i][0] = __half2float(sws[rr * G + g]);
+                    wsc[i][1] = __half2float(sws[(rr + 8) * G + g]);
+                    if constexpr (FOLD == 2) { wsc[i][0] *= 0.0625f; wsc[i][1] *= 0.0625f; }
+                }
+#pragma unroll
+                for (int j = 0; j < NTL; j++) {
+                    const int trow = wn * WN + j * 8 + b_row;
+                    const int chunk = g * 4 + b_chunk;
+                    uint32_t b0, b1, b2, b3;
+                    ldsm_x4(b0, b1, b2, b3, smem_u32(sx + trow * XRB + swz<XCPR>(trow, chunk) * 16));
+                    const int tt = wn * WN + j * 8 + 2 * tg;
+                    const float2 v = *(const float2*)(sxs + g * BM + tt);
+                    const float xs0 = v.x, xs1 = v.y;
+#pragma unroll
+                    for (int i = 0; i < MT; i++) {
+                        int d0, d1, d2, d3;
+                        mma_s8_zero(d0, d1, d2, d3, A[i][0][0], A[i][0][1], A[i][0][2], A[i][0][3], b0, b1);
+                        mma_s8_acc(d0, d1, d2, d3, A[i][1][0], A[i][1][1], A[i][1][2], A[i][1][3], b2, b3);
+                        const float f0 = i2f16<FOLD>(d0), f1 = i2f16<FOLD>(d1);
+                        const float f2 = i2f16<FOLD>(d2), f3 = i2f16<FOLD>(d3);
+                        acc[i][j][0] += wsc[i][0] * xs0 * f0;
+                        acc[i][j][1] += wsc[i][0] * xs1 * f1;
+                        acc[i][j][2] += wsc[i][1] * xs0 * f2;
+                        acc[i][j][3] += wsc[i][1] * xs1 * f3;
+                    }
+                }
+            }
+        }
+    }
+    cp_wait<0>();
+
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+        const int row0 = r0 + wm * WM + i * 16 + gid;
+#pragma unroll
+        for (int j = 0; j < NTL; j++) {
+            const int tok0 = t0 + wn * WN + j * 8 + 2 * tg;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = row0 + (e >= 2 ? 8 : 0), tok = tok0 + (e & 1);
+                if (row < rows && tok < T) y[(size_t)tok * rows + row] = acc[i][j][e];
+            }
+        }
+    }
+}
+
+// Tensor maps through the driver entry point (no -lcuda): a 2D byte tensor
+// [outer][inner] with a box of [box_outer][box_inner] bytes and the swizzle
+// that matches the kernel's smem layout for that pitch.
+typedef CUresult (*EncodeTiledFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*,
+                                  const cuuint64_t*, const cuuint64_t*, const cuuint32_t*,
+                                  const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                                  CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static EncodeTiledFn encode_tiled() {
+    static EncodeTiledFn fn = nullptr;
+    if (!fn) {
+        cudaDriverEntryPointQueryResult q;
+        // the un-versioned cudaGetDriverEntryPoint is deprecated and returns
+        // cudaErrorInvalidValue on this toolkit; ask for the 12.0 ABI, where
+        // cuTensorMapEncodeTiled first appeared
+        CK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", (void**)&fn, 12000,
+                                            cudaEnableDefault, &q));
+        if (!fn || q != cudaDriverEntryPointSuccess) {
+            fprintf(stderr, "cuTensorMapEncodeTiled unavailable (query %d)\n", (int)q);
+            exit(1);
+        }
+    }
+    return fn;
+}
+static void make_map_2d(CUtensorMap* map, const void* base, uint64_t inner, uint64_t outer,
+                        uint64_t pitch, uint32_t box_inner, uint32_t box_outer,
+                        CUtensorMapSwizzle swz_mode) {
+    const cuuint64_t dims[2] = {inner, outer};
+    const cuuint64_t strides[1] = {pitch};
+    const cuuint32_t box[2] = {box_inner, box_outer};
+    const cuuint32_t estr[2] = {1, 1};
+    const CUresult r = encode_tiled()(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base),
+                                      dims, strides, box, estr, CU_TENSOR_MAP_INTERLEAVE_NONE, swz_mode,
+                                      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (r != CUDA_SUCCESS) { fprintf(stderr, "cuTensorMapEncodeTiled failed (%d)\n", (int)r); exit(1); }
+}
+
+template <int BN, int BM, int BK, int STAGES, int WARPS_M, int WARPS_N, int FOLD>
+void launch_tma(const uint8_t* W, const __half* S, const int8_t* Xp, const float* xs, float* y,
+                int rows, int cols, int T, cudaStream_t st) {
+    constexpr int G = BK / 64;
+    constexpr int STAGE_BYTES = (BN * (BK / 2) + BM * BK + BN * G * 2 + BM * G * 4 + 1023) / 1024 * 1024;
+    constexpr size_t SMEM = (size_t)STAGES * STAGE_BYTES + STAGES * 8 + 1024;  // + alignment slack
+    auto* kfn = k_w4a8_tma<BN, BM, BK, STAGES, WARPS_M, WARPS_N, FOLD>;
+    static bool attr = false;
+    if (!attr) {
+        CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
+        attr = true;
+    }
+    if (cols % BK) { fprintf(stderr, "cols %d %% BK %d\n", cols, BK); exit(1); }
+    // maps are cheap to encode (host-side, microseconds) but cache them per
+    // (pointer, shape) so the timing loop measures the kernel
+    struct Key { const void* p; int a, b; };
+    static Key kw{nullptr, 0, 0}, kx{nullptr, 0, 0};
+    alignas(64) static CUtensorMap tmW, tmX;
+    if (kw.p != W || kw.a != rows || kw.b != cols) {
+        make_map_2d(&tmW, W, (uint64_t)cols / 2, (uint64_t)rows, (uint64_t)cols / 2, BK / 2, BN,
+                    CU_TENSOR_MAP_SWIZZLE_64B);
+        kw = Key{W, rows, cols};
+    }
+    if (kx.p != Xp || kx.a != T || kx.b != cols) {
+        make_map_2d(&tmX, Xp, (uint64_t)cols, (uint64_t)T, (uint64_t)cols, BK, BM,
+                    CU_TENSOR_MAP_SWIZZLE_128B);
+        kx = Key{Xp, T, cols};
+    }
+    dim3 grid((T + BM - 1) / BM, (rows + BN - 1) / BN);
+    kfn<<<grid, WARPS_M * WARPS_N * 32, SMEM, st>>>(tmW, tmX, S, xs, y, rows, cols, T);
+    CK(cudaGetLastError());
+}
+
 }  // namespace spike
 
 // ---------------------------------------------------------------------------
@@ -1039,10 +1300,19 @@ struct Variant {
     Variant{name, spike::launch_ws<BN, BM, BK, ST, WM, WN, FOLD>}
 #define VA256(name, ABL) Variant{name, spike::launch<256, 128, 128, 2, 4, 2, 1, 1, ABL>}
 #define VA44(name, ABL) Variant{name, spike::launch<128, 128, 128, 2, 4, 4, 1, 1, ABL>}
+#define VT(name, BN, BM, BK, ST, WM, WN, FOLD) \
+    Variant{name, spike::launch_tma<BN, BM, BK, ST, WM, WN, FOLD>}
 
 static const Variant variants[] = {
     VF("128x128x128 s2 4x2 magic", 128, 128, 128, 2, 4, 2, 1),
     VF("128x128x128 s2 4x4 magic", 128, 128, 128, 2, 4, 4, 1),
+    VT("tma 128x128x128 s2 4x2 magic", 128, 128, 128, 2, 4, 2, 1),
+    VT("tma 128x128x128 s3 4x2 magic", 128, 128, 128, 3, 4, 2, 1),
+    VT("tma 128x128x128 s3 4x4 magic", 128, 128, 128, 3, 4, 4, 1),
+    VT("tma 128x128x128 s2 4x4 magic", 128, 128, 128, 2, 4, 4, 1),
+    VT("tma 128x64x128 s2 4x2 magic", 128, 64, 128, 2, 4, 2, 1),   // 35 KB: two blocks per SM
+    VT("tma 128x64x128 s3 4x2 magic", 128, 64, 128, 3, 4, 2, 1),
+    VT("tma 128x64x128 s4 4x2 magic", 128, 64, 128, 4, 4, 2, 1),
     VW("ws 128x128x128 s2 4x2 magic", 128, 128, 128, 2, 4, 2, 1),
     VW("ws 128x128x128 s3 4x2 magic", 128, 128, 128, 3, 4, 2, 1),
     VW("ws 128x128x128 s3 4x2 cvt16", 128, 128, 128, 3, 4, 2, 2),
