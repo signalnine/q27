@@ -196,7 +196,10 @@ calls). Both miss classes 0; prefill wall 255 -> 110 s at matched turn
 counts; first-turn wall 85.5 -> 44.3 s (-48%, of which two cold bootstrap
 turns are 14 s -- the -70% bar assumed hits from session 2, the mechanism
 needs one extra session); round wall 18.63 = baseline; quality unchanged.
-Live probes are in bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py.
+Live probes are in bench/ladder/pfx_evict_probe.py and pfx_shared_probe.py,
+and (promotion, BUILDLOG (r)) pfx_promote_probe.py: an old client's short
+entry followed by new-client sessions whose block shares a longer prefix
+among themselves -- the cold-only rule could never move the cut forward.
 Phase 0 is CLOSED; `d2-pfx` is production (launch script, campaign.sh
 relaunch line, BUILDLOG 2026-09-08 (g)). gpt-6-astra reviewed the shared
 cut afterwards (docs/reviews/2026-09-08-gpt6astra-shared-cut.md, BUILDLOG

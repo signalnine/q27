@@ -15714,6 +15714,94 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-08 (r): shared-cut PROMOTION + access-LRU -- a client's system entry can now move forward; the one entry every session hits no longer ages out first
+
+Item 3 of (p). Two defects in the P16b machinery, both structural, both
+measured before they were touched.
+
+THE PROMOTION GAP. The (g) shared cut is cold-only: a request that restored
+an entry (base != 0) never writes a system entry, and its conversation
+entry sits behind the 8192-token step gate. So once a client's block grows
+past an indexed entry that is still an exact prefix of it (the block grew;
+or an early line changed, the first new session cut at the old shared
+length, and that short entry is now everyone's restore), every session
+restores the short entry and re-prefills the rest of the block for ever.
+Control (bench/ladder/pfx_promote_probe.py on the pre-change binary, one
+old-client session then four new-client sessions whose block shares a
+longer prefix among themselves, a foreign request between each so the VRAM
+tiers miss): every new session after the first restored the old cut and
+re-prefilled 3.4-4.8K tokens (1.03-1.36 s), the root held two entries per
+shape, and nothing would ever change that. Two prompt sets, two shapes
+each (sys_len chunk boundary inside the shared region / inside the
+per-session tail), 4 of 4 stuck.
+
+The fix (engine.cuh generate_prefill, the shared-cut block): a request
+restored from the disk/RAM tier whose block extends >= one chunk past the
+restore runs the shared-prefix scan too, and then one of two rules --
+  promote: an indexed entry agrees with this prompt >= one chunk beyond
+           base -> cut there (the shared length another session proved);
+  explore: nothing does, but the block runs >= one chunk past every known
+           divergence point -> write ONE sys_len-cut entry so the next
+           session can measure the shared length against it. Once per
+           restored prefix per engine (a std::set of prefix hashes; the
+           probe's two shapes collided when it was keyed by length). A
+           block whose known divergence sits within a chunk of sys_len (the
+           gitStatus tail) is never explored -- that entry would be a
+           prefix of nobody, the (g) finding again.
+System entries take pfx_should_persist_sys: no step gate (that gate spaces
+one conversation's blobs; a system entry is hit by every new session), but
+>= one chunk past base, within min/max, not indexed or in flight, writer
+idle. pfx_sys_cut_here requires the boundary to be one this prefill reaches
+(> base), so a restored request never claims a boundary inside its restore.
+Same-conversation restores (P8 snapshot, P9 checkpoint) are not eligible.
+
+Paired gate, same prompts on both binaries, [req] hit / pf / pf_ms:
+  shape A (boundary inside the shared region), old entry a pure prefix:
+    control  N1..N4  7168 / 3434 / 1028 ms, 2 entries
+    fix      N1 explores (writes 10240); N2..N4  10240 / 360 / 235 ms
+  shape B (boundary inside the tail), old entry a pure prefix:
+    control  N1..N4  7168 / 3853 / 1133 ms
+    fix      N1 explores (10240, a prefix of nobody); N2 promotes (9216);
+             N3..N4  9216 / 1802 / 620 ms; N4 "skip" (no further writes)
+  shape A, first new session cold with the 6144 shared cut:
+    control  N2..N4  6144 / 4263 / 1242 ms
+    fix      N2 explores (10240); N3..N4  10240 / 166 / 178 ms
+  shape B, same:
+    control  N2..N4  6144 / 4782 / 1360 ms
+    fix      N2 explores; N3 promotes (9216); N4  9216 / 1605 / 545 ms
+Cost of convergence: one extra entry when the sys_len boundary is inside
+the shared region (the exploratory entry IS the promoted one), two when it
+is inside the tail (one exploratory entry nobody restores, then the
+promoted one), then "skip" for every later session. The 1024-token
+granularity shows in shape B: promoted at 9216 against a shared length of
+10046-10234, so those sessions still re-prefill ~1.6-1.8K.
+
+On the production root today the new rules do nothing: every Claude Code
+session restores 21504, shares 22460 with the sys_len entry, and the block
+ends 84 tokens later -> "skip". They act the day the block changes.
+
+ACCESS-LRU. Eviction sorted by write mtime. Measured on the production
+root before touching it: 28 entries, 23 of 40 GB, and the 21504 system
+entry every new session restores was the SECOND-OLDEST file -- the next
+12-instance campaign (~20 GB of conversation entries) would have evicted
+it first. PrefixCache::touch(e) re-stamps the file (utimensat, so a rescan
+after restart keeps the order) and the index on every successful restore;
+tools/test_prefix_cache.cpp test_touch_protects_hot_entry (a touched old
+entry outlives a newer untouched one under the byte budget, and the stamp
+survives a re-index). The RAM-tier hit path does not touch the disk file
+(tier is off in production).
+
+Traps: the probe's filler carries the tag in every unit, so a different
+tag tokenizes differently -- the "fix2" prompts made the old entry a pure
+prefix of the new block (a third scenario, kept) while the "ctl" prompts
+made the first new session cold; pair control and treatment on the SAME
+tag. Scripts: bench/ladder/pfx_promote_probe.py (<base> <tag> <A|B>),
+bench/ladder/pfx_promote_run.sh (fresh root, production config, both
+shapes, journal + root listing; stops and relaunches q27-38).
+
+Next per (p): item 2 (turn replay / quality / queue attribution) or item 4
+(one TMA W/X-only spike at the 1.6x bar).
+
 ## 2026-09-08 (q): the width-8 wall was the gemm_min=9 dispatch switch, not an engine bug -- widths 9-12 are bitwise on the matched family; wider K loses on the round wall at every depth; K=7 stays
 
 Item 1 of (p), run to the reviewer's recipe. Scripts and the trap list in

@@ -213,6 +213,34 @@ static void test_eviction_respects_budget() {
     CHECK(pc.size() >= 1);
 }
 
+// LRU by access (2026-09-08 (p) item 3): a restored entry is re-stamped, so
+// an old entry that is hit all the time outlives newer ones nobody reads.
+static void test_touch_protects_hot_entry() {
+    const std::string root = tmproot("touch");
+    q27::PrefixCache pc;
+    q27::PrefixCacheCfg c = cfg_for(root);
+    const std::string blob(1500, 'z');
+    const size_t entry_bytes = sizeof(q27::PfxHdr) + 32 * 4 + 2 * blob.size();
+    c.max_bytes = 2 * entry_bytes + 64; // room for two whole entries, never three
+    CHECK(pc.init(c, COMPAT_A));
+    const std::vector<int> a = seq(64, 1000), b = seq(64, 2000), d = seq(64, 3000);
+    CHECK(pc.write(a, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    CHECK(pc.write(b, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    q27::PrefixCache::Entry ea;
+    CHECK(pc.find(a, &ea));
+    pc.touch(ea, (long)time(nullptr) + 100);            // a is hot: newer than b
+    CHECK(pc.write(d, 32, blob.data(), blob.size(), blob.data(), blob.size()));
+    CHECK(pc.size() == 2);
+    q27::PrefixCache::Entry e;
+    CHECK(pc.find(a, &e));                              // the hot old entry survived
+    CHECK(!pc.find(b, &e));                             // the cold one went
+    CHECK(pc.find(d, &e));
+    // the stamp is on the file too, so a fresh index after restart keeps it
+    q27::PrefixCache pc2;
+    CHECK(pc2.init(c, COMPAT_A));
+    CHECK(pc2.find(a, &e) && e.mtime >= (long)time(nullptr) + 99);
+}
+
 // P16b shared cut (2026-09-08): Claude Code sessions agree on the system block
 // up to a per-session gitStatus tail (five sessions shared exactly 22460 of a
 // 22544-22578-token block), so an entry cut at sys_len is hit by nobody. The
@@ -306,6 +334,7 @@ int main() {
     test_truncated_file_is_not_indexed();
     test_rescan_survives_restart();
     test_eviction_respects_budget();
+    test_touch_protects_hot_entry();
     test_shared_prefix_across_sessions();
     test_reserve_serialises_writers();
     test_bad_root_disables();

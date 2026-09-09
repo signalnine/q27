@@ -256,6 +256,22 @@ class PrefixCache {
         return best;
     }
 
+    // Access recency for the LRU: re-stamp an entry that was just restored
+    // (file mtime, so a rescan after restart sees it too, and the index).
+    // Without this the eviction order is write order and the one system
+    // entry every new session hits is among the first to go once the byte
+    // budget fills (gpt-6-astra 2026-09-08 (p), item 3). `now` is a
+    // parameter for the unit test only.
+    void touch(const Entry& e, long now = (long)time(nullptr)) {
+        struct timespec ts[2];
+        ts[0].tv_sec = now; ts[0].tv_nsec = 0;
+        ts[1] = ts[0];
+        ::utimensat(AT_FDCWD, e.path.c_str(), ts, 0);
+        std::lock_guard<std::mutex> lk(m_);
+        for (auto& x : index_)
+            if (x.path == e.path) x.mtime = now;
+    }
+
     // Read the state region (gdn then kv, contiguous) into `dst`.
     bool read_state(const Entry& e, void* dst, size_t dst_n) const {
         int fd = ::open(e.path.c_str(), O_RDONLY);

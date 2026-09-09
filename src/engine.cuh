@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <chrono>
+#include <set>
 #include <functional>
 #include <cassert>
 #include <cmath>
@@ -4154,6 +4155,16 @@ struct Engine {
     // against this request -- sys_len, or the longest prefix an indexed entry
     // shares with this prompt when that is shorter (engine-set per prefill).
     int pfx_sys_cut = 0;
+    // whether THIS prefill may write a system entry at the cut (cold: always;
+    // restored: promotion or exploration, see generate_prefill)
+    bool pfx_sys_ok = false;
+    // restored prefixes (hash of prompt[0,base)) this engine has already
+    // written an exploratory sys_len entry from -- one per prefix per
+    // process, which bounds the useless-entry cost when a client's
+    // per-session tail is longer than a chunk. Keyed by the prefix, not the
+    // length: two clients whose entries happen to be cut at the same L are
+    // different explorations (the probe's two shapes collided on 6144).
+    std::set<uint64_t> pfx_explored;
     double pfx_read_ms = 0;  // last disk-read cost, logged with the import split
     double pfx_alloc_ms = 0; // pinned-staging allocation, counted separately
     q27::PrefixRam* pram = nullptr;   // P16c host-RAM tier (null/off = disk only)
@@ -4304,14 +4315,31 @@ struct Engine {
                (pfx_last_persist == 0 || L - pfx_last_persist >= pcache->cfg().step_tokens) &&
                !pcache->has(prompt, L);
     }
+    // System entries (P16b, and its promotion from a restored base) skip the
+    // step gate: that gate spaces a CONVERSATION's entries 8192 tokens apart
+    // to stop one chain writing a blob per turn, but a system entry is hit by
+    // every new session of the client, so it pays for itself one chunk past
+    // whatever this request restored (gpt-6-astra 2026-09-08 (p), item 3:
+    // "the shared 8192-token step gate" was one of the three promotion
+    // blockers). Everything else is the shared policy.
+    bool pfx_should_persist_sys(const std::vector<int>& prompt, int L, int base) const {
+        return pcache && pcache->enabled() && !pfx_busy.load() &&
+               L >= pcache->cfg().min_tokens && L <= pcache->cfg().max_tokens &&
+               L - base >= (int)PF_T && !pcache->has(prompt, L);
+    }
     // P16b: the LAST prefill-chunk boundary at or before the system block ends.
     // Cutting ON a chunk boundary is deliberate -- stopping the loop at an
     // arbitrary sys_len would re-chunk the prefill, and chunk size is not a
     // free variable (PF_T is tuned, and a different reduction order could move
     // results). At most PF_T-1 tokens of the block get re-prefilled on a hit,
-    // which costs ~0.3 s against the ~6 s the entry saves.
+    // which costs ~0.3 s against the ~6 s the entry saves. `pfx_sys_ok` is
+    // decided per request by the shared-cut block in generate_prefill (cold
+    // prefills always; restored ones only when promotion or exploration
+    // applies); the boundary must be one this prefill actually reaches
+    // (> base), so a restored request never claims a boundary inside its
+    // restored prefix.
     bool pfx_sys_cut_here(int base, int boundary) const {
-        return base == 0 && pfx_sys_cut > 0 && boundary <= pfx_sys_cut &&
+        return pfx_sys_ok && pfx_sys_cut > 0 && boundary > base && boundary <= pfx_sys_cut &&
                boundary + (int)PF_T > pfx_sys_cut;
     }
 
@@ -4957,6 +4985,12 @@ struct Engine {
                 if (dst && pcache->read_state(pe, dst, pfx_bytes(pe.L))) {
                     base = pe.L;
                     pfx_hit = true;
+                    // LRU by ACCESS: a restore re-stamps the entry, so the
+                    // one system entry every new session hits is not the
+                    // first to age out under the byte budget ((p) item 3;
+                    // measured 09-08: the shared 21504 entry was the
+                    // second-oldest of 28 at 23 of 40 GB).
+                    pcache->touch(pe);
                     if (slot) {
                         pram->publish(slot, prompt, pe.L);
                         pfx_ram_hit = slot;
@@ -4985,19 +5019,62 @@ struct Engine {
             // hits. Cold prefills only; a restored or snapshotted base never
             // writes a system entry (pfx_sys_cut_here requires base == 0).
             pfx_sys_cut = pfx_sys_len;
-            if (base == 0 && pcache && pcache->enabled() &&
-                pfx_sys_len >= pcache->cfg().min_tokens) {
+            pfx_sys_ok = false;
+            // PROMOTION (2026-09-08 (p) item 3): the cold-only rule above
+            // could never move a client's entry FORWARD. Once an old, short
+            // entry is an exact prefix of every new session (the client's
+            // block grew, or an early line changed and the second session
+            // cut at the old shared length), every session restores it and
+            // re-prefills the rest of the block for ever: base != 0, so no
+            // system entry, and the conversation entry sits behind the 8192
+            // step gate. Two rules for a request restored from the disk/RAM
+            // tier whose block extends at least a chunk past the restore:
+            //   promote  -- an indexed entry agrees with this prompt >= one
+            //               chunk beyond base: cut there (the shared length
+            //               some other session already proved).
+            //   explore  -- nothing does, but the block runs >= a chunk past
+            //               every known divergence point: write ONE sys_len
+            //               entry so the next session can measure the shared
+            //               length against it. Once per restored prefix per
+            //               engine (pfx_explored); a
+            //               block whose known divergence sits within a chunk
+            //               of sys_len (the per-session gitStatus tail) is
+            //               never explored -- that entry would be a prefix of
+            //               nobody, which is the (g) finding all over again.
+            // Same-conversation restores (P8 snapshot, P9 checkpoint) are
+            // not eligible: their block is already covered or in the past.
+            const bool sys_eligible = pcache && pcache->enabled() &&
+                                      pfx_sys_len >= pcache->cfg().min_tokens &&
+                                      (base == 0 || (pfx_hit && pfx_sys_len >= base + (int)PF_T));
+            if (sys_eligible) {
                 const int shared = pcache->shared_prefix(prompt, pfx_sys_len);
                 // the cut lands on the last chunk boundary <= shared; that
                 // boundary is what pfx_should_persist measures against
                 // min_tokens, so check IT (review P3: an unaligned min_tokens
                 // could otherwise trade a usable sys_len cut for an unusable one)
                 const int shared_b = (shared / (int)PF_T) * (int)PF_T;
-                if (shared_b >= pcache->cfg().min_tokens && shared < pfx_sys_len)
-                    pfx_sys_cut = shared;
-                if (shared > 0)
+                const char* how = "cold";
+                if (base == 0) {
+                    pfx_sys_ok = true;
+                    if (shared_b >= pcache->cfg().min_tokens && shared < pfx_sys_len)
+                        pfx_sys_cut = shared;
+                } else if (shared >= base + (int)PF_T) {
+                    pfx_sys_ok = true;
+                    how = "promote";
+                    if (shared < pfx_sys_len) pfx_sys_cut = shared;
+                } else if (pfx_sys_len - std::max(shared, base) >= (int)PF_T &&
+                           pfx_explored
+                               .insert(q27::pfx_fnv1a64(prompt.data(), (size_t)base * sizeof(int)))
+                               .second) {
+                    pfx_sys_ok = true;
+                    how = "explore";
+                } else {
+                    how = "skip";
+                }
+                if (shared > 0 || base > 0)
                     fprintf(stderr, "[pfx] system block %d tokens, shares %d with an indexed entry"
-                            " -> cut at %d\n", pfx_sys_len, shared, (pfx_sys_cut / (int)PF_T) * (int)PF_T);
+                            " (restored %d) -> %s, cut at %d\n", pfx_sys_len, shared, base, how,
+                            pfx_sys_ok ? (pfx_sys_cut / (int)PF_T) * (int)PF_T : 0);
             }
             gs.pfx = pfx_hit ? base : 0;
             fprintf(stderr, "[gen] prompt=%d prefix_hit=%d snap=%zu ckpt=%d pfx=%d\n", NP, base,
@@ -5082,8 +5159,9 @@ struct Engine {
                     ckpt_save(prompt, c0 + Tc);
                     last_ck = c0 + Tc;
                 }
-                // P16b: system-block entry, at most one per cold prefill.
-                if (pfx_sys_cut_here(base, c0 + Tc) && pfx_should_persist(prompt, c0 + Tc))
+                // P16b: system-block entry, at most one per prefill (the cut
+                // window is one chunk wide; promotion/exploration reuse it).
+                if (pfx_sys_cut_here(base, c0 + Tc) && pfx_should_persist_sys(prompt, c0 + Tc, base))
                     pfx_persist(prompt, c0 + Tc);
                 round_gap();
             }
