@@ -160,7 +160,7 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-09-09)
+## State of the engine (2026-09-10)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
@@ -172,10 +172,13 @@ Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
 
 - Claude Code traffic, 12 SWE-bench instances, medium effort (the only
-  level both engines render): **q27 207 t/s** aggregate decode (219 median,
-  3.89 tok/round, 96.9% prefix reuse) vs ninfer's DFlash2 arm 221 (240,
-  4.19, 96.8%). Wall per instance 108 s vs 36 s: q27's sessions run 25 turns
-  and 18K output tokens per instance against 15 and 6K. Attributed on
+  level both engines render), 2026-09-10 re-bench: **q27 v0.11.3 218-222
+  t/s** aggregate decode (232-233 median, 4.05-4.10 tok/round, two runs)
+  vs ninfer's DFlash2 arm 218 (241, 4.11) the same day -- decode parity, up
+  from 207 vs 221 on 09-09; the sampler-order fix is +4-6% of it against a
+  same-day control. Prefix reuse 95.7% vs 96.1%. Wall per instance 98 s vs
+  24 s: q27's sessions run 25 turns and 15K output tokens per instance
+  against 11 and 4K. Attributed on
   09-09: per-turn reasoning on an identical prompt puts every q27 arm on
   the llama.cpp Q8_0 reference (median 276-340 chars vs 314) and ninfer
   1.5x under it (209), so the trajectory length is ninfer's NVFP4 arm
@@ -480,9 +483,25 @@ is each engine's own defaults; n=1 per instance. Full methodology:
 [docs/BENCHMARKING.md](docs/BENCHMARKING.md); harness and raw data:
 [bench/swebench/](bench/swebench/) and [bench/crossengine/](bench/crossengine/).
 
-**Real agentic traffic, DFlash2 era** (2026-09-09, both engines on block
-drafters, effort pinned to medium, q27 on the production recipe with a
-fresh cache root; [readout](bench/crossengine/agentic-2026-09-09/README.md)):
+**Real agentic traffic, DFlash2 era** (2026-09-10 re-bench, same harness
+and effort pin as 09-09, both engines on block drafters, q27 on the
+production recipe with a fresh cache root, same-day control;
+[readout](bench/crossengine/agentic-2026-09-10/README.md)):
+
+| engine | decode agg / median | tok/round | prefix reuse | wall/inst | turns, out tok /inst | gold |
+|---|--:|--:|--:|--:|--:|--:|
+| **q27** v0.11.3 (Q8 pack, K=7) | 218.0 / 232.2 t/s | 4.05 | 95.7% | 98 s | 25.2, 15.3K | 10/12 |
+| q27 before PR #43 (control) | 209.7 / 223.1 t/s | 3.98 | --* | --* | 23.2, 16.8K | 12/12 |
+| ninfer DFlash2 k=7 (NVFP4) | 218.2 / **240.5** t/s | 4.11 | 96.1% | **24 s** | 10.8, 4.0K | 11/12 |
+
+A second v0.11.3 run measured 221.8 / 233.2 t/s at 4.10 tok/round. The
+sampler-order fix (PR #43) is worth +4-6% aggregate decode on this traffic
+against the same-day control and closes the tokens-per-round gap to ninfer
+(3.89 vs 4.19 on 09-09). Wall stays apart on trajectory length, attributed
+below. \*The control's reuse and wall (and the first v0.11.3 run's) are
+confounded -- the shared /dev/shm filled mid-run and prefix-cache writes
+failed (readout, read 4); the v0.11.3 row above is a rerun with a healthy
+cache. The 09-09 table:
 
 | engine | decode agg / median | tok/round | prefix reuse | wall/inst | turns, out tok /inst | gold |
 |---|--:|--:|--:|--:|--:|--:|

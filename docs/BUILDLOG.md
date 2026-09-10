@@ -15714,6 +15714,52 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ac): v0.11.3 re-bench on Claude Code traffic -- decode parity with ninfer (218-222 vs 218.2 t/s, 4.05-4.10 vs 4.11 tok/round); PR #43 is +4-6% against a same-day control; reuse 95.7% once a tmpfs confound was removed
+
+bench/crossengine/agentic-2026-09-10/ (campaign.sh legs q27v0113,
+ninferd2b, q27pre0113 -- new names so the 09-09 workspaces survive; the
+campaign now waits for :8081 to free between legs). Same 12 instances,
+medium effort, card sampler; q27 legs on the production recipe with a
+fresh cache root, both wsum b743d26b1f0562a9.
+
+q27 v0.11.3 221.8 agg / 233.2 med t/s, 4.101 tok/round, 23.8 turns, 15.2K
+out tok/inst, 10/12 gold. Control (bd81f73, PR #43 absent) 209.7 / 223.1,
+3.978, 23.2, 16.8K, 12/12. ninfer DFlash2 218.2 / 240.5, 4.113, 96.1%
+reuse, 24 s/inst, 10.8 turns, 4.0K, 11/12. Reads: decode parity (different
+request mixes, so parity rather than a lead); PR #43 +5.8% agg / +4.5%
+median / +3.1% tok/round on this traffic, matching the replay; wall still
+trajectory length (the 09-09 attribution).
+
+CONFOUND, and a retraction: /dev/shm is a 62 GB tmpfs, and production's
+own prefix cache already held 38 GB of it (+ 5.3 GB of stale 09-08
+scratch roots), so each leg's fresh root had ~19 GB. It filled at
+14:52:57 and the disk tier's writes failed from then on -- 26 of the
+v0.11.3 leg's 41 persists, all 60 of the control's. The q27 legs' reuse
+(92.8%, 90.0%) and wall (108 s, 123 s) are therefore not measurements of
+the engine. A first read of the logs took the resulting pattern --
+restores falling back to the shared 23552 system entry after side
+requests -- for a Claude Code history change caused by v0.11.1's model
+echo; every deeper entry it cited (45490/50546/51596/54859/59571) is on
+the failed-write list, so that hypothesis is retracted. What stands: on
+every consecutive same-conversation pair, today and on 09-09, the warm
+turn reuses prev_prompt - 5 and re-prefills the previous turn's own
+output (by design -- the snapshot sits at the stable prefix). Fix:
+campaign.sh checks /dev/shm free space against each q27 leg's cache
+budget before booting it (refuses and says why) and deletes the leg's
+root after the leg. The stale roots and today's leg roots were deleted
+(tmpfs 62 -> 38 GB used).
+
+RERUN (leg q27v0113b, CLEAR_PROD_PFX=1 so production's 38 GB cache was
+dropped after q27-38 stopped and the leg had its full 40 GB): zero failed
+writes, 32 persists, 31 restores. 218.0 agg / 232.2 med t/s, 4.052
+tok/round, 95.7% reuse, 98 s/inst, 25.2 turns, 15.3K out tok/inst,
+10/12 gold. So: decode parity holds across two runs (218.0 / 221.8 vs
+ninfer 218.2); PR #43 is +4.0% / +5.8% agg across them vs the control;
+reuse 95.7% vs ninfer 96.1% and 09-09's 96.9% -- no regression; wall 98
+vs 24 s/inst on trajectory length. Production relaunched on an empty
+cache (wsum modal, health 200). README State/table carry the rerun row
+with the confounded cells marked.
+
 ## 2026-09-10 (ab): PR #43 merged (sampler filter order + small-top-k nucleus), v0.11.3 cut and deployed to production
 
 PR #43 (the Codex session's sampler work, rebased onto published master)
