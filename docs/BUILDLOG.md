@@ -15787,8 +15787,12 @@ boundary, eviction order, no-deadlock argument), in README Open items;
 measured on the reporter's log) still leaves free-at-ready growing with
 slot count (2.56 -> 3.97 GB at 4 -> 8 slots) -- recalibrating it would
 buy ~2.8 GB of pool at 8 slots but moves every arch's safety margin, so
-it is its own change with its own boots. CPU suite green; issue #42
-follow-up drafted, not posted.
+it is its own change with its own boots. CPU suite green. Shipped as
+v0.11.2 (tag on the README pointer bump after this commit) with the
+concurrency trade in the release notes -- concurrent sessions that each
+fit a divided window before may now take turns, since each reserves its
+full max_tokens; an explicit --ctx keeps fixed windows -- and the
+issue #42 follow-up posted against the release.
 
 ## 2026-09-09 (y): v0.11.1 on thunderdome -- T14/T12 spot check, then the ninfer pair at medium: engines within 3% on every engine-side number, Claude Code emits the same output volume on both
 
