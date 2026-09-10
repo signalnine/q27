@@ -15714,6 +15714,44 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ab): PR #43 merged (sampler filter order + small-top-k nucleus), v0.11.3 cut and deployed to production
+
+PR #43 (the Codex session's sampler work, rebased onto published master)
+merged as 818990a on top of bd81f73. The CUDA nucleus applied min_p
+before top_p, which shrank top_p's denominator and could drop a boundary
+token -- the SampleParams comment already said top_k -> top_p -> min_p
+(llama.cpp's and HF's order) and the kernel did not do it. Now top_p is
+normalized over top_k's support and min_p cuts after. For top_k <= 32
+(serving uses 20) top_p is computed from the survivors sorted in shared
+memory instead of a 16-pass bisection over the vocabulary, and the top_k
+bisection stops once exactly k survive; larger or tie-overflowing
+supports keep the general path. Codex's numbers: 8-lane nucleus 0.7036 ->
+0.2335 ms, decode -2.5% on a 15-request replay with identical hashes
+against a reference that already had the order fix.
+
+Checked on the merged tree before merging: clean merge (no file overlap
+with step 2), server + test builds, test_sampling PASS, test_kernels
+--sampling-only 102/102 on the 5090 (new: top_p-before-min_p support and
+probabilities with and without k, 248321-token ragged vocab at k=20/32/64,
+single- vs multi-lane bit identity on every case), test-tools 453. The
+Metal backend and the DFlash2 drafter carry no min_p/top_p chain, so
+nothing else drifts. Sampled outputs change vs v0.11.2 wherever top_p < 1
+and min_p > 0 -- the agentic recipe included; greedy and the canonical
+gates are unchanged.
+
+v0.11.3 tagged on the README pointer bump after this entry (step 2 + this
+PR). Deployed: q27-server built from 818990a in a master worktree
+(/mnt/ai/projects/q27-master, md5 0e48d741...), moved over
+/mnt/ai/projects/q27/build/q27-server (previous binary kept as
+q27-server.pre-v0.11.3, md5 5870dff0...), production relaunched d2-pfx:
+wsum b743d26b1f0562a9 (modal), DFlash2 ON, batching OFF as configured;
+smoke -- a sampled chat request (the card sampler) and an Anthropic tool
+call (model echoed, get_weather{city: Paris}) both correct. OPS NOTE: the
+main checkout is on codex/perf-sampler-20260909 and production's binary
+lives in its build/; a rebuild there from that branch would silently
+replace production with the older branch's code. Build masters in
+/mnt/ai/projects/q27-master.
+
 ## 2026-09-10 (aa): incremental KV entitlements (issue #42 step 2) -- reserve as tokens are written under a banker's safety check; four 50K sessions keep their caches (69 s vs 189 s for 12 turns)
 
 Plan and the no-deadlock argument: docs/plans/2026-09-10-incremental-kv.md.
