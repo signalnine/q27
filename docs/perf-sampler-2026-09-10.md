@@ -46,9 +46,11 @@ Both corrected and optimized kernels matched the intended support on all
 
 ## Integration validation
 
-This sampler-only port is based on master `bd81f73`, including incremental KV
-entitlements. It carries the sampler changes and their tests from the earlier
-performance branch, without changing proposal-temperature or head selection.
+This sampler-only port targets published master `86a822c`. It carries the
+sampler changes and their tests from the earlier performance branch, without
+changing proposal-temperature or head selection. The integration checks below
+were run on local master `bd81f73`, including incremental KV entitlements;
+that separate, unpublished KV change is not part of this sampler port.
 
 - Standard `make -j2 build/test_sampling build/test_kernels build/q27-server`
   succeeds for the default sm_86, sm_89, and sm_120 targets.
