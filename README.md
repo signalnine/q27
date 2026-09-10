@@ -362,6 +362,15 @@ continuous batching, auto-sized `--ctx`. Every knob keeps its env/flag
 override, `Q27_PROFILE=ref` restores conservative reference behavior, and the
 CLI binary keeps reference defaults so the bitwise canonicals are untouched.
 
+**Multi-slot windows are elastic** (`--slots N` with auto `--ctx`, since
+2026-09-10, [issue #42](https://github.com/signalnine/q27/issues/42)): the
+slots share one paged KV pool and any one of them may hold up to the whole
+of it -- on a 5090, 262K tokens per slot at 4 slots, 152K at 8, where the
+old per-slot division gave 49K and 2K. Pages are reserved per request
+(prompt + max_tokens); a request the free pages cannot cover reclaims idle
+conversations' caches, least recently used first, then waits for a running
+one to finish. An explicit `--ctx` / `--slot1-ctx` still fixes the windows.
+
 **Persistent prefix cache**: `--prefix-cache DIR` (opt-in). Restart TTFT
 8.15 s -> 1.20 s; entries verified token-by-token; LRU capped by
 `--prefix-cache-max-gb`. Stores conversation content on disk in plaintext --
@@ -552,6 +561,13 @@ real coding while MTP nearly doubled stock llama.cpp.
   re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
   costs pinned staging memory per slot. Not yet measured against 128K
   admission.
+- **KV pages are reserved up front.** Elastic windows (issue #42 step 1)
+  let one slot use the whole pool, but each request reserves prompt +
+  max_tokens at admission and Claude Code asks for 64K, so a burst mostly
+  queues behind a long session instead of sharing. Step 2 is reserving
+  pages as tokens are written, parking a generation at a round boundary
+  when the pool runs dry; it needs an eviction order and a no-deadlock
+  argument first.
 - **Wall per instance is not the cross-engine number.** The 09-09 turn
   and token gap is ninfer reasoning less than the model at 8 bits (see the
   09-09-echo readout); which of its NVFP4 weights, int8 KV or sampler does

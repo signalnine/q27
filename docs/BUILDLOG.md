@@ -15714,6 +15714,82 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (z): elastic multi-slot windows (issue #42 step 1) -- the pool was shared since 08-16, the windows were not; 4 slots on a 5090 go from 49K to 262K per slot, 8 slots from 2K to 152K, at the same free VRAM
+
+Issue #42 (the #41 reporter): with `--slots N` and auto ctx, the card
+is divided into N fixed windows at boot -- 4 slots 45K each on their
+5090, 7 slots 2K, 8 slots no boot -- so a mostly-single-user resident
+service loses most of its context to slots that are idle. The M2b plan
+(docs/plans/2026-08-16-m2-paged-kv.md) had already said the fix: the KV
+is one paged pool with per-request entitlements and LRU scavenging of
+idle lineages (M2b gate battery, (e)), and the auto-ctx multi-slot
+arithmetic should "drop the per_tok * n_slots divisor". It never did.
+Two defects in that one block: the division itself (the pool is sized
+afterwards from what is actually free, so on the reporter's box 249K
+tokens of pool sat behind 180K of caps), and a per-slot charge of the
+whole single-engine stack including kEngBase (~0.9 GB, once per process;
+the pool block's fixed_for already charges it once), which is why 7
+slots got 2K.
+
+Change (server.cu, boot sizing only): want_pool is read before auto-ctx;
+with auto ctx, N > 1 and the pool on, every slot's window is the cap
+(262144 compact KV / 131072 fp16), the pool block's existing r_max clamp
+brings it to what the pool can entitle, and the auto-ctx slot clamp no
+longer applies (the pool block's fit_slots and floor loop decide the
+slot count). The pool floor for elastic slots is a fixed 16384 rows per
+slot instead of half the window (half of a pool-sized window would trade
+every extra slot away). The divided window and slot count are kept as
+the fallback when the pool does not come up (per-slot KV at a pool-sized
+window would OOM). An explicit --slot1-ctx is honored in elastic mode.
+Single slot, Q27_KV_POOL=0 and explicit --ctx are untouched. Admission
+is unchanged: prompt + max_tokens reserved at claim, LRU scavenge of idle
+lineages, route_cv wait behind busy ones.
+
+Gate (bench/pool/elastic_boot.sh + elastic_admission.py; journal reads
+keyed on InvocationID, GPU-occupancy guard; production down 08:49-08:55,
+relaunched wsum b743d26b1f0562a9):
+
+| card, tier, KV | config | window before (divided) | window after | pool | free at ready |
+|---|---|--:|--:|--:|--:|
+| 5090, q4 17.0 GB, fp8 | single slot | 262144 | 262144 | 12.35 GB | 1.50 GB |
+| | --slots 4 | 49152 | 262144 | 9.36 GB | 2.56 GB (divided: 2.57) |
+| | --slots 7 | 4096 | 180224 | 6.37 GB | 3.62 GB |
+| | --slots 8 | 2048 | 151552 | 5.38 GB | 3.97 GB |
+| | --slots 4, Q27_KV_POOL=0 | 49152 | 49152 (unchanged path) | -- | 5.09 GB |
+| | --slots 4 --ctx 196608 --slot1-ctx 32768 | 196608 / 32768 | unchanged | 9.36 GB | 2.57 GB |
+| 3090, q4s 15.7 GB, fp16 | --slots 2 | 2048 | 32768 | 2.34 GB | 3.85 GB |
+| 3090, q4s, turbo5k (Ampere default) | --slots 2 | 2048 | 126976 | 2.34 GB | 3.84 GB |
+| | --slots 3 | 2048 | 57344 | 1.04 GB | 4.36 GB |
+
+Bigger windows cost nothing measurable: free at ready is the same at 4
+slots elastic vs divided (2.56 vs 2.57 GB), and on sm_86 -- where the
+auto-ctx comments warn of a ctx-scaled graph zoo -- a 4x larger window
+(126976 vs 32768) leaves the same 3.84/3.85 GB. Block tables are 8 B a
+page; d_gen is 4 B a row.
+
+Admission suite on elastic --slots 4 (window 262144), ALL PASS:
+beyond-old-cap -- a 60661-token prompt admits (the divided window here
+was 49152, the reporter's 45056); four concurrent 31.5K prompts run
+together (queue waits 0-0.7 s); pressure -- four concurrent 91.6K
+prompts (1.4x the pool) run two at a time, the other two wait 64-65 s,
+scavenge the finished slots and complete, nothing hangs; oversized -- a
+282786-token prompt 400s in 0.1 s ("> 262129 maximum"); continuation --
+the next turn lands on its slot with hit=60656. Also visible, and the
+trade this change makes: the pressure test scavenged test 1's idle
+conversation, so its repeat re-prefilled 60K (hit=0) before the
+continuation reused it.
+
+Left as they were, and why: (1) reservation is still prompt + max_tokens
+up front, so Claude Code's 64K asks make a burst queue behind a long
+session -- step 2 (reserve as tokens are written, park at a round
+boundary, eviction order, no-deadlock argument), in README Open items;
+(2) the pool block's per-extra-slot charge (~1.0 GB modeled vs ~0.64 GB
+measured on the reporter's log) still leaves free-at-ready growing with
+slot count (2.56 -> 3.97 GB at 4 -> 8 slots) -- recalibrating it would
+buy ~2.8 GB of pool at 8 slots but moves every arch's safety margin, so
+it is its own change with its own boots. CPU suite green; issue #42
+follow-up drafted, not posted.
+
 ## 2026-09-09 (y): v0.11.1 on thunderdome -- T14/T12 spot check, then the ninfer pair at medium: engines within 3% on every engine-side number, Claude Code emits the same output volume on both
 
 Thunderdome (claude-code-q27-haight, production :8081, effort unpinned =

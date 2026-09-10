@@ -302,7 +302,8 @@ int main(int argc, char** argv) {
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
-                "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; single-slot). Escapes:\n"
+                "  (auto-ctx cap 262144 fp8/turbo3, 131072 fp16; with --slots N every\n"
+                "  slot may use the whole shared KV pool -- elastic windows). Escapes:\n"
                 "  Q27_PROFILE=ref (conservative\n"
                 "  reference: fp16/ungated/no-suffix/fd2), any individual Q27_* env,\n"
                 "  --kv-fp16 --no-fast-head --think --request-think (honor per-\n"
@@ -742,6 +743,30 @@ int main(int argc, char** argv) {
     // 2048 B, fp8 1024 B) or N_KV*(HEAD_DIM/128)*50 B = 400 B turbo3 /
     // *82 B = 656 B turbo5 K.
     // MIRROR WARNING: matches Engine::kv_bytes -- update together.
+    //
+    // M2b: the process-wide paged KV pool. DEFAULT ON since 2026-08-16 (M1b
+    // flip criterion met: pooled C=4/C=6 at parity with per-slot --
+    // 270.0/309.8 vs 271.2/307.7 -- while buying a 7th slot and per-request
+    // ctx). Q27_KV_POOL=0 restores per-slot KV. Read here, before auto-ctx,
+    // because it decides whether multi-slot windows are divided or elastic.
+    const bool want_pool = [] {
+        const char* e = getenv("Q27_KV_POOL");
+        return !e || atoi(e) != 0;
+    }();
+    // ELASTIC multi-slot windows (issue #42, 2026-09-10). With the pool on,
+    // KV pages are already shared and handed out per request at claim_slot;
+    // the only thing that still partitioned the card was each slot's
+    // max_ctx, which auto-ctx computed by dividing VRAM by the slot count
+    // (4 slots on a 5090: 45056 each, 180K summed against a 249K-token pool,
+    // and no request past 45K with three slots idle). The M2b plan said to
+    // drop that divisor and cap every slot at the native window; this does.
+    // Every slot's window becomes the cap (262144/131072), the pool block
+    // below clamps it to what the pool can entitle, and admission arbitrates
+    // the rest: idle lineages are scavenged LRU-first, busy ones are waited
+    // for. The divided window is kept only as the fallback when the pool
+    // does not come up. Explicit --ctx / --slot1-ctx are untouched.
+    bool elastic_ctx = false;
+    int ctx_divided = 0, n_slots_divided = 0;
     {
         // clamp slot count BEFORE auto-ctx divides the budget by it. Ceiling
         // 8 = the conductor's hard MAX_K/2 fusion limit (W_PLUMB=16 lane
@@ -822,16 +847,30 @@ int main(int argc, char** argv) {
                 if (pf_arena_on) free_b = free_b > kEngArena ? free_b - (size_t)kEngArena : 0;
                 int fit = (int)(free_b / (per_slot + per_tok * 4096.0));
                 if (fit < 1) fit = 1;
-                if (fit < n_slots) {
-                    fprintf(stderr,
-                            "--ctx auto: only %d of %d requested slots fit in %.1f GB "
-                            "(~%.1f GB/slot fixed) -- sizing for %d\n",
-                            fit, n_slots, free_b / 1e9, per_slot / 1e9, fit);
-                    n_slots = fit;
+                // Elastic (pool on): this divided sizing is only the fallback
+                // for a pool that fails to come up, so it must not clamp the
+                // slot count -- it charges kEngBase to every slot, which the
+                // pool block's own arithmetic (base once) does not, and would
+                // throw away slots the pool can hold (issue #42: 7 slots sized
+                // to 2K each here). The pool block clamps slots itself.
+                int ns = n_slots;
+                if (fit < ns) {
+                    if (!want_pool)
+                        fprintf(stderr,
+                                "--ctx auto: only %d of %d requested slots fit in %.1f GB "
+                                "(~%.1f GB/slot fixed) -- sizing for %d\n",
+                                fit, ns, free_b / 1e9, per_slot / 1e9, fit);
+                    ns = fit;
                 }
-                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * n_slots; // arch margin (issue #6), per slot
-                budget = (long)((double)free_b - n_slots * per_slot - slack);
-                c = budget > 0 ? (long)(budget / (per_tok * n_slots)) : 0;
+                const double slack = (cc_arch >= 120 ? 0.25e9 : 1.0e9) * ns; // arch margin (issue #6), per slot
+                budget = (long)((double)free_b - ns * per_slot - slack);
+                c = budget > 0 ? (long)(budget / (per_tok * ns)) : 0;
+                if (want_pool) {
+                    elastic_ctx = true;
+                    n_slots_divided = ns;
+                } else {
+                    n_slots = ns;
+                }
             }
             // cap: native window (262144) for the compact KV formats
             // (2026-07-11, Gabe sign-off: fp8 measured to 294912 on the
@@ -841,7 +880,16 @@ int main(int argc, char** argv) {
             const long cap = (fp8 || t3 || t3v || t5k) ? 262144 : 131072;
             if (c > cap) c = cap;
             ctx = (int)(c / 4096 * 4096);
-            if (ctx < 4096) {
+            if (elastic_ctx) {
+                // keep the divided window as the no-pool fallback only
+                ctx_divided = std::max(ctx, 2048);
+                ctx = (int)cap;
+                fprintf(stderr,
+                        "--ctx auto: elastic -- %d slots share one KV pool, each may hold "
+                        "up to %d tokens (clamped to the pool below; %d per slot if the "
+                        "pool fails)\n",
+                        n_slots, ctx, ctx_divided);
+            } else if (ctx < 4096) {
                 fprintf(stderr,
                         "--ctx auto: only %d fits (free %.1fGB post-weights, %s KV, W_MAX=%d) -- "
                         "likely to OOM; pass a smaller --ctx or rebuild with a lower Q27_W_MAX\n",
@@ -856,7 +904,9 @@ int main(int argc, char** argv) {
                 if (ctx < 16384)
                     fprintf(stderr, "  (tight -- a lower Q27_W_MAX build would free more)\n");
             }
-            if (n_slots > 1) slot1_ctx = ctx; // auto: every slot gets the same window
+            // auto: every slot gets the same window (elastic: an explicit
+            // --slot1-ctx still sizes slots 1+)
+            if (n_slots > 1 && !(elastic_ctx && slot1_ctx_set)) slot1_ctx = ctx;
         }
     }
     // Explicit --ctx propagates to slots 1+ unless --slot1-ctx was given.
@@ -924,13 +974,7 @@ int main(int argc, char** argv) {
     // M3a: one process-wide prefill scratch arena instead of ~0.73 GB per
     // engine (prefill_arena.h). Q27_PF_ARENA=0 restores per-engine buffers.
     q27::PrefillArena pf_arena;
-    // DEFAULT ON since 2026-08-16 (M1b flip criterion met: pooled C=4/C=6
-    // at parity with per-slot -- 270.0/309.8 vs 271.2/307.7 -- while buying
-    // a 7th slot and per-request ctx). Q27_KV_POOL=0 restores per-slot KV.
-    const bool want_pool = [] {
-        const char* e = getenv("Q27_KV_POOL");
-        return !e || atoi(e) != 0;
-    }();
+    // (want_pool is read above the auto-ctx block -- it decides elastic.)
     // M3a: the shared prefill arena is allocated before any Engine exists
     // (allocation during serving is illegal under graph capture, the pool's
     // discipline) and before the POOL BLOCK measures free VRAM, so its numbers
@@ -1000,16 +1044,19 @@ int main(int argc, char** argv) {
                    (double)(ns - 1) * (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
                    pool_slack + (double)ns * (double)(256ull << 20);
         };
-        const int half_rows = std::max(4096, slot1_ctx / 2);
+        // Elastic windows (issue #42) are pool-sized, so half of one would
+        // trade every extra slot away; they get a FIXED 16K concurrent share
+        // per slot instead, and admission arbitrates anything larger.
+        const int floor_rows = elastic_ctx ? 16384 : std::max(4096, slot1_ctx / 2);
         const double ent_bytes =
-            (double)(17 * (size_t)((half_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
+            (double)(17 * (size_t)((floor_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
         double pool_b = (double)freeb - fixed_for(n_slots);
         while (n_slots > 1 && pool_b < (double)n_slots * ent_bytes) {
             n_slots--;
             pool_b = (double)freeb - fixed_for(n_slots);
         }
-        fprintf(stderr, "[pool] %d slots, floor %.2f GB (half-ctx x slots), pool %.2f GB\n",
-                n_slots, n_slots * ent_bytes / 1e9, pool_b / 1e9);
+        fprintf(stderr, "[pool] %d slots, floor %.2f GB (%d rows x slots), pool %.2f GB\n",
+                n_slots, n_slots * ent_bytes / 1e9, floor_rows, pool_b / 1e9);
 
         // AN EXPLICIT --ctx BIDS AGAINST THE ARCH SLACK (2026-08-20, the #25
         // follow-up). pool_b above is "whatever free VRAM is left after a
@@ -1126,6 +1173,14 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[pool] cannot entitle even 4096 rows -- per-slot KV\n");
                 for (int s_ = 0; s_ < 2; s_++)
                     if (kv_pool.base[s_]) { cudaFree(kv_pool.base[s_]); kv_pool.base[s_] = nullptr; }
+            } else if (elastic_ctx) {
+                // the expected outcome, not a clamp worth warning about
+                if (ctx > r_max) ctx = r_max;
+                if (slot1_ctx > r_max) slot1_ctx = r_max;
+                fprintf(stderr,
+                        "[pool] elastic windows: each of %d slots may hold up to %d tokens "
+                        "of the shared pool (slots 1+: %d)\n",
+                        n_slots, ctx, slot1_ctx);
             } else {
                 if (ctx > r_max) {
                     fprintf(stderr, "[pool] ctx %d -> %d (pool-entitlable window)\n", ctx,
@@ -1143,6 +1198,18 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "[pool] sizing failed -- per-slot KV (paged pool is the default; "
                     "Q27_KV_POOL=0 selects per-slot explicitly)\n");
+    }
+    // Elastic windows exist only on the pool: per-slot KV at a pool-sized
+    // window would self-provision N full windows and OOM. Fall back to the
+    // divided sizing auto-ctx computed (and its slot clamp).
+    if (elastic_ctx && !kv_pool.enabled()) {
+        fprintf(stderr, "[pool] elastic windows need the pool -- falling back to %d per slot "
+                        "x %d slots\n",
+                ctx_divided, std::min(n_slots, n_slots_divided));
+        ctx = ctx_divided;
+        if (!slot1_ctx_set) slot1_ctx = ctx_divided;
+        n_slots = std::min(n_slots, n_slots_divided);
+        elastic_ctx = false;
     }
     std::vector<Slot> slots;
     for (int si = 0; si < n_slots; si++) {
