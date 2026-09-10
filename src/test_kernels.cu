@@ -2524,9 +2524,9 @@ static void test_wy_stream_isolation() {
 
 // top_k/min_p added 2026-08-23. Both are gated against the CPU reference:
 // top_k is native to q27::SamplingParams, and min_p is applied to the host's
-// kept set by its defining property (p_i >= min_p * p_max), which is
-// scale-invariant and therefore independent of where in the chain it runs --
-// the reason the kernel can compose all three as max() of logit thresholds.
+// kept set AFTER top_p, by its defining property (p_i >= min_p * p_max).
+// The min_p threshold is scale-invariant, but applying it before top_p
+// changes top_p's denominator and can remove an extra boundary token.
 // NOTE the kernel filters on the TEMPERATURE-SCALED distribution while
 // llama.cpp filters raw logits and applies temperature last; the two coincide
 // exactly at T=1.0, which is the Qwen3.8 card value and the config we serve.
@@ -2565,6 +2565,14 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
             if (logits[token] < floor_logit) host_kept[token] = 0;
     }
 
+    double host_mass = 0.0;
+    for (size_t i = 0; i < host.tokens.size(); i++)
+        if (host_kept[host.tokens[i]]) host_mass += host.weights[i];
+    std::vector<double> host_probability(logits.size(), 0.0);
+    for (size_t i = 0; i < host.tokens.size(); i++)
+        if (host_kept[host.tokens[i]])
+            host_probability[host.tokens[i]] = host.weights[i] / host_mass;
+
     int support_mismatches = 0;
     double max_probability_error = 0.0;
     for (uint32_t token = 0; token < logits.size(); token++) {
@@ -2576,10 +2584,9 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
                            nucleus[2]) /
                       nucleus[3]
                 : 0.0;
-        if (min_p <= 0.0f) // served_probability has no min_p notion to compare against
-            max_probability_error =
-                std::max(max_probability_error,
-                         std::fabs(device_probability - q27::served_probability(host, token)));
+        max_probability_error =
+            std::max(max_probability_error,
+                     std::fabs(device_probability - host_probability[token]));
     }
 
     char label[128];
@@ -2587,6 +2594,22 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
     check(label, (double)support_mismatches, 0.5);
     std::snprintf(label, sizeof label, "%s probabilities", name);
     check(label, max_probability_error, 2e-5);
+
+    // The captured verify path uses the multi-lane entry point. It must
+    // share the single-lane distribution and remain deterministic despite
+    // the small-support path's atomic compaction.
+    float* d_multi;
+    CUDA_CHECK(cudaMalloc(&d_multi, 8 * 4 * sizeof(float)));
+    q27k::CP3 lanes{};
+    for (int i = 0; i < 8; i++) lanes.p[i] = d_logits;
+    q27k::nucleus_multi(lanes, (int)logits.size(), d_params, d_multi, 8);
+    float multi[8][4];
+    CUDA_CHECK(cudaMemcpy(multi, d_multi, sizeof multi, cudaMemcpyDeviceToHost));
+    int unequal = 0;
+    for (int i = 0; i < 8; i++) unequal += memcmp(multi[i], nucleus, sizeof nucleus) != 0;
+    std::snprintf(label, sizeof label, "%s multi-lane identity", name);
+    check(label, (double)unequal, 0.5);
+    CUDA_CHECK(cudaFree(d_multi));
 
     CUDA_CHECK(cudaFree(d_logits));
     CUDA_CHECK(cudaFree(d_nucleus));
@@ -2618,6 +2641,17 @@ static void test_sample() {
     check_nucleus_contract("sample host/CUDA qwen38 chain", x, 1.0f, 0.95f, 20, 0.05f);
     check_nucleus_contract("sample host/CUDA k>vocab is off", x, 1.0f, 0.95f, 100000, 0.0f);
     check_nucleus_contract("sample host/CUDA chain on ties", tied, 1.0f, 0.95f, 20, 0.05f);
+    // After top_k the weights are 1, .1, .055, .04. top_p=.95 needs the
+    // first three; pre-applying min_p=.05 incorrectly leaves only two.
+    std::vector<float> order_case = {0.f, std::log(.1f), std::log(.055f),
+                                    std::log(.04f), -20.f};
+    check_nucleus_contract("sample top_p before min_p", order_case, 1.f, .95f, 4, .05f);
+    check_nucleus_contract("sample top_p before min_p no k", order_case, 1.f, .95f, 0, .05f);
+    std::vector<float> large = rand_vec(248321, 20260909);
+    for (auto& value : large) value *= 2.5f;
+    check_nucleus_contract("sample large ragged k=20", large, 1.f, .95f, 20, .05f);
+    check_nucleus_contract("sample large ragged k=32 hot", large, 2.f, .8f, 32, .1f);
+    check_nucleus_contract("sample large ragged k=64 fallback", large, .7f, .95f, 64, .05f);
     // CPU argmax + full-softmax probs at a given inv_temp
     auto cpu_argmax = [&]() {
         int bi = 0; for (int i = 1; i < n; i++) if (x[i] > x[bi]) bi = i; return bi;

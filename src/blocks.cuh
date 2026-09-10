@@ -118,11 +118,10 @@ struct SampleParams {
     float inv_temp; // 1/T (>0)
     float top_p;    // (0,1]; >=1 => full vocab
     unsigned long long seed;
-    // 2026-08-23: llama-server's chain for Qwen3.8 is top_k 20 -> top_p 0.95
-    // -> min_p 0.05 -> temperature, and q27 had only top_p, so a "matched
-    // sampler" comparison was never actually matched. Both are expressed as
-    // logit thresholds by nucleus_body and composed in the SAME order llama
-    // applies them, so the kept set is identical rather than merely similar.
+    // Filters run top_k -> top_p -> min_p on temperature-scaled weights.
+    // top_p is normalized over top_k's support BEFORE min_p is applied.
+    // At the Qwen3.8 serving temperature T=1 this also matches the filter
+    // order of llama-server's temperature-last chain.
     // Defaults are off, and the members carry NSDMIs so existing three-field
     // brace-init sites keep compiling.
     int top_k = 0;     // <=0 or >=vocab => off

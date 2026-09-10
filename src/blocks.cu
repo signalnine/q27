@@ -533,12 +533,12 @@ void argmax_masked(const float* x, int n, const unsigned* pool, int words, const
 // Philox4x32-10 lives in blocks.cuh (philox_uniform / am_mulhi) since the
 // DFlash2 drafter's sampled selector walk draws from the same generator.
 
-// Single block: max M, logsumexp logZ at inv_temp, and the top-p logit
-// threshold via a fixed 12-iteration bisection on a prob cutoff (no sort, no
-// atomics -> deterministic, and graph-capturable at fixed geometry). Reads
-// inv_temp/top_p from the device param block (graph-fixed pointer). Writes
-// out[0]=logit_thresh, out[1]=M, out[2]=logZ. thresh clamped <= M so the argmax
-// token is always in the nucleus (guards degenerate/tiny top_p).
+// Single block: max M, logsumexp logZ at inv_temp, and the served logit
+// threshold. Small top-k supports use a compact sort; the general path uses
+// logit bisection. Both are deterministic and graph-capturable at fixed
+// geometry. Reads the device param block (graph-fixed pointer). Writes
+// out[0]=threshold, out[1]=M, out[2]=logZ, out[3]=retained full-softmax mass.
+// Threshold is clamped <= M so the argmax always survives.
 // Body factored out so the single-lane and multi-lane entry points cannot drift:
 // one block computes one lane, exactly as before. Every reduction is within the
 // block and no state crosses blocks, so running L lanes as L BLOCKS is bitwise
@@ -587,14 +587,10 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
     }
     __syncthreads();
     const float logZ = s_logZ;
-    // --- top_k, then min_p, then top_p: llama.cpp's order, as thresholds ----
-    // Each filter only REMOVES tokens, so a chain is an intersection of kept
-    // sets, and an intersection of "x_i >= thr" sets is "x_i >= max(thr)".
-    // top_k and min_p do not depend on which other tokens survive, so they
-    // compose by max() exactly. top_p DOES depend on the surviving mass, so it
-    // is bisected below over the set the first two already left -- computing
-    // it on the full vocab instead would keep too many tokens whenever top_k
-    // binds, which for k=20 on a peaked distribution is almost always.
+    // --- top_k, then top_p, then min_p, on temperature-scaled weights ----
+    // top_p's denominator is the mass left by top_k. Although min_p's logit
+    // threshold is independent of normalization, applying it before top_p
+    // shrinks that denominator and can drop an extra boundary token.
     // s_logZp is SEPARATE from s_logZ on purpose: out[2] exports the FULL-vocab
     // logZ and out[3]'s mass is sum_{kept} softmax_full(i), which the Phase-2
     // accept test divides by. Overwriting s_logZ here would make mass ~1 and
@@ -602,16 +598,9 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
     __shared__ float s_pre, s_logZp;
     if (t == 0) { s_pre = -FLT_MAX; s_logZp = s_logZ; }
     __syncthreads();
-    // min_p: p_i/p_max >= min_p  <=>  inv_temp*(x_i - M) >= log(min_p).
-    // Scale-invariant under renormalisation, so its threshold is the same
-    // whether it runs before or after any other filter -- closed form, no
-    // bisection.
-    if (t == 0 && min_p > 0.f && min_p <= 1.0f && inv_temp > 0.f)
-        s_pre = fmaxf(s_pre, M + __logf(min_p) / inv_temp);
-    __syncthreads();
-    // top_k: bisect for the k-th largest LOGIT (same window and iteration
-    // count as the top_p bisection below, counting instead of summing). The
-    // count is monotone decreasing in thr, so the invariant matches.
+    // top_k: bisect the transition from >k to <=k retained logits. This
+    // existing threshold representation cannot split exact boundary ties
+    // by token ID (unlike an explicit top-k candidate list).
     if (top_k > 0 && top_k < n) {
         if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
         __syncthreads();
@@ -624,17 +613,64 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
                 if (t < s) sh[t] += sh[t + s];
                 __syncthreads();
             }
-            // keep the largest thr whose count still covers k
+            // Retain the upper endpoint whose count is at most k.
             if (t == 0) { if (sh[0] > (float)top_k) s_lo = thr; else s_hi = thr; }
             __syncthreads();
+            // Once the support has exactly k members, further bisection
+            // cannot change it. The shared count makes this branch uniform.
+            if (sh[0] == (float)top_k) break;
         }
         if (t == 0) s_pre = fmaxf(s_pre, s_hi); // s_hi keeps <= k tokens
         __syncthreads();
     }
     const float pre = s_pre;
+    // Serving uses k=20: select top_p from that small support instead of
+    // rereading the entire vocabulary sixteen times. Compaction order is
+    // irrelevant after the deterministic value sort. Tied top-k boundaries
+    // may retain more than k tokens; overflow takes the general path below.
+    __shared__ float candidates[32];
+    __shared__ int candidate_count;
+    bool compact = false;
+    if (top_k > 0 && top_k <= 32 && top_p < 1.f) {
+        if (t == 0) candidate_count = 0;
+        __syncthreads();
+        for (int i = t; i < n; i += B) {
+            if (x[i] >= pre) {
+                const int slot = atomicAdd(&candidate_count, 1);
+                if (slot < 32) candidates[slot] = x[i];
+            }
+        }
+        __syncthreads();
+        compact = candidate_count > 0 && candidate_count <= 32;
+        if (compact && t == 0) {
+            const int count = candidate_count;
+            for (int i = 1; i < count; i++) {
+                const float value = candidates[i];
+                int j = i;
+                while (j > 0 && candidates[j - 1] < value) {
+                    candidates[j] = candidates[j - 1];
+                    --j;
+                }
+                candidates[j] = value;
+            }
+            float weights[32], total = 0.f;
+            for (int i = 0; i < count; i++) {
+                weights[i] = expf(inv_temp * (candidates[i] - M));
+                total += weights[i];
+            }
+            const float target = top_p * total;
+            float cumulative = 0.f;
+            int last = 0;
+            do { cumulative += weights[last++]; }
+            while (last < count && cumulative < target);
+            // Every token tied at the boundary survives the logit threshold.
+            s_thresh = candidates[last - 1];
+        }
+        __syncthreads();
+    }
     // Renormalise the remaining mass so top_p's cumulative is taken over the
-    // set that survived top_k/min_p, exactly as llama.cpp does.
-    if (top_p < 1.0f && pre > -FLT_MAX) {
+    // set that survived top_k; min_p is applied only after top_p.
+    if (!compact && top_p < 1.0f && pre > -FLT_MAX) {
         float se2 = 0.f;
         for (int i = t; i < n; i += B)
             if (x[i] >= pre) se2 += expf(inv_temp * (x[i] - M));
@@ -647,7 +683,7 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
         __syncthreads();
     }
     const float logZp = s_logZp;
-    if (top_p < 1.0f) {
+    if (!compact && top_p < 1.0f) {
         if (t == 0) { s_lo = M - 40.0f * fmaxf(1.0f, 1.0f / inv_temp); s_hi = M; }
         __syncthreads();
         for (int it = 0; it < 16; it++) {
@@ -666,14 +702,17 @@ __device__ __forceinline__ void nucleus_body(const float* __restrict__ x, int n,
         }
     }
     if (t == 0) {
-        float thresh = (top_p >= 1.0f) ? -FLT_MAX : s_lo; // s_lo is now the logit threshold
-        thresh = fmaxf(thresh, pre);  // intersect with top_k/min_p
+        float thresh = (top_p >= 1.0f) ? -FLT_MAX : (compact ? s_thresh : s_lo);
+        thresh = fmaxf(thresh, pre);
+        // min_p: p_i/p_max >= min_p <=> x_i >= M + log(min_p)/inv_temp.
+        if (min_p > 0.f && min_p <= 1.0f && inv_temp > 0.f)
+            thresh = fmaxf(thresh, M + __logf(min_p) / inv_temp);
         s_thresh = fminf(thresh, M);  // argmax token always in nucleus
     }
     __syncthreads();
     // out[3] = nucleus mass = sum_{x_i >= thresh} softmax_full(i) (Phase 2 accept
     // test needs the RENORMALIZED served prob p(dr)=softmax_full(dr)/mass, not
-    // softmax_full(dr); mass==1 when top_p>=1 so the plain path is unaffected).
+    // softmax_full(dr); mass==1 only when no filter removes any mass).
     // One extra grid-stride pass over the just-fixed threshold (argmax cost class).
     const float thr = s_thresh;
     float ms = 0.f;
