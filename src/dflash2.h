@@ -93,6 +93,10 @@ struct Dflash2 {
     float* d_qrow = nullptr; // [WMAX-1][TOPK]
     const q27k::SampleParams* d_sp = nullptr; // engine's device sampler params (fixed ptr)
     void set_sampler(const q27k::SampleParams* sp) { d_sp = sp; }
+    // Zero follows the request's temperature. A positive override changes
+    // only the proposal law; d_qrow retains that law for exact rejection.
+    // Set before capture_draft: this scalar is a captured kernel argument.
+    float proposal_inv_temp = 0.f;
     int* d_ctx_n = nullptr;  // device mirror of ctx_n (graph-stable attn)
     float* d_attn_part = nullptr; // flash-decoding partials [ASPLIT][NKV][AQMAX][HD+2]
     unsigned long long* d_c1 = nullptr; // top-16 stage-1 (value,id) keys [WMAX-1][256*16]
@@ -103,12 +107,18 @@ struct Dflash2 {
     const void* ehead_data = nullptr;
     const __half* ehead_scales = nullptr;
     bool ehead_q4 = false;
+    int head_vocab = D2_V;
+    int* d_head_ids = nullptr; // compact row -> original vocabulary token ID
     q27k::XQuant hxq[D2_WMAX - 1] = {};
     void set_engine_head(const void* data, const __half* scales, bool q4) {
         ehead_data = data;
         ehead_scales = scales;
         ehead_q4 = q4;
     }
+    // Optional proposal-only row subset, loaded before graph capture. File:
+    // unique little-endian int32 token IDs, in head row order. Target head
+    // and embedding remain full-vocabulary. Owns the gathered head buffers.
+    void load_engine_shortlist(const char* path);
     // Engine Q8 embedding reuse (serving): the drafter's anchor/mask embed
     // rows come from the engine's own token_embd (Q8_G128) instead of a
     // packed fp16 target.embed -- saves 2.5 GB of VRAM (= more KV/ctx).
@@ -178,7 +188,9 @@ struct Dflash2 {
 // (vs a CPU reference over a windowed ring), and the selector walk
 // (integrated device-walk + sparse-q verify gate on synthetic codebooks).
 void d2_top16_launch(const float* d_logits, unsigned long long* d_c1, int* d_cand, float* d_cval,
-                     int K, cudaStream_t st);
+                     int K, cudaStream_t st, int vocab = D2_V, const int* d_ids = nullptr);
+void d2_gather_head_launch(const void* src, const __half* scales, void* dst, __half* dst_scales,
+                           const int* ids, int rows, bool q4, cudaStream_t st);
 // part: caller-provided partials buffer, D2_ASPLIT * D2_NKV * D2_AQMAX * (D2_HD + 2) floats.
 void d2_attn_launch(const float* q, const float* ringK, const float* ringV, const int* ring_pos,
                     const int* d_ctx_n, const float* nk, const float* nv, const int* npos,
@@ -187,6 +199,6 @@ constexpr int D2_ATTN_PART_FLOATS = 32 * D2_NKV * (D2_WMAX * (D2_NH / D2_NKV)) *
 void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
                     const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
                     int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,
-                    float* d_qrow, cudaStream_t st);
+                    float* d_qrow, cudaStream_t st, float proposal_inv_temp = 0.f);
 
 } // namespace q27d2

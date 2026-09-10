@@ -298,15 +298,16 @@ __device__ __forceinline__ void d2_bitonic_desc(unsigned long long* s) {
 }
 
 __global__ void k_d2_top16a(const float* __restrict__ logits, unsigned long long* __restrict__ c1,
-                            int rows) {
+                            int rows, int vocab, const int* __restrict__ ids) {
     const int r = blockIdx.x, b = blockIdx.y;
     if (r >= rows) return;
-    constexpr int slice = D2_V / D2_T16B;
+    const int slice = (vocab + D2_T16B - 1) / D2_T16B;
     const int v0 = b * slice;
     const float* lg = logits + (size_t)r * D2_V;
     __shared__ unsigned long long s[D2_T16A_N];
     for (int i = threadIdx.x; i < D2_T16A_N; i += blockDim.x)
-        s[i] = i < slice ? d2_key(lg[v0 + i], v0 + i) : 0ull;
+        s[i] = i < slice && v0 + i < vocab
+                   ? d2_key(lg[v0 + i], ids ? ids[v0 + i] : v0 + i) : 0ull;
     __syncthreads();
     d2_bitonic_desc<D2_T16A_N>(s);
     if (threadIdx.x < D2_TOPK)
@@ -328,9 +329,9 @@ __global__ void k_d2_top16b(const unsigned long long* __restrict__ c1, int* __re
     }
 }
 static void d2_top16_launches(const float* logits, unsigned long long* c1, int* cand, float* cval,
-                              int K, cudaStream_t st) {
+                              int K, cudaStream_t st, int vocab = D2_V, const int* ids = nullptr) {
     dim3 g1(K, D2_T16B);
-    k_d2_top16a<<<g1, 256, 0, st>>>(logits, c1, K);
+    k_d2_top16a<<<g1, 256, 0, st>>>(logits, c1, K, vocab, ids);
     k_d2_top16b<<<K, 1024, (size_t)D2_T16B_N * 8, st>>>(c1, cand, cval, K);
 }
 // Selector path walk (z-lab CandidateSelector.select, greedy): one block,
@@ -349,7 +350,8 @@ __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict_
                           const __half* __restrict__ succ, const int* __restrict__ d_anchor,
                           int K, int* __restrict__ out, int sampled,
                           const q27k::SampleParams* __restrict__ sp,
-                          const int* __restrict__ posW, float* __restrict__ qrow) {
+                          const int* __restrict__ posW, float* __restrict__ qrow,
+                          float proposal_inv_temp) {
     __shared__ float ph[D2_RANK];
     __shared__ float sc[D2_TOPK][256 / 32]; // per-warp partials per candidate
     __shared__ int s_prev;
@@ -381,7 +383,7 @@ __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict_
                 if (s[i] > best) { best = s[i]; besti = i; }
             }
             if (sampled) {
-                const float invT = sp->inv_temp;
+                const float invT = proposal_inv_temp > 0.f ? proposal_inv_temp : sp->inv_temp;
                 float w[D2_TOPK], sum = 0.f;
                 for (int i = 0; i < D2_TOPK; i++) {
                     w[i] = expf(invT * (s[i] - best));
@@ -416,21 +418,79 @@ __global__ void k_d2_walk(const int* __restrict__ cand, const float* __restrict_
 }
 
 void d2_top16_launch(const float* d_logits, unsigned long long* d_c1, int* d_cand, float* d_cval,
-                     int K, cudaStream_t st) {
-    d2_top16_launches(d_logits, d_c1, d_cand, d_cval, K, st);
+                     int K, cudaStream_t st, int vocab, const int* d_ids) {
+    d2_top16_launches(d_logits, d_c1, d_cand, d_cval, K, st, vocab, d_ids);
     D2CHECK(cudaGetLastError());
 }
 
 void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
                     const __half* d_pred, const __half* d_succ, const int* d_anchor, int K,
                     int* d_out, bool sampled, const q27k::SampleParams* d_sp, const int* d_posW,
-                    float* d_qrow, cudaStream_t st) {
+                    float* d_qrow, cudaStream_t st, float proposal_inv_temp) {
     k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, d_hp, d_pred, d_succ, d_anchor, K, d_out,
-                                 sampled ? 1 : 0, d_sp, d_posW, d_qrow);
+                                 sampled ? 1 : 0, d_sp, d_posW, d_qrow, proposal_inv_temp);
     D2CHECK(cudaGetLastError());
 }
 
 // ---- pack loader --------------------------------------------------------
+
+// Gather already-quantized rows without requantizing: the proposal head's
+// only numerical change is its vocabulary subset. Original IDs also key the
+// top-16 tie break, embedding lookup, codebooks, and sparse-q rejection.
+__global__ void k_d2_gather_head(const unsigned* src, const __half* scales,
+                                unsigned* dst, __half* dst_scales, const int* ids,
+                                int words, int groups) {
+    const int row = blockIdx.x, id = ids[row];
+    for (int i = threadIdx.x; i < words; i += blockDim.x)
+        dst[(size_t)row * words + i] = src[(size_t)id * words + i];
+    for (int i = threadIdx.x; i < groups; i += blockDim.x)
+        dst_scales[(size_t)row * groups + i] = scales[(size_t)id * groups + i];
+}
+
+void d2_gather_head_launch(const void* src, const __half* scales, void* dst, __half* dst_scales,
+                           const int* ids, int rows, bool q4, cudaStream_t st) {
+    k_d2_gather_head<<<rows, 256, 0, st>>>((const unsigned*)src, scales, (unsigned*)dst,
+                                         dst_scales, ids, D2_H / (q4 ? 8 : 4),
+                                         D2_H / (q4 ? 64 : 128));
+    D2CHECK(cudaGetLastError());
+}
+
+void Dflash2::load_engine_shortlist(const char* path) {
+    auto fail = []() {
+        fprintf(stderr, "dflash2 shortlist: expected 128..248320 unique int32 token IDs, "
+                        "row count a multiple of 128, quantized engine head set before capture\n");
+        exit(1);
+    };
+    if (!ehead_data || !ehead_scales || d_head_ids || draft_exec || draft_exec_s) fail();
+    FILE* f = fopen(path, "rb");
+    if (!f) { perror("dflash2 shortlist open"); exit(1); }
+    if (fseek(f, 0, SEEK_END)) { fclose(f); fail(); }
+    const long bytes = ftell(f);
+    if (bytes < 128 * 4 || bytes > D2_V * 4 || bytes % (128 * 4)) { fclose(f); fail(); }
+    rewind(f);
+    const int rows = (int)(bytes / 4);
+    std::vector<int> ids(rows);
+    const size_t got = fread(ids.data(), 4, rows, f);
+    fclose(f);
+    if (got != (size_t)rows) fail();
+    std::vector<unsigned char> seen(D2_V, 0);
+    for (int id : ids) {
+        if (id < 0 || id >= D2_V || seen[id]) fail();
+        seen[id] = 1;
+    }
+    void* head = nullptr;
+    __half* scales = nullptr;
+    D2CHECK(cudaMalloc(&d_head_ids, (size_t)rows * 4));
+    D2CHECK(cudaMemcpy(d_head_ids, ids.data(), (size_t)rows * 4, cudaMemcpyHostToDevice));
+    D2CHECK(cudaMalloc(&head, (size_t)rows * D2_H / (ehead_q4 ? 2 : 1)));
+    D2CHECK(cudaMalloc(&scales, (size_t)rows * (D2_H / (ehead_q4 ? 64 : 128)) * 2));
+    d2_gather_head_launch(ehead_data, ehead_scales, head, scales, d_head_ids, rows, ehead_q4, 0);
+    D2CHECK(cudaDeviceSynchronize());
+    ehead_data = head;
+    ehead_scales = scales;
+    head_vocab = rows;
+    fprintf(stderr, "dflash2 proposal head shortlist: %d/%d rows\n", rows, D2_V);
+}
 
 void Dflash2::load(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -834,10 +894,10 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
         q27k::XQuant qs[16];
         for (int i = 0; i < 16; i++) qs[i] = hxq[i < K ? i : 0];
         if (ehead_q4)
-            q27k::gemv_q4_n((const uint8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
+            q27k::gemv_q4_n((const uint8_t*)ehead_data, ehead_scales, qs, K, ys, head_vocab, D2_H,
                             st);
         else
-            q27k::gemv_q8_n((const int8_t*)ehead_data, ehead_scales, qs, K, ys, D2_V, D2_H,
+            q27k::gemv_q8_n((const int8_t*)ehead_data, ehead_scales, qs, K, ys, head_vocab, D2_H,
                             st);
     } else {
         q27k::gemv_f16_3(f16("target.head.weight"), mkCP3(nhf, D2_H, K),
@@ -846,13 +906,13 @@ void Dflash2::draft_compute(int K, cudaStream_t st, bool sampling) {
     mmq("candidate_selector.hidden_projection.weight", nhf, nhp, K, st);
     // on-device top-16 (two-stage) + selector walk; proposals land in d_prop
     {
-        d2_top16_launches(nlogits, d_c1, d_cand, d_cval, K, st);
+        d2_top16_launches(nlogits, d_c1, d_cand, d_cval, K, st, head_vocab, d_head_ids);
     }
     k_d2_walk<<<1, 256, 0, st>>>(d_cand, d_cval, nhp,
                                  (const __half*)T("candidate_selector.predecessor_codebook").dev,
                                  (const __half*)T("candidate_selector.successor_codebook").dev,
                                  d_anchor_tok, K, d_prop, (sampling && d_sp) ? 1 : 0, d_sp,
-                                 d_posW, d_qrow);
+                                 d_posW, d_qrow, proposal_inv_temp);
     D2CHECK(cudaGetLastError());
 }
 

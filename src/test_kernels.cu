@@ -2524,9 +2524,9 @@ static void test_wy_stream_isolation() {
 
 // top_k/min_p added 2026-08-23. Both are gated against the CPU reference:
 // top_k is native to q27::SamplingParams, and min_p is applied to the host's
-// kept set by its defining property (p_i >= min_p * p_max), which is
-// scale-invariant and therefore independent of where in the chain it runs --
-// the reason the kernel can compose all three as max() of logit thresholds.
+// kept set AFTER top_p, by its defining property (p_i >= min_p * p_max).
+// The min_p threshold is scale-invariant, but applying it before top_p
+// changes top_p's denominator and can remove an extra boundary token.
 // NOTE the kernel filters on the TEMPERATURE-SCALED distribution while
 // llama.cpp filters raw logits and applies temperature last; the two coincide
 // exactly at T=1.0, which is the Qwen3.8 card value and the config we serve.
@@ -2565,6 +2565,14 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
             if (logits[token] < floor_logit) host_kept[token] = 0;
     }
 
+    double host_mass = 0.0;
+    for (size_t i = 0; i < host.tokens.size(); i++)
+        if (host_kept[host.tokens[i]]) host_mass += host.weights[i];
+    std::vector<double> host_probability(logits.size(), 0.0);
+    for (size_t i = 0; i < host.tokens.size(); i++)
+        if (host_kept[host.tokens[i]])
+            host_probability[host.tokens[i]] = host.weights[i] / host_mass;
+
     int support_mismatches = 0;
     double max_probability_error = 0.0;
     for (uint32_t token = 0; token < logits.size(); token++) {
@@ -2576,10 +2584,9 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
                            nucleus[2]) /
                       nucleus[3]
                 : 0.0;
-        if (min_p <= 0.0f) // served_probability has no min_p notion to compare against
-            max_probability_error =
-                std::max(max_probability_error,
-                         std::fabs(device_probability - q27::served_probability(host, token)));
+        max_probability_error =
+            std::max(max_probability_error,
+                     std::fabs(device_probability - host_probability[token]));
     }
 
     char label[128];
@@ -2587,6 +2594,22 @@ static void check_nucleus_contract(const char* name, const std::vector<float>& l
     check(label, (double)support_mismatches, 0.5);
     std::snprintf(label, sizeof label, "%s probabilities", name);
     check(label, max_probability_error, 2e-5);
+
+    // The captured verify path uses the multi-lane entry point. It must
+    // share the single-lane distribution and remain deterministic despite
+    // the small-support path's atomic compaction.
+    float* d_multi;
+    CUDA_CHECK(cudaMalloc(&d_multi, 8 * 4 * sizeof(float)));
+    q27k::CP3 lanes{};
+    for (int i = 0; i < 8; i++) lanes.p[i] = d_logits;
+    q27k::nucleus_multi(lanes, (int)logits.size(), d_params, d_multi, 8);
+    float multi[8][4];
+    CUDA_CHECK(cudaMemcpy(multi, d_multi, sizeof multi, cudaMemcpyDeviceToHost));
+    int unequal = 0;
+    for (int i = 0; i < 8; i++) unequal += memcmp(multi[i], nucleus, sizeof nucleus) != 0;
+    std::snprintf(label, sizeof label, "%s multi-lane identity", name);
+    check(label, (double)unequal, 0.5);
+    CUDA_CHECK(cudaFree(d_multi));
 
     CUDA_CHECK(cudaFree(d_logits));
     CUDA_CHECK(cudaFree(d_nucleus));
@@ -2618,6 +2641,17 @@ static void test_sample() {
     check_nucleus_contract("sample host/CUDA qwen38 chain", x, 1.0f, 0.95f, 20, 0.05f);
     check_nucleus_contract("sample host/CUDA k>vocab is off", x, 1.0f, 0.95f, 100000, 0.0f);
     check_nucleus_contract("sample host/CUDA chain on ties", tied, 1.0f, 0.95f, 20, 0.05f);
+    // After top_k the weights are 1, .1, .055, .04. top_p=.95 needs the
+    // first three; pre-applying min_p=.05 incorrectly leaves only two.
+    std::vector<float> order_case = {0.f, std::log(.1f), std::log(.055f),
+                                    std::log(.04f), -20.f};
+    check_nucleus_contract("sample top_p before min_p", order_case, 1.f, .95f, 4, .05f);
+    check_nucleus_contract("sample top_p before min_p no k", order_case, 1.f, .95f, 0, .05f);
+    std::vector<float> large = rand_vec(248321, 20260909);
+    for (auto& value : large) value *= 2.5f;
+    check_nucleus_contract("sample large ragged k=20", large, 1.f, .95f, 20, .05f);
+    check_nucleus_contract("sample large ragged k=32 hot", large, 2.f, .8f, 32, .1f);
+    check_nucleus_contract("sample large ragged k=64 fallback", large, .7f, .95f, 64, .05f);
     // CPU argmax + full-softmax probs at a given inv_temp
     auto cpu_argmax = [&]() {
         int bi = 0; for (int i = 1; i < n; i++) if (x[i] > x[bi]) bi = i; return bi;
@@ -3044,11 +3078,13 @@ static void test_spec_sample() {
 //       to sample_stop's (q NOT subtracted on a non-rejection);
 //   (f) numerically empty residual (q >= p on the whole nucleus) falls back
 //       to sample_stop's exclude-d draw instead of emitting garbage.
-static void test_d2_walk_reject() {
+static void test_d2_walk_reject(float proposal_inv_temp = 0.f) {
     using q27d2::D2_TOPK;
     using q27d2::D2_RANK;
     const int V = 64, K = 3, LANES = K + 1, W = K + 1;
     const float invT = 1.0f / 0.9f, topp = 0.92f;
+    const float draft_invT = proposal_inv_temp > 0.f ? proposal_inv_temp : invT;
+    printf("    [d2 target T=0.9, proposal T=%.3f]\n", 1.f / draft_invT);
     const unsigned long long seed = 20260907ull;
     // target logits per verify lane; lane 3 is a spike (nucleus == {7}) for (f)
     std::vector<float> flat(LANES * V);
@@ -3076,7 +3112,7 @@ static void test_d2_walk_reject() {
             if (cval[pos * D2_TOPK + c] > mx) { mx = cval[pos * D2_TOPK + c]; bi = c; }
         amax[pos] = bi;
         double Z = 0;
-        for (int c = 0; c < D2_TOPK; c++) { q[pos][c] = std::exp((double)invT * (cval[pos * D2_TOPK + c] - mx)); Z += q[pos][c]; }
+        for (int c = 0; c < D2_TOPK; c++) { q[pos][c] = std::exp((double)draft_invT * (cval[pos * D2_TOPK + c] - mx)); Z += q[pos][c]; }
         for (int c = 0; c < D2_TOPK; c++) q[pos][c] /= Z;
     }
 
@@ -3141,7 +3177,7 @@ static void test_d2_walk_reject() {
         for (int i = 0; i < W; i++) posW[i] = t * 16 + i;
         CUDA_CHECK(cudaMemcpy(d_posW, posW, W * 4, cudaMemcpyHostToDevice));
         q27d2::d2_walk_launch(d_cand, d_cval, d_hp, d_pred, d_succ, d_anchor, K, d_prop, sampled,
-                              d_sp, d_posW, d_qrow, 0);
+                              d_sp, d_posW, d_qrow, 0, proposal_inv_temp);
     };
     auto tail = [&](int P, int md, int& n, int& stop, int& excl, int& nt) {
         CUDA_CHECK(cudaMemcpy(d_P, &P, 4, cudaMemcpyHostToDevice));
@@ -3403,7 +3439,7 @@ static void test_d2_walk_reject() {
                     if (s[c] > mx) { mx = s[c]; bi = c; }
                 }
                 double Z = 0, qq[D2_TOPK];
-                for (int c = 0; c < D2_TOPK; c++) { qq[c] = std::exp((double)invT * (s[c] - mx)); Z += qq[c]; }
+                for (int c = 0; c < D2_TOPK; c++) { qq[c] = std::exp((double)draft_invT * (s[c] - mx)); Z += qq[c]; }
                 int pc = -1;
                 for (int c = 0; c < D2_TOPK; c++) {
                     qq[c] /= Z;
@@ -3463,8 +3499,74 @@ static void test_d2_top16() {
             if (cand[r * D2_TOPK + c] != ids[c] || cval[r * D2_TOPK + c] != row[ids[c]]) bad++;
     }
     check("d2 top-16 bitonic == CPU (value desc, id asc)", (double)bad, 0.5);
+    // Shortlisted rows are not token IDs. Reverse mapping makes ties break
+    // in the opposite order from compact row index; the excluded spike in
+    // row 1 also catches accidental reads beyond the shortened head.
+    for (int vocab : {131072, 131073}) {
+        std::vector<int> map(vocab);
+        for (int i = 0; i < vocab; i++) map[i] = D2_V - 1 - i;
+        int* d_map;
+        CUDA_CHECK(cudaMalloc(&d_map, vocab * 4));
+        CUDA_CHECK(cudaMemcpy(d_map, map.data(), vocab * 4, cudaMemcpyHostToDevice));
+        q27d2::d2_top16_launch(d_lg, d_c1, d_cand, d_cval, K, 0, vocab, d_map);
+        CUDA_CHECK(cudaMemcpy(cand.data(), d_cand, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cval.data(), d_cval, K * D2_TOPK * 4, cudaMemcpyDeviceToHost));
+        bad = 0;
+        for (int r = 0; r < K; r++) {
+            std::vector<int> rows(vocab);
+            for (int i = 0; i < vocab; i++) rows[i] = i;
+            const float* row = lg.data() + (size_t)r * D2_V;
+            std::partial_sort(rows.begin(), rows.begin() + D2_TOPK, rows.end(), [&](int a, int b) {
+                return row[a] > row[b] || (row[a] == row[b] && map[a] < map[b]);
+            });
+            for (int c = 0; c < D2_TOPK; c++)
+                if (cand[r * D2_TOPK + c] != map[rows[c]] ||
+                    cval[r * D2_TOPK + c] != row[rows[c]]) bad++;
+        }
+        check("d2 shortlisted top-16 uses original IDs", (double)bad, 0.5);
+        CUDA_CHECK(cudaFree(d_map));
+    }
     CUDA_CHECK(cudaFree(d_lg)); CUDA_CHECK(cudaFree(d_c1));
     CUDA_CHECK(cudaFree(d_cand)); CUDA_CHECK(cudaFree(d_cval));
+}
+
+static void test_d2_gather_head() {
+    constexpr int N = 256, R = 128;
+    std::vector<int> ids(R);
+    for (int r = 0; r < R; r++) ids[r] = N - 1 - 2 * r;
+    int* d_ids;
+    CUDA_CHECK(cudaMalloc(&d_ids, R * 4));
+    CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), R * 4, cudaMemcpyHostToDevice));
+    for (bool q4 : {true, false}) {
+        const int bytes = q27d2::D2_H / (q4 ? 2 : 1);
+        const int groups = q27d2::D2_H / (q4 ? 64 : 128);
+        std::vector<unsigned char> packed((size_t)N * bytes), back((size_t)R * bytes);
+        std::vector<__half> scales((size_t)N * groups), back_scales((size_t)R * groups);
+        for (int r = 0; r < N; r++) {
+            for (int i = 0; i < bytes; i++) packed[(size_t)r * bytes + i] = (r * 197 + i * 13) % 256;
+            for (int i = 0; i < groups; i++) scales[(size_t)r * groups + i] = __float2half(.01f * (r + i));
+        }
+        void *d_src, *d_dst;
+        __half *d_scales, *d_dst_scales;
+        CUDA_CHECK(cudaMalloc(&d_src, packed.size()));
+        CUDA_CHECK(cudaMalloc(&d_dst, back.size()));
+        CUDA_CHECK(cudaMalloc(&d_scales, scales.size() * 2));
+        CUDA_CHECK(cudaMalloc(&d_dst_scales, back_scales.size() * 2));
+        CUDA_CHECK(cudaMemcpy(d_src, packed.data(), packed.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_scales, scales.data(), scales.size() * 2, cudaMemcpyHostToDevice));
+        q27d2::d2_gather_head_launch(d_src, d_scales, d_dst, d_dst_scales, d_ids, R, q4, 0);
+        CUDA_CHECK(cudaMemcpy(back.data(), d_dst, back.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(back_scales.data(), d_dst_scales, back_scales.size() * 2, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        for (int r = 0; r < R; r++) {
+            bad += memcmp(back.data() + (size_t)r * bytes, packed.data() + (size_t)ids[r] * bytes, bytes) != 0;
+            bad += memcmp(back_scales.data() + r * groups, scales.data() + ids[r] * groups, groups * 2) != 0;
+        }
+        check(q4 ? "d2 Q4 shortlisted head rows bitwise" : "d2 Q8 shortlisted head rows bitwise", bad, .5);
+        CUDA_CHECK(cudaFree(d_src)); CUDA_CHECK(cudaFree(d_dst));
+        CUDA_CHECK(cudaFree(d_scales)); CUDA_CHECK(cudaFree(d_dst_scales));
+    }
+    CUDA_CHECK(cudaFree(d_ids));
 }
 
 // DFlash2 drafter attention (parallel softmax + window-restricted ring loop,
@@ -3606,7 +3708,10 @@ int main(int argc, char** argv) {
         test_sample();
         test_spec_sample();
         test_d2_walk_reject();
+        test_d2_walk_reject(2.f);  // colder proposals, same target distribution
+        test_d2_walk_reject(.5f); // hotter proposals, same target distribution
         test_d2_top16();
+        test_d2_gather_head();
         test_d2_attn();
         test_rmsnorm3q();
         printf("%s\n", g_fail ? "FAILED" : "ALL PASS");
@@ -3643,7 +3748,10 @@ int main(int argc, char** argv) {
     test_sample();
     test_spec_sample();
     test_d2_walk_reject();
+    test_d2_walk_reject(2.f);
+    test_d2_walk_reject(.5f);
     test_d2_top16();
+    test_d2_gather_head();
     test_d2_attn();
     test_rmsnorm3q();
     test_gemv10_scaling(dm, m);

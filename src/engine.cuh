@@ -2845,11 +2845,27 @@ struct Engine {
             exit(1);
         }
         d2 = new q27d2::Dflash2();
+        // Calibrate proposals independently of the served target sampler.
+        // The walk stores its actual q; neither target logits nor d_samp
+        // are changed. Unset preserves request-temperature behavior.
+        if (const char* dt = getenv("Q27_D2_TEMP")) {
+            char* end = nullptr;
+            const float temperature = strtof(dt, &end);
+            if (end == dt || *end || !std::isfinite(temperature) || temperature <= 0.f ||
+                !std::isfinite(1.f / temperature)) {
+                fprintf(stderr, "Q27_D2_TEMP must be finite and positive\n");
+                exit(1);
+            }
+            d2->proposal_inv_temp = 1.f / temperature;
+            fprintf(stderr, "dflash2 proposal temperature: %.6g (target sampler unchanged)\n",
+                    temperature);
+        }
         d2->load(pk);
         const char* vh = (fast_head && dm.model_has("output_q4.weight")) ? "output_q4.weight"
                                                                          : "output.weight";
         const DevTensor& hw = dm.get(vh);
         d2->set_engine_head(hw.data, (const __half*)hw.scales, hw.dtype == DType::Q4_G64);
+        if (const char* ids = getenv("Q27_D2_SHORTLIST")) d2->load_engine_shortlist(ids);
         // reuse the engine's Q8 token embedding for the drafter's anchor/mask
         // rows (the serving pack ships no fp16 target.embed). MUST precede
         // alloc(), which caches the mask-token embedding.
