@@ -157,13 +157,18 @@ int main() {
         int rounds = 0;      // rounds this member actually ran (solo or fused)
         bool finished = false; // finish path ran (pre_round or a round's done)
         bool left = false;     // on_leave ran
+        int park_for = 0;      // incremental KV: park this many upcoming rounds
+        bool is_parked = false;
         bool pre_round() {
             if (cancel || budget <= 0) {
                 finished = true; // models finish_decode("cancelled"/"n_max")
                 return false;
             }
+            is_parked = park_for > 0; // models pre_round's entitlement guard
+            if (is_parked) park_for--;
             return true;
         }
+        bool parked() const { return is_parked; }
         int want_width() { return want; }
         bool round_is_suffix() const { return suffix; }
         void set_granted(int w) { granted = w; }
@@ -311,6 +316,69 @@ int main() {
         int live = core.round();
         CHECK(live == 0 && solo_calls == 0 && A.finished && left,
               "core: pre-check cancel beats the solo hook");
+    }
+    { // Incremental KV (issue #42 step 2): a parked member passed its
+      // pre-checks but may not write this round. It stays a member, runs no
+      // hook, and resumes when it unparks; the others run without it; a round
+      // where every member is parked runs nothing and reports last_idle.
+        q27::ConductorCore<FakeMember> core(12);
+        FakeMember A{}, B{}, C{};
+        A.id = 1; A.budget = 5;
+        B.id = 2; B.budget = 5; B.park_for = 2;
+        C.id = 3; C.budget = 5;
+        std::vector<std::vector<int>> ids;
+        int solo_calls = 0, fused_calls = 0;
+        core.solo_round = [&](FakeMember& mm) {
+            solo_calls++;
+            ids.push_back({mm.id});
+            mm.rounds++;
+            return --mm.budget <= 0;
+        };
+        core.fused_round = [&](FakeMember** ms, const int*, const bool*, int k, bool* done) {
+            fused_calls++;
+            std::vector<int> r;
+            for (int i = 0; i < k; i++) {
+                r.push_back(ms[i]->id);
+                ms[i]->rounds++;
+                done[i] = --ms[i]->budget <= 0;
+            }
+            ids.push_back(r);
+        };
+        core.on_leave = [](FakeMember& mm) { mm.left = true; };
+        core.join(&A);
+        core.join(&B);
+        core.join(&C);
+        int live = core.round();
+        CHECK(live == 3 && ids.back() == std::vector<int>({1, 3}) && !core.last_idle &&
+                  B.rounds == 0 && !B.left,
+              "park: parked member skipped, kept, others run fused");
+        live = core.round();
+        CHECK(live == 3 && ids.back() == std::vector<int>({1, 3}) && B.rounds == 0,
+              "park: still parked the next round");
+        live = core.round();
+        CHECK(live == 3 && ids.back() == std::vector<int>({1, 2, 3}) && B.rounds == 1,
+              "park: unparked member rejoins the fused round");
+        // everyone parked: nothing runs, members kept, last_idle raised
+        A.park_for = C.park_for = B.park_for = 1;
+        int fc = fused_calls, sc = solo_calls;
+        live = core.round();
+        CHECK(live == 3 && fused_calls == fc && solo_calls == sc && core.last_idle,
+              "park: all parked -> idle round, no hooks, members kept");
+        live = core.round();
+        CHECK(!core.last_idle && fused_calls == fc + 1, "park: idle flag clears once work runs");
+        // one runnable member among parked ones takes the solo path
+        A.park_for = C.park_for = 1;
+        sc = solo_calls;
+        live = core.round();
+        CHECK(solo_calls == sc + 1 && ids.back() == std::vector<int>({2}),
+              "park: k==1 among parked members takes the solo hook");
+        // a parked member that is cancelled still leaves through pre_round
+        B.park_for = 3;
+        B.cancel = true;
+        const int b_rounds = B.rounds;
+        live = core.round();
+        CHECK(B.finished && B.left && B.rounds == b_rounds,
+              "park: cancel beats park at the boundary (no further rounds)");
     }
     { // Producer-side provenance must remain attached to its token while the
       // request thread drains concurrently; no shared DecodeTask flag is read.

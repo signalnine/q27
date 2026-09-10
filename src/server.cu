@@ -35,6 +35,7 @@
 #include "tokenizer.h"
 #include "api_common.h"
 #include "conductor.h"
+#include "kv_bank.h"
 #include "metrics.h"
 #include "toolgram.h"
 #include "toolconstrain.h"
@@ -929,6 +930,10 @@ int main(int argc, char** argv) {
         int id = 0;
         bool busy = false;                   // R1b: claimed by a generation
         bool stamp_on_free = false;          // LRU-stamp when freed (not refused)
+        // incremental KV (issue #42 step 2): rows the active request may grow
+        // to (prompt + max_tokens + close + round reserve, clamped to the
+        // window); 0 while idle. Guarded by route_m.
+        int ent_max = 0;
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
     // P16 persistent prefix cache. Declared BEFORE `slots` so it outlives the
@@ -1574,6 +1579,66 @@ int main(int argc, char** argv) {
     // bounded by <=4 slots and self-limiting clients -- the GPU gate is the
     // fair one.
     long slot_use_counter = 0;
+    // ---- Incremental KV entitlements (issue #42 step 2; plan
+    // docs/plans/2026-09-10-incremental-kv.md). With the conductor on, a
+    // request is entitled to its prompt + kKvHeadroom rows at claim and its
+    // lineage grows kKvGrowChunk rows at a time from pre_round, instead of
+    // reserving prompt + max_tokens up front (Claude Code asks for 64K, so
+    // up front a burst queued behind one long session). Every grant --
+    // claim or growth -- must leave the pool SAFE (q27::kv_bank_safe): some
+    // completion order exists in which every active request reaches its
+    // declared maximum, counting idle lineages' pages as reclaimable. The
+    // request with the smallest remaining need can then always grow, so
+    // some request always progresses; others park at round boundaries until
+    // one finishes. Off (full up-front reservation, the pre-step-2 path)
+    // without the conductor -- solo generate() cannot sit a round out -- or
+    // with Q27_KV_INCREMENTAL=0. Set after the conductor is built below.
+    bool kv_incremental = false;
+    q27::Conductor* kv_conductor = nullptr; // for poke(); same lifetime rules
+    constexpr int kKvHeadroom = 4096, kKvGrowChunk = 4096;
+    // Safety of granting `c` a lineage of `c_rows` rows while it may grow to
+    // `c_max` rows. Under route_m. Busy slots other than c are claims (a
+    // finished-decoding one needs nothing more: kv_growth_done); idle slots'
+    // pages are reclaimable; c's own pages count toward its claim.
+    auto kv_bank_ok = [&](Slot& c, int c_rows, int c_max) -> bool {
+        if (!kv_pool.enabled()) return true;
+        long avail = std::min((long)kv_pool.free_pages(0), (long)kv_pool.free_pages(1));
+        std::vector<q27::KvClaim> claims;
+        claims.reserve(slots.size());
+        for (auto& s : slots) {
+            if (&s == &c) continue;
+            const long h = s.eng->kv_pages_held();
+            if (!s.busy) {
+                avail += h;
+                continue;
+            }
+            const long m = s.eng->kv_growth_done.load() || s.ent_max <= 0
+                               ? h
+                               : h + s.eng->kv_pages_needed(s.ent_max);
+            claims.push_back({h, m});
+        }
+        const long hc = c.eng->kv_pages_held();
+        const long grow = c.eng->kv_pages_needed(c_rows);
+        claims.push_back({hc + grow, hc + c.eng->kv_pages_needed(std::max(c_rows, c_max))});
+        return q27::kv_bank_safe(std::move(claims), avail - grow);
+    };
+    // Entitle `c` to `rows`, reclaiming idle lineages LRU-first when the free
+    // list is short (they are cache, not entitlement -- the M2b scavenge).
+    // Under route_m; callers have already checked kv_bank_ok.
+    auto kv_grant = [&](Slot& c, int rows) -> bool {
+        bool ok = c.eng->kv_entitle(rows);
+        while (!ok) {
+            Slot* victim = nullptr;
+            for (auto& sv : slots)
+                if (!sv.busy && &sv != &c && sv.eng->kv_rows > 0 &&
+                    (!victim || sv.last_used < victim->last_used))
+                    victim = &sv;
+            if (!victim) break;
+            victim->eng->kv_release_for_takeover();
+            ok = c.eng->kv_entitle(rows);
+        }
+        return ok;
+    };
     auto claim_slot = [&](const std::vector<int>& prompt, int requested,
                           bool thinking, const q27::ThinkCfg& cfg,
                           bool budget_aware) -> Slot& {
@@ -1624,6 +1689,11 @@ int main(int argc, char** argv) {
                 // same route_cv wait as slot scarcity and retry the whole
                 // selection (a takeover elsewhere may free pages).
                 if (fits_any) {
+                    // Declared maximum: prompt + max_tokens as the admission
+                    // limits resolved it + the forced reasoning-close tokens
+                    // (they may run past max_tokens; before step 2 they were
+                    // left out and could write a few rows past the mapped
+                    // pages) + one round's reserve, clamped to the window.
                     const int rows =
                         (int)prompt.size() +
                         q27::resolve_think_decode_limits(
@@ -1631,32 +1701,31 @@ int main(int argc, char** argv) {
                             best->eng->ctx_round_reserve(), limit_close, thinking,
                             limit_cfg, limit_flag)
                             .n_max +
-                        best->eng->ctx_round_reserve() - 1;
+                        limit_close + best->eng->ctx_round_reserve() - 1;
+                    const int max_rows = std::min(rows, best->eng->max_ctx);
+                    // Incremental: entitle the prompt plus headroom now; the
+                    // lineage grows as tokens are written (pre_round ->
+                    // on_need_rows). Otherwise the whole maximum up front.
+                    const int init_rows =
+                        kv_incremental
+                            ? std::min(max_rows, (int)prompt.size() + kKvHeadroom +
+                                                     best->eng->ctx_round_reserve() - 1)
+                            : max_rows;
                     if (best_tier < 2) best->eng->kv_release_for_takeover();
-                    bool entitled =
-                        best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
-                    // Pool scavenge on exhaustion: idle lineages are CACHE,
-                    // not entitlement -- reclaim them LRU-first until the
-                    // reservation fits. Without this the selector can retry
-                    // an empty-lineage slot forever while another idle slot
-                    // holds the pages (starvation). Busy slots and the chosen
-                    // slot are never touched; releasing clears the victim's
-                    // reuse tiers (the R1 rule), exactly like a takeover.
-                    while (!entitled) {
-                        Slot* victim = nullptr;
-                        for (auto& sv : slots)
-                            if (!sv.busy && &sv != best && sv.eng->kv_rows > 0 &&
-                                (!victim || sv.last_used < victim->last_used))
-                                victim = &sv;
-                        if (!victim) break;
-                        victim->eng->kv_release_for_takeover();
-                        entitled =
-                            best->eng->kv_entitle(std::min(rows, best->eng->max_ctx));
-                    }
+                    // Grant only into a SAFE state (kv_bank_ok); the pages
+                    // come from the free list, then from idle lineages
+                    // LRU-first (kv_grant -- the M2b scavenge: idle lineages
+                    // are cache, not entitlement; busy slots are never
+                    // touched). Unsafe or short: wait for a request to
+                    // finish and retry the whole selection.
+                    const bool entitled =
+                        kv_bank_ok(*best, init_rows, max_rows) && kv_grant(*best, init_rows);
                     if (!entitled) {
                         route_cv.wait(lk);
                         continue;
                     }
+                    best->ent_max = max_rows;
+                    best->eng->kv_growth_done.store(false);
                 }
                 best->busy = true;
                 // LRU is stamped at FREE, not here: eviction preference must
@@ -1682,9 +1751,12 @@ int main(int argc, char** argv) {
         {
             std::lock_guard<std::mutex> lk(route_m);
             s.busy = false;
+            s.ent_max = 0; // its pages are an idle lineage now: reclaimable
             if (s.stamp_on_free) s.last_used = ++slot_use_counter;
         }
         route_cv.notify_all();
+        // parked conductor members re-check their growth now (incremental KV)
+        if (kv_conductor) kv_conductor->poke();
     };
     // scope guard so the claim is released on every exit path
     auto slot_guard = [&free_slot](Slot& s) {
@@ -1816,6 +1888,56 @@ int main(int argc, char** argv) {
             // future path unsets it: report which.
             fprintf(stderr, "continuous batching: OFF (%s)\n",
                     ref_profile ? "Q27_PROFILE=ref" : "Q27_BATCH unset");
+        }
+    }
+    // Incremental KV entitlements (issue #42 step 2): needs the pool, more
+    // than one slot (one slot has nobody to share with) and the conductor
+    // (only a conductor member can sit a round out; every decode runs there
+    // when it exists). Each engine's growth hook runs on the conductor thread
+    // from pre_round, holding the GPU gate, then route_m -- no route_m holder
+    // ever takes the gate, so the order is safe.
+    {
+        const char* e = getenv("Q27_KV_INCREMENTAL");
+        const bool want = !e || atoi(e) != 0;
+        if (conductor && kv_pool.enabled() && slots.size() > 1 && want) {
+            kv_incremental = true;
+            kv_conductor = conductor.get();
+            for (auto& s : slots) {
+                Slot* sp = &s; // slots is fully built; it never reallocates now
+                s.eng->on_need_rows = [&, sp](int need_rows) -> bool {
+                    std::lock_guard<std::mutex> lk(route_m);
+                    Slot& c = *sp;
+                    // the declared max is exceeded only by a forced close
+                    // tail, and never past the window (the ctx guard ran first)
+                    const int cap =
+                        std::min(std::max(c.ent_max, need_rows), c.eng->max_ctx);
+                    if (need_rows > cap) return false;
+                    // Grow in WHOLE pages: rows = 64k-1 fills k pages on every
+                    // pair (attention ceil(r/64) = k, MTP ceil((r+1)/64) = k), so
+                    // a grant never leaves a partial page to re-request next
+                    // round (the first gate ran 200-500 row-sized growths per
+                    // request under pressure).
+                    auto cover = [](int r) { return ((r + 1 + 63) / 64) * 64 - 1; };
+                    int target = std::min(
+                        cap, cover(std::max(need_rows, c.eng->kv_rows + kKvGrowChunk)));
+                    const int minimal = std::min(cap, cover(need_rows));
+                    for (;;) {
+                        if (kv_bank_ok(c, target, cap) && kv_grant(c, target)) return true;
+                        if (target <= minimal) return false; // park this round
+                        target = minimal; // retry with the smallest whole-page growth
+                    }
+                };
+            }
+            fprintf(stderr,
+                    "[pool] incremental reservation ON: prompt + %d rows at admission, "
+                    "+%d per growth, every grant under a banker's safety check "
+                    "(Q27_KV_INCREMENTAL=0 reserves prompt + max_tokens up front)\n",
+                    kKvHeadroom, kKvGrowChunk);
+        } else if (kv_pool.enabled() && slots.size() > 1) {
+            fprintf(stderr,
+                    "[pool] incremental reservation OFF (%s): requests reserve prompt + "
+                    "max_tokens up front\n",
+                    !want ? "Q27_KV_INCREMENTAL=0" : "needs continuous batching");
         }
     }
     // Batch-mode generation driver shared by every generate() call site.
@@ -4363,6 +4485,7 @@ int main(int argc, char** argv) {
                 "FATAL: cannot bind %s:%d (port already in use? see `ss -tlnp | grep %d`)\n",
                 host.c_str(), port, port);
         if (conductor) conductor->request_stop();
+        kv_conductor = nullptr; // free_slot must not poke a destroyed conductor
         conductor.reset();
         return 1;
     }
@@ -4373,6 +4496,7 @@ int main(int argc, char** argv) {
     // any remaining members) and join it BEFORE the engines it drives tear
     // down with `slots` at scope exit.
     if (conductor) conductor->request_stop();
+    kv_conductor = nullptr; // free_slot must not poke a destroyed conductor
     conductor.reset();
     return 0;
 }

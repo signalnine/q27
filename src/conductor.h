@@ -30,6 +30,7 @@
 // Conductor further down are CUDA-only and compile away under plain g++
 // (the __CUDACC__ guard), so the CPU unit test never sees them.
 
+#include <algorithm>
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
@@ -170,6 +171,9 @@ private:
 // MemberT surface:
 //   bool pre_round();        false => member is DONE (cancel/budget/ctx);
 //                            its finish path already ran inside
+//   bool parked() const;     true after a pre_round() that returned true but
+//                            may not write this round (incremental KV could
+//                            not grow): skipped this round, kept as a member
 //   int  want_width();       draft phase (real: suffix_propose() or
 //                            draft_and_gate() on the member engine's OWN
 //                            stream); returns the want width, >= 2.
@@ -230,6 +234,7 @@ struct ConductorCore {
         // boundary: joins land here and only here
         for (MemberT* m : joins) members.push_back(m);
         joins.clear();
+        last_idle = false;
         // pre-checks (decode_step's top, A3): a done/cancelled member leaves
         // NOW, before any draft work -- its finish path ran inside
         // pre_round(), it gets its on_leave, and it is absent from this and
@@ -243,27 +248,36 @@ struct ConductorCore {
                 i++;
             }
         }
+        // Parked members (incremental KV, issue #42 step 2) passed their
+        // pre-checks but may not write this round -- their lineage could not
+        // grow safely. They stay members, sit this round out, and are
+        // re-checked at the next boundary; the round runs over the rest.
+        std::vector<MemberT*> act;
+        act.reserve(members.size());
+        for (MemberT* m : members)
+            if (!m->parked()) act.push_back(m);
+        auto drop = [&](MemberT* gone) {
+            members.erase(std::find(members.begin(), members.end(), gone));
+            on_leave(*gone);
+        };
         if (needs_solo_round) {
-            for (size_t i = 0; i < members.size(); i++) {
-                MemberT* mm = members[i];
+            for (MemberT* mm : act) {
                 if (!needs_solo_round(*mm)) continue;
-                if (solo_round(*mm)) {
-                    members.erase(members.begin() + i);
-                    on_leave(*mm);
-                }
+                if (solo_round(*mm)) drop(mm);
                 return (int)members.size();
             }
         }
-        const int k = (int)members.size();
-        if (k == 0) return 0;
+        const int k = (int)act.size();
+        if (k == 0) {
+            // every live member parked: nothing ran. The wrapper waits for a
+            // join / release instead of spinning on the gate.
+            last_idle = !members.empty();
+            return (int)members.size();
+        }
         if (k == 1) {
             // solo fallthrough: byte-for-byte today's path (captured
             // graphs); fusion only engages at >= 2 (design "Scheduler").
-            if (solo_round(*members[0])) {
-                MemberT* gone = members[0];
-                members.clear();
-                on_leave(*gone);
-            }
+            if (solo_round(*act[0])) drop(act[0]);
             return (int)members.size();
         }
         // Batch-formation HARD check (review L1), not an assert: k members at
@@ -284,7 +298,7 @@ struct ConductorCore {
         MemberT* ms[MAX_K];
         int want[MAX_K];
         bool sfx[MAX_K], done[MAX_K];
-        for (int i = 0; i < k; i++) ms[i] = members[i];
+        for (int i = 0; i < k; i++) ms[i] = act[i];
         // Draft phase (P2a): the batch hook interleaves gated members' draft
         // steps so the engines' chains run concurrently on their own
         // streams; without it, the per-member calls are the serial path.
@@ -324,15 +338,13 @@ struct ConductorCore {
         for (int i = 0; i < k; i++) ms[i]->set_granted(want[i]);
         fused_round(ms, want, sfx, k, done);
         // leave-on-done at the boundary (EOS/budget/client-stop this round)
-        for (int i = k - 1; i >= 0; i--) {
-            if (done[i]) {
-                MemberT* gone = members[i];
-                members.erase(members.begin() + i);
-                on_leave(*gone);
-            }
-        }
+        for (int i = k - 1; i >= 0; i--)
+            if (done[i]) drop(ms[i]);
         return (int)members.size();
     }
+    // true when the last round() ran no member because every live one was
+    // parked (incremental KV); false after any round that did work
+    bool last_idle = false;
 };
 
 } // namespace q27
@@ -838,6 +850,7 @@ public:
         int gate_cap = -1, md_used = -1;  // draft_and_gate outs -> commit_outcome
         cudaEvent_t draft_done = nullptr; // recorded on e->stm after drafting
         bool pre_round() { return e->pre_round(*t); }
+        bool parked() const { return t->parked; }
         // P2a: the serial draft path. The real conductor installs the
         // core.draft_widths hook (Conductor::draft_widths below), which
         // supersedes this per-member call with the interleaved equivalent;
@@ -1077,7 +1090,20 @@ public:
                 return;
             }
             t->on_token = std::move(sink);
+            // only a conductor member can sit a round out (incremental KV);
+            // a solo generate() task keeps can_park false and stops instead
+            t->can_park = true;
             join_q.push_back(std::move(mm));
+        }
+        cv.notify_one();
+    }
+    // Incremental KV (issue #42 step 2): the server calls this when KV pages
+    // may have been released (a slot freed), so a round loop whose members
+    // are all parked re-checks them now instead of at the idle timeout.
+    void poke() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            poked = true;
         }
         cv.notify_one();
     }
@@ -1149,8 +1175,22 @@ private:
                 }
                 join_q.clear();
             }
-            GpuGate::Lease lease(gate); // released per round (A7 above)
-            core.round();
+            bool idle;
+            {
+                GpuGate::Lease lease(gate); // released per round (A7 above)
+                core.round();
+                idle = core.last_idle;
+            }
+            // Every member parked (incremental KV): holding the gate and
+            // re-running would starve the prefill that the banker's head of
+            // line is waiting on. Wait off the gate for a join, a poke (a
+            // slot freed pages), or a short timeout, then re-check.
+            if (idle) {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait_for(lk, std::chrono::milliseconds(2),
+                            [&] { return stop || poked || !join_q.empty(); });
+                poked = false;
+            }
         }
         // shutdown drain: adopt any last-instant joins, then cancel + finish
         // every remaining member exactly like a client cancel (A3).
@@ -2068,10 +2108,11 @@ private:
     long gc_recycles_ = 0, gc_recycle_fails_ = 0;
     std::vector<GCacheEnt> gcache_;
     std::thread th;
-    std::mutex m; // guards join_q + stop (the cross-thread handoff surface)
+    std::mutex m; // guards join_q + stop + poked (the cross-thread handoff surface)
     std::condition_variable cv;
     std::vector<std::unique_ptr<Member>> join_q;
     bool stop = false;
+    bool poked = false; // incremental KV: pages may have been released
 };
 
 } // namespace q27

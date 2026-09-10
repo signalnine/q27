@@ -366,10 +366,19 @@ CLI binary keeps reference defaults so the bitwise canonicals are untouched.
 2026-09-10, [issue #42](https://github.com/signalnine/q27/issues/42)): the
 slots share one paged KV pool and any one of them may hold up to the whole
 of it -- on a 5090, 262K tokens per slot at 4 slots, 152K at 8, where the
-old per-slot division gave 49K and 2K. Pages are reserved per request
-(prompt + max_tokens); a request the free pages cannot cover reclaims idle
-conversations' caches, least recently used first, then waits for a running
-one to finish. An explicit `--ctx` / `--slot1-ctx` still fixes the windows.
+old per-slot division gave 49K and 2K. With continuous batching (the
+default), a request is entitled to its prompt plus 4K rows and grows as it
+writes, instead of reserving its whole max_tokens up front; every grant
+passes a banker's-algorithm safety check, so some request can always
+finish and one that cannot grow sits out a round rather than deadlocking
+([plan](docs/plans/2026-09-10-incremental-kv.md)). What that buys is cache
+survival: four 50K-token Claude-Code-shaped sessions on a 4-slot 5090 keep
+all four conversations cached (warm turns 0.4 s) where up-front reservations
+evicted each other on every turn (15 s re-prefills). A request the free
+pages cannot cover reclaims idle conversations' caches, least recently used
+first, then waits for a running one to finish. `Q27_KV_INCREMENTAL=0`
+restores up-front reservation; an explicit `--ctx` / `--slot1-ctx` still
+fixes the windows.
 
 **Persistent prefix cache**: `--prefix-cache DIR` (opt-in). Restart TTFT
 8.15 s -> 1.20 s; entries verified token-by-token; LRU capped by
@@ -561,13 +570,12 @@ real coding while MTP nearly doubled stock llama.cpp.
   re-prefilled 29K after a side request; raising `--prefix-cache-max-tokens`
   costs pinned staging memory per slot. Not yet measured against 128K
   admission.
-- **KV pages are reserved up front.** Elastic windows (issue #42 step 1)
-  let one slot use the whole pool, but each request reserves prompt +
-  max_tokens at admission and Claude Code asks for 64K, so a burst mostly
-  queues behind a long session instead of sharing. Step 2 is reserving
-  pages as tokens are written, parking a generation at a round boundary
-  when the pool runs dry; it needs an eviction order and a no-deadlock
-  argument first.
+- **Incremental KV admits optimistically.** When long outputs outgrow the
+  pool together, the request first in the safe order runs and the others
+  park until it finishes: same total wall as up-front reservation in the
+  gate (201 vs 203 s), but three of four requests finished later. There is
+  no preemption and no fairness beyond the safety check, and the block
+  table still uploads from pageable host memory on each growth.
 - **Wall per instance is not the cross-engine number.** The 09-09 turn
   and token gap is ninfer reasoning less than the model at 8 bits (see the
   09-09-echo readout); which of its NVFP4 weights, int8 KV or sampler does

@@ -15714,6 +15714,83 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (aa): incremental KV entitlements (issue #42 step 2) -- reserve as tokens are written under a banker's safety check; four 50K sessions keep their caches (69 s vs 189 s for 12 turns)
+
+Plan and the no-deadlock argument: docs/plans/2026-09-10-incremental-kv.md.
+With continuous batching on, more than one slot and the pool,
+`claim_slot` entitles prompt + 4096 rows + round reserve instead of
+prompt + max_tokens, and `Engine::pre_round` grows the lineage at round
+boundaries through the server's `on_need_rows` hook (4096 rows, or the
+smallest whole-page growth that is safe). Every grant must leave the pool
+safe per `q27::kv_bank_safe` (src/kv_bank.h): an order exists in which
+every active request reaches its declared maximum, idle lineages counted
+reclaimable. A member that cannot grow is PARKED -- it skips the round,
+keeps its slot and state, and is re-checked next boundary; a round where
+every member is parked releases the gate and waits for a join or a freed
+slot (Conductor::poke). Serial mode (Q27_BATCH=0, DFlash2 production) and
+single-slot boots keep the up-front reservation; there the new pre_round
+guard is a belt that stops instead of writing past the entitlement.
+`Q27_KV_INCREMENTAL=0` restores up-front reservation.
+
+Two things found on the way: (1) the declared maximum left out the forced
+reasoning-close tokens, which can run past max_tokens -- a close landing
+within a few rows of a page boundary at the very end of a response could
+write through an unmapped table entry into the lineage's own page 0. The
+maximum now includes them and the guard catches anything else. (2)
+`build/fused_smoke` had not linked since DFlash2 moved into the engine
+(src/dflash2.cu missing from its Makefile target); fixed.
+
+Gates:
+
+- CPU: tools/test_kv_bank.cpp 18/18 (page arithmetic, safe/unsafe states,
+  order independence, over-held lineages, the head-of-line growth
+  property); tools/test_conductor.cpp + 7 parking cases (skipped and kept,
+  rejoin, all-parked idle round, solo among parked, cancel beats park);
+  test-tools 453 PASS.
+- fused_smoke: FUSED / CONDUCTOR / A2 ERROR-PATH / GRAPH SMOKE PASS
+  (union-vs-solo byte identity through the changed round loop).
+- Boot matrix: incremental ON at 4 slots with batching, OFF (with the
+  reason) for Q27_BATCH=0; single slot and Q27_KV_POOL=0 unchanged. Step 1's
+  elastic_admission.py 5/5 with incremental on.
+- bench/pool/incremental_admission.py + multisession.py, each with
+  Q27_KV_INCREMENTAL=0 as the same-day control (4-slot 5090, pool 268879
+  tokens, window 262144):
+
+| scenario | incremental | up front |
+|---|---|---|
+| burst: 4 x 43.7K prompts, max_tokens 64000, short answers | all admitted at once (qw <= 0.7 s), wall 54 s, all finish 53-54 s | 2 wait 28-30 s to start, wall 56 s, finish 28/30/55/56 s |
+| decode burst: 3 x 60K prompts, ~3K-token counts, max_tokens 64000 | wall 82 s (76-82), every count 1..700 intact | wall 88 s (55-88), third admitted after 55 s |
+| growth: 4 x 61K prompts + 9000-token counts (sum outgrows the pool) | wall 201 s (174-201); head grew twice, never parked; others parked ~650 rounds; all four outputs 1..1121 unbroken | wall 203 s (131-203) |
+| multi-session: 4 x 50K conversations x 3 turns, sequential, max_tokens 64000 | 69 s; turns 2-3 hit the whole conversation, 0.3-0.4 s each | 189 s; every turn cold (hit=0), 15.2-15.3 s each |
+
+Reads. The multi-session row is the point: under up-front reservation an
+idle conversation's lineage keeps prompt + 64K pages, so four ~50K sessions
+(4 x 114K) overflow the pool and scavenge each other on every turn; under
+incremental each keeps ~54K and all four stay resident -- 2.7x on the
+12-turn wall, warm turns 38x. That is the resident multi-session Claude
+Code case #42 describes. The cold bursts change little in total wall
+(prefill is GPU-bound and not batched across requests); incremental
+admits everyone at once, which with time-sliced prefill makes equal-sized
+jobs finish together rather than first-come-first-served (burst: mean
+completion 54 vs 42 s). The growth row is the adversarial case --
+outputs that together outgrow the pool: same total wall, but the parked
+requests finish later than up front, where three ran concurrently from
+the start. Content survived every remap (the unbroken counts).
+
+Efficiency fix inside the gate: the first run showed 227-487 growths per
+parked request -- the minimal-growth fallback granted a round's worth of
+rows at a time and kv_entitle re-uploaded the whole block table even when
+no page was added. Growth is now whole pages (rows = 64k - 1 fills every
+pair) and kv_entitle skips the upload when nothing new is mapped: 17-21
+growths per parked request, same content and wall.
+
+Left: no preemption (optimistic admission redistributes latency under
+true pressure, above); no fairness beyond the safety check (barging, as
+for slot waits); the block table still uploads from pageable host memory
+on each page-adding growth (the 5090's pageable-DMA corruption is ~1e-6
+per MB -- pinning h_kv_tab is the follow-up). README Serving paragraph and
+Open items updated.
+
 ## 2026-09-10 (z): elastic multi-slot windows (issue #42 step 1) -- the pool was shared since 08-16, the windows were not; 4 slots on a 5090 go from 49K to 262K per slot, 8 slots from 2K to 152K, at the same free VRAM
 
 Issue #42 (the #41 reporter): with `--slots N` and auto ctx, the card

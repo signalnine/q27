@@ -57,7 +57,7 @@ build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/mark
 # extract_check first: the integration harness embeds server.cu's handle()
 # byte-for-byte, and a stale copy tests logic that no longer ships (it had
 # drifted for ten commits before anything noticed).
-test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge \
+test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai_bridge build/test_kv_bank \
             build/test_chat_completions_integration build/test_think_resolve \
             build/test_stream_split build/test_toolconstrain build/test_template_golden \
             build/test_drift_capture build/test_drift_hook
@@ -73,6 +73,7 @@ test-tools: build/test_tool_drift build/test_tool_drift_corpus build/test_openai
 	./build/test_template_golden
 	./build/test_drift_capture
 	./build/test_drift_hook
+	./build/test_kv_bank
 
 build/test_openai_bridge: tools/test_openai_bridge.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_openai_bridge.cpp -o $@
@@ -327,9 +328,13 @@ build/ninv_test: tools/ninv_test.cu src/vgemm.cuh src/kernels.cuh src/blocks.cuh
 build/test_conductor: tools/test_conductor.cpp src/conductor.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/test_conductor.cpp -o $@
 
-build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/prefix_cache.h src/prefix_ram.h src/blocks.cu src/prefill.cu \
+# incremental KV entitlements (issue #42 step 2): banker's safety check, CPU
+build/test_kv_bank: tools/test_kv_bank.cpp src/kv_bank.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/test_kv_bank.cpp -o $@
+
+build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill_arena.h src/conductor.h src/prefix_cache.h src/prefix_ram.h src/dflash2.cu src/dflash2.h src/blocks.cu src/prefill.cu \
                    src/kernels.cu src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o | build
-	$(NVCC) $(NVCCFLAGS) tools/fused_smoke.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	$(NVCC) $(NVCCFLAGS) tools/fused_smoke.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)

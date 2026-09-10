@@ -784,6 +784,35 @@ struct Engine {
     q27::KvPool* kvpool = nullptr;
     std::vector<std::vector<int>> kv_pages[2];
     int kv_rows = 0;
+    // Incremental KV (issue #42 step 2): the server installs this on every
+    // pooled engine when the conductor is on. pre_round calls it on the
+    // decoding thread when the next round would write past kv_rows; it
+    // returns true once kv_entitle() has grown the lineage to cover
+    // need_rows (under route_m and the banker's check), false to park.
+    std::function<bool(int need_rows)> on_need_rows;
+    // finish_decode sets it (the lineage will not grow again this request);
+    // the server clears it at claim. Read under route_m by other threads.
+    std::atomic<bool> kv_growth_done{false};
+    // Pages per side this lineage maps now, and the extra pages per side
+    // kv_entitle(rows) would take -- the exact inputs of the banker's check
+    // (mirrors kv_entitle's want/have walk; side 0, the sides are equal).
+    long kv_pages_held() const {
+        long n = 0;
+        for (const auto& v : kv_pages[0]) n += (long)v.size();
+        return n;
+    }
+    long kv_pages_needed(int rows) const {
+        if (!(kvpool && kvpool->enabled()) || rows <= 0) return 0;
+        const int P = (rows + KV_PAGE - 1) / KV_PAGE;
+        const int Pm = (rows + 1 + KV_PAGE - 1) / KV_PAGE;
+        long need = 0;
+        for (int c = 0; c < kv_pairs; c++) {
+            const int want = c == kv_mtp_pair() ? Pm : P;
+            const int have = (int)kv_pages[0][c].size();
+            if (want > have) need += want - have;
+        }
+        return need;
+    }
     void* const* kv_ktab(int pair) const { return d_kv_tab + (size_t)pair * kv_npages; }
     void* const* kv_vtab(int pair) const {
         return d_kv_tab + ((size_t)kv_pairs + pair) * kv_npages;
@@ -815,6 +844,14 @@ struct Engine {
                 if (want > have) need[s_] += want - have;
             }
         if (kvpool->free_pages(0) < need[0] || kvpool->free_pages(1) < need[1]) return false;
+        // Nothing to map: every wanted page is already in the table (entries
+        // are written only when their page is added; the rest alias page 0
+        // and stay so), so just raise the entitlement -- no upload. Growth
+        // inside the last mapped page (issue #42 step 2) lands here.
+        if (need[0] == 0 && need[1] == 0) {
+            if (rows > kv_rows) kv_rows = rows;
+            return true;
+        }
         for (int s_ = 0; s_ < 2; s_++)
             for (int c = 0; c < kv_pairs; c++) {
                 const int want = c == kv_mtp_pair() ? Pm : P;
@@ -4501,6 +4538,15 @@ struct Engine {
         // writes them, and the request thread reads them after the queue
         // closes (the close is the synchronization edge).
         long bat_members = 0, bat_r2 = 0;
+        // Incremental KV (issue #42 step 2): a pooled lineage may be entitled
+        // to fewer rows than max_ctx and grows at round boundaries through
+        // on_need_rows. can_park is set by Conductor::register_member (only
+        // the conductor can skip a member for a round); parked is recomputed
+        // by every pre_round; kv_ext / park_rounds feed the [kv-grow] line.
+        // Written by the decoding thread only, read after the queue closes.
+        bool can_park = false;
+        bool parked = false;
+        int kv_ext = 0, park_rounds = 0;
         // Forced control ids are engine-owned decoder transitions. DecodeTask
         // stores only request-local queue/accounting state so solo generate()
         // and the conductor drive the identical round-boundary operation.
@@ -4670,6 +4716,13 @@ struct Engine {
     // pre_round/post_round/decode_step is followed by a non-throwing
     // return, so a throwing round cannot have already finished).
     void finish_decode(DecodeTask& t, const char* why) {
+        // this lineage will not grow again this request: the server's safety
+        // check stops counting its unused max_tokens as a future need now,
+        // before the request thread gets around to freeing the slot
+        kv_growth_done.store(true);
+        if (t.kv_ext || t.park_rounds)
+            fprintf(stderr, "[kv-grow] %s: %d extensions, parked %d rounds, entitled %d rows\n",
+                    why, t.kv_ext, t.park_rounds, kv_rows);
         t.budget_truncated = t.budget_cancelled ||
                              (t.public_budget_reduced && !strcmp(why, "n_max"));
         if (t.prof_decode) {
@@ -4734,6 +4787,34 @@ struct Engine {
             finish_decode(t, "ctx-guard");
             return false;
         }
+        // Entitlement guard (issue #42 step 2). On the pool, table entries past
+        // kv_rows alias page 0 of THIS lineage, so a round past the
+        // entitlement would overwrite the conversation's own first rows. Grow
+        // through the server's hook (under route_m + its banker's check);
+        // failing that, a conductor member sits this round out (parked, not
+        // finished) and is re-checked next boundary; anything else stops
+        // instead of writing -- serial mode reserves the whole request up
+        // front, so there this is a belt that should never fire.
+        if (kvpool && kvpool->enabled()) {
+            const int need_rows = t.Ph + ctx_round_reserve();
+            if (need_rows > kv_rows) {
+                const bool grown =
+                    on_need_rows && on_need_rows(need_rows) && need_rows <= kv_rows;
+                if (grown) {
+                    t.kv_ext++;
+                } else if (on_need_rows && t.can_park) {
+                    t.parked = true;
+                    t.park_rounds++;
+                    return true;
+                } else {
+                    fprintf(stderr, "[kv] round needs %d rows, entitled %d -- stopping\n",
+                            need_rows, kv_rows);
+                    finish_decode(t, "kv-guard");
+                    return false;
+                }
+            }
+        }
+        t.parked = false;
         set_reasoning_accept_cap(reasoning_transition_active(t));
         // ConductorCore pre-checks every member, then its solo fallback calls
         // decode_step(), which pre-checks again. Preserve an id staged by the
@@ -4849,6 +4930,7 @@ struct Engine {
     // place of the solo round below.
     bool decode_step(DecodeTask& t) {
         if (!pre_round(t)) return false;
+        if (t.parked) return true; // conductor re-checks at the next boundary
         int em[W_MAX]; // width-12: spec_round can emit up to 12 tokens
         int n;
         if (t.round_forced && t.sampling && t.force_plain_sample) {
@@ -4913,6 +4995,15 @@ struct Engine {
             // NP==0 would decode from stale d_token/recurrent state and echo the
             // prior request's token (Security #2); NP>max_ctx overruns the cache.
             fprintf(stderr, "[gen] prompt %d out of range (1..%d) -- refusing\n", NP, max_ctx);
+            gs.end = "refused";
+            return false;
+        }
+        // pooled: prefill writes rows [0, NP) through the block table, and
+        // entries past the entitlement alias this lineage's page 0. Admission
+        // always entitles the prompt plus headroom; refuse if it did not.
+        if (kvpool && kvpool->enabled() && NP > kv_rows) {
+            fprintf(stderr, "[gen] prompt %d exceeds the KV entitlement %d -- refusing\n", NP,
+                    kv_rows);
             gs.end = "refused";
             return false;
         }
