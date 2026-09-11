@@ -704,12 +704,24 @@ int main(int argc, char** argv) {
         q27::normalize_cc_billing_header(a);
         q27::normalize_cc_billing_header(b);
         bool ok = a == b && a.find("cch=fffff;") != std::string::npos;
-        // 2.1.200-era header carries no cch -> untouched
+        // 2.1.200+ headers carry no cch; the per-session stamp is cc_version's
+        // 4th component (5a81225, 2026-07-24) and is pinned, the rest untouched.
+        // (This case asserted "untouched" until 2026-09-10 -- stale since
+        // 5a81225, and hidden behind the bare-fallback failure above it.)
         std::string c = "x-anthropic-billing-header: cc_version=2.1.200.77d; "
                         "cc_entrypoint=sdk-cli;You are a Claude agent.";
-        std::string c0 = c;
+        std::string c2 = "x-anthropic-billing-header: cc_version=2.1.200.e04; "
+                         "cc_entrypoint=sdk-cli;You are a Claude agent.";
         q27::normalize_cc_billing_header(c);
-        ok = ok && c == c0;
+        q27::normalize_cc_billing_header(c2);
+        ok = ok && c == c2 &&
+             c == "x-anthropic-billing-header: cc_version=2.1.200.fff; "
+                  "cc_entrypoint=sdk-cli;You are a Claude agent.";
+        // a 3-component version has no stamp -> untouched
+        std::string c3 = "x-anthropic-billing-header: cc_version=2.1.200; cc_entrypoint=cli;X";
+        std::string c30 = c3;
+        q27::normalize_cc_billing_header(c3);
+        ok = ok && c3 == c30;
         // non-CC prompt with a stray cch= in the body -> untouched
         std::string d = "You are a bot. Config: cch=zzzzz; end.";
         std::string d0 = d;

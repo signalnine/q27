@@ -6446,6 +6446,14 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
             // model prepends a bare {"name": before a batch of VALID calls ("read all files
             // in parallel"). Don't discard the rest: advance past the opener and keep scanning
             // so the real calls after it recover normally.
+            // The opener's '{' must not reach the context lexer either: it never
+            // closes, so the lexer would hold it open as a JSON container and
+            // classify every call after it as inert nested data -- the mode-8
+            // batch then recovered 1 call of 3 (the name-dropped fallback's
+            // first unit) from 9d2f866 (2026-08-07) to 2026-09-10. Only this
+            // dangling-{"name" branch skips it; other unbalanced candidates keep
+            // their contents inert.
+            candidate_context_cursor = i + 1;
             i = text.find('{', i + 1);
             continue;
         }

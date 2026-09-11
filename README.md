@@ -643,8 +643,6 @@ real coding while MTP nearly doubled stock llama.cpp.
   catastrophic positions and introduces 40 new ones. Net -43%, but a workload
   fine on one is not guaranteed fine on the other. TCQ filed as its own plan,
   not started.
-- **`billing-header cch normalize`** fails in `test_tokenizer` on HEAD
-  (`5a81225` last touched that normalizer). Filed, not fixed.
 
 Closed items keep their receipts in [docs/BUILDLOG.md](docs/BUILDLOG.md);
 measured-and-parked levers in [docs/notes.md](docs/notes.md).
