@@ -309,7 +309,7 @@ build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 # zoo for every build, so the w8 delta is now small -- kept for the widest
 # fits (the historical role-set + 12x-zoo savings are engine-wide now).
 # Same sources, own binary.
-build/q27-server-w8: src/server.cu src/engine.cuh src/dflash2.cu src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+build/q27-server-w8: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
@@ -338,11 +338,11 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp build/pf4.o -o $@
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
-build/q27-server-w16: src/server.cu src/engine.cuh src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
+build/q27-server-w16: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
                       src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h src/kv_pool.h src/prefill_arena.h third_party/httplib.h build/pf4.o | build
-	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/blocks.cu src/prefill.cu src/kernels.cu \
+	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
 	        src/spec3.cu src/vgemm.cu src/device_model.cu src/loader.cpp src/tokenizer.cpp build/pf4.o -o $@
 
 # Native Metal backend primitives. Kept separate from the engine/CLI targets so
