@@ -15714,6 +15714,18 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ae): v0.11.4 cut (tokenizer fix + 3.8 history rendering), NOT deployed
+
+Tag v0.11.4 on master after 85412b7 (the (ad) readout). Source-wise the
+release is 5c28eaf (history rendering) + 6084562 (tokenizer) over v0.11.3.
+Gates on this tree: make test-tools (462 PASS, the three template goldens
+byte-exact), test_tokenizer HF-parity 9/9 (its pre-existing "bare tool-call
+fallback" FAIL is identical on v0.11.3), server build clean. The canonical
+md5s cannot move -- the gates feed token ids, the encoder never runs -- and
+no kernel changed. Live validation is (ad): two Claude Code legs on a
+binary built from this source. Production stays on v0.11.3 until a deploy,
+which needs a fresh prefix-cache root.
+
 ## 2026-09-10 (ad): the reasoning-length gap was mostly a tokenizer bug -- the tool tags never encoded as their added tokens; fixed: -43% thinking per turn on Claude Code, +8% decode, 11/12 gold
 
 bench/crossengine/agentic-2026-09-10-effort/README.md has every table.

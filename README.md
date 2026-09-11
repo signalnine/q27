@@ -39,7 +39,12 @@ A narrow inference engine for **Qwen3.6-27B-MTP and Qwen3.8-27B-MTP** (hybrid GD
   defects were found and fixed on the way (the served model name made
   Claude Code drop prior thinking blocks; the `<tools>` block had been
   rendered compact and key-sorted since 08-22) without moving the gap:
-  [bench/crossengine/agentic-2026-09-09-echo/](bench/crossengine/agentic-2026-09-09-echo/README.md).)*
+  [bench/crossengine/agentic-2026-09-09-echo/](bench/crossengine/agentic-2026-09-09-echo/README.md).
+  Corrected 2026-09-10: most of the per-turn gap was q27's -- its tokenizer
+  spelled the `<tool_call>`/`<tool_response>` tags as text on every agentic
+  prompt, which a turn-0 probe barely sees. v0.11.4 fixes it: 40% less
+  thinking per turn, 70-75 s/inst; what remains is turn count
+  ([bench/crossengine/agentic-2026-09-10-effort/](bench/crossengine/agentic-2026-09-10-effort/README.md)).)*
 - **Self-speculation as the whole design**: trained-in MTP ladder + free
   suffix drafter through one shared-KV MMA verify -- 5.3-5.8 accepted tokens
   per weight read on live traffic (231-246 t/s aggregate on a 5090).
@@ -166,7 +171,7 @@ One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.11.3](https://github.com/signalnine/q27/releases).
+release: [v0.11.4](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -179,7 +184,7 @@ under [bench/crossengine/](bench/crossengine/):
   same-day control. Prefix reuse 95.7% vs 96.1%. Wall per instance 98 s vs
   24 s: q27's sessions run 25 turns and 15K output tokens per instance
   against 11 and 4K.
-- **Tokenizer fix on master (unreleased)**: q27's encoder never matched the
+- **Tokenizer fix (v0.11.4)**: q27's encoder never matched the
   vocab's `<tool_call>` / `<tool_response>` added tokens, so every agentic
   prompt since July showed the model its own tool calls and results spelled
   out as text. Fixed (0/34 -> 34/34 recorded Claude Code prompts identical
@@ -496,7 +501,7 @@ production recipe with a fresh cache root, same-day control;
 | **q27** v0.11.3 (Q8 pack, K=7) | 218.0 / 232.2 t/s | 4.05 | 95.7% | 98 s | 25.2, 15.3K | 10/12 |
 | q27 before PR #43 (control) | 209.7 / 223.1 t/s | 3.98 | --* | --* | 23.2, 16.8K | 12/12 |
 | ninfer DFlash2 k=7 (NVFP4) | 218.2 / **240.5** t/s | 4.11 | 96.1% | **24 s** | 10.8, 4.0K | 11/12 |
-| **q27 master** (tokenizer fix, unreleased; two runs) | **228.0-231.5** / 242.9-247.2 t/s | **4.21-4.27** | 95.7-96.5% | 70-75 s | 22.6-22.9, 11.2-11.7K | 10-11/12 |
+| **q27 v0.11.4** (tokenizer fix; two runs) | **228.0-231.5** / 242.9-247.2 t/s | **4.21-4.27** | 95.7-96.5% | 70-75 s | 22.6-22.9, 11.2-11.7K | 10-11/12 |
 
 The last row is the tokenizer fix from the same day
 ([readout](bench/crossengine/agentic-2026-09-10-effort/README.md)): q27's
@@ -611,8 +616,8 @@ real coding while MTP nearly doubled stock llama.cpp.
   gate (201 vs 203 s), but three of four requests finished later. There is
   no preemption and no fairness beyond the safety check, and the block
   table still uploads from pageable host memory on each growth.
-- **The tokenizer fix is unreleased.** Master has it (plus 3.8 history
-  rendering); production still runs v0.11.3. A deploy needs a fresh
+- **v0.11.4 is not in production yet.** It has the tokenizer fix (plus 3.8
+  history rendering); production still runs v0.11.3. A deploy needs a fresh
   prefix-cache root, since every tool-bearing prompt tokenizes differently.
   Every q27 agentic number before 2026-09-10 ran with the bug, the drift
   corpus included; whether the tool-call drift shapes (issue #38) came from
