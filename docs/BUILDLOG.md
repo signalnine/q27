@@ -15714,7 +15714,7 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
-## 2026-09-10 (ae): v0.11.4 cut (tokenizer fix + 3.8 history rendering), NOT deployed
+## 2026-09-10 (ae): v0.11.4 cut (tokenizer fix + 3.8 history rendering) and deployed
 
 Tag v0.11.4 on master after 85412b7 (the (ad) readout). Source-wise the
 release is 5c28eaf (history rendering) + 6084562 (tokenizer) over v0.11.3.
@@ -15723,8 +15723,16 @@ byte-exact), test_tokenizer HF-parity 9/9 (its pre-existing "bare tool-call
 fallback" FAIL is identical on v0.11.3), server build clean. The canonical
 md5s cannot move -- the gates feed token ids, the encoder never runs -- and
 no kernel changed. Live validation is (ad): two Claude Code legs on a
-binary built from this source. Production stays on v0.11.3 until a deploy,
-which needs a fresh prefix-cache root.
+binary built from this source.
+
+DEPLOYED 21:17 PDT: master build (md5 e6a35d34) moved atomically into
+/mnt/ai/projects/q27/build/q27-server, v0.11.3 kept as q27-server.v0.11.3
+(0e48d741) for rollback; q27-38 stopped, /dev/shm/q27-pfx cleared,
+relaunched with tools/launch_q27_38.sh d2-pfx -E Q27_SYSBLK=1. Running exe
+e6a35d34, wsum b743d26b1f0562a9, XML dialect. Smoke: count_tokens on the
+recorded 28-tool Claude Code turn-0 body = 24582 = AutoTokenizer on the
+same render (v0.11.3: 24593); /v1/messages -> thinking + Bash tool_use,
+model tag echoed; the 23552-token system entry persisted.
 
 ## 2026-09-10 (ad): the reasoning-length gap was mostly a tokenizer bug -- the tool tags never encoded as their added tokens; fixed: -43% thinking per turn on Claude Code, +8% decode, 11/12 gold
 

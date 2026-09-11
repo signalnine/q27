@@ -616,11 +616,9 @@ real coding while MTP nearly doubled stock llama.cpp.
   gate (201 vs 203 s), but three of four requests finished later. There is
   no preemption and no fairness beyond the safety check, and the block
   table still uploads from pageable host memory on each growth.
-- **v0.11.4 is not in production yet.** It has the tokenizer fix (plus 3.8
-  history rendering); production still runs v0.11.3. A deploy needs a fresh
-  prefix-cache root, since every tool-bearing prompt tokenizes differently.
-  Every q27 agentic number before 2026-09-10 ran with the bug, the drift
-  corpus included; whether the tool-call drift shapes (issue #38) came from
+- **Every q27 agentic number before 2026-09-10 ran with the tokenizer bug**,
+  the drift corpus included (v0.11.4, deployed 2026-09-10 on a fresh
+  prefix-cache root); whether the tool-call drift shapes (issue #38) came from
   it is untested.
 - **Turn count is the remaining gap.** With correct tokens q27 thinks within
   5% of ninfer per turn on identical states, and the Q8_0 reference agrees
