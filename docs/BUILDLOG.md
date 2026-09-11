@@ -15714,6 +15714,17 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ag): v0.11.5 cut (the (af) follow-ups), NOT deployed
+
+Tag v0.11.5 on master after bf0a40d: PR #44 + the w16 fix, the mode-8 parser
+fix, HF-exact Unicode tokenization and trim. Gates are (af)'s on this tree
+(test_tokenizer exit 0, make test-tools 464, corpus 165/165, fuzz 120 s,
+tok_parity all identical, q27-server builds). Canonical md5s cannot move
+(token-id input). Production stays on v0.11.4 until a deploy; ASCII traffic
+renders and tokenizes identically between the two (the one ASCII change: a
+message edge of U+001C-001F is now trimmed, as Python does), so only cache
+entries holding non-ASCII text stop matching.
+
 ## 2026-09-10 (af): follow-ups -- PR #44 (narrow builds link again), a month-old parser regression, and HF-exact Unicode tokenization
 
 PR #44 (external, chaudhryfaisal): build/q27-server-w8 has not linked since

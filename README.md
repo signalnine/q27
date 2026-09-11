@@ -171,7 +171,7 @@ One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.11.4](https://github.com/signalnine/q27/releases).
+release: [v0.11.5](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -192,7 +192,10 @@ under [bench/crossengine/](bench/crossengine/):
   40-43%, decode rises to 228-232 t/s at 4.21-4.27 tok/round, wall 70-75 s
   per instance, 10-11/12 gold (two runs, 2026-09-10). What remains of the
   gap to ninfer is turn count: q27 still reproduces and verifies before it
-  edits, as the Q8_0 reference does on the same states.
+  edits, as the Q8_0 reference does on the same states. v0.11.5 finishes the
+  job for Unicode (NFC and the regex's character classes, taken from the
+  reference itself): `tools/tok_parity.py` matches AutoTokenizer on every
+  Unicode scalar value.
 - Production at Claude Code's default effort (xhigh): DFlash2 is +22%
   aggregate decode over the MTP ladder on the same instances; the
   prefix-cache tiers with the shared system-block cut took the prefill wall
