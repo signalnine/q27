@@ -15714,6 +15714,50 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-11 (ah): wait diagnostics -- a stuck request now says why, and a short slot count says so at boot
+
+Issue #42 comment (WSL user): `--slots 4/6/8` with 4/6/7 concurrent ~10K-char
+requests ran 3/4/6 at once, the rest "waiting indefinitely". Not reproduced
+on the 5090 with their command (114 requests over 4/6/8 slots, burst and
+back to back, English and Chinese prompts, max_tokens default and 32768: all
+ran, longest pre-prefill wait 1.4 s); reply posted asking for details.
+Building the diagnostics then found the likely cause: the pool block trades
+slots for a 16K-token KV floor each (`while (pool_b < n_slots * ent_bytes)
+n_slots--`) with no message, so a card with less free VRAM than a 5090's
+comes up with fewer slots than `--slots` -- under an 8 GB hold here, `--slots
+4` came up as 2 -- and requests past that count wait for a slot. The
+reporter's 3-of-4, 4-of-6, 6-of-7 fits that exactly.
+
+src/server.cu:
+- `[pool] trading slots for KV: 4 -> 2, so each keeps a 16384-token KV floor
+  (0.57 GB) next to its 1.00 GB fixed stack`, and after the slots are built
+  `WARNING: --slots 4 requested, 2 slots came up (not enough free VRAM: 6.0 GB
+  free after the weights); a request past 2 concurrent waits for a free slot`
+  (or "8 is the maximum").
+- `[wait]` lines once a wait passes Q27_WAIT_LOG_MS (default 5000, 0 = off),
+  repeated every 30 s, closed by a started/resumed line; rid= matches [req]:
+  admission (the only slot / all N slots busy; KV pool short; KV pool would
+  be unsafe -- no completion order for the declared maxima), parked KV growth
+  (needs/has/up-to rows, pool state), the GPU gate before a prefill, a
+  prefill time-sliced with other requests (only when it handed the GPU over),
+  and a long gap from prefill end to first token.
+- boot `http: N worker threads, M slots`, warning when N < M + 2 (httplib
+  holds a worker per connection, keep-alive included; connections past it
+  queue unlogged).
+
+Exercised live (Q27_WAIT_LOG_MS=1000): slot busy waits with 30 s repeats and
+start lines; with a small pool and max_tokens 30000 the second request waited
+35.5 s beside a free slot -- "KV pool would be unsafe: 4158 rows to start, up
+to 30064 with max_tokens" -- though both outputs stopped near 12K tokens (the
+admission is conservative exactly when a client's max_tokens is large next
+to the pool); the step-2 growth gate (4 x 60K-token prompts, 265K pool)
+logged three parks of ~16.5 s each and their resumes, and still passes with
+intact counts; seven 9.5K-token prompts in a burst each logged a ~16 s
+prefill with 11 GPU handovers (2.4 s alone) -- the time-slicing that makes
+a burst stream nothing until every prefill is done, now visible. make
+test-tools 464 PASS; extract_check in sync (claim_slot takes the rid); server
+and w8 build.
+
 ## 2026-09-10 (ag): v0.11.5 cut (the (af) follow-ups), NOT deployed
 
 Tag v0.11.5 on master after bf0a40d: PR #44 + the w16 fix, the mode-8 parser

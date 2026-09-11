@@ -360,6 +360,8 @@ int main(int argc, char** argv) {
     bool ctx_explicit = false;
     int ctx_requested = -1;
     int n_slots = 1, slot1_ctx = 32768;
+    int n_slots_requested = 1;       // --slots as given, for the came-up-short warning
+    size_t vram_post_weights = 0;    // free VRAM after the weight upload, for the same
     bool slot1_ctx_set = false; // explicit --slot1-ctx wins over --ctx propagation
     int fast_flag = -1;        // tri-state: explicit flag wins over profile
     int think_flag = -1;
@@ -386,7 +388,7 @@ int main(int argc, char** argv) {
             ctx_explicit = ctx > 0;
             ctx_requested = ctx;
         }
-        else if (!strcmp(argv[i], "--slots") && i + 1 < argc) n_slots = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--slots") && i + 1 < argc) { n_slots = atoi(argv[++i]); n_slots_requested = n_slots; }
         else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = atoi(argv[++i]); slot1_ctx_set = true; }
         else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
         else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
@@ -779,6 +781,7 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
         fprintf(stderr, "vram: free %.2f GB post-weights\n", free_b / 1e9);
+        vram_post_weights = free_b;
         if (ctx < 0) {
             const char* kvv = getenv("Q27_KV");
             const bool fp8 = kvv && !strcmp(kvv, "fp8");
@@ -934,6 +937,11 @@ int main(int argc, char** argv) {
         // to (prompt + max_tokens + close + round reserve, clamped to the
         // window); 0 while idle. Guarded by route_m.
         int ent_max = 0;
+        // wait diagnostics (Q27_WAIT_LOG_MS): the request on this slot, and
+        // how long its KV growth has been parked. Guarded by route_m.
+        long rid = -1;
+        bool parking = false, park_logged = false;
+        std::chrono::steady_clock::time_point park_t0{}, park_next{};
         std::vector<int> tool_mask_host2dev; // per-engine mask-pool ids (P7)
     };
     // P16 persistent prefix cache. Declared BEFORE `slots` so it outlives the
@@ -1056,10 +1064,17 @@ int main(int argc, char** argv) {
         const double ent_bytes =
             (double)(17 * (size_t)((floor_rows + 63) / 64)) * 64.0 * (double)(k_row + v_row);
         double pool_b = (double)freeb - fixed_for(n_slots);
+        const int slots_before_floor = n_slots;
         while (n_slots > 1 && pool_b < (double)n_slots * ent_bytes) {
             n_slots--;
             pool_b = (double)freeb - fixed_for(n_slots);
         }
+        // this trade used to be silent -- the only trace was the slot count
+        // below (issue #42 field report: --slots 4/6/8 ran 3/4/6 at once)
+        if (n_slots < slots_before_floor)
+            fprintf(stderr, "[pool] trading slots for KV: %d -> %d, so each keeps a %d-token "
+                            "KV floor (%.2f GB) next to its %.2f GB fixed stack\n",
+                    slots_before_floor, n_slots, floor_rows, ent_bytes / 1e9, per_extra / 1e9);
         fprintf(stderr, "[pool] %d slots, floor %.2f GB (%d rows x slots), pool %.2f GB\n",
                 n_slots, n_slots * ent_bytes / 1e9, floor_rows, pool_b / 1e9);
 
@@ -1280,6 +1295,21 @@ int main(int argc, char** argv) {
         s.eng->build_spec_graphs();
         slots.push_back(std::move(s));
         fprintf(stderr, "slot %d ready: ctx=%d\n", si, sctx);
+    }
+    // Fewer slots than --slots asked for -- the 8 cap, fixed stacks or the KV
+    // floor trade above, or the build loop's skip -- means concurrent requests
+    // past this count wait for a free slot. Say it where it can't be missed.
+    if ((int)slots.size() < n_slots_requested) {
+        char why[96];
+        if ((int)slots.size() < std::min(8, n_slots_requested))
+            snprintf(why, sizeof why, "not enough free VRAM: %.1f GB free after the weights",
+                     vram_post_weights / 1e9);
+        else
+            snprintf(why, sizeof why, "8 is the maximum");
+        fprintf(stderr,
+                "WARNING: --slots %d requested, %zu slot%s came up (%s); a request past %zu "
+                "concurrent waits for a free slot\n",
+                n_slots_requested, slots.size(), slots.size() == 1 ? "" : "s", why, slots.size());
     }
     // P16c sizing needs an engine: pfx_bytes() depends on the KV format and
     // the layer geometry. Slots are built by now, so ask slot 0.
@@ -1596,6 +1626,38 @@ int main(int argc, char** argv) {
     bool kv_incremental = false;
     q27::Conductor* kv_conductor = nullptr; // for poke(); same lifetime rules
     constexpr int kKvHeadroom = 4096, kKvGrowChunk = 4096;
+    // Wait diagnostics (issue #42 field report, 2026-09-11: "one request waits
+    // indefinitely" that did not reproduce here). Silent until something waits
+    // longer than Q27_WAIT_LOG_MS (default 5000; 0 = off), then a [wait] line
+    // says what and why -- admission (all slots busy / KV pool unsafe or
+    // short), parked KV growth, the GPU gate before a prefill, the gap from
+    // prefill to first token -- repeated every 30 s while it lasts, and once
+    // more when it ends. rid= matches the request's [req] line.
+    const int wait_log_ms = [] {
+        const char* e = getenv("Q27_WAIT_LOG_MS");
+        return e && *e ? std::max(0, atoi(e)) : 5000;
+    }();
+    constexpr auto kWaitRepeat = std::chrono::seconds(30);
+    auto secs_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+    };
+    // one-line pool state for [wait] lines. Under route_m.
+    auto pool_state = [&]() -> std::string {
+        char b[160];
+        int busy = 0;
+        for (auto& s : slots) busy += s.busy;
+        if (!kv_pool.enabled()) {
+            snprintf(b, sizeof b, "%d/%zu slots busy", busy, slots.size());
+        } else {
+            const long fp = std::min(kv_pool.free_pages(0), kv_pool.free_pages(1));
+            long idle = 0;
+            for (auto& s : slots)
+                if (!s.busy) idle += s.eng->kv_pages_held();
+            snprintf(b, sizeof b, "%d/%zu slots busy, KV pool %ld free + %ld idle-cache pages",
+                     busy, slots.size(), fp, idle);
+        }
+        return b;
+    };
     // Safety of granting `c` a lineage of `c_rows` rows while it may grow to
     // `c_max` rows. Under route_m. Busy slots other than c are claims (a
     // finished-decoding one needs nothing more: kv_growth_done); idle slots'
@@ -1641,8 +1703,24 @@ int main(int argc, char** argv) {
     };
     auto claim_slot = [&](const std::vector<int>& prompt, int requested,
                           bool thinking, const q27::ThinkCfg& cfg,
-                          bool budget_aware) -> Slot& {
+                          bool budget_aware, long rid) -> Slot& {
         std::unique_lock<std::mutex> lk(route_m);
+        // wait diagnostics: why the last selection failed, and when to say so
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        auto wait_next = wait_t0 + std::chrono::milliseconds(wait_log_ms);
+        bool wait_logged = false;
+        std::string why;
+        auto wait_route = [&] {
+            if (wait_log_ms <= 0) { route_cv.wait(lk); return; }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= wait_next) {
+                fprintf(stderr, "[wait] rid=%ld not started after %.1f s (prompt %zu tokens): %s; %s\n",
+                        rid, secs_since(wait_t0), prompt.size(), why.c_str(), pool_state().c_str());
+                wait_logged = true;
+                wait_next = now + kWaitRepeat;
+            }
+            route_cv.wait_until(lk, wait_next);
+        };
         const q27::ThinkCfg raw_cfg{false, -1, true};
         const q27::ThinkCfg& limit_cfg = budget_aware ? cfg : raw_cfg;
         const int limit_close = budget_aware ? (int)think_close_ids.size() : 0;
@@ -1718,16 +1796,30 @@ int main(int argc, char** argv) {
                     // are cache, not entitlement; busy slots are never
                     // touched). Unsafe or short: wait for a request to
                     // finish and retry the whole selection.
-                    const bool entitled =
-                        kv_bank_ok(*best, init_rows, max_rows) && kv_grant(*best, init_rows);
+                    const bool safe = kv_bank_ok(*best, init_rows, max_rows);
+                    const bool entitled = safe && kv_grant(*best, init_rows);
                     if (!entitled) {
-                        route_cv.wait(lk);
+                        char b[200];
+                        snprintf(b, sizeof b,
+                                 safe ? "KV pool short: %d rows to start (up to %d) did not fit "
+                                        "after reclaiming idle slots"
+                                      : "KV pool would be unsafe: %d rows to start, up to %d with "
+                                        "max_tokens, would leave no order in which every running "
+                                        "request can finish",
+                                 init_rows, max_rows);
+                        why = b;
+                        wait_route();
                         continue;
                     }
                     best->ent_max = max_rows;
                     best->eng->kv_growth_done.store(false);
                 }
                 best->busy = true;
+                best->rid = rid;
+                best->parking = best->park_logged = false;
+                if (wait_logged)
+                    fprintf(stderr, "[wait] rid=%ld started after %.1f s on slot %d\n", rid,
+                            secs_since(wait_t0), best->id);
                 // LRU is stamped at FREE, not here: eviction preference must
                 // track completion recency (a slot claimed early but finishing
                 // last is the likeliest to continue). Claim-time stamps are
@@ -1744,7 +1836,19 @@ int main(int argc, char** argv) {
                     best->eng->dctl.reset();
                 return *best;
             }
-            route_cv.wait(lk);
+            {
+                int busy = 0;
+                for (auto& s : slots) busy += s.busy;
+                char b[120];
+                if (busy == (int)slots.size())
+                    snprintf(b, sizeof b, slots.size() == 1 ? "the only slot is busy" : "all %zu slots busy",
+                             slots.size());
+                else
+                    snprintf(b, sizeof b, "no free slot's window fits the request (%d of %zu free)",
+                             (int)slots.size() - busy, slots.size());
+                why = b;
+            }
+            wait_route();
         }
     };
     auto free_slot = [&](Slot& s) {
@@ -1753,6 +1857,11 @@ int main(int argc, char** argv) {
             s.busy = false;
             s.ent_max = 0; // its pages are an idle lineage now: reclaimable
             if (s.stamp_on_free) s.last_used = ++slot_use_counter;
+            if (s.park_logged)
+                fprintf(stderr, "[wait] rid=%ld finished while its KV growth was parked (%.1f s)\n",
+                        s.rid, secs_since(s.park_t0));
+            s.rid = -1;
+            s.parking = s.park_logged = false;
         }
         route_cv.notify_all();
         // parked conductor members re-check their growth now (incremental KV)
@@ -1921,11 +2030,36 @@ int main(int argc, char** argv) {
                     int target = std::min(
                         cap, cover(std::max(need_rows, c.eng->kv_rows + kKvGrowChunk)));
                     const int minimal = std::min(cap, cover(need_rows));
+                    bool safe = false;
                     for (;;) {
-                        if (kv_bank_ok(c, target, cap) && kv_grant(c, target)) return true;
-                        if (target <= minimal) return false; // park this round
+                        safe = kv_bank_ok(c, target, cap);
+                        if (safe && kv_grant(c, target)) {
+                            if (c.park_logged)
+                                fprintf(stderr, "[wait] rid=%ld resumed after %.1f s parked (KV now %d rows)\n",
+                                        c.rid, secs_since(c.park_t0), c.eng->kv_rows);
+                            c.parking = c.park_logged = false;
+                            return true;
+                        }
+                        if (target <= minimal) break; // park this round
                         target = minimal; // retry with the smallest whole-page growth
                     }
+                    // parked: say so once it has lasted Q27_WAIT_LOG_MS
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!c.parking) {
+                        c.parking = true;
+                        c.park_t0 = now;
+                        c.park_next = now + std::chrono::milliseconds(wait_log_ms);
+                    } else if (wait_log_ms > 0 && now >= c.park_next) {
+                        fprintf(stderr,
+                                "[wait] rid=%ld parked %.1f s on slot %d: needs %d KV rows (has %d, "
+                                "up to %d) -- %s; %s\n",
+                                c.rid, secs_since(c.park_t0), c.id, minimal, c.eng->kv_rows, cap,
+                                safe ? "pool short" : "growing now would be unsafe",
+                                pool_state().c_str());
+                        c.park_logged = true;
+                        c.park_next = now + kWaitRepeat;
+                    }
+                    return false;
                 };
             }
             fprintf(stderr,
@@ -1984,10 +2118,19 @@ int main(int argc, char** argv) {
                               const ReqTrace& rt, Engine::DecodeTask& t,
                               std::string* err_out) -> int {
         q27::TokenQueue q;
+        std::chrono::steady_clock::time_point t_pf_done;
         {
+            const auto t_gate = std::chrono::steady_clock::now();
+            const int ahead = gpu_gate.contended();
             q27::GpuGate::Lease lk(gpu_gate);
             qw = ms_since(rt.t0);
+            if (wait_log_ms > 0 && secs_since(t_gate) * 1000.0 >= wait_log_ms)
+                fprintf(stderr,
+                        "[wait] rid=%ld waited %.1f s for the GPU before its prefill "
+                        "(%d ahead in the gate queue when it arrived)\n",
+                        rt.rid, secs_since(t_gate), ahead);
             int P = 0;
+            const auto t_pf = std::chrono::steady_clock::now();
             if (!eng.generate_prefill(prompt, stable_len, &P)) {
                 eng.on_round_gap = nullptr;
                 return 0; // refused; gs.end already stamped for req_log
@@ -1996,12 +2139,38 @@ int main(int argc, char** argv) {
             // register_member replaces this placeholder with the queue sink.
             auto placeholder = [](int) { return true; };
             eng.make_decode_task(t, nm, EOS, placeholder, P);
+            t_pf_done = std::chrono::steady_clock::now();
+            // Concurrent prefills hand the GPU to each other at chunk
+            // boundaries, so a burst of N long prompts finishes all of them
+            // together, N x one prefill later (issue #42 follow-up: seven
+            // 9.5K-token prompts each took ~16 s, ~2.4 s alone, 11 handovers).
+            // Only a prefill that actually shared the GPU: a long prompt alone
+            // is not a wait (a cold 24K Claude Code turn takes ~6.5 s by itself).
+            if (wait_log_ms > 0 && eng.gs.yields > 0 &&
+                secs_since(t_pf) * 1000.0 >= wait_log_ms)
+                fprintf(stderr,
+                        "[wait] rid=%ld prefill of %zu tokens took %.1f s with %d GPU handovers "
+                        "(time-sliced with other requests; %d waiting on the gate now)\n",
+                        rt.rid, prompt.size(), secs_since(t_pf), eng.gs.yields,
+                        gpu_gate.contended());
         } // lease released: decode arbitration belongs to the conductor
         conductor->register_member(&eng, &t, &q, std::move(on_emit));
         bool client_gone = false;
+        bool first_pop = true;
         std::vector<q27::TokenQueue::Token> ids;
         try {
             while (q.pop(ids)) {
+                // the first decode round can queue behind other requests'
+                // prefills on the gate (a simultaneous burst streams nothing
+                // until every prefill is done); say so when it is long
+                if (first_pop && !ids.empty()) {
+                    first_pop = false;
+                    if (wait_log_ms > 0 && secs_since(t_pf_done) * 1000.0 >= wait_log_ms)
+                        fprintf(stderr,
+                                "[wait] rid=%ld first token %.1f s after its prefill finished "
+                                "(%d waiting on the GPU gate now)\n",
+                                rt.rid, secs_since(t_pf_done), gpu_gate.contended());
+                }
                 for (const auto& token : ids) {
                     if (!client_gone && !on_token(token.id, token.forced)) {
                         client_gone = true;
@@ -2357,7 +2526,7 @@ int main(int argc, char** argv) {
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware); // may wait for a free engine
+            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
@@ -2594,7 +2763,7 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, created, chat, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware);
+                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
@@ -3050,7 +3219,7 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double, std::milli>(tk2 - tk0).count()};
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
@@ -3217,7 +3386,7 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v,
              allowed_tool_names, tchoice, tools, stable_len, rt, thinking, tcfg,
              sys_len](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
@@ -3793,7 +3962,7 @@ int main(int argc, char** argv) {
         };
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng};
@@ -3987,7 +4156,7 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
              thinking, tcfg, sys_len, tchoice, response_choice,
              eligible_call_names](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true);
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng};
@@ -4493,6 +4662,22 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "q27-server listening on http://%s:%d (ctx %d, %s head)\n", host.c_str(),
             port, ctx, fast ? "fast" : "faithful");
+    {
+        // httplib serves each CONNECTION on one pool worker for its whole life
+        // (keep-alive included, up to CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND after
+        // the last response), so concurrent connections past the pool wait in
+        // httplib's queue before q27 sees them -- they never reach a [wait] or
+        // [req] line. Worth knowing on a machine with few cores.
+        const unsigned workers = CPPHTTPLIB_THREAD_POOL_COUNT;
+        fprintf(stderr, "http: %u worker threads, %zu slots%s\n", workers, slots.size(),
+                workers < slots.size() + 2
+                    ? " -- WARNING: fewer workers than slots + 2; extra concurrent "
+                      "connections queue in the HTTP layer, unlogged"
+                    : "");
+        if (wait_log_ms > 0)
+            fprintf(stderr, "wait diagnostics: [wait] lines after %d ms (Q27_WAIT_LOG_MS; 0 = off)\n",
+                    wait_log_ms);
+    }
     srv.listen_after_bind();
     // P1 Task 10 shutdown: stop the conductor (its thread cancels + closes
     // any remaining members) and join it BEFORE the engines it drives tear

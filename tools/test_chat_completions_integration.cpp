@@ -481,7 +481,7 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         long rid; const char* api; unsigned long long conv;
         std::chrono::steady_clock::time_point t0; double tok_ms;
     };
-    auto claim_slot = [&](const std::vector<int>&, int, bool, const q27::ThinkCfg&, bool) -> Slot& {
+    auto claim_slot = [&](const std::vector<int>&, int, bool, const q27::ThinkCfg&, bool, long) -> Slot& {
         slots[0].busy = true;
         return slots[0];
     };
@@ -760,7 +760,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware); // may wait for a free engine
+            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
@@ -997,7 +997,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             [&, samp, prompt, n_max, created, chat, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware);
+                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid);
                 auto sl_lease = slot_guard(sl);
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin

@@ -394,6 +394,20 @@ first, then waits for a running one to finish. `Q27_KV_INCREMENTAL=0`
 restores up-front reservation; an explicit `--ctx` / `--slot1-ctx` still
 fixes the windows.
 
+**When a request seems stuck**, read the startup lines and the `[wait]`
+lines. Each slot needs a fixed stack plus a 16K-token KV floor, so on a
+card with less free VRAM `--slots N` can bring up fewer slots; the server
+now says so (`WARNING: --slots 4 requested, 2 slots came up (not enough
+free VRAM ...)`), and requests past that count wait for a free slot.
+Anything that waits longer than `Q27_WAIT_LOG_MS` (default 5000; 0 turns
+it off) prints a `[wait]` line with its request id -- the same `rid` as
+its final `[req]` line -- and the reason: all slots busy, the KV pool
+short or unsafe to grow into, a parked KV growth, the GPU gate before a
+prefill, or a prefill time-sliced with other requests' prefills. It
+repeats every 30 s while the wait lasts and once more when it ends. The
+`http:` startup line gives the HTTP worker count; connections past it
+queue inside the HTTP layer before q27 sees them, with no log line.
+
 **Persistent prefix cache**: `--prefix-cache DIR` (opt-in). Restart TTFT
 8.15 s -> 1.20 s; entries verified token-by-token; LRU capped by
 `--prefix-cache-max-gb`. Stores conversation content on disk in plaintext --
