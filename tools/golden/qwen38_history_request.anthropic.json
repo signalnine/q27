@@ -1,0 +1,36 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 1024,
+  "system": [{"type": "text", "text": "You are a coding agent."}],
+  "tools": [
+    {"name": "Read", "description": "Read a file.", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["file_path"]}},
+    {"name": "Edit", "description": "Replace a string in a file.", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}, "required": ["file_path", "old_string", "new_string"]}},
+    {"name": "Grep", "description": "Search files.", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}, "context": {"type": "object"}}, "required": ["pattern"]}}
+  ],
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "<system-reminder>ctx</system-reminder>\n"}, {"type": "text", "text": "Fix the empty-name bug in app.py.\n"}]},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "The bug is in app.py. Read it first.\n", "signature": "q27-local"},
+      {"type": "text", "text": "\n\nI'll read the file.\n\n"},
+      {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/w/app.py", "offset": 10, "limit": 40}}
+    ]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "10\tdef make(name):\n11\t    return App(name)\n"}]},
+    {"role": "system", "content": "The task tools haven't been used recently.\n"},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "\nAdd a check for an empty name.\n\n", "signature": "q27-local"},
+      {"type": "tool_use", "id": "toolu_2", "name": "Edit", "input": {"file_path": "/w/app.py", "old_string": "    return App(name)", "new_string": "    if not name:\n        raise ValueError(\"empty name\")\n    return App(name)", "replace_all": false}},
+      {"type": "tool_use", "id": "toolu_3", "name": "Grep", "input": {"pattern": "make\\(", "paths": ["/w/app.py", "/w/tests"], "context": {"b": 1, "a": 2}}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_2", "content": "The file /w/app.py has been updated."},
+      {"type": "tool_result", "tool_use_id": "toolu_3", "content": [{"type": "text", "text": "/w/tests/test_app.py:3: make(\"\")\n"}]}
+    ]},
+    {"role": "assistant", "content": [
+      {"type": "thinking", "thinking": "Done.", "signature": "q27-local"},
+      {"type": "text", "text": "Fixed: empty names now raise ValueError.\n"}
+    ]},
+    {"role": "user", "content": "Thanks. Anything else?\n"}
+  ],
+  "thinking": {"type": "adaptive"},
+  "output_config": {"effort": "medium"}
+}

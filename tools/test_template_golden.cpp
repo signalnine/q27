@@ -132,29 +132,87 @@ static void openai_boundaries() {
        "openai decl: garbage / wrong type -> empty");
 }
 
-int main() {
-    boundaries();
-    openai_boundaries();
-    if (fails) { printf("template golden: %d boundary FAILURE(S)\n", fails); return 1; }
-    const std::string raw = slurp("tools/golden/qwen38_tools_request.anthropic.json");
-    const std::string want = slurp("tools/golden/qwen38_tools_request.prompt");
+// One Anthropic fixture against its llama.cpp capture; prints the first
+// differing byte with context so a failure is diagnosable.
+static int anthropic_golden(const char* tag, const char* fixture, const char* prompt) {
+    const std::string raw = slurp(fixture);
+    const std::string want = slurp(prompt);
     if (raw.empty() || want.empty()) { fprintf(stderr, "fixture missing (run from repo root)\n"); return 2; }
-
     json body = json::parse(raw);
     q27::tool_dialect_xml_default() = true;                 // a Qwen3.8 checkpoint boots XML
     q27::TemplateOpts opts = q27::template_opts_from_body(body);
     opts.tools_decl = q27::anthropic_tools_decl(raw);        // ordered, minja-spaced
     const json tools = q27::anthropic_tools_json(body);
-    const std::string got = q27::chatml_prompt(q27::anthropic_msgs(body), tools, /*think=*/true,
+    const std::string got = q27::chatml_prompt(q27::anthropic_msgs(body, &raw), tools, /*think=*/true,
                                                nullptr, nullptr, {}, nullptr, &opts);
-    if (got == want) { printf("template golden: PASS (%zu bytes)\n", got.size()); return openai_golden(); }
-    // first differing byte, with context, so a failure is diagnosable
+    if (got == want) { printf("%s: PASS (%zu bytes)\n", tag, got.size()); return 0; }
     size_t i = 0; while (i < got.size() && i < want.size() && got[i] == want[i]) i++;
-    printf("template golden: FAIL at byte %zu (got %zu bytes, want %zu)\n", i, got.size(), want.size());
-    auto show = [&](const char* tag, const std::string& s) {
+    printf("%s: FAIL at byte %zu (got %zu bytes, want %zu)\n", tag, i, got.size(), want.size());
+    auto show = [&](const char* t, const std::string& s) {
         size_t a = i > 60 ? i - 60 : 0, b = std::min(s.size(), i + 80);
-        printf("  %s: %s\n", tag, json(s.substr(a, b - a)).dump().c_str());
+        printf("  %s: %s\n", t, json(s.substr(a, b - a)).dump().c_str());
     };
     show("got ", got); show("want", want);
     return 1;
+}
+
+// The 3.8 history rules (2026-09-10) on the pieces the first golden never
+// had: thinking and text with the edges a q27 response really carries
+// ("...\n" / "\n\n...\n\n"), text before a call, two calls in one turn, an
+// Edit whose client key order is NOT alphabetical, non-string arguments
+// (bool, list, object), a mid-conversation system message (Claude Code 2.1.x
+// sends them; the capture template renders them inline, as ninfer does), a
+// text-only assistant turn, and user text with a trailing newline.
+static void history_boundaries() {
+    q27::tool_dialect_xml_default() = true;
+    ok(q27::trim_ws(" \n\tx y\n\n") == "x y" && q27::trim_ws("\n\n").empty() && q27::trim_ws("").empty(),
+       "trim_ws: both edges, all-whitespace -> empty");
+    ok(q27::assistant_content_38("\n\nI'll read.\n\n", {"<tool_call>A</tool_call>"}) ==
+           "I'll read.\n\n<tool_call>A</tool_call>",
+       "assistant_content_38: trimmed text, \\n\\n before the first call");
+    ok(q27::assistant_content_38("  ", {"<tool_call>A</tool_call>", "<tool_call>B</tool_call>"}) ==
+           "<tool_call>A</tool_call>\n<tool_call>B</tool_call>",
+       "assistant_content_38: no text -> call first, \\n between calls");
+    {   // OpenAI path: arguments string order and spacing reach the prompt
+        json body = json::parse(R"({"messages":[{"role":"user","content":"u"},{"role":"assistant","content":"\n\nok\n","reasoning_content":"r\n","tool_calls":[{"type":"function","function":{"name":"Edit","arguments":"{\"old_string\":\"a\",\"new_string\":\"b\",\"n\":[1,2]}"}}]}]})");
+        auto msgs = q27::openai_msgs(body);
+        const std::string& c = msgs.back().content;
+        ok(c.rfind("ok\n\n<tool_call>\n<function=Edit>\n<parameter=old_string>\na\n</parameter>\n<parameter=new_string>\nb\n</parameter>\n<parameter=n>\n[1, 2]\n</parameter>", 0) == 0,
+           "openai_msgs: trimmed text, client arg order, spaced list");
+        const std::string p = q27::chatml_prompt(msgs, json::array(), true);
+        ok(p.find("<think>\nr\n</think>\n\nok\n\n<tool_call>") != std::string::npos,
+           "chatml_prompt: reasoning trimmed, no doubled newlines");
+    }
+    {   // without the raw body the order falls back to sorted, spacing still template
+        const std::string raw = R"({"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"E","input":{"z":1,"a":[1,2]}}]}]})";
+        const std::string p1 = q27::chatml_prompt(q27::anthropic_msgs(json::parse(raw), &raw), json::array(), true);
+        const std::string p0 = q27::chatml_prompt(q27::anthropic_msgs(json::parse(raw)), json::array(), true);
+        ok(p1.find("<parameter=z>") < p1.find("<parameter=a>") && p1.find("[1, 2]") != std::string::npos,
+           "anthropic_msgs(raw): client order z before a, spaced list");
+        ok(p0.find("<parameter=a>") < p0.find("<parameter=z>") && p0.find("[1, 2]") != std::string::npos,
+           "anthropic_msgs(no raw): sorted fallback, spacing unchanged");
+    }
+    {   // the JSON dialect (3.6 family) keeps its legacy flattening byte for byte
+        q27::tool_dialect_xml_default() = false;
+        const std::string raw = R"({"messages":[{"role":"user","content":"u\n"},{"role":"assistant","content":[{"type":"thinking","thinking":"r\n"},{"type":"text","text":"t"},{"type":"tool_use","id":"t","name":"E","input":{"a":1}}]}]})";
+        const std::string p = q27::chatml_prompt(q27::anthropic_msgs(json::parse(raw), &raw), json::array(), true);
+        ok(p.find("<think>\nr\n\n</think>\n\nt\n<tool_call>\n{\"name\": \"E\", \"arguments\": {\"a\":1}}") != std::string::npos &&
+               p.find("u\n<|im_end|>") != std::string::npos,
+           "json dialect: legacy render unchanged (no trim, one \\n, compact args)");
+        q27::tool_dialect_xml_default() = true;
+    }
+}
+
+int main() {
+    boundaries();
+    openai_boundaries();
+    history_boundaries();
+    if (fails) { printf("template golden: %d boundary FAILURE(S)\n", fails); return 1; }
+    int rc = anthropic_golden("template golden", "tools/golden/qwen38_tools_request.anthropic.json",
+                              "tools/golden/qwen38_tools_request.prompt");
+    if (rc) return rc;
+    rc = anthropic_golden("history golden", "tools/golden/qwen38_history_request.anthropic.json",
+                          "tools/golden/qwen38_history_request.prompt");
+    if (rc) return rc;
+    return openai_golden();
 }

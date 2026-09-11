@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
         q27::TemplateOpts topts = q27::template_opts_from_body(body);
         topts.tools_decl = q27::anthropic_tools_decl(raw, &selected.names);
         const std::string rendered = q27::chatml_prompt(
-            q27::anthropic_msgs(body), tools, thinking, nullptr, nullptr,
+            q27::anthropic_msgs(body, &raw), tools, thinking, nullptr, nullptr,
             q27::anthropic_tool_choice_instruction(tchoice), &unavailable, &topts);
         fprintf(stderr, "%s: %zu chars, %zu tools, think=%d\n",
                 path, rendered.size(), tools.size(), (int)thinking);

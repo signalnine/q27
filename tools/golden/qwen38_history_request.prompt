@@ -1,0 +1,118 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "Read", "description": "Read a file.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["file_path"]}}}
+{"type": "function", "function": {"name": "Edit", "description": "Replace a string in a file.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}, "required": ["file_path", "old_string", "new_string"]}}}
+{"type": "function", "function": {"name": "Grep", "description": "Search files.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}, "context": {"type": "object"}}, "required": ["pattern"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a coding agent.<|im_end|>
+<|im_start|>user
+<system-reminder>ctx</system-reminder>
+Fix the empty-name bug in app.py.<|im_end|>
+<|im_start|>assistant
+<think>
+The bug is in app.py. Read it first.
+</think>
+
+I'll read the file.
+
+<tool_call>
+<function=Read>
+<parameter=file_path>
+/w/app.py
+</parameter>
+<parameter=offset>
+10
+</parameter>
+<parameter=limit>
+40
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+10	def make(name):
+11	    return App(name)
+</tool_response><|im_end|>
+<|im_start|>system
+The task tools haven't been used recently.<|im_end|>
+<|im_start|>assistant
+<think>
+Add a check for an empty name.
+</think>
+
+<tool_call>
+<function=Edit>
+<parameter=file_path>
+/w/app.py
+</parameter>
+<parameter=old_string>
+    return App(name)
+</parameter>
+<parameter=new_string>
+    if not name:
+        raise ValueError("empty name")
+    return App(name)
+</parameter>
+<parameter=replace_all>
+false
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=Grep>
+<parameter=pattern>
+make\(
+</parameter>
+<parameter=paths>
+["/w/app.py", "/w/tests"]
+</parameter>
+<parameter=context>
+{"b": 1, "a": 2}
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+The file /w/app.py has been updated.
+</tool_response>
+<tool_response>
+/w/tests/test_app.py:3: make("")
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+Done.
+</think>
+
+Fixed: empty names now raise ValueError.<|im_end|>
+<|im_start|>user
+Thanks. Anything else?<|im_end|>
+<|im_start|>assistant
+<think>

@@ -2908,8 +2908,10 @@ int main(int argc, char** argv) {
         // render_request never moved, so the offline corpus was the right
         // prompt and the server was not.
         if(raw_body) topts.tools_decl=q27::anthropic_tools_decl(*raw_body,&tool_names);
+        // raw_body also carries each tool_use input's client key order into
+        // the 3.8 history rules (anthropic_msgs; nullptr = sorted fallback)
         std::string rendered=q27::chatml_prompt(
-            q27::anthropic_msgs(body),tools,thinking,stable_off,sys_off,
+            q27::anthropic_msgs(body,raw_body),tools,thinking,stable_off,sys_off,
             q27::anthropic_tool_choice_instruction(tchoice),&unavailable,&topts);
         if(tchoice.mode==q27::ToolChoice::FORCED) rendered+="<tool_call>\n";
         return rendered;
