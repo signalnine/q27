@@ -178,13 +178,16 @@ under [bench/crossengine/](bench/crossengine/):
   from 207 vs 221 on 09-09; the sampler-order fix is +4-6% of it against a
   same-day control. Prefix reuse 95.7% vs 96.1%. Wall per instance 98 s vs
   24 s: q27's sessions run 25 turns and 15K output tokens per instance
-  against 11 and 4K. Attributed on
-  09-09: per-turn reasoning on an identical prompt puts every q27 arm on
-  the llama.cpp Q8_0 reference (median 276-340 chars vs 314) and ninfer
-  1.5x under it (209), so the trajectory length is ninfer's NVFP4 arm
-  reasoning less than the model, not q27 reasoning more; the model-name
-  echo and the tools-declaration fix that came out of the investigation are
-  on master.
+  against 11 and 4K.
+- **Tokenizer fix on master (unreleased)**: q27's encoder never matched the
+  vocab's `<tool_call>` / `<tool_response>` added tokens, so every agentic
+  prompt since July showed the model its own tool calls and results spelled
+  out as text. Fixed (0/34 -> 34/34 recorded Claude Code prompts identical
+  to AutoTokenizer's ids): on the same traffic per-turn reasoning drops
+  40-43%, decode rises to 228-232 t/s at 4.21-4.27 tok/round, wall 70-75 s
+  per instance, 10-11/12 gold (two runs, 2026-09-10). What remains of the
+  gap to ninfer is turn count: q27 still reproduces and verifies before it
+  edits, as the Q8_0 reference does on the same states.
 - Production at Claude Code's default effort (xhigh): DFlash2 is +22%
   aggregate decode over the MTP ladder on the same instances; the
   prefix-cache tiers with the shared system-block cut took the prefill wall
@@ -493,8 +496,14 @@ production recipe with a fresh cache root, same-day control;
 | **q27** v0.11.3 (Q8 pack, K=7) | 218.0 / 232.2 t/s | 4.05 | 95.7% | 98 s | 25.2, 15.3K | 10/12 |
 | q27 before PR #43 (control) | 209.7 / 223.1 t/s | 3.98 | --* | --* | 23.2, 16.8K | 12/12 |
 | ninfer DFlash2 k=7 (NVFP4) | 218.2 / **240.5** t/s | 4.11 | 96.1% | **24 s** | 10.8, 4.0K | 11/12 |
+| **q27 master** (tokenizer fix, unreleased; two runs) | **228.0-231.5** / 242.9-247.2 t/s | **4.21-4.27** | 95.7-96.5% | 70-75 s | 22.6-22.9, 11.2-11.7K | 10-11/12 |
 
-A second v0.11.3 run measured 221.8 / 233.2 t/s at 4.10 tok/round. The
+The last row is the tokenizer fix from the same day
+([readout](bench/crossengine/agentic-2026-09-10-effort/README.md)): q27's
+encoder never matched the `<tool_call>`/`<tool_response>` added tokens, so
+every agentic prompt spelled them as text. Fixed, q27 thinks 40-43% less
+per turn on this traffic (1295-1387 chars vs 2281; ninfer 954) and drafts
+better. A second v0.11.3 run measured 221.8 / 233.2 t/s at 4.10 tok/round. The
 sampler-order fix (PR #43) is worth +4-6% aggregate decode on this traffic
 against the same-day control and closes the tokens-per-round gap to ninfer
 (3.89 vs 4.19 on 09-09). Wall stays apart on trajectory length, attributed
@@ -526,6 +535,13 @@ served model name in responses made Claude Code drop prior thinking blocks
 (now echoes the requested model), and the serving path's `<tools>` block
 had been the compact key-sorted dump since 08-22 (now the template's
 client-ordered spaced form, +5% prompt tokens on a 28-tool request).
+[Corrected 2026-09-10: most of the per-turn gap WAS q27's. Its tokenizer
+spelled the tool tags as text on every agentic prompt; a turn-0 probe
+holds only a few tags, which is why it read "q27 = reference". Fixed, per-turn
+reasoning drops 40-43% on Claude Code traffic. On identical mid-session
+states, with identical token ids, the Q8_0 reference still matches q27
+(1.11x, p=0.80) and ninfer sits within 5%; what remains is turn count --
+q27 reproduces and verifies before it edits. See the 09-10 effort readout.]
 
 **Real agentic traffic** (2026-08-17, ninfer before its prefix-reuse fix):
 
@@ -595,15 +611,21 @@ real coding while MTP nearly doubled stock llama.cpp.
   gate (201 vs 203 s), but three of four requests finished later. There is
   no preemption and no fairness beyond the safety check, and the block
   table still uploads from pageable host memory on each growth.
-- **Wall per instance is not the cross-engine number.** The 09-09 turn
-  and token gap is ninfer reasoning less than the model at 8 bits (see the
-  09-09-echo readout); which of its NVFP4 weights, int8 KV or sampler does
-  it is unmeasured here. Compare per-token cost at equal reasoning, and
-  run a same-day control before reading a 12-instance turn count.
-- **The request replay has no corpus yet.** `Q27_REQ_LOG` and
-  `bench/replay/` are gated (two fresh boots agree on every output); a
-  recorded multi-session Claude Code log is the missing input for a
-  binary-vs-binary A/B that does not ride on the harness's trajectory noise.
+- **The tokenizer fix is unreleased.** Master has it (plus 3.8 history
+  rendering); production still runs v0.11.3. A deploy needs a fresh
+  prefix-cache root, since every tool-bearing prompt tokenizes differently.
+  Every q27 agentic number before 2026-09-10 ran with the bug, the drift
+  corpus included; whether the tool-call drift shapes (issue #38) came from
+  it is untested.
+- **Turn count is the remaining gap.** With correct tokens q27 thinks within
+  5% of ninfer per turn on identical states, and the Q8_0 reference agrees
+  with q27, but q27 still runs about twice the turns: it tries to reproduce
+  and verify in harness containers that have no repo dependencies. The
+  gold-file proxy cannot say whether that verification pays; SWE-bench's
+  test images would. Effort low is not a lever on the evidence so far.
+- **The request replay has a corpus now, locally.** `Q27_REQ_LOG` recorded
+  five 12-instance Claude Code legs on 2026-09-10 (session content, kept out
+  of the repo); `bench/replay/` has not yet been run on them.
 - **W4A8 prefill GEMM on the shelf**: bitwise at 1.33-1.39x of the incumbent
   with TMA fills, short of the 1.6x bar; `tools/gemm_w4a8_spike.cu` holds
   it if a 1.35x is ever wanted as-is.

@@ -1,0 +1,24 @@
+{"seed": 1, "think": 758, "text": 2, "tools": ["Bash"], "out": 258, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 8.07}
+{"seed": 2, "think": 221, "text": 2, "tools": ["Bash"], "out": 109, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.53}
+{"seed": 3, "think": 110, "text": 2, "tools": ["Bash"], "out": 86, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.41}
+{"seed": 4, "think": 603, "text": 2, "tools": ["Bash"], "out": 204, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 1.17}
+{"seed": 5, "think": 309, "text": 3, "tools": ["Bash", "Bash"], "out": 185, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.79}
+{"seed": 6, "think": 529, "text": 2, "tools": ["Bash"], "out": 182, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.88}
+{"seed": 7, "think": 240, "text": 2, "tools": ["Bash"], "out": 120, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.63}
+{"seed": 8, "think": 343, "text": 2, "tools": ["Bash"], "out": 136, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.63}
+{"seed": 9, "think": 415, "text": 2, "tools": ["Read"], "out": 140, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.81}
+{"seed": 10, "think": 165, "text": 2, "tools": ["Read"], "out": 83, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.41}
+{"seed": 11, "think": 236, "text": 2, "tools": ["Bash"], "out": 127, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.7}
+{"seed": 12, "think": 254, "text": 2, "tools": ["Read"], "out": 93, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.49}
+{"seed": 13, "think": 279, "text": 73, "tools": ["Read"], "out": 114, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.7}
+{"seed": 14, "think": 590, "text": 2, "tools": ["Read"], "out": 189, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 1.02}
+{"seed": 15, "think": 1237, "text": 2, "tools": ["Read"], "out": 356, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 2.24}
+{"seed": 16, "think": 850, "text": 2, "tools": ["Read"], "out": 242, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 1.36}
+{"seed": 17, "think": 297, "text": 2, "tools": ["Bash"], "out": 133, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.77}
+{"seed": 18, "think": 314, "text": 2, "tools": ["Bash"], "out": 135, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.74}
+{"seed": 19, "think": 226, "text": 2, "tools": ["Bash"], "out": 119, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.66}
+{"seed": 20, "think": 1719, "text": 2, "tools": ["Read"], "out": 494, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 2.94}
+{"seed": 21, "think": 184, "text": 117, "tools": ["Bash"], "out": 126, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.7}
+{"seed": 22, "think": 280, "text": 2, "tools": ["Bash"], "out": 140, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.79}
+{"seed": 23, "think": 345, "text": 2, "tools": ["Bash"], "out": 137, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.59}
+{"seed": 24, "think": 193, "text": 2, "tools": ["Bash"], "out": 103, "stop": "tool_use", "model": "claude-opus-4-8", "secs": 0.61}

@@ -15714,6 +15714,80 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (ad): the reasoning-length gap was mostly a tokenizer bug -- the tool tags never encoded as their added tokens; fixed: -43% thinking per turn on Claude Code, +8% decode, 11/12 gold
+
+bench/crossengine/agentic-2026-09-10-effort/README.md has every table.
+Question: q27 thinks ~2x per turn and runs ~2x the turns of ninfer on the
+12 Claude Code SWE-bench instances (09-09/09-10), 4x the wall at equal
+decode rate.
+
+What did NOT explain it:
+- ninfer's KV dtype, weight format or drafter: turn-0 probe, 24 seeds,
+  NVFP4 int8/bf16 KV and the groupwise-int weights without speculation all
+  234-248 median chars vs q27 291. ninfer renders medium effort as q27 does
+  and samples in q27's post-PR #43 order.
+- effort low (the template's trained line): Claude Code leg `q27low` vs
+  same-day control `q27v0113c` -- 69 vs 106 s/inst, 18.1 vs 21.8 turns,
+  11.2K vs 16.6K out tok, gold 10/12 both; but thinking PER TURN barely
+  moves (1864 vs 2281 chars; ninfer 954) and at turn 0 low thinks LONGER
+  (382 vs 291, p=0.03).
+- history rendering: q27 showed its own turns as
+  "...\n\n</think>\n\n\n\ntext" (the 3.8 template trims content and
+  reasoning), Edit args in sorted order (new_string before old_string) and
+  compact lists. Fixed for the XML dialect (commit 5c28eaf, new
+  llama.cpp-captured golden tools/golden/qwen38_history_request.*), but on
+  34 recorded mid-session states x 4 seeds, trimmed vs untrimmed: 1.02x,
+  p=0.39.
+
+What did: the tokenizer (commit 6084562). `src/tokenizer.cpp` matched
+CONTROL tokens plus hardcoded <think>/</think>; the Qwen3.6/3.8 vocab's
+other USER_DEFINED added tokens -- <tool_call>, </tool_call>,
+<tool_response>, </tool_response> -- encoded as "<","tool","_call",">" in
+the tool-format paragraph, every past call and every tool result, since the
+tokenizer landed (07-01). llama.cpp tokenized a q27-rendered prompt to
+26544, q27 to 26578; AutoTokenizer agrees with llama.cpp. Also fixed: the
+pretokenizer's \s*[\r\n]+ stopped at the first newline ("\n \n" is one HF
+token). Parity on the 34 prompts, q27 ids vs AutoTokenizer: 0/34 -> 34/34;
+test_tokenizer HF-parity block 9/9 (3/9 on the old encoder). The text
+goldens could not see any of this -- they compare bytes, not ids.
+
+Claude Code leg `q27tok` (the master build, 6084562 + 5c28eaf, medium, fresh
+cache root, 0 failed writes, wsum b743d26b1f0562a9) vs `q27v0113c`: decode
+231.5 vs 213.9 t/s agg (242.9 vs 231.9 med), 4.265 vs 3.977 tok/round,
+reuse 95.7 vs 95.2%, wall 75 vs 106 s/inst, out tok 11.2K vs 16.6K,
+thinking 27.5K vs 47.5K chars/inst = 1295 vs 2281 per turn (ninfer 954),
+turns >2K chars 17% vs 26%, gold 11/12 vs 10/12. Turns 21-23, unchanged:
+the remaining wall gap to ninfer (24 s, 10.8 turns) is trajectory -- q27
+still tries to reproduce and verify before it edits (14 vs 5.6 tool calls
+before the first edit; the harness containers have no repo dependencies,
+so most of that fails, and the gold-file proxy scores neither way).
+Replicate `q27tokb`: 228.0 / 247.2 t/s, 4.211 tok/round, 96.5% reuse, 70
+s/inst, 21.4 turns, 29.7K thinking chars = 1387/turn, 11.7K out tok, 10/12
+(seven sessions repeat exactly -- seed-0 determinism -- five diverged).
+`q27toklow` (fixed binary, effort low): 218.4 / 248.4, 4.070, 85 s, 22.2
+turns, 1637 chars/turn, 11/12 -- no gain over medium; one runaway
+xarray-4094 session (80 turns, 52K tokens) dominates, and the v0.11.3
+low-effort turn cut (18 vs 22) is inside the +-3 turn noise. Effort low is
+not a lever on this evidence.
+
+Reference check, byte-identical raw prompts (raw_think.py: pre-rendered
+text to /v1/completions and llama.cpp /completion, so no template is in the
+comparison), 34 states x 4 seeds: llama.cpp Q8_0 vs q27 fixed tokenizer
+1.11x thinking (p=0.80); ninfer vs q27 fixed 0.95x (was 0.77x against the
+old tokenizer); every engine picks the same next action mix (Bash 55-58%,
+Read 25-29%). Turn-0 probes cannot see the tokenizer effect (303 vs 291):
+the turn-0 prompt holds only the tool-format paragraph's tags.
+
+Instrument notes: q27's /v1/completions takes raw text; llama.cpp's stock
+jinja REFUSES Claude Code 2.1.x bodies (mid-conversation system messages:
+"System message must be at the beginning" -- use the harness sysinline
+template or raw prompts); ninfer's TIME_WAIT sockets block a q27 bind right
+after it (campaign.sh now waits for every :8081 socket).
+
+Deploy note: every tool-bearing prompt tokenizes differently, so a deploy
+needs a fresh prefix-cache root. Every q27 agentic number before this entry
+ran with the bug.
+
 ## 2026-09-10 (ac): v0.11.3 re-bench on Claude Code traffic -- decode parity with ninfer (218-222 vs 218.2 t/s, 4.05-4.10 vs 4.11 tok/round); PR #43 is +4-6% against a same-day control; reuse 95.7% once a tmpfs confound was removed
 
 bench/crossengine/agentic-2026-09-10/ (campaign.sh legs q27v0113,

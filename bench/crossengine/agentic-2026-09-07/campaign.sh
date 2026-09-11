@@ -21,6 +21,9 @@ Q27ARGS="--host 0.0.0.0 --port 8081 --think --temp 1.0 --top-p 0.95 --top-k 20 -
 # field and renders its boot default (xhigh). The only effort reachable on
 # BOTH engines is medium: run.sh pins CLAUDE_CODE_EFFORT_LEVEL=medium and the
 # q27 legs render medium too. This is NOT production's xhigh -- say so.
+# (2026-09-10: q27 now reads output_config.effort -- template_opts_from_body
+# -- so a request's effort wins over the boot default on both engines; legs
+# named *low run Claude Code at effort low, everything else at medium.)
 # Q27_PRINT_WSUM so every leg's weight digest is in its journal: the 5090's
 # pageable-DMA load corruption (~1%/load) is otherwise invisible in a
 # campaign result. Added 2026-09-09; the 09-07/08/09 legs ran without it.
@@ -82,10 +85,21 @@ start_engine() { # $1 label
     # pre-v0.11.3 binary (bd81f73: identical engine minus PR #43) as the
     # same-day control. Own pfx root each; new leg names so the 09-09
     # q27prod/ninferd2 workspaces under /mnt/ai/swebench-work survive.
-    q27v0113|q27v0113b|q27pre0113)
+    # 2026-09-10 reasoning-length lever: q27low = the q27v0113 config with
+    # Claude Code at effort low (SWEBENCH_EFFORT below), so every request
+    # renders the template's trained low-effort instruction line; q27v0113c =
+    # the same-day medium control. REQBODY_LOG=<prefix> records every request
+    # body (Q27_REQ_LOG) to <prefix>.<leg>.jsonl -- real session content, keep
+    # it OUT of the repo.
+    # q27tok = the same config on a CANDIDATE binary (Q27_CANDIDATE, default
+    # the master worktree's build): 2026-09-10 tokenizer fix (the tool tags as
+    # added tokens) + 3.8 history rendering, against q27v0113c as the control.
+    q27v0113|q27v0113b|q27v0113c|q27pre0113|q27low|q27tok|q27tokb|q27toklow)
               B=$Q27; [ "$1" = q27pre0113 ] && B=$Q/build/q27-server.pre-v0.11.3
+              case "$1" in q27tok*) B=${Q27_CANDIDATE:-/mnt/ai/projects/q27-master/build/q27-server} ;; esac
               rm -rf /dev/shm/q27-pfx-$1; pfx_fits || return 1; mkdir -p /dev/shm/q27-pfx-$1
-              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 $B $MODEL $TOK $Q27ARGS \
+              systemd-run --user --unit $unit $Q27ENV -E Q27_BATCH=0 -E Q27_DFLASH2=$PACK8 -E Q27_DFLASH2_RESERVE_GB=3 -E Q27_SYSBLK=1 \
+                ${REQBODY_LOG:+-E Q27_REQ_LOG=$REQBODY_LOG.$1.jsonl} $B $MODEL $TOK $Q27ARGS \
                 --prefix-cache /dev/shm/q27-pfx-$1 --prefix-cache-max-gb $PFX_GB --prefix-cache-ram-gb 0 --prefix-cache-max-tokens 65536 ;;
     ninferd2|ninferd2b) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec dflash2 --draft-tokens 7 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
     ninfermtp) systemd-run --user --unit $unit $NINFER $ART $NARGS --spec mtp --draft-tokens 3 --request-log-jsonl $DIR/$1.reqlog.jsonl ;;
@@ -102,7 +116,10 @@ stop_engine() { systemctl --user stop $1-eval 2>/dev/null; sleep 3
   # a leg's cache root is scratch: drop it so it cannot crowd the next leg
   case "$1" in q27prod) rm -rf /dev/shm/q27-pfx-campaign ;; q27*) rm -rf /dev/shm/q27-pfx-$1 ;; esac
   # the next leg binds :8081 too; ninfer exits on EADDRINUSE (09-09 probes)
-  for i in $(seq 1 30); do ss -ltn | grep -q ':8081 ' || break; sleep 1; done; }
+  for i in $(seq 1 30); do ss -ltn | grep -q ':8081 ' || break; sleep 1; done
+  # and for the old server's TIME_WAIT sockets: a q27 bind right after a
+  # ninfer leg failed EADDRINUSE on them (2026-09-10 gap probe)
+  for i in $(seq 1 90); do [ -z "$(ss -tanH '( sport = :8081 )')" ] && break; sleep 1; done; }
 
 systemctl --user stop q27-38 q27-d2test 2>/dev/null
 sudo -n systemctl stop vox-transcriber vox-transcriber-gmrs 2>/dev/null
@@ -121,6 +138,7 @@ for leg in $LEGS; do
   if ! start_engine $leg; then log "leg $leg SKIPPED (engine failed)"; stop_engine $leg; continue; fi
   export SWEBENCH_UNIT=$leg-eval SWEBENCH_HOST=127.0.0.1
   case "$leg" in ninfer*) export SWEBENCH_REQLOG=$DIR/$leg.reqlog.jsonl ;; *) unset SWEBENCH_REQLOG ;; esac
+  case "$leg" in *low) export SWEBENCH_EFFORT=low ;; *) export SWEBENCH_EFFORT=medium ;; esac
   bash $Q/bench/swebench/run.sh $leg $INSTANCE 2>&1 | tee $DIR/$leg.log
   cp $Q/bench/swebench/results.$leg.jsonl $DIR/ 2>/dev/null
   cp $Q/bench/swebench/swebench_$leg.journal $DIR/ 2>/dev/null

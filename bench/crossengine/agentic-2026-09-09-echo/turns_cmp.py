@@ -9,7 +9,8 @@ import json, os, sys, glob
 from collections import defaultdict
 W = "/mnt/ai/swebench-work"
 HERE = os.path.dirname(os.path.abspath(__file__))
-DIRS = [HERE, os.path.join(HERE, "..", "agentic-2026-09-09")]
+DIRS = [HERE, os.path.join(HERE, "..", "agentic-2026-09-09"), os.path.join(HERE, "..", "agentic-2026-09-10"),
+        os.path.join(HERE, "..", "agentic-2026-09-10-effort")]
 
 def transcript(path):
     msgs = {}; order = []
