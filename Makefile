@@ -43,7 +43,7 @@ test-repack-canonical: tools/repack_canonical_gate.sh tools/repack.py
 build/test_sampling: src/test_sampling.cpp src/sampling.h | build
 	$(CXX) $(CXXFLAGS) src/test_sampling.cpp -o $@
 
-build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/tokenizer.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+build/test_tokenizer: src/test_tokenizer.cpp src/tokenizer.cpp src/unicode_tables.h src/tokenizer.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
 	$(CXX) $(CXXFLAGS) -DQ27_TOKENIZER_TESTING src/test_tokenizer.cpp src/tokenizer.cpp -o $@
 
 build/test_stream_split: tools/test_stream_split.cpp src/stream_split.h src/markdown_lex.h | build
@@ -122,10 +122,14 @@ fuzz-gcc: build/fuzz_tool_parser_gcc
 
 .PHONY: fuzz fuzz-gcc
 
-build/render_request: tools/render_request.cpp src/api_common.h src/drift_capture.h src/tokenizer.cpp src/tokenizer.h | build
+# Tokenizer parity vs the HF reference (tools/tok_parity.py drives it)
+build/tok_encode: tools/tok_encode.cpp src/tokenizer.cpp src/unicode_tables.h src/tokenizer.h | build
+	$(CXX) $(CXXFLAGS) -I src tools/tok_encode.cpp src/tokenizer.cpp -o $@
+
+build/render_request: tools/render_request.cpp src/api_common.h src/drift_capture.h src/tokenizer.cpp src/unicode_tables.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/render_request.cpp src/tokenizer.cpp -o $@
 
-build/flip_regions: tools/flip_regions.cpp src/tokenizer.cpp src/tokenizer.h | build
+build/flip_regions: tools/flip_regions.cpp src/tokenizer.cpp src/unicode_tables.h src/tokenizer.h | build
 	$(CXX) $(CXXFLAGS) -I src tools/flip_regions.cpp src/tokenizer.cpp -o $@
 
 build/test_tool_drift: tools/test_tool_drift.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
@@ -219,7 +223,7 @@ build/test_manifest: tools/test_manifest.cu src/engine.cuh src/kv_pool.h src/pre
 
 
 build/q27-server: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
+                  src/device_model.cu src/loader.cpp src/tokenizer.cpp src/unicode_tables.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                   src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                   src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -310,7 +314,7 @@ build/i8g64_test: tools/i8g64_test.cu src/i8g64.cuh | build
 # fits (the historical role-set + 12x-zoo savings are engine-wide now).
 # Same sources, own binary.
 build/q27-server-w8: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
+                     src/device_model.cu src/loader.cpp src/tokenizer.cpp src/unicode_tables.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                      src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                      src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=8 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -339,7 +343,7 @@ build/fused_smoke: tools/fused_smoke.cu src/engine.cuh src/kv_pool.h src/prefill
 
 # w16 serving build (batch mode's natural target; was hand-built since part 10)
 build/q27-server-w16: src/server.cu src/engine.cuh src/dflash2.cu src/dflash2.h src/metrics.h src/kv_pool.h src/prefill_arena.h src/conductor.h src/blocks.cu src/prefill.cu src/kernels.cu src/spec3.cu src/vgemm.cu \
-                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
+                      src/device_model.cu src/loader.cpp src/tokenizer.cpp src/unicode_tables.h src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h \
                       src/blocks.cuh src/kernels.cuh src/spec3.cuh src/prefill.cuh src/fdmma.cuh src/turbo3.cuh src/turbo5.cuh src/cuda_common.h src/toolgram.h \
                       src/depthctl.h src/toolconstrain.h src/tokenizer.h src/prefix_cache.h src/prefix_ram.h src/kv_pool.h src/prefill_arena.h third_party/httplib.h build/pf4.o | build
 	$(NVCC) $(NVCCFLAGS) -DQ27_W_MAX=16 -Xcompiler -pthread src/server.cu src/dflash2.cu src/blocks.cu src/prefill.cu src/kernels.cu \
@@ -394,7 +398,7 @@ metal-engine: build/metal-engine.o
 build/q27-metal: src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
                  src/metal/metal_backend.mm src/metal/metal_engine.h \
                  src/metal/metal_backend.h src/metal/q27_kernels.metal \
-                 src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp \
+                 src/backend.h src/loader.cpp src/loader.h src/tokenizer.cpp src/unicode_tables.h \
                  src/tokenizer.h src/sampling.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) src/metal/metal_cli.cpp src/metal/metal_engine.cpp \
 	       src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp \
@@ -419,7 +423,7 @@ build/q27-metal-server: src/metal/metal_server.cpp src/metal/metal_engine.cpp \
                         src/metal/snapshot_evict.h \
                         src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                         src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
-                        src/sampling.h src/tokenizer.h src/tokenizer.cpp \
+                        src/sampling.h src/tokenizer.h src/tokenizer.cpp src/unicode_tables.h \
                         third_party/httplib.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) -I src/metal src/metal/metal_server.cpp src/metal/metal_engine.cpp \
 	        src/metal/metal_backend.mm src/loader.cpp src/tokenizer.cpp $(METALLIBS) -o $@
@@ -431,7 +435,7 @@ build/q27-metal-server-test: src/metal/metal_server.cpp src/metal/metal_engine.c
                              src/metal/snapshot_evict.h \
                              src/metal/q27_kernels.metal src/api_common.h src/drift_capture.h src/stream_split.h \
                              src/toolconstrain.h src/toolgram.h src/backend.h src/loader.h src/loader.cpp \
-                             src/sampling.h src/tokenizer.h src/tokenizer.cpp \
+                             src/sampling.h src/tokenizer.h src/tokenizer.cpp src/unicode_tables.h \
                              third_party/httplib.h third_party/json.hpp | build
 	$(CXX) $(METALFLAGS) -DQ27_METAL_TEST_FAILPOINTS=1 -I src/metal \
 	        src/metal/metal_server.cpp src/metal/metal_engine.cpp src/metal/metal_backend.mm \

@@ -511,12 +511,45 @@ inline bool is_tool_response_failure(const std::string& content) {
     return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
 }
 
-// The chat template's `|trim` (ASCII whitespace; Python's str.strip also takes
-// a few exotic Unicode spaces no client sends at a block edge).
+// The chat template's `|trim`. transformers renders templates with jinja2, whose
+// trim is Python's str.strip(): it removes every code point str.isspace()
+// accepts -- \t\n\v\f\r and space, U+001C-U+001F, U+0085, U+00A0, U+1680,
+// U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 (29 in all; checked
+// exhaustively against Python). llama.cpp's minja strips " \t\n\r" only; the
+// checkpoint was trained on the Python rendering.
+inline bool py_isspace_cp(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
+           cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+// The code point starting at s[i] (0xFFFFFFFF if the bytes there are not valid
+// UTF-8); *len = its byte length (1 for invalid).
+inline uint32_t utf8_cp_at(const std::string& s, size_t i, size_t* len) {
+    const unsigned char c = (unsigned char)s[i];
+    size_t n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+    *len = 1;
+    if (n == 1) return c;
+    if (n == 0 || i + n > s.size()) return 0xFFFFFFFFu;
+    uint32_t cp = c & (0x7F >> n);
+    for (size_t k = 1; k < n; k++) {
+        const unsigned char b = (unsigned char)s[i + k];
+        if ((b & 0xC0) != 0x80) return 0xFFFFFFFFu;
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *len = n;
+    return cp;
+}
 inline std::string trim_ws(const std::string& s) {
-    const size_t a = s.find_first_not_of(" \t\r\n\v\f");
-    if (a == std::string::npos) return std::string();
-    return s.substr(a, s.find_last_not_of(" \t\r\n\v\f") - a + 1);
+    size_t a = 0, e = s.size(), len = 0;
+    while (a < e && py_isspace_cp(utf8_cp_at(s, a, &len))) a += len;
+    while (e > a) {
+        size_t p = e - 1;  // step back to the start of the last code point
+        while (p > a && e - p < 4 && ((unsigned char)s[p] & 0xC0) == 0x80) p--;
+        const uint32_t cp = utf8_cp_at(s, p, &len);
+        if (p + len != e || !py_isspace_cp(cp)) break;
+        e = p;
+    }
+    return s.substr(a, e - a);
 }
 
 // v22.3: strip a leading think block from content when explicit reasoning is
@@ -968,10 +1001,8 @@ inline std::string tool_response_text(const std::string& out,
             std::to_string(o.size()) + " chars]";
     // The template runs every message's content through |trim. A tool result
     // ending in "\n" otherwise renders a blank line inside <tool_response>
-    // that llama.cpp does not (golden test).
-    const size_t a = o.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) o.clear();
-    else o = o.substr(a, o.find_last_not_of(" \t\r\n") - a + 1);
+    // that llama.cpp does not (golden test). Python's strip set (trim_ws).
+    o = trim_ws(o);
     return "<tool_response>\n" + o + "\n</tool_response>";
 }
 

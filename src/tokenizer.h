@@ -1,4 +1,5 @@
-// Byte-level BPE tokenizer (GPT-2 family, qwen35 pretokenizer approximation).
+// Byte-level BPE tokenizer (GPT-2 family): NFC, the Qwen3.6/3.8 Split regex on
+// Unicode classes, byte-level BPE -- HF-exact (src/unicode_tables.h).
 // Loads the q27.tok export. Pretokenizer: hand-coded scanner covering the qwen
 // regex for ASCII + "non-ASCII == letter" approximation; exactness is gated
 // against llama-tokenize on an English/code corpus (see test_tokenizer).
@@ -60,6 +61,11 @@ class Tokenizer {
     std::vector<int> bpe_word(const std::string& word) const;
 
     std::vector<std::string> pretokenize(const std::string& text) const;
+
+public:
+    // NFC, the checkpoint's normalizer, applied to every span between added
+    // tokens before pretokenize (as HF does: added tokens are normalized=false).
+    static std::string nfc(const std::string& s);
 };
 
 #ifdef Q27_TOKENIZER_TESTING

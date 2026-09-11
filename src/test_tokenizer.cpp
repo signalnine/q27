@@ -434,6 +434,19 @@ int main(int argc, char** argv) {
             {"  \n\t\nbar\n", {2228, 1517, 2185, 198}},
             {"x = 1\n    \n    \ny = 2", {87, 283, 220, 16, 61332, 88, 283, 220, 17}},
             {"<think>\nhmm\n</think>\n\nok", {248068, 198, 71, 3693, 198, 248069, 271, 547}},
+            // Unicode classes and NFC (2026-09-10; before it q27 treated every
+            // byte >= 0x80 as a letter and skipped NFC -- tools/tok_parity.py
+            // now matches the reference on all 1,112,064 scalar values)
+            {"don’t stop", {14572, 1357, 2842}},                  // punctuation mid-word
+            {"a—b", {64, 2218, 65}},                              // em dash between letters
+            {"x ٣٤ ½", {87, 220, 149, 96, 149, 97, 220, 25229}},  // \p{N} one each
+            {"a b　c", {64, 3966, 65, 21742, 66}},           // Unicode \s
+            {"café", {895, 56868}},                             // NFC composes e + acute
+            {"각", {149252}},                          // Hangul jamo -> syllable
+            {"x'ſa", {87, 6, 129, 123, 64}},                      // (?i) folds long s
+            {"\U0001F44D\U0001F3FD 中文", {9008, 239, 235, 9008, 237, 121, 220, 99986}},
+            {"\x1c\x1c" "a", {216, 216, 64}},                          // U+001C is not \s here
+            {"Å Å", {169111, 76533}},                        // singleton: Angstrom -> A-ring
         };
         int hp = 0;
         for (const auto& [text, want] : hf) {

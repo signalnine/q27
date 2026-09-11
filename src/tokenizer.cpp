@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <unordered_map>
 #include <memory>
+#include <array>
+
+#include "unicode_tables.h"
 
 namespace q27 {
 
@@ -187,89 +190,269 @@ std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
     return out;
 }
 
-// qwen35 pretokenizer approximation:
-//  (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n L N]?[L M]+ | N |
-//  ?[^\s L M N]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-// with L = letter (ASCII alpha or any byte >= 0x80), N = single digit.
-std::vector<std::string> Tokenizer::pretokenize(const std::string& t) const {
-    std::vector<std::string> out;
-    size_t i = 0, n = t.size();
-    auto is_l = [&](size_t j) {
-        return j < n && (isalpha((unsigned char)t[j]) || (unsigned char)t[j] >= 0x80);
-    };
-    auto is_d = [&](size_t j) { return j < n && isdigit((unsigned char)t[j]); };
-    auto is_sp = [&](size_t j) { return j < n && isspace((unsigned char)t[j]); };
-    auto is_nl = [&](size_t j) { return j < n && (t[j] == '\r' || t[j] == '\n'); };
+// ---- Unicode: code points, pre-tokenizer classes, NFC ----
+// The Qwen3.6/3.8 tokenizer.json runs NFC, then this Split regex, then byte-level
+// BPE:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|
+//    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Until 2026-09-10 q27 approximated it on BYTES (every byte >= 0x80 a letter,
+// ASCII-only digits and whitespace) and skipped NFC, so "don’t", "a—b", "٣",
+// "a b" or a decomposed "é" split differently from HF. The classes and NFC
+// data now come from the reference itself (tools/gen_unicode_tables.py probes
+// the tokenizers library; src/unicode_tables.h), and the matcher below walks
+// code points alternative by alternative in the regex's order.
+namespace {
+enum : uint8_t { C_O = 0, C_LM = 1, C_N = 2, C_S = 3, C_NL = 4 };
 
+template <class R, size_t N>
+bool in_ranges(const R (&r)[N], uint32_t cp) {
+    size_t lo = 0, hi = N;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < r[mid].lo) hi = mid;
+        else if (cp > r[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+uint8_t cp_class(uint32_t cp) {
+    if (cp == '\n' || cp == '\r') return C_NL;
+    if (cp < 0x80) {
+        static const auto ascii = [] {
+            std::array<uint8_t, 128> a{};
+            for (uint32_t c = 0; c < 128; c++)
+                a[c] = in_ranges(unicode::kLetterMark, c) ? C_LM
+                     : in_ranges(unicode::kNumber, c)     ? C_N
+                     : in_ranges(unicode::kSpace, c)      ? C_S : C_O;
+            a['\n'] = a['\r'] = C_NL;
+            return a;
+        }();
+        return ascii[cp];
+    }
+    if (in_ranges(unicode::kLetterMark, cp)) return C_LM;
+    if (in_ranges(unicode::kNumber, cp)) return C_N;
+    if (in_ranges(unicode::kSpace, cp)) return C_S;
+    return C_O;
+}
+
+// Decode one scalar at s[i]; *len = bytes consumed. Invalid or truncated UTF-8
+// yields one byte as its own "code point" (cp >= 0x110000 marks it) so every
+// input byte still reaches BPE, as before.
+uint32_t decode_cp(const std::string& s, size_t i, int* len) {
+    const auto b = [&](size_t k) { return (uint32_t)(uint8_t)s[k]; };
+    const uint32_t c = b(i);
+    int n = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+    if (n == 1) { *len = 1; return c; }
+    if (n == 0 || i + n > s.size()) { *len = 1; return 0x110000 + c; }
+    uint32_t cp = c & (0x7F >> n);
+    for (int k = 1; k < n; k++) {
+        if ((b(i + k) & 0xC0) != 0x80) { *len = 1; return 0x110000 + c; }
+        cp = (cp << 6) | (b(i + k) & 0x3F);
+    }
+    static const uint32_t kMin[5] = {0, 0, 0x80, 0x800, 0x10000};
+    if (cp < kMin[n] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { *len = 1; return 0x110000 + c; }
+    *len = n;
+    return cp;
+}
+
+void append_utf8(std::string& o, uint32_t cp) {
+    if (cp < 0x80) o += (char)cp;
+    else if (cp < 0x800) { o += (char)(0xC0 | cp >> 6); o += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) {
+        o += (char)(0xE0 | cp >> 12); o += (char)(0x80 | ((cp >> 6) & 0x3F));
+        o += (char)(0x80 | (cp & 0x3F));
+    } else {
+        o += (char)(0xF0 | cp >> 18); o += (char)(0x80 | ((cp >> 12) & 0x3F));
+        o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+uint8_t ccc_of(uint32_t cp) {
+    if (cp < 0x300) return 0;
+    const auto& r = unicode::kCcc;
+    size_t lo = 0, hi = sizeof(r) / sizeof(r[0]);
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < r[mid].lo) hi = mid;
+        else if (cp > r[mid].hi) lo = mid + 1;
+        else return r[mid].ccc;
+    }
+    return 0;
+}
+
+constexpr uint32_t kSBase = 0xAC00, kLBase = 0x1100, kVBase = 0x1161, kTBase = 0x11A7;
+constexpr uint32_t kLCount = 19, kVCount = 21, kTCount = 28, kNCount = 588, kSCount = 11172;
+
+void decompose_cp(uint32_t cp, std::vector<uint32_t>& out) {
+    if (cp >= kSBase && cp < kSBase + kSCount) {
+        const uint32_t s = cp - kSBase;
+        out.push_back(kLBase + s / kNCount);
+        out.push_back(kVBase + (s % kNCount) / kTCount);
+        if (s % kTCount) out.push_back(kTBase + s % kTCount);
+        return;
+    }
+    const auto& d = unicode::kDecomp;
+    size_t lo = 0, hi = sizeof(d) / sizeof(d[0]);
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < d[mid].cp) hi = mid;
+        else if (cp > d[mid].cp) lo = mid + 1;
+        else {
+            out.insert(out.end(), unicode::kDecompFlat + d[mid].off,
+                       unicode::kDecompFlat + d[mid].off + d[mid].len);
+            return;
+        }
+    }
+    out.push_back(cp);
+}
+
+uint32_t compose_pair(uint32_t a, uint32_t b) {
+    if (a >= kLBase && a < kLBase + kLCount && b >= kVBase && b < kVBase + kVCount)
+        return kSBase + ((a - kLBase) * kVCount + (b - kVBase)) * kTCount;
+    if (a >= kSBase && a < kSBase + kSCount && (a - kSBase) % kTCount == 0 && b > kTBase &&
+        b < kTBase + kTCount)
+        return a + (b - kTBase);
+    const uint64_t key = ((uint64_t)a << 21) | b;
+    const auto& c = unicode::kComp;
+    size_t lo = 0, hi = sizeof(c) / sizeof(c[0]);
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (key < c[mid].pair) hi = mid;
+        else if (key > c[mid].pair) lo = mid + 1;
+        else return c[mid].cp;
+    }
+    return 0;
+}
+}  // namespace
+
+// NFC (UAX #15: full canonical decomposition, canonical ordering, canonical
+// composition). Text below U+0300 is already NFC, so ASCII and Latin-1 traffic
+// returns untouched without decoding: a byte >= 0xCC is the only way to start a
+// code point at or above U+0300. Invalid UTF-8 is returned unchanged (the
+// reference cannot even receive it).
+std::string Tokenizer::nfc(const std::string& s) {
+    bool need = false;
+    for (unsigned char c : s)
+        if (c >= 0xCC) { need = true; break; }
+    if (!need) return s;
+    std::vector<uint32_t> d;
+    d.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        int len = 0;
+        const uint32_t cp = decode_cp(s, i, &len);
+        if (cp >= 0x110000) return s;
+        decompose_cp(cp, d);
+        i += len;
+    }
+    for (size_t i = 1; i < d.size(); i++) {  // canonical ordering (stable)
+        const uint8_t c = ccc_of(d[i]);
+        if (c == 0) continue;
+        for (size_t j = i; j > 0 && ccc_of(d[j - 1]) > c; j--) std::swap(d[j - 1], d[j]);
+    }
+    std::vector<uint32_t> r;
+    r.reserve(d.size());
+    size_t starter = SIZE_MAX;
+    int last_cc = -1;  // ccc of the last char appended after the starter
+    for (uint32_t ch : d) {
+        const int cc = ccc_of(ch);
+        if (starter != SIZE_MAX) {
+            const bool adjacent = r.size() == starter + 1;
+            const bool blocked = !adjacent && (last_cc == 0 || last_cc >= cc);
+            if (!blocked) {
+                if (const uint32_t comp = compose_pair(r[starter], ch)) {
+                    r[starter] = comp;
+                    continue;
+                }
+            }
+        }
+        if (cc == 0) { starter = r.size(); last_cc = -1; }
+        else last_cc = cc;
+        r.push_back(ch);
+        if (cc == 0) last_cc = -1;
+    }
+    std::string o;
+    o.reserve(s.size());
+    for (uint32_t cp : r) append_utf8(o, cp);
+    return o;
+}
+
+std::vector<std::string> Tokenizer::pretokenize(const std::string& t) const {
+    struct Cp { uint32_t cp; uint32_t off; uint8_t cls; };
+    std::vector<Cp> v;
+    v.reserve(t.size());
+    for (size_t i = 0; i < t.size();) {
+        int len = 0;
+        const uint32_t cp = decode_cp(t, i, &len);
+        v.push_back({cp, (uint32_t)i, cp >= 0x110000 ? (uint8_t)C_O : cp_class(cp)});
+        i += len;
+    }
+    const size_t n = v.size();
+    std::vector<std::string> out;
+    auto emit = [&](size_t a, size_t b) {
+        const size_t e = b < n ? v[b].off : t.size();
+        out.push_back(t.substr(v[a].off, e - v[a].off));
+    };
+    // (?i:...) folds: ASCII case, and U+017F (long s) folds to 's' -- the one
+    // non-ASCII fold that reaches this branch (probed against tokenizers).
+    auto fold = [&](size_t j) -> uint32_t {
+        if (j >= n) return 0;
+        const uint32_t c = v[j].cp;
+        if (c == 0x17F) return 's';
+        return c < 0x80 ? (uint32_t)tolower((int)c) : 0;
+    };
+    size_t i = 0;
     while (i < n) {
-        // contractions (case-insensitive)
-        if (t[i] == '\'' && i + 1 < n) {
-            char c1 = tolower(t[i + 1]);
-            char c2 = i + 2 < n ? tolower(t[i + 2]) : 0;
-            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
-                out.push_back(t.substr(i, 2)); i += 2; continue;
-            }
+        const uint8_t ci = v[i].cls;
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (v[i].cp == '\'' && i + 1 < n) {
+            const uint32_t c1 = fold(i + 1), c2 = fold(i + 2);
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') { emit(i, i + 2); i += 2; continue; }
             if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
-                out.push_back(t.substr(i, 3)); i += 3; continue;
+                emit(i, i + 3); i += 3; continue;
             }
         }
-        // [^\r\n L N]? [L M]+   (optional leading non-letter joins a letter run)
+        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+  (a mark is a legal prefix too, but the
+        // letter run would absorb it anyway, so L and M share one class)
         {
             size_t j = i;
-            bool lead = false;
-            if (!is_nl(j) && !is_l(j) && !is_d(j) && j < n && is_l(j + 1)) { lead = true; j++; }
-            if (is_l(j)) {
+            if (ci != C_NL && ci != C_LM && ci != C_N && j + 1 < n && v[j + 1].cls == C_LM) j++;
+            if (v[j].cls == C_LM) {
                 size_t k = j;
-                while (is_l(k)) k++;
-                out.push_back(t.substr(lead ? i : j, k - (lead ? i : j)));
-                i = k;
-                continue;
+                while (k < n && v[k].cls == C_LM) k++;
+                emit(i, k); i = k; continue;
             }
         }
-        // single digit
-        if (is_d(i)) { out.push_back(t.substr(i, 1)); i++; continue; }
-        // " ?[^\s L M N]+[\r\n]*"  (punct run, optional leading space)
+        // \p{N}
+        if (ci == C_N) { emit(i, i + 1); i++; continue; }
+        // " ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"  (the optional space is U+0020 only)
         {
             size_t j = i;
-            if (t[j] == ' ' && j + 1 < n && !is_sp(j + 1) && !is_l(j + 1) && !is_d(j + 1)) j++;
-            if (j < n && !is_sp(j) && !is_l(j) && !is_d(j)) {
+            if (v[j].cp == ' ' && j + 1 < n && v[j + 1].cls == C_O) j++;
+            if (v[j].cls == C_O) {
                 size_t k = j;
-                while (k < n && !is_sp(k) && !is_l(k) && !is_d(k)) k++;
-                while (is_nl(k)) k++;
-                out.push_back(t.substr(i, k - i));
-                i = k;
-                continue;
+                while (k < n && v[k].cls == C_O) k++;
+                while (k < n && v[k].cls == C_NL) k++;
+                emit(i, k); i = k; continue;
             }
         }
-        // \s*[\r\n]+ : \s* is greedy over ALL whitespace, newlines included,
-        // and backtracks only far enough for [\r\n]+ -- the match is the
-        // whitespace run up to and including its LAST \r/\n. (Until 2026-09-10
-        // \s* stopped at the first newline, so "\n \n" -- a blank line holding
-        // a space, common in diffs and tool output -- split as "\n" + " \n"
-        // where HF has the single token "\n \n".)
-        {
-            size_t k = i;
-            while (is_sp(k)) k++;
-            size_t last = std::string::npos;
-            for (size_t p = i; p < k; p++)
-                if (is_nl(p)) last = p;
-            if (last != std::string::npos) {
-                out.push_back(t.substr(i, last + 1 - i));
-                i = last + 1;
-                continue;
-            }
-        }
-        // \s+(?!\S) | \s+
-        if (is_sp(i)) {
-            size_t k = i;
-            while (is_sp(k)) k++;
-            // \s+(?!\S): trailing run keeps all; else leave last space for next token
+        // \s*[\r\n]+ : \s* is greedy over ALL whitespace, newlines included, and
+        // backtracks only far enough for [\r\n]+ -- the match is the whitespace
+        // run up to and including its LAST newline. (Before 2026-09-10 \s*
+        // stopped at the first newline, so "\n \n" split in two.)
+        size_t k = i;
+        while (k < n && (v[k].cls == C_S || v[k].cls == C_NL)) k++;
+        size_t last = SIZE_MAX;
+        for (size_t p = i; p < k; p++)
+            if (v[p].cls == C_NL) last = p;
+        if (last != SIZE_MAX) { emit(i, last + 1); i = last + 1; continue; }
+        // \s+(?!\S) | \s+ : a run followed by non-space leaves its last char
+        // for the next token's prefix; a lone space is \s+
+        if (k > i) {
             if (k < n && k - i > 1) k--;
-            out.push_back(t.substr(i, k - i));
-            i = k;
-            continue;
+            emit(i, k); i = k; continue;
         }
-        out.push_back(t.substr(i, 1)); // fallback single byte
+        emit(i, i + 1);  // unreachable for valid text: every class has a branch
         i++;
     }
     return out;
@@ -302,7 +485,7 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
             if (p != std::string::npos && p < next) next = p;
         }
         size_t end = next == std::string::npos ? text.size() : next;
-        std::string span = text.substr(i, end - i);
+        const std::string span = nfc(text.substr(i, end - i));
         for (auto& w : pretokenize(span)) {
             auto ids = bpe_word(w);
             out.insert(out.end(), ids.begin(), ids.end());

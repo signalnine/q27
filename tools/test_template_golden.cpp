@@ -167,6 +167,12 @@ static void history_boundaries() {
     q27::tool_dialect_xml_default() = true;
     ok(q27::trim_ws(" \n\tx y\n\n") == "x y" && q27::trim_ws("\n\n").empty() && q27::trim_ws("").empty(),
        "trim_ws: both edges, all-whitespace -> empty");
+    // Python's str.strip set (jinja2 under transformers), not ASCII only
+    ok(q27::trim_ws(" 　x y \x1c ") == "x y" &&
+           q27::trim_ws("​x​") == "​x​",
+       "trim_ws: NBSP/ideographic/U+2028/U+001C trimmed, interior kept, ZWSP is not space");
+    ok(q27::tool_response_text(" out　") == "<tool_response>\nout\n</tool_response>",
+       "tool_response_text: same strip set");
     ok(q27::assistant_content_38("\n\nI'll read.\n\n", {"<tool_call>A</tool_call>"}) ==
            "I'll read.\n\n<tool_call>A</tool_call>",
        "assistant_content_38: trimmed text, \\n\\n before the first call");
