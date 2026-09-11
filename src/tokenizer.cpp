@@ -102,14 +102,21 @@ Tokenizer::Tokenizer(const std::string& path) : impl_(std::make_unique<Impl>()) 
 
     for (uint32_t i = 0; i < n; i++) impl_->tok2id.emplace(tokens_[i], (int)i);
     build_byte_maps(impl_->b2u, impl_->u2b);
+    // Added tokens match in text as whole tokens, like HF's added-token split
+    // and llama.cpp: type 3 (CONTROL) and type 4 (USER_DEFINED). Until
+    // 2026-09-10 only CONTROL plus a hardcoded <think>/</think> matched, so
+    // the other USER_DEFINED tokens of the Qwen3.6/3.8 vocab -- <tool_call>,
+    // </tool_call>, <tool_response>, </tool_response> -- encoded as plain
+    // text ("<", "tool", "_call", ">") in every prompt: the template's
+    // tool-format instructions, every past tool call, every tool result. The
+    // checkpoint was trained on (and itself emits) the single added tokens.
     for (uint32_t i = 0; i < n; i++)
-        if (types_[i] == 3) impl_->specials.push_back({tokens_[i], (int)i});
-    // added tokens that are not type-3 controls but that BPE merges cannot
-    // form -- must match in text like HF added tokens (think-block prefills
-    // and the server's string-rendered prompts depend on this)
+        if (types_[i] == 3 || types_[i] == 4) impl_->specials.push_back({tokens_[i], (int)i});
+    // <think>/</think> by name as well, for a vocab that types them NORMAL
+    // (BPE merges cannot form them; think-block prefills depend on this)
     for (const char* s : {"<think>", "</think>"}) {
         auto it = impl_->tok2id.find(s);
-        if (it != impl_->tok2id.end() && types_[it->second] != 3)
+        if (it != impl_->tok2id.end() && types_[it->second] != 3 && types_[it->second] != 4)
             impl_->specials.push_back({s, it->second});
     }
     // longest-first for greedy matching
@@ -234,15 +241,21 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& t) const {
                 continue;
             }
         }
-        // \s*[\r\n]+
+        // \s*[\r\n]+ : \s* is greedy over ALL whitespace, newlines included,
+        // and backtracks only far enough for [\r\n]+ -- the match is the
+        // whitespace run up to and including its LAST \r/\n. (Until 2026-09-10
+        // \s* stopped at the first newline, so "\n \n" -- a blank line holding
+        // a space, common in diffs and tool output -- split as "\n" + " \n"
+        // where HF has the single token "\n \n".)
         {
-            size_t j = i;
-            while (is_sp(j) && !is_nl(j)) j++;
-            if (is_nl(j)) {
-                size_t k = j;
-                while (is_nl(k)) k++;
-                out.push_back(t.substr(i, k - i));
-                i = k;
+            size_t k = i;
+            while (is_sp(k)) k++;
+            size_t last = std::string::npos;
+            for (size_t p = i; p < k; p++)
+                if (is_nl(p)) last = p;
+            if (last != std::string::npos) {
+                out.push_back(t.substr(i, last + 1 - i));
+                i = last + 1;
                 continue;
             }
         }

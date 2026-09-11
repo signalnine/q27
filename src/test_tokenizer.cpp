@@ -411,6 +411,40 @@ int main(int argc, char** argv) {
     printf("\nexact: %d/%d cases   token-prefix agreement: %d/%d = %.2f%%\n", pass, total,
            tok_match, tok_total, 100.0 * tok_match / (tok_total ? tok_total : 1));
 
+    // HF parity on what a Claude Code prompt is made of (2026-09-10). Reference
+    // ids from transformers' AutoTokenizer on the Qwen3.8 checkpoint -- the
+    // tokenizer the model was trained with; llama.cpp agrees. Qwen3.8 vocab
+    // only: skipped when the loaded .tok lacks the 3.8 tool tags at these ids.
+    // Before the fix q27 split every <tool_call>/<tool_response> tag into
+    // four text tokens (0/34 recorded Claude Code prompts HF-identical) and
+    // broke "\n \n" in two; after it, 34/34.
+    if (tok.token_id("<tool_call>") == 248058 && tok.token_id("</tool_response>") == 248067) {
+        const std::vector<std::pair<std::string, std::vector<int>>> hf = {
+            {"x <tool_call></tool_call> y", {87, 220, 248058, 248059, 374}},
+            {"<tool_call>\n<function=Read>\n<parameter=file_path>\n/w/a.py\n</parameter>\n</function>\n</tool_call>",
+             {248058, 198, 27, 1628, 28, 4274, 29, 198, 27, 15704, 57242, 2551, 29, 198, 6125, 13780, 6971,
+              198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059}},
+            {"<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n",
+             {248045, 846, 198, 248066, 198, 547, 198, 248067, 248046, 198}},
+            {"- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags",
+             {12, 5534, 6526, 26834, 1732, 279, 5024, 3443, 25, 449, 8906, 361, 1628, 28, 1076, 1419, 1628, 29,
+              2424, 1902, 381, 23283, 2785, 220, 248058, 248059, 11535, 9212}},
+            {"a\n \nb", {64, 25952, 65}},
+            {"\n\n  foo", {271, 220, 14785}},
+            {"  \n\t\nbar\n", {2228, 1517, 2185, 198}},
+            {"x = 1\n    \n    \ny = 2", {87, 283, 220, 16, 61332, 88, 283, 220, 17}},
+            {"<think>\nhmm\n</think>\n\nok", {248068, 198, 71, 3693, 198, 248069, 271, 547}},
+        };
+        int hp = 0;
+        for (const auto& [text, want] : hf) {
+            const bool ok = tok.encode(text) == want;
+            hp += ok;
+            if (!ok) printf("HF parity MISMATCH: %s\n", nlohmann::json(text).dump().c_str());
+        }
+        printf("HF parity (added tokens, whitespace runs): %d/%zu\n", hp, hf.size());
+        if (hp != (int)hf.size()) return 1;
+    }
+
     // bare tool-call fallback: models sometimes drop the <tool_call> wrapper
     // and emit the JSON as plain text (observed: Qwopus v1.4 no-think greedy
     // on long write calls, with trailing junk like "</file>"). The server must
