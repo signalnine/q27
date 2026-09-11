@@ -15714,6 +15714,42 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-10 (af): follow-ups -- PR #44 (narrow builds link again), a month-old parser regression, and HF-exact Unicode tokenization
+
+PR #44 (external, chaudhryfaisal): build/q27-server-w8 has not linked since
+the DFlash2 server wiring (794eba8, 09-06) added src/dflash2.cu to
+build/q27-server only; every release since v0.11.0 shipped a w8 target that
+the README sends 24GB cards to and that fails at link time. Merged as
+7e3efe8; 2029a38 fixes the same gap in w16 and adds src/dflash2.h to both
+variants' prerequisites (every target including engine.cuh checked; w8/w16
+built, linked, ran).
+
+Codex reviewed 6084562 and flagged two follow-ups; both, plus what they hid:
+
+- test_tokenizer had failed since 08-07 and returned at its first failure.
+  "bare tool-call fallback" sub-check 10 was a real regression: drift mode 8
+  (a batch of {"function": "Read", ...} calls behind a dangling {"name":
+  line) recovered 1 call of 3. Bisected to 9d2f866 (08-07, "serving: restore
+  shared API hardening"): its context lexer held the never-closing {"name":
+  as an open JSON container, so every later object was classified inert; the
+  main scan found nothing and the name-dropped fallback returned its first
+  unit. Fixed in the dangling-{"name" branch only (the opener's '{' stays out
+  of the lexer), bc67b08. Behind it, "billing-header cch normalize" was a
+  stale test from before 5a81225's cc_version pinning. test_tokenizer exit 0,
+  test-tools, corpus 165/165 with identical verdicts, make fuzz 120 s clean.
+- Unicode (5fc654f): the pretokenizer ran the Split regex on bytes (every
+  byte >= 0x80 a letter) and skipped the checkpoint's NFC normalizer; trim
+  was ASCII where jinja2's |trim is Python's str.strip(). Classes now come
+  from probing the reference pre-tokenizer on every scalar value
+  (tools/gen_unicode_tables.py -> src/unicode_tables.h), NFC data from the
+  tokenizers normalizers; trim uses Python's 29 isspace code points. Parity
+  with tokenizers (tools/tok_parity.py): every scalar in two contexts
+  1,112,064/1,112,064 each (was 1,110,942 and 1,110,233), NFD/mark/Hangul
+  sequences 99,699/99,699 (was 21,547), 200K random mixed strings all (was
+  161,531), the 34 Claude Code prompts 34/34 (already). Encode time +3%.
+
+Not deployed: production runs v0.11.4 (6084562); these are on master.
+
 ## 2026-09-10 (ae): v0.11.4 cut (tokenizer fix + 3.8 history rendering) and deployed
 
 Tag v0.11.4 on master after 85412b7 (the (ad) readout). Source-wise the
