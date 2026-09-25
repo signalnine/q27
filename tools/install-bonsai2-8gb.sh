@@ -21,7 +21,7 @@
 set -euo pipefail
 
 DIR=${BONSAI2_DIR:-$HOME/bonsai2}
-Q27_REF=${Q27_REF:-v0.14.0}          # the q27 release this was tested with (T3 pack support + the conductor fix)
+Q27_REF=${Q27_REF:-v0.14.1}          # the q27 release this was tested with (T3 pack + the faster T3 GEMV)
 HF=https://huggingface.co/signalnine/Bonsai-2-27B-q27/resolve/main
 PACK=bonsai2-27b-t3-slim.q27; STACK=0.6
 if [ "${1:-}" = "--mtp" ]; then PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; fi
