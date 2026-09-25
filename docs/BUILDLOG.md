@@ -15714,6 +15714,43 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-09-25 (ax): gemv_t3 passes gemv_t2 -- subtract-form digit pop + hoisted addressing; T3 decode 72-74 -> 79-82 t/s on the 3090, still bitwise
+
+Prompted by an agentic-CUDA-optimizer repo (not used: no license, OpenAI-only,
+unsandboxed generated Python, tolerance oracle); the same loop run by hand with
+t3_gate as the bitwise oracle, SASS counts and ncu.
+
+**SASS (sm_86), main loop per 32-weight chunk**: gemv_t2 41.5 instructions,
+gemv_t3 72.6 -- 1.75x the issue on 20% fewer bytes, which is why the 24% byte
+saving bought nothing. Two cuts:
+
+- **Digit pop without the chain.** With q the scaled byte, T_r = floor(3^r q /
+  256) and digit_r = T_{r+1} - 3 T_r (brute-forced over all 243 values, and
+  packed four-wide). Each T_{r+1} comes from the ORIGINAL 16-bit lanes (e *
+  3^(r+1) < 65536, floor(/256) = the lane's high byte, one PRMT gathers four),
+  and since each byte of T_{r+1} - 3T_r is 0..2 the four-lane subtract is one
+  plain 32-bit IMAD with no inter-byte borrow. 21 ops per u32 (was 27), rounds
+  independent. 72.6 -> 66.2.
+- **Addressing.** Per-chunk pointer math and bounds checks were 12.6
+  IADD3/LEA per chunk (T2: 4). Base pointers now hoist once per unit (chunk I
+  of a unit is ch0 + 32I and (ch0 + 32I) >> 2 == (ch0 >> 2) + 8I, so offsets
+  fold into load immediates) and full windows skip the check. 66.2 -> 56.4;
+  single-lane registers 56 -> 40.
+
+Tried and dropped: prefetching window m+1 before decoding m (3 interleaved
+rounds x 3 builds: no single-lane gain, -20% at width 2 from spills at the
+64-register cap). ncu after the cuts: ALU pipe 36%, FMA 17% -- latency, not
+issue.
+
+**Result (3090)**: t3_gate 400/400 bitwise at w1/2/5/8 + conversion,
+test_kernels 429/0, ninv ALL PASS, CLI canonical identical (T3 82.9 vs T2
+76.5 t/s). Per matrix, T3 now beats T2 at width 1 (ffn_gate/up 0.028 vs
+0.033 ms, ffn_down 0.031-0.033 vs 0.033), ties at width 2, trails 4% at 8.
+Server 1 slot turbo5k: T3 79-82 t/s (was 71-74; T2 74-76), texts IDENTICAL
+x4; conductor on (server defaults) 66-67 (was 59-60), identical. The 3060
+Ti should gain at least as much (the cut is issue, and it has 38 SMs to the
+3090's 82); unmeasured until the field bench reruns.
+
 ## 2026-09-20 (aw): Bonsai 2 on an 8 GB card -- T3_G128, five trits per byte, bitwise the T2 pack; 6.06 GB, 45K context at 8.0 GB free
 
 The 12 GB fit left 7.2 GB of weights against a card with ~8 GB usable, so

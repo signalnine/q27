@@ -876,17 +876,28 @@ uint64_t t3_device_bytes(uint64_t rows, uint64_t cols) { return rows * t3_row_by
 // (bytes e3.1, o3.1, e3.3, o3.3); the ANDs drop them for the next round. The
 // 3090 measures this GEMV INT-issue-bound at parity with its DRAM time, so
 // every op here is a measurable fraction of the T3 decode step.
+// 2026-09-25: the pop no longer chains through a masked remainder. With q the
+// scaled byte, T_r = floor(3^r * q / 256) and digit_r = T_{r+1} - 3*T_r
+// (exact; brute-forced over all 243 values). Each T comes straight from the
+// ORIGINAL lanes (e * 3^(r+1) < 65536, so floor(/256) is the lane's high
+// byte, gathered by one PRMT), and because every byte of the difference is
+// 0..2, the four-lane subtraction is one plain 32-bit IMAD with no borrow
+// between bytes. Per u32: 21 ops for its five words (was 27), and the five
+// rounds no longer depend on each other. k is constant-folded once the
+// callers' loops unroll.
 struct T3Dec {
-    uint32_t e, o;
+    uint32_t e, o, t, k;
     __device__ __forceinline__ void init(uint32_t w) {
         e = w & 0x00FF00FFu;
         o = __byte_perm(w, 0u, 0x4341); // bytes {w.1, 0, w.3, 0}
+        t = 0u;                          // T_0 = floor(q/256) = 0 (q <= 255)
+        k = 3u;
     }
     __device__ __forceinline__ uint32_t next() {
-        const uint32_t e3 = e * 3u, o3 = o * 3u;
-        const uint32_t d = __byte_perm(e3, o3, 0x7351); // {e3.1, o3.1, e3.3, o3.3}
-        e = e3 & 0x00FF00FFu;
-        o = o3 & 0x00FF00FFu;
+        const uint32_t T = __byte_perm(e * k, o * k, 0x7351); // {E.1, O.1, E.3, O.3}
+        const uint32_t d = T - 3u * t;
+        t = T;
+        k *= 3u;
         return d;
     }
 };
@@ -918,29 +929,39 @@ __device__ __forceinline__ int t3_dot32(const uint32_t (&cw)[8], const uint4 xv0
 // Same float chain as k_gemv_t2 per chunk (s = wscale * xs; acc += s * (dot -
 // isum)), same lane -> chunk map and order: the two kernels are bitwise on the
 // same ternary matrix.
-__device__ __forceinline__ void t3_acc_chunk(float& acc, const uint32_t (&cw)[8], int ch,
-                                             const __half* __restrict__ sr,
-                                             const uint2* __restrict__ xeo,
-                                             const float* __restrict__ xs,
-                                             const int* __restrict__ xisum) {
-    const uint4* xp = (const uint4*)(xeo + (size_t)ch * 4);
-    const uint4 xv0 = __ldg(xp), xv1 = __ldg(xp + 1);
-    const float s = __half2float(__ldg(sr + (ch >> 2))) * __ldg(xs + ch);
-    acc += s * (float)(t3_dot32(cw, xv0, xv1) - __ldg(xisum + ch));
+// Pointers arrive pre-offset to the unit's first chunk (ch0); chunk I of the
+// unit is ch0 + 32*I, so every per-chunk offset is a compile-time constant
+// the loads fold into their immediates ((ch0 + 32I) >> 2 == (ch0 >> 2) + 8I).
+// CK: bounds-check the chunk (tail windows only; a full window never runs past
+// n_chunks).
+template <int I, bool CK>
+__device__ __forceinline__ void t3_acc_chunk(float& acc, const uint32_t (&cw)[8], int ch0,
+                                             int n_chunks, const __half* __restrict__ sr0,
+                                             const uint4* __restrict__ xp0,
+                                             const float* __restrict__ xs0,
+                                             const int* __restrict__ is0) {
+    if (CK && ch0 + 32 * I >= n_chunks) return;
+    const uint4 xv0 = __ldg(xp0 + 64 * I), xv1 = __ldg(xp0 + 64 * I + 1);
+    const float s = __half2float(__ldg(sr0 + 8 * I)) * __ldg(xs0 + 32 * I);
+    acc += s * (float)(t3_dot32(cw, xv0, xv1) - __ldg(is0 + 32 * I));
 }
-template <int NI>
+template <int NI, bool CK>
 __device__ __forceinline__ void t3_unit_acc(float& acc, const uint32_t* __restrict__ w, int ch0,
                                             int n_chunks, const __half* __restrict__ sr,
                                             const uint2* __restrict__ xeo,
                                             const float* __restrict__ xs,
                                             const int* __restrict__ xisum) {
+    const __half* sr0 = sr + (ch0 >> 2);
+    const uint4* xp0 = (const uint4*)(xeo + (size_t)ch0 * 4);
+    const float* xs0 = xs + ch0;
+    const int* is0 = xisum + ch0;
     T3Dec dec[8];
     uint32_t cw[8];
-    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); if (ch0 < n_chunks) t3_acc_chunk(acc, cw, ch0, sr, xeo, xs, xisum); }
-    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); if (ch0 + 32 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 32, sr, xeo, xs, xisum); }
-    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); if (ch0 + 64 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 64, sr, xeo, xs, xisum); }
-    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); if (ch0 + 96 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 96, sr, xeo, xs, xisum); }
-    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); if (ch0 + 128 < n_chunks) t3_acc_chunk(acc, cw, ch0 + 128, sr, xeo, xs, xisum); }
+    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); t3_acc_chunk<0, CK>(acc, cw, ch0, n_chunks, sr0, xp0, xs0, is0); }
+    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); t3_acc_chunk<1, CK>(acc, cw, ch0, n_chunks, sr0, xp0, xs0, is0); }
+    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); t3_acc_chunk<2, CK>(acc, cw, ch0, n_chunks, sr0, xp0, xs0, is0); }
+    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); t3_acc_chunk<3, CK>(acc, cw, ch0, n_chunks, sr0, xp0, xs0, is0); }
+    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); t3_acc_chunk<4, CK>(acc, cw, ch0, n_chunks, sr0, xp0, xs0, is0); }
 }
 __global__ void k_gemv_t3(const uint8_t* __restrict__ W, const __half* __restrict__ S,
                           const uint2* __restrict__ xeo, const float* __restrict__ xs,
@@ -953,13 +974,15 @@ __global__ void k_gemv_t3(const uint8_t* __restrict__ W, const __half* __restric
     const __half* sr = S + row * (cols / 128);
     const int n_chunks = (int)(cols / 32), n_full = n_chunks / 160, tail = n_chunks % 160;
     float acc = 0.f;
+    // half-split window: u32 0..3 of every lane's unit sit lane-major in the
+    // first 512 B, u32 4..7 in the second, so each LDG.128 is 512 contiguous B.
+    // (Prefetching window m+1 before decoding m measured no gain single-lane
+    // and -20% at width 2 from register pressure, 2026-09-25; not done.)
     for (int m = 0; m < n_full; m++) {
-        // half-split window: u32 0..3 of every lane's unit sit lane-major in the
-        // first 512 B, u32 4..7 in the second, so each LDG.128 is 512 contiguous B
         const uint4 a = __ldg((const uint4*)(wr + (size_t)m * 1024 + lane * 16));
         const uint4 b = __ldg((const uint4*)(wr + (size_t)m * 1024 + 512 + lane * 16));
         const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-        t3_unit_acc<5>(acc, w, 160 * m + lane, n_chunks, sr, xeo, xs, xisum);
+        t3_unit_acc<5, false>(acc, w, 160 * m + lane, n_chunks, sr, xeo, xs, xisum);
     }
     if (tail) {
         const int ni = (tail + 31) / 32, nu = t3_tail_u32(ni), ch0 = 160 * n_full + lane;
@@ -971,20 +994,23 @@ __global__ void k_gemv_t3(const uint8_t* __restrict__ W, const __half* __restric
         if (nu >= 6) { const uint2 v = __ldg((const uint2*)up + 2); w[4] = v.x; w[5] = v.y; }
         if (nu >= 8) { const uint2 v = __ldg((const uint2*)up + 3); w[6] = v.x; w[7] = v.y; }
         switch (ni) { // warp-uniform
-            case 1: t3_unit_acc<1>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
-            case 2: t3_unit_acc<2>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
-            case 3: t3_unit_acc<3>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
-            default: t3_unit_acc<4>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 1: t3_unit_acc<1, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 2: t3_unit_acc<2, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            case 3: t3_unit_acc<3, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
+            default: t3_unit_acc<4, true>(acc, w, ch0, n_chunks, sr, xeo, xs, xisum); break;
         }
     }
     acc = warp_reduce(acc);
     if (lane == 0) y[row] = acc;
 }
 // Multi-lane twin (mirrors k_gemv_t2_n's chain: acc += wsc * xs * (dot - isum)).
-template <int N>
-__device__ __forceinline__ void t3_acc_chunk_n(float* acc, const uint32_t (&cw)[8], int ch,
-                                               const __half* __restrict__ sr, const T2Lanes& L) {
-    const float wsc = __half2float(__ldg(sr + (ch >> 2)));
+template <int N, int I, bool CK>
+__device__ __forceinline__ void t3_acc_chunk_n(float* acc, const uint32_t (&cw)[8], int ch0,
+                                               int n_chunks, const __half* __restrict__ sr0,
+                                               const T2Lanes& L) {
+    if (CK && ch0 + 32 * I >= n_chunks) return;
+    const int ch = ch0 + 32 * I;
+    const float wsc = __half2float(__ldg(sr0 + 8 * I));
 #pragma unroll
     for (int n = 0; n < N; n++) {
         const uint4* xp = (const uint4*)(L.eo[n] + (size_t)ch * 4);
@@ -992,17 +1018,18 @@ __device__ __forceinline__ void t3_acc_chunk_n(float* acc, const uint32_t (&cw)[
         acc[n] += wsc * __ldg(L.xs[n] + ch) * (float)(t3_dot32(cw, xv0, xv1) - __ldg(L.is[n] + ch));
     }
 }
-template <int N, int NI>
+template <int N, int NI, bool CK>
 __device__ __forceinline__ void t3_unit_acc_n(float* acc, const uint32_t* __restrict__ w, int ch0,
                                               int n_chunks, const __half* __restrict__ sr,
                                               const T2Lanes& L) {
+    const __half* sr0 = sr + (ch0 >> 2);
     T3Dec dec[8];
     uint32_t cw[8];
-    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); if (ch0 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0, sr, L); }
-    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); if (ch0 + 32 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 32, sr, L); }
-    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); if (ch0 + 64 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 64, sr, L); }
-    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); if (ch0 + 96 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 96, sr, L); }
-    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); if (ch0 + 128 < n_chunks) t3_acc_chunk_n<N>(acc, cw, ch0 + 128, sr, L); }
+    if (NI > 0) { t3_chunk_words<0>(w, dec, cw); t3_acc_chunk_n<N, 0, CK>(acc, cw, ch0, n_chunks, sr0, L); }
+    if (NI > 1) { t3_chunk_words<1>(w, dec, cw); t3_acc_chunk_n<N, 1, CK>(acc, cw, ch0, n_chunks, sr0, L); }
+    if (NI > 2) { t3_chunk_words<2>(w, dec, cw); t3_acc_chunk_n<N, 2, CK>(acc, cw, ch0, n_chunks, sr0, L); }
+    if (NI > 3) { t3_chunk_words<3>(w, dec, cw); t3_acc_chunk_n<N, 3, CK>(acc, cw, ch0, n_chunks, sr0, L); }
+    if (NI > 4) { t3_chunk_words<4>(w, dec, cw); t3_acc_chunk_n<N, 4, CK>(acc, cw, ch0, n_chunks, sr0, L); }
 }
 // widths 1-2 fit T2's 4-CTA tier at 64 regs (ptxas: 52/64); 3 spills there
 template <int N>
@@ -1019,12 +1046,10 @@ __global__ void __launch_bounds__(256, N < 3 ? 4 : N < Q27_GEMV_3CTA_MIN_Q4 ? 3 
 #pragma unroll
     for (int n = 0; n < N; n++) acc[n] = 0.f;
     for (int m = 0; m < n_full; m++) {
-        // half-split window: u32 0..3 of every lane's unit sit lane-major in the
-        // first 512 B, u32 4..7 in the second, so each LDG.128 is 512 contiguous B
         const uint4 a = __ldg((const uint4*)(wr + (size_t)m * 1024 + lane * 16));
         const uint4 b = __ldg((const uint4*)(wr + (size_t)m * 1024 + 512 + lane * 16));
         const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-        t3_unit_acc_n<N, 5>(acc, w, 160 * m + lane, n_chunks, sr, L);
+        t3_unit_acc_n<N, 5, false>(acc, w, 160 * m + lane, n_chunks, sr, L);
     }
     if (tail) {
         const int ni = (tail + 31) / 32, nu = t3_tail_u32(ni), ch0 = 160 * n_full + lane;
@@ -1036,10 +1061,10 @@ __global__ void __launch_bounds__(256, N < 3 ? 4 : N < Q27_GEMV_3CTA_MIN_Q4 ? 3 
         if (nu >= 6) { const uint2 v = __ldg((const uint2*)up + 2); w[4] = v.x; w[5] = v.y; }
         if (nu >= 8) { const uint2 v = __ldg((const uint2*)up + 3); w[6] = v.x; w[7] = v.y; }
         switch (ni) {
-            case 1: t3_unit_acc_n<N, 1>(acc, w, ch0, n_chunks, sr, L); break;
-            case 2: t3_unit_acc_n<N, 2>(acc, w, ch0, n_chunks, sr, L); break;
-            case 3: t3_unit_acc_n<N, 3>(acc, w, ch0, n_chunks, sr, L); break;
-            default: t3_unit_acc_n<N, 4>(acc, w, ch0, n_chunks, sr, L); break;
+            case 1: t3_unit_acc_n<N, 1, true>(acc, w, ch0, n_chunks, sr, L); break;
+            case 2: t3_unit_acc_n<N, 2, true>(acc, w, ch0, n_chunks, sr, L); break;
+            case 3: t3_unit_acc_n<N, 3, true>(acc, w, ch0, n_chunks, sr, L); break;
+            default: t3_unit_acc_n<N, 4, true>(acc, w, ch0, n_chunks, sr, L); break;
         }
     }
 #pragma unroll
