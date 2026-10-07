@@ -710,6 +710,60 @@ static void test_issue35_bare_function_reengage() {
     unsetenv("Q27_TG_REENGAGE");
 }
 
+// 2026-10-07: the XML grammar's mask-cache key must cover the schema, not
+// just the tool names: in the states from which </function> is reachable
+// the signature carried only the emitted-parameter bits + the required key,
+// and those bits index the CURRENT tool's sorted parameter list. Two tools
+// named alike with different parameters but the same required key reached
+// the same signature after one parameter, so the server-global cache served
+// one request's mask to the other (one forced to emit an unwanted optional
+// parameter, or allowed to close without its required one).
+static void test_xml_mask_key_covers_schema() {
+    auto walk = [](const std::vector<std::string>& params, const std::string& text) {
+        q27::ToolGrammarXml g;
+        g.reset({"Edit"}, {params}, {{"b"}});
+        for (char c : text) if (!g.advance(c)) break;
+        return g.signature();
+    };
+    // tool A {a,b} after emitting a (bit 0, b still owed) vs tool B {b,c}
+    // after emitting b (bit 0, satisfied): the same bits, the same required
+    // key, opposite answers on </function>
+    const std::string sa = walk({"a", "b"}, "<function=Edit>\n<parameter=a>\nx\n</parameter>\n");
+    const std::string sb = walk({"b", "c"}, "<function=Edit>\n<parameter=b>\nx\n</parameter>\n");
+    CHECK(sa != sb);
+    // the same schema twice still shares (the cache must keep hitting)
+    CHECK(walk({"a", "b"}, "<function=Edit>\n<parameter=a>\nx\n</parameter>\n") == sa);
+    // and NAME-state masks differ when the parameter sets differ
+    CHECK(walk({"a", "b"}, "<function=Ed") != walk({"b", "c"}, "<function=Ed"));
+}
+
+// 2026-10-07: the opener as the tokenizer actually splits it. The Qwen
+// pre-tokenizer ends the letter run before '=', so "<function=" always
+// completes in a token that STARTS at '=' ("=bash>\n..." or "=" alone); the
+// old test above packed the whole opener into one token and could not see
+// that the completion test (bp + 9 > start) never fired on a real stream.
+static void test_issue35_reengage_real_tokenization() {
+    FakeEngine eng;
+    FakeTok t2;
+    t2.vocab = {"<function", "=bash>\n<parameter=command>\nls\n</param", "eter>\n</function>\n"};
+    q27::ToolMaskCache<q27::ToolGrammar> cache;
+    q27::ToolMaskCache<q27::ToolGrammarXml> cache_xml;
+    cache.init(&t2.vocab, T_CLOSER);
+    cache_xml.init(&t2.vocab, T_CLOSER);
+    std::vector<int> host2dev;
+    TC tc;
+    tc.eng = &eng; tc.tok = &t2; tc.cache = &cache; tc.cache_xml = &cache_xml; tc.host2dev = &host2dev;
+    tc.enabled = true;
+    std::vector<std::vector<std::string>> pp = {{"command"}};
+    std::vector<std::vector<std::string>> rq = {{}};
+    tc.begin({"bash"}, pp, rq, /*dialect_xml=*/true);
+    int em[3] = {0, 1, 2};
+    int m = tc.scan_round(em, 3);
+    CHECK(m == 2);          // re-engaged at token 1 (the one holding '='), round truncated after it
+    CHECK(tc.engaged == 1);
+    CHECK(tc.active);
+}
+
 // signalnine/q27#35: default-on re-engage is SELF-LIMITING on prose that
 // merely QUOTES the dialect. A bare <function=bash> in an answer engages the
 // grammar (the <function= completion is real), but the first non-conforming
@@ -806,6 +860,8 @@ int main() {
     test_required_keys_extractor();
     test_issue35_key_junk_suffix_rejected();
     test_issue35_bare_function_reengage();
+    test_issue35_reengage_real_tokenization();
+    test_xml_mask_key_covers_schema();
     test_issue35_bare_prose_self_limits();
     test_issue35_on_pending_xml_guards();
     if (fails) {

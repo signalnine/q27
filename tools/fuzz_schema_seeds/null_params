@@ -1,0 +1,7 @@
+[{"name":"Ping","input_schema":null},{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+@@
+<tool_call>
+<function=Ping>
+</function>
+</tool_call>
+then <tool_call>{"name":"Bash","arguments":{"command":"ls"}}</tool_call>

@@ -1,0 +1,7 @@
+[{"name":"Edit","input_schema":{"type":"object","required":["path","mode"],"properties":{"path":{"type":"string"},"mode":{"enum":["a","b"]},"opts":{"type":"object","properties":{"deep":{"type":"array","items":{"type":"string"}}}}}}}]
+@@
+<function=Edit>
+<parameter=path>x.py</parameter>
+<parameter=mode>a</parameter>
+<parameter=opts>{"deep":["1","2"]}</parameter>
+</function>

@@ -269,6 +269,16 @@ struct ConductorCore {
         if (needs_solo_round) {
             for (MemberT* mm : act) {
                 if (!needs_solo_round(*mm)) continue;
+                // An always-fused (draftless) member keeps its forced id on
+                // the fused path: prep_round snapshots the installed d_token
+                // as the round's pending, which the verify forwards and the
+                // commit emits. Its solo decode_step runs the plain token
+                // graph instead (pending-emitted convention), which emitted
+                // the close to the client without forwarding it and let the
+                // next fused round re-snapshot the stale pending (a doubled
+                // token, the model still reasoning past its "close";
+                // bug hunt 2026-10-07, Bonsai non-MTP packs in batch mode).
+                if (always_fused && always_fused(*mm)) continue;
                 if (solo_round(*mm)) drop(mm);
                 return (int)members.size();
             }

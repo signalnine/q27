@@ -1,0 +1,3 @@
+[{"name":"T","input_schema":"not an object"}]
+@@
+<tool_call>{"name":"T","arguments":"x"}</tool_call>

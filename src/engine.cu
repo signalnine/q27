@@ -19,7 +19,9 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--tokens") && i + 1 < argc) {
             for (const char* p = argv[++i]; *p;) {
-                toks.push_back(atoi(p));
+                const int id = atoi(p);
+                if (id < 0 || id >= VOCAB) { fprintf(stderr, "--tokens: id %d outside [0, %d)\n", id, VOCAB); return 1; }
+                toks.push_back(id);
                 while (*p && *p != ',') p++;
                 if (*p == ',') p++;
             }

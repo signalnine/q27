@@ -104,6 +104,11 @@ build/fuzz_tool_parser: tools/fuzz_tool_parser.cpp src/api_common.h src/drift_ca
 	  -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 	  -I src tools/fuzz_tool_parser.cpp -o $@
 
+build/fuzz_tool_schema: tools/fuzz_tool_schema.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h src/toolgram.h | build
+	$(FUZZ_CLANG) --gcc-install-dir=$(FUZZ_GCC_DIR) -O1 -g -std=c++17 \
+	  -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+	  -I src tools/fuzz_tool_schema.cpp -o $@
+
 build/fuzz_tool_parser_gcc: tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp src/api_common.h src/drift_capture.h src/stream_split.h src/markdown_lex.h | build
 	$(CXX) -O1 -g -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
 	  -I src tools/fuzz_tool_parser.cpp tools/fuzz_tool_parser_main.cpp -o $@
@@ -116,11 +121,17 @@ fuzz: build/fuzz_tool_parser
 	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_tool_parser build/fuzz_corpus \
 	  -max_total_time=$${FUZZ_SECONDS:-300} -max_len=32768 -print_final_stats=1
 
+# schema x output: the tool list varies with the input (BUILDLOG (ba) class)
+fuzz-schema: build/fuzz_tool_schema
+	mkdir -p build/fuzz_schema_corpus && cp -n tools/fuzz_schema_seeds/* build/fuzz_schema_corpus/ 2>/dev/null || true
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_tool_schema build/fuzz_schema_corpus \
+	  -max_total_time=$${FUZZ_SECONDS:-300} -max_len=16384 -print_final_stats=1
+
 fuzz-gcc: build/fuzz_tool_parser_gcc
 	ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 	  ./build/fuzz_tool_parser_gcc $${FUZZ_ITERS:-200000} $${FUZZ_SEED:-1}
 
-.PHONY: fuzz fuzz-gcc
+.PHONY: fuzz fuzz-gcc fuzz-schema
 
 # Tokenizer parity vs the HF reference (tools/tok_parity.py drives it)
 build/tok_encode: tools/tok_encode.cpp src/tokenizer.cpp src/unicode_tables.h src/tokenizer.h | build

@@ -75,6 +75,13 @@ the streaming `BareToolTextHoldback` on both TEXT and THINK, and
 depends on (`source_begin <= source_end <= size`) rather than waiting for the
 underflow downstream.
 
+`make fuzz-schema` (2026-10-07) is the same chain with the TOOL SCHEMA varying
+alongside the model bytes: the fixed three-tool schema above never reached the
+2026-10-04 crash (an MCP-style `"type":["string","null"]` threw out of the
+streaming parse), so this harness feeds `anthropic_tools_json` whatever JSON
+the input starts with and runs every schema-reading entry point, plus the JSON
+tool grammar, over the rest.
+
 Status 2026-08-24: 1.7M inputs under ASan+UBSan with the standalone mutator
 (six seeds, zero hits), plus a coverage-guided libFuzzer session at ~3,100
 exec/s that added 8,161 coverage-increasing inputs without a crash. Neither is

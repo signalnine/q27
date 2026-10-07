@@ -2677,6 +2677,32 @@ static void test_request_depth_guard() {
 // array (["string","null"], valid JSON Schema, common in MCP tools) made
 // value("type", std::string()) throw type_error.302 in modes 11/23, and
 // "parameters": null or a string made the mode-22 zero-arg check throw 306.
+// 2026-10-07: the MODEL's side of the depth guard. nlohmann parses iteratively
+// but copies and dump()s recursively, so a tool-call value nested tens of
+// thousands deep ("[[[[" is one BPE token) overflowed the worker stack after
+// a successful parse. Deep segments now read as prose at every entry point.
+static void test_model_depth_guard() {
+    auto nest = [](int d) { return std::string(d, '[') + std::string(d, ']'); };
+    json tools = json::parse(R"([{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"p":{}}}}}])");
+    const std::string deep = "<tool_call>{\"name\":\"Read\",\"arguments\":{\"p\":" + nest(5000) + "}}</tool_call>";
+    const std::string fine = "<tool_call>{\"name\":\"Read\",\"arguments\":{\"p\":" + nest(100) + "}}</tool_call>";
+    bool threw = false; size_t deep_calls = 1, fine_calls = 0; bool strict_deep_ok = true, tail_called = false;
+    try {
+        std::string pre, rem;
+        deep_calls = q27::parse_bare_tool_calls(deep, &pre, &tools, true, true, &rem).size();
+        fine_calls = q27::parse_bare_tool_calls(fine, &pre, &tools, true, true, &rem).size();
+        strict_deep_ok = q27::parse_tool_call(deep.substr(11, deep.size() - 23)).ok;
+        q27::recover_unclosed_tool_tail(deep.substr(0, deep.size() - 14), &tools,
+                                        [&](const std::string&) { tail_called = true; },
+                                        [](const q27::ToolCall&) { return true; });
+    } catch (const std::exception& e) { threw = true; printf("    threw: %s\n", e.what()); }
+    ok(!threw, "model depth guard: no throw");
+    ok(deep_calls == 0, "model depth guard: 5000-deep value is not a call");
+    ok(fine_calls == 1, "model depth guard: 100-deep value still parses");
+    ok(!strict_deep_ok, "model depth guard: strict parser refuses the deep value");
+    ok(tail_called, "model depth guard: unclosed deep tail passes through as text");
+}
+
 static void test_hostile_schemas_never_throw() {
     json tools = json::parse(R"([
       {"type":"function","function":{"name":"Bash","parameters":{"type":"object",
@@ -2735,6 +2761,7 @@ int main() {
     test_aborted_second_call();
     test_batch_mixed_opener_spellings();
     test_zero_arg_mode22_call();
+    test_model_depth_guard();
     test_hostile_schemas_never_throw();
     test_request_depth_guard();
     test_parameter_name_opener();

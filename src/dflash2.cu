@@ -431,61 +431,158 @@ void d2_walk_launch(const int* d_cand, const float* d_cval, const float* d_hp,
 }
 
 // ---- pack loader --------------------------------------------------------
+// The .d2w container (tools/dflash2_pack.py): every length is checked against
+// the file, every tensor's bytes against its dtype and dims, and the tensor set
+// against the manifest the kernels and the D2_* buffer sizes assume (bug hunt
+// 2026-10-07: a truncated or wrong file was an unchecked memcpy into a 32-byte
+// stack array, a cudaMemcpy past the host buffer, and rows that overran the
+// fixed device buffers).
+namespace {
+[[noreturn]] void d2_die(const std::string& m) {
+    fprintf(stderr, "dflash2: %s -- refusing the pack\n", m.c_str());
+    fflush(stderr);
+    exit(1); // a bad file is not a bug to core-dump on
+}
+struct D2Spec { std::string name; int kind; std::vector<int64_t> dims; }; // kind 0 f16, 1 f32, 2 q4|q8
+std::vector<D2Spec> d2_manifest() {
+    std::vector<D2Spec> m = {
+        {"fc.weight", 2, {D2_H, D2_TAPD}},
+        {"hidden_norm.weight", 1, {D2_H}},
+        {"norm.weight", 1, {D2_H}},
+        {"candidate_selector.hidden_projection.weight", 2, {D2_RANK, D2_H}},
+        {"candidate_selector.predecessor_codebook", 0, {D2_V, D2_RANK}},
+        {"candidate_selector.successor_codebook", 0, {D2_V, D2_RANK}},
+    };
+    for (int l = 0; l < D2_LAYERS; l++) {
+        const std::string L = "layers." + std::to_string(l) + ".";
+        const int64_t convp = (int64_t)D2_CONVG * D2_CONVK * 2;
+        m.push_back({L + "attention_conv.base_kernel", 1, {D2_CONVK, 2, D2_H}});
+        m.push_back({L + "attention_conv.kernel_projection.weight", 2, {convp, D2_H}});
+        m.push_back({L + "mlp_conv.base_kernel", 1, {D2_CONVK, 2, D2_H}});
+        m.push_back({L + "mlp_conv.kernel_projection.weight", 2, {convp, D2_H}});
+        m.push_back({L + "input_layernorm.weight", 1, {D2_H}});
+        m.push_back({L + "post_attention_layernorm.weight", 1, {D2_H}});
+        m.push_back({L + "self_attn.q_norm.weight", 1, {D2_HD}});
+        m.push_back({L + "self_attn.k_norm.weight", 1, {D2_HD}});
+        m.push_back({L + "self_attn.q_proj.weight", 2, {D2_QD, D2_H}});
+        m.push_back({L + "self_attn.k_proj.weight", 2, {D2_KVD, D2_H}});
+        m.push_back({L + "self_attn.v_proj.weight", 2, {D2_KVD, D2_H}});
+        m.push_back({L + "self_attn.o_proj.weight", 2, {D2_H, D2_QD}});
+        m.push_back({L + "mlp.gate_proj.weight", 2, {D2_I, D2_H}});
+        m.push_back({L + "mlp.up_proj.weight", 2, {D2_I, D2_H}});
+        m.push_back({L + "mlp.down_proj.weight", 2, {D2_H, D2_I}});
+    }
+    return m;
+}
+} // namespace
 
 void Dflash2::load(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "dflash2: cannot open %s\n", path); abort(); }
+    if (!f) d2_die(std::string("cannot open ") + path);
     fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
+    const long szl = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (szl < 8) d2_die("pack shorter than its header");
+    const size_t sz = (size_t)szl;
     pack.resize(sz);
-    if (fread(pack.data(), 1, sz, f) != (size_t)sz) abort();
+    if (fread(pack.data(), 1, sz, f) != sz) d2_die("short read");
     fclose(f);
     const char* p = pack.data();
-    assert(!memcmp(p, "D2W2", 4));
-    int n;
-    memcpy(&n, p + 4, 4);
-    size_t off = 8;
+    size_t off = 0;
+    auto take = [&](void* dst, size_t nb, const std::string& what) {
+        if (nb > sz - off)
+            d2_die("truncated at " + what + " (offset " + std::to_string(off) + " of " + std::to_string(sz) + ")");
+        if (dst) memcpy(dst, p + off, nb);
+        off += nb;
+    };
+    auto pad64 = [&]() { off += (64 - (off % 64)) % 64; if (off > sz) d2_die("truncated at padding"); };
+    char magic[4];
+    take(magic, 4, "magic");
+    if (memcmp(magic, "D2W2", 4)) d2_die("bad magic (not a D2W2 pack)");
+    int32_t n = 0;
+    take(&n, 4, "tensor count");
+    if (n < 1 || n > 4096) d2_die("tensor count " + std::to_string(n));
+    std::map<std::string, std::vector<int64_t>> dims_of;
     for (int i = 0; i < n; i++) {
-        int nlen;
-        memcpy(&nlen, p + off, 4);
-        off += 4;
-        std::string name(p + off, nlen);
-        off += nlen;
+        int32_t nlen = 0;
+        take(&nlen, 4, "name length");
+        if (nlen < 1 || nlen > 512) d2_die("name length " + std::to_string(nlen));
+        std::string name((size_t)nlen, '\0');
+        take(name.data(), (size_t)nlen, "name");
+        if (w.count(name)) d2_die(name + ": duplicate tensor");
         D2Tensor t;
-        int ndim;
-        memcpy(&t.dtype, p + off, 4);
-        memcpy(&ndim, p + off + 4, 4);
-        off += 8;
+        int32_t dtype = 0, ndim = 0;
+        take(&dtype, 4, name + " dtype");
+        take(&ndim, 4, name + " ndim");
+        if (dtype < 0 || dtype > 3) d2_die(name + ": dtype " + std::to_string(dtype));
+        if (ndim < 1 || ndim > 4) d2_die(name + ": ndim " + std::to_string(ndim));
+        t.dtype = dtype;
         int64_t dims[4] = {1, 1, 1, 1};
-        memcpy(dims, p + off, 8 * ndim);
-        off += 8 * ndim;
-        int64_t nbytes;
-        memcpy(&nbytes, p + off, 8);
-        off += 8;
-        off += (64 - (off % 64)) % 64;
-        D2CHECK(cudaMalloc(&t.dev, nbytes));
-        D2CHECK(cudaMemcpy(t.dev, p + off, nbytes, cudaMemcpyHostToDevice));
-        off += nbytes;
+        take(dims, 8 * (size_t)ndim, name + " dims");
+        int64_t nel = 1;
+        for (int d = 0; d < ndim; d++) {
+            if (dims[d] < 1 || dims[d] > ((int64_t)1 << 31)) d2_die(name + ": bad dim " + std::to_string(dims[d]));
+            nel *= dims[d];
+            if (nel > ((int64_t)1 << 40)) d2_die(name + ": too many elements");
+        }
+        dims_of[name].assign(dims, dims + ndim);
+        int64_t nbytes = 0;
+        take(&nbytes, 8, name + " data size");
+        pad64();
         t.rows = dims[0];
         t.cols = ndim > 1 ? dims[1] : 1;
         for (int d = 2; d < ndim; d++) t.cols *= dims[d];
         t.n = t.rows * t.cols;
-        if (t.dtype == 2 || t.dtype == 3) { // q4_g64 / q8_g128: scales blob follows
-            int64_t sbytes;
-            memcpy(&sbytes, p + off, 8);
-            off += 8;
-            off += (64 - (off % 64)) % 64;
+        const int64_t want = dtype == 0 ? 2 * nel : dtype == 1 ? 4 * nel : dtype == 2 ? nel / 2 : nel;
+        if (nbytes != want)
+            d2_die(name + ": " + std::to_string(nbytes) + " data bytes, dtype " + std::to_string(dtype) +
+                   " over " + std::to_string(nel) + " elements wants " + std::to_string(want));
+        if (dtype == 2 && t.cols % 64) d2_die(name + ": q4 cols not a multiple of 64");
+        if (dtype == 3 && t.cols % 128) d2_die(name + ": q8 cols not a multiple of 128");
+        if ((size_t)nbytes > sz - off) d2_die(name + ": data runs past the end of the file");
+        D2CHECK(cudaMalloc(&t.dev, nbytes));
+        D2CHECK(cudaMemcpy(t.dev, p + off, nbytes, cudaMemcpyHostToDevice));
+        if (dtype == 2 || dtype == 3) { // q4_g64 / q8_g128: scales blob follows
+            off += nbytes;
+            int64_t sbytes = 0;
+            take(&sbytes, 8, name + " scale size");
+            pad64();
+            const int64_t swant = t.rows * (t.cols / (dtype == 2 ? 64 : 128)) * 2;
+            if (sbytes != swant)
+                d2_die(name + ": " + std::to_string(sbytes) + " scale bytes, wants " + std::to_string(swant));
+            if ((size_t)sbytes > sz - off) d2_die(name + ": scales run past the end of the file");
             D2CHECK(cudaMalloc(&t.dscales, sbytes));
             D2CHECK(cudaMemcpy(t.dscales, p + off, sbytes, cudaMemcpyHostToDevice));
             off += sbytes;
         } else {
-            t.host = p + off - nbytes; // codebooks read host-side by the walk
+            t.host = p + off; // codebooks read host-side by the walk
+            off += nbytes;
         }
         w[name] = t;
     }
-    assert(T("fc.weight").rows == D2_H && T("fc.weight").cols == D2_TAPD);
-    assert(T("candidate_selector.predecessor_codebook").rows == D2_V);
+    if (off != sz) d2_die(std::to_string(sz - off) + " trailing bytes after the last tensor");
+    // the manifest: every tensor the drafter reads, in the shape its buffers assume
+    for (const D2Spec& sp : d2_manifest()) {
+        auto it = dims_of.find(sp.name);
+        if (it == dims_of.end()) d2_die("missing tensor " + sp.name);
+        const int dt = w[sp.name].dtype;
+        const bool kind_ok = sp.kind == 2 ? (dt == 2 || dt == 3) : dt == sp.kind;
+        if (!kind_ok || it->second != sp.dims) {
+            std::string got = "dtype " + std::to_string(dt) + " dims";
+            for (int64_t d : it->second) got += " " + std::to_string(d);
+            std::string want = "dims";
+            for (int64_t d : sp.dims) want += " " + std::to_string(d);
+            d2_die(sp.name + ": " + got + "; this engine wants " + want +
+                   (sp.kind == 2 ? " (q4 or q8)" : sp.kind == 1 ? " (f32)" : " (f16)"));
+        }
+    }
+    // optional target copies (training packs carry them; serving packs drop them)
+    for (const char* opt : {"target.embed.weight", "target.head.weight"}) {
+        auto it = dims_of.find(opt);
+        if (it == dims_of.end()) continue;
+        if (w[opt].dtype != 0 || it->second != std::vector<int64_t>{D2_V, D2_H})
+            d2_die(std::string(opt) + ": wants f16 [" + std::to_string(D2_V) + ", " + std::to_string(D2_H) + "]");
+    }
 }
 
 // Quantized matmul mirroring the engine's qx5+mm5: quantize the W-column

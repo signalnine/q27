@@ -1,0 +1,4 @@
+[{"name":"a b","input_schema":{"type":"object"}},{"name":"","input_schema":{}},{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+@@
+{"command": "echo hi"}
+</function>

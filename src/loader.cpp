@@ -236,6 +236,12 @@ Model Model::open(const std::string& path) {
     if (c.read<uint32_t>() != VERSION) throw std::runtime_error("q27: unsupported version");
     uint32_t n_tensors = c.read<uint32_t>();
     uint32_t meta_len  = c.read<uint32_t>();
+    // Sizes come from the header: a corrupt one must read as "truncated file",
+    // not a 4 GB resize / 400 GB reserve that aborts on bad_alloc (2026-10-07).
+    // The smallest tensor record is 2 + 1 + 1 + 8 + 4 * 8 bytes.
+    if (meta_len > (size_t)(c.end - c.p)) throw std::runtime_error("q27: truncated file (meta)");
+    if ((uint64_t)n_tensors * 44 > (uint64_t)(c.end - c.p) - meta_len)
+        throw std::runtime_error("q27: truncated file (tensor table)");
     m.meta_json.resize(meta_len);
     c.bytes(m.meta_json.data(), meta_len);
 

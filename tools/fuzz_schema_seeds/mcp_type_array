@@ -1,0 +1,9 @@
+[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":["string","null"]},"n":{"type":["integer","null"]}}}}]
+@@
+<tool_call>
+<function=Read>
+<parameter=file_path>
+a.txt
+</parameter>
+</function>
+</tool_call>

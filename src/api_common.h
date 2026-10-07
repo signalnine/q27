@@ -3419,6 +3419,30 @@ inline void capture_drift(const std::string& text, const std::string& outcome,
     drift_records_written++;
 }
 
+inline constexpr int kMaxRequestJsonDepth = 512;
+// Bracket nesting of a JSON-looking text, strings skipped. Also guards the
+// MODEL's side (2026-10-07): a tool-call segment is parsed with the same
+// iterative parser, then its arguments are copied and dump()ed recursively
+// on the worker stack, and "[[[[" is one BPE token, so a looping model can
+// write a 40K-deep value in a few thousand tokens.
+inline bool json_nesting_exceeds(const std::string& body, int cap) {
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < body.size(); i++) {
+        const char c = body[i];
+        if (in_str) {
+            if (c == '\\') i++;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > cap) return true;
+        } else if (c == '}' || c == ']') {
+            depth--;
+        }
+    }
+    return false;
+}
 inline ToolCall parse_tool_call_impl(const std::string& seg) {
     ToolCall tc;
     tc.raw = seg;
@@ -3467,6 +3491,7 @@ inline ToolCall parse_tool_call_impl(const std::string& seg) {
 // capture_drift falls back to the thread's context (set by the non-stream
 // resolver) and otherwise keeps identifier-like tool names verbatim.
 inline ToolCall parse_tool_call(const std::string& seg) {
+    if (json_nesting_exceeds(seg, kMaxRequestJsonDepth)) return ToolCall{}; // not a call we can carry
     ToolCall tc = parse_tool_call_impl(seg);
     if (drift_parse_depth == 0 && drift_corpus_path()) {
         if (tc.ok) {
@@ -4868,24 +4893,9 @@ inline std::string first_balanced_object(const std::string& s) {
 // input_schema, say) overflowed the HTTP worker's stack -- a SIGSEGV no catch
 // can stop, reachable by any client that passes auth (2026-10-04). Real tool
 // schemas nest a few dozen levels at most.
-inline constexpr int kMaxRequestJsonDepth = 512;
 inline json parse_request_body(const std::string& body) {
-    int depth = 0;
-    bool in_str = false;
-    for (size_t i = 0; i < body.size(); i++) {
-        const char c = body[i];
-        if (in_str) {
-            if (c == '\\') i++;
-            else if (c == '"') in_str = false;
-        } else if (c == '"') {
-            in_str = true;
-        } else if (c == '{' || c == '[') {
-            if (++depth > kMaxRequestJsonDepth)
-                throw std::runtime_error("request JSON nested deeper than 512 levels");
-        } else if (c == '}' || c == ']') {
-            depth--;
-        }
-    }
+    if (json_nesting_exceeds(body, kMaxRequestJsonDepth))
+        throw std::runtime_error("request JSON nested deeper than 512 levels");
     return json::parse(body);
 }
 
@@ -6967,6 +6977,11 @@ inline std::vector<ToolCall> parse_bare_tool_calls(const std::string& text_in,
                                                    bool allow_o10,
                                                    bool allow_eof_repair,
                                                    std::string* remaining_text) {
+    if (json_nesting_exceeds(text_in, kMaxRequestJsonDepth)) { // stays prose (see json_nesting_exceeds)
+        if (prefix) *prefix = text_in;
+        if (remaining_text) remaining_text->clear();
+        return {};
+    }
     DriftParseScope drift_scope;
     bool from_strict_miss = false;
     if (drift_parse_depth == 1) {
@@ -7106,6 +7121,7 @@ template<class EmitText, class EmitCall>
 inline size_t recover_unclosed_tool_tail(const std::string& raw,
     const json* tools, EmitText emit_text, EmitCall emit_call) {
     if(raw.empty()) return 0;
+    if(json_nesting_exceeds(raw, kMaxRequestJsonDepth)){ emit_text(raw); return 0; }
     if(!tools || !tools->is_array() || tools->empty()){
         emit_text(raw); return 0;
     }

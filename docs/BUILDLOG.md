@@ -15714,6 +15714,105 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-07 (be): third bug hunt -- the plain-lanes forced close was broken both ways, a grammar cache that mixed schemas, a re-engage that never fired, and the pack loaders
+
+Four independent read-only reviews over surfaces no earlier hunt had read
+(the draft-vocab diff; dflash2.cu + conductor.h + suffixdraft.h + the spec3
+accept loops; the file-format boundary: loader.cpp, tokenizer.cpp,
+device_model.cu, the prefix caches; the output side: stream_split, toolgram,
+toolconstrain, drift_capture, sampling, the SSE emitters), every CPU suite
+including the nine test binaries `make test-tools` does not run
+(test_auth/conductor/depthctl/manifest/prefix_cache/sampling/suffixdraft,
+test_tokenizer --selftest, test_argmax_tie), the parser fuzzer for 15 min
+(448,753 runs, clean), a NEW schema-varying fuzzer (`make fuzz-schema`:
+the tool list rides in the input; 1,253,913 runs in 10 min, clean), and 3090
+probes for everything a reading could not settle. Every finding below was
+reproduced or its test shown to fail on the old code before the fix.
+
+**Fixed:**
+
+- **A forced reasoning close on a plain-lanes pack (Bonsai 2 without the MTP
+  head, no DFlash2 -- the 8/12 GB installer's default pack) was wrong in BOTH
+  serving modes.** The plain token/sample rounds run the pending-EMITTED
+  convention; the forced-close install replaced the last emitted token in
+  d_token. Solo (Q27_BATCH=0): the round forwarded the close and emitted its
+  successor flagged forced -- the model answered, the client never saw the
+  close, the whole answer streamed as reasoning (`--think-budget 64`: solo
+  "thinking:1043 chars, no text block" vs batch "330 | 651"). Batch: the
+  member took the solo forced round (needs_solo_round ran before
+  always_fused), whose plain_first path emitted the close WITHOUT forwarding
+  it, and the next fused round re-snapshotted the stale pending: a doubled
+  token and the model reasoning on past its "close" ("NeedNeed final only one
+  sentence.\n</think>\n\nThe capital..." in the TEXT channel). Reachable
+  with `--think-budget N>0` or `--request-think` budgets; the installer and
+  README recipes pass `--think-budget 0`, so stock setups never tripped it.
+  Fix: decode_step's plain forced branch forwards the last emitted token
+  (its successor discarded), then installs the close as the pending and
+  emits it, the way the Q27_SAMPLE_PLAIN branch already did (first round:
+  the close takes the unemitted pending's place); the conductor keeps
+  always-fused members on the fused path, where prep_round snapshots the
+  installed close as the round's pending. Probe (3090, T3 slim pack, four
+  prompts, greedy): solo == batch byte-identical, close at the cap, answer in
+  TEXT; the T3+MTP pack (ladder, unaffected) byte-identical before and after.
+- **Q27_DRAFT_VOCAB pad rows duplicated row 0, so the top-1/top-2 margin was
+  0 whenever token 0 was the draft** and the depth gate exited after one
+  token. The argmax kernels take an optional device-side row count
+  (graph-safe); dv_set_context/dv_observe publish the live count after the
+  rows it covers. Also off under Q27_DFLASH2 (63 MB and a per-request
+  gather for a head DFlash2 never reads), and freed in ~Engine. CLI bitwise
+  at six shapes (321-row to full-vocab heads), memcheck 0 errors.
+- **The XML tool grammar's mask cache (`--constrain-tools`) keyed the
+  </function>-reachable states on emitted bits + the required key only**;
+  the bits index the current tool's sorted parameter list, so tool A {a,b}
+  after `a` and tool B {b,c} after `b` shared a signature with opposite
+  answers on closing -- and the cache is server-global. The signature now
+  carries every tool's parameter and required lists. test_toolconstrain
+  reproduces (2 FAILED on the old key).
+- **Bare `<function=` re-engage (issue #35, default-on) never fired on a
+  real stream**: `bp + 9 > start` needs the opener's `=` to be a token's
+  second-or-later byte, and the pre-tokenizer always starts a token at `=`
+  (it ends the letter run). The unit test packed the opener into one token.
+  Fixed to `bp + 10`; a test with the real split fails on the old code
+  (3 checks).
+- **A tool-call value nested tens of thousands deep crashed the worker**:
+  nlohmann parses iteratively, then the arguments copy and dump() recurse;
+  "[[[[" is one BPE token. The request-side scanner (ba) is now
+  `json_nesting_exceeds` and guards parse_tool_call, parse_bare_tool_calls
+  and recover_unclosed_tool_tail (deep segments stay prose). Test.
+- **The .d2w DFlash2 pack loader validated nothing**: `ndim` from the file
+  into `int64_t dims[4]` (a 512-byte stack write at ndim 64), nbytes/sbytes
+  past the end of the host buffer into cudaMemcpy, rows that overran the
+  D2_*-sized device buffers. Every length is now checked against the file,
+  every tensor's bytes against its dtype and dims, and the set against a
+  manifest of the 81 tensors (+ the optional target copies). The three real
+  packs load and decode as before (3090: Bonsai Q8 94.7 t/s, q4s + Q8
+  106.8, q4s + Q4 107.0); a truncated pack and an ndim-64 pack are refused
+  with the tensor named.
+- **tokenizer**: an empty added token matched forever in encode() (skipped);
+  the server refuses a .tok with more tokens than the model's vocab (nothing
+  downstream clamps ids; token_embd was read past its end on the device);
+  the CLI's --tokens rejects ids outside [0, VOCAB).
+- **loader.cpp**: meta_len and n_tensors are checked against the file
+  before the resize/reserve (a corrupt header was a bad_alloc abort).
+
+**Measured, not changed:** the splitter's rescans after a provisional closer
+inside a long tool value are quadratic but cheap: 24 ms per 100 KB value,
+227 ms at 300 KB, in 5-byte feeds.
+
+**Found, not fixed:** an engine error mid-stream ends the body without a
+terminal SSE event (clients see EOF, not a hang); a stray `</think>` in TEXT
+reaches the client as text; the mask cache never evicts (--constrain-tools);
+`.pf4` sidecars bypass the tensor manifest (Q27_PREFILL=fp4); the streaming
+classify paths lack the span guard their batch twins have (no mode returns
+npos today); Q27_BONSAI_FUSED=0 serializes members (A/B lever); the (ba) KV
+items stand.
+
+**Clean:** every CPU suite; both fuzzers; the reviews' checked lists --
+dflash2 ring retention/width/accept loops and the sampled residuals,
+suffixdraft sync/eviction, the conductor's union bound/graph key/shutdown
+order, loader bounds arithmetic for all 8 dtypes, prefix-cache size checks
+and the compat key, SSE block indices, the sampler's clamps.
+
 ## 2026-10-05 (bd): Qwen3.8-27B-pi -- same gold, 30% less wall on the agentic campaign, and the base drafter accepts more
 
 bytkim/Qwen3.8-27B-pi (Apache-2.0; SFT on successful Pi agent-harness coding

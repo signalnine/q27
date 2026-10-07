@@ -284,8 +284,15 @@ struct BasicToolConstrainer {
                 size_t bp = tail.rfind("<function=");
                 // fire when the opener COMPLETES within this token (mirror of
                 // the <tool_call> test: skip only when it ended earlier)
+                // "<function=" is 10 bytes: fire when its END (exclusive,
+                // bp + 10) lies past this token's start -- i.e. its last
+                // byte '=' is inside this token. Until 2026-10-07 this read
+                // bp + 9 > start, which needs a token holding "n=" or more;
+                // the pre-tokenizer always starts a new token at '=' (it
+                // ends the letter run), so the re-engage never fired on a
+                // real stream and bare calls decoded unconstrained.
                 if (bp != std::string::npos &&
-                    bp + 9 > tail.size() - bytes.size()) {
+                    bp + 10 > tail.size() - bytes.size()) {
                     std::string rem = tail.substr(bp);
                     tg_xml.reset(names, params_per_name, required_per_name);
                     active = true;

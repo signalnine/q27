@@ -757,6 +757,14 @@ int main(int argc, char** argv) {
     // the post-upload block below; no legacy 8192 fallback.
     fprintf(stderr, "loading tokenizer...\n");
     q27::Tokenizer tok(tokpath);
+    // A .tok with more tokens than the model's embedding rows can encode ids
+    // the device would read past token_embd (nothing downstream clamps them);
+    // the wrong tokenizer file is a one-line error here instead (2026-10-07).
+    if (tok.vocab_size() > (size_t)VOCAB) {
+        fprintf(stderr, "tokenizer: %zu tokens, the model's vocab is %d -- wrong .tok for this model\n",
+                tok.vocab_size(), VOCAB);
+        return 1;
+    }
     const std::vector<int> think_close_ids = tok.encode("</think>\n\n");
     fprintf(stderr, "loading model...\n");
     // P10-A1: weights owned here and shared into the Engine(s) by reference.

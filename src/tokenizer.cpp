@@ -118,8 +118,11 @@ Tokenizer::Tokenizer(const std::string& path) : impl_(std::make_unique<Impl>()) 
     // text ("<", "tool", "_call", ">") in every prompt: the template's
     // tool-format instructions, every past tool call, every tool result. The
     // checkpoint was trained on (and itself emits) the single added tokens.
+    // An empty added token would match at every position of encode() without
+    // advancing (bug hunt 2026-10-07): skip it, it can never occur in text.
     for (uint32_t i = 0; i < n; i++)
-        if (types_[i] == 3 || types_[i] == 4) impl_->specials.push_back({tokens_[i], (int)i});
+        if ((types_[i] == 3 || types_[i] == 4) && !tokens_[i].empty())
+            impl_->specials.push_back({tokens_[i], (int)i});
     // <think>/</think> by name as well, for a vocab that types them NORMAL
     // (BPE merges cannot form them; think-block prefills depend on this)
     for (const char* s : {"<think>", "</think>"}) {

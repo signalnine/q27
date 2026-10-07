@@ -398,6 +398,7 @@ inline DraftVocabPlan draft_vocab_plan(const q27::Model& m) {
     if (n <= 0 || !m.find("blk.64.nextn.eh_proj.weight")) return p;
     const char* b = getenv("Q27_BATCH");
     if (b && atoi(b) != 0) { p.off_why = "needs Q27_BATCH=0: fused rounds share one head"; return p; }
+    if (getenv("Q27_DFLASH2")) { p.off_why = "DFlash2 drafts without the MTP head"; return p; }
     const q27::Tensor* h = m.find("output_q4.weight");
     if (!h) h = m.find("output.weight");
     if (!h) { p.off_why = "no output head"; return p; }
@@ -471,6 +472,8 @@ struct Engine {
     DevTensor dv_head;
     int* d_dv_ids = nullptr;
     int* dv_ids = nullptr;                // host mirror of d_dv_ids (PINNED: the pageable DMA path flips bits on this host)
+    int* d_dv_live = nullptr;             // device: rows in use (static + context); the argmax stops there, not at the pad rows
+    int* dv_live_h = nullptr;             // pinned source for d_dv_live
     std::vector<uint8_t> dv_in_static;    // VOCAB flags
     std::vector<uint8_t> dv_in_dyn;       // VOCAB flags: this request's context rows (prompt + generated)
     int dv_ndyn = 0;                      // context rows filled
@@ -1148,6 +1151,7 @@ struct Engine {
         if (pfx_thr.joinable()) pfx_thr.join();
         if (pfx_stage) cudaFreeHost(pfx_stage);
         if (pfx_wstage) cudaFreeHost(pfx_wstage);
+        if (dv_ids) dv_free(); // Q27_DRAFT_VOCAB head, ids, pinned mirrors
     }
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
@@ -2120,10 +2124,11 @@ struct Engine {
         // soft allocation: a card too tight for the subset head keeps the full one
         const size_t data_b = (size_t)dv_rows * dv_row_bytes, sc_b = (size_t)dv_rows * dv_row_scales * sizeof(__half);
         if (cudaMalloc((void**)&d_dv_ids, (size_t)dv_rows * sizeof(int)) != cudaSuccess ||
+            cudaMalloc((void**)&d_dv_live, sizeof(int)) != cudaSuccess ||
+            cudaMallocHost((void**)&dv_live_h, sizeof(int)) != cudaSuccess ||
             cudaMalloc(&dv_head.data, data_b) != cudaSuccess || cudaMalloc(&dv_head.scales, sc_b) != cudaSuccess) {
             cudaGetLastError();
-            cudaFree(d_dv_ids); cudaFree(dv_head.data); cudaFree(dv_head.scales); cudaFreeHost(dv_ids);
-            d_dv_ids = nullptr; dv_head.data = nullptr; dv_head.scales = nullptr; dv_ids = nullptr;
+            dv_free();
             fprintf(stderr, "Q27_DRAFT_VOCAB: off (%.0f MB draft head did not fit; full head kept)\n", p.bytes() / 1e6);
             return;
         }
@@ -2133,11 +2138,28 @@ struct Engine {
         dv_head.data_bytes = data_b;
         dv_head.scales_bytes = sc_b;
         dv_upload(0, dv_rows);
+        dv_set_live();
         CUDA_CHECK(cudaStreamSynchronize(stm));
         dv_on = true;
         fprintf(stderr, "Q27_DRAFT_VOCAB: draft head %d rows (%d static + %d per-request context) of %d, "
                         "%.0f MB vs %.0f MB\n", dv_rows, dv_nstatic, dv_rows - dv_nstatic, vocab,
                 dv_head.data_bytes / 1e6, (double)vocab * dv_row_bytes / 1e6);
+    }
+    void dv_free() {
+        cudaFree(d_dv_ids); cudaFree(d_dv_live); cudaFree(dv_head.data); cudaFree(dv_head.scales);
+        cudaFreeHost(dv_ids); cudaFreeHost(dv_live_h);
+        d_dv_ids = nullptr; d_dv_live = nullptr; dv_head.data = nullptr; dv_head.scales = nullptr;
+        dv_ids = nullptr; dv_live_h = nullptr;
+        dv_on = false;
+    }
+    // The pad rows duplicate row 0, so an argmax over all dv_rows would report
+    // a zero top-1/top-2 margin whenever token 0 is the draft (the depth gate
+    // would then exit early; bug hunt 2026-10-07). The argmax kernels read the
+    // live row count from the device instead; it is written AFTER the rows it
+    // covers, on the same stream.
+    void dv_set_live() {
+        *dv_live_h = dv_nstatic + dv_ndyn;
+        CUDA_CHECK(cudaMemcpyAsync(d_dv_live, dv_live_h, sizeof(int), cudaMemcpyHostToDevice, stm));
     }
     // upload ids [lo, hi) and gather those head rows (stream-ordered on stm)
     void dv_upload(int lo, int hi) {
@@ -2170,6 +2192,7 @@ struct Engine {
         }
         for (int i = dv_nstatic + dv_ndyn; i < dv_rows; i++) dv_ids[i] = dv_ids[0];
         dv_upload(dv_nstatic, dv_rows);
+        dv_set_live();
     }
     // committed tokens that are in neither set take the next free context
     // row. No sync: an in-flight upload covering that row (dv_set_context's)
@@ -2185,7 +2208,9 @@ struct Engine {
             dv_in_dyn[t] = 1;
             dv_ids[dv_nstatic + dv_ndyn++] = t;
         }
+        if (dv_nstatic + dv_ndyn == lo) return;
         dv_upload(lo, dv_nstatic + dv_ndyn);
+        dv_set_live();
     }
     void mtp_post(const MtpLaneView& v) {
         const int il = 64;
@@ -2232,11 +2257,12 @@ struct Engine {
     void mtp_tail(const MtpLaneView& v) {
         const int nlog = dv_on ? dv_rows : VOCAB;
         for (int t = 0; t < v.vw; t++) {
+            const int* nlive = dv_on ? d_dv_live : nullptr;
             if (v.margin_dst[t])
                 q27k::argmax_margin(v.lg[t], nlog, v.draft_dst[t], v.margin_dst[t],
-                                    v.am_blk1[t], v.am_blk2[t], v.stm);
+                                    v.am_blk1[t], v.am_blk2[t], v.stm, nlive);
             else
-                q27k::argmax(v.lg[t], nlog, v.draft_dst[t], v.amax[t], v.stm);
+                q27k::argmax(v.lg[t], nlog, v.draft_dst[t], v.amax[t], v.stm, nlive);
             if (dv_on) q27k::remap_id(v.draft_dst[t], d_dv_ids, v.stm); // subset index -> token id
         }
     }
@@ -5129,6 +5155,8 @@ struct Engine {
         bool budget_cancelled = false;
         bool budget_truncated = false; // final stop actually came from either condition
         bool round_forced = false;
+        int pre_forced_token = -1;    // d_token before a forced install (the last EMITTED token on the plain path)
+        bool forced_at_first = false; // the install happened before the first plain/sample round
         bool callback_forced = false; // true only while on_token receives an injected id
         int forced_id = -1;
         std::vector<int> forced_tokens;
@@ -5207,6 +5235,13 @@ struct Engine {
     void stage_forced_pending(DecodeTask& t) {
         t.forced_id = t.forced_tokens[t.forced_pos++];
         if (!(t.sampling && t.force_plain_sample)) {
+            // The plain token/sample rounds (no MTP block, no DFlash2) run the
+            // pending-EMITTED convention: d_token is the last token the client
+            // already saw. decode_step's forced branch needs it back (to
+            // forward it before the close takes its place), so keep it.
+            t.forced_at_first = t.sampling ? samp_first : plain_first;
+            CUDA_CHECK(cudaMemcpyAsync(&t.pre_forced_token, d_token, 4, cudaMemcpyDeviceToHost, stm));
+            CUDA_CHECK(cudaStreamSynchronize(stm));
             install_forced_pending(t);
             if (t.sampling) samp_first = false;
         }
@@ -5518,6 +5553,28 @@ struct Engine {
             n = sample_round(em);
             install_forced_pending(t);
             em[0] = t.forced_id;
+        } else if (t.round_forced && !has_mtp && !d2_on) {
+            // Plain rounds (Bonsai 2 packs without an MTP head, no DFlash2)
+            // emit the token they forward: pre_round's install replaced the
+            // last EMITTED token in d_token with the close, so a plain round
+            // forwarded the close (the model saw it) and emitted its
+            // successor, flagged forced -- the client never saw the close and
+            // its stream never left the reasoning channel (bug hunt
+            // 2026-10-07). Do what the sampled-plain branch above does: at
+            // the first round the pending is still unemitted, so the close
+            // simply takes its place; later, forward the last emitted token
+            // (its successor is discarded), then install the close as the
+            // new pending and emit it. The next round forwards the close.
+            if (t.forced_at_first) {
+                em[0] = t.forced_id;
+                n = 1;
+                plain_first = false;
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(d_token, &t.pre_forced_token, 4, cudaMemcpyHostToDevice, stm));
+                n = t.sampling ? sample_round(em) : plain_round(em);
+                install_forced_pending(t);
+                em[0] = t.forced_id;
+            }
         } else if (d2_on && !(t.sampling && t.force_plain_sample)) {
             // Lever 2 (2026-09-07): DFlash2 serves sampled requests through the
             // rejection-verify twin; Q27_SAMPLE_PLAIN still forces the plain

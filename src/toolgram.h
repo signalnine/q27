@@ -521,6 +521,23 @@ struct ToolGrammarXml {
         std::sort(sorted.begin(), sorted.end());
         names_key_.clear();
         for (auto& n : sorted) { names_key_ += n; names_key_ += '\x1f'; }
+        // The whole schema, not just the names: token legality in the
+        // </function>-reachable states reads emitted_ bits against the
+        // CURRENT tool's sorted parameter list, and in NAME a token can run
+        // on into "<parameter=k", so two requests whose tools share names
+        // and emitted-bit patterns but differ in parameters must never share
+        // a cached mask (bug hunt 2026-10-07; the cache is server-global).
+        schema_key_.clear();
+        for (size_t i = 0; i < tool_names.size(); i++) {
+            schema_key_ += tool_names[i];
+            schema_key_ += ':';
+            if (i < params_per_name.size())
+                for (auto& k : params_per_name[i]) { schema_key_ += k; schema_key_ += '\x1f'; }
+            schema_key_ += '/';
+            if (i < required_per_name.size())
+                for (auto& k : required_per_name[i]) { schema_key_ += k; schema_key_ += '\x1f'; }
+            schema_key_ += '\x1e';
+        }
         cur_params_key_.clear();
         cur_name_idx_ = -1;
         st_ = WS0;
@@ -780,6 +797,7 @@ struct ToolGrammarXml {
     std::vector<char> emitted_;
     std::string required_key_;
     std::string names_key_;
+    std::string schema_key_; // every tool's params + required (see reset)
     std::string cur_params_key_;
     std::string name_pref_;
     std::string key_pref_;
@@ -799,6 +817,8 @@ struct ToolGrammarXml {
         std::string s;
         s += (char)('a' + (int)st_);
         s += dead_ ? '!' : '.';
+        s += '|';
+        s += schema_key_;
         // Required-argument enforcement (issue #2) makes token legality depend
         // on WHICH keys were already emitted, in two places: KEY (a duplicate
         // is illegal) and SLASH (</function> is illegal until required are

@@ -97,7 +97,7 @@ void nll_rows(const float* logits, const int* tgt, float* nll, int nrows, int64_
 void argmax_masked(const float* x, int n, const unsigned* pool, int words, const int* mask_ids,
                    int slot, int* d_out, unsigned long long* d_scratch, cudaStream_t st = 0);
 void argmax(const float* x, int n, int* d_out, unsigned long long* d_scratch,
-            cudaStream_t st = 0);
+            cudaStream_t st = 0, const int* n_dev = nullptr);
 
 // Top1-top2 logit margin (drafter confidence for P12 p_min-gated depth). Writes
 // one float (m1 - m2) to d_out. Separate pass; does not affect argmax/canonical.
@@ -108,7 +108,7 @@ void margin(const float* x, int n, float* d_out, cudaStream_t st = 0);
 // gets the same value as margin(). d_blk1 (128 u64) + d_blk2 (128 float) are
 // caller-allocated block-partial scratch (no allocation during graph capture).
 void argmax_margin(const float* x, int n, int* d_tok, float* d_margin,
-                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st = 0);
+                   unsigned long long* d_blk1, float* d_blk2, cudaStream_t st = 0, const int* n_dev = nullptr);
 
 // Sampling (roadmap #2, docs/sampling-design.md Phase 1). temp>0 ONLY: greedy
 // stays on argmax/argmax_masked (bitwise, canonical-gated) via a host branch.
