@@ -13,7 +13,7 @@
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends git g++ make ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-ARG Q27_REF=v0.14.3
+ARG Q27_REF=v0.14.4
 RUN git clone --depth 1 --branch ${Q27_REF} https://github.com/signalnine/q27 /src
 WORKDIR /src
 # sm_86 (A5000/A6000) + sm_89 (4090/L40/L40S) cover the 24-48GB serverless

@@ -40,24 +40,24 @@ fastest decode, best context.)
 
 ```bash
 # recommended: build from source, r570+ driver floor (safe on any RunPod host)
-docker build -f Dockerfile.source -t <you>/q27-serverless:v0.14.3 .
+docker build -f Dockerfile.source -t <you>/q27-serverless:v0.14.4 .
 
 # OR, only if your worker pool is confirmed r580+ (CUDA 13 host driver):
-docker build -f Dockerfile -t <you>/q27-serverless:v0.14.3 .
-docker push <you>/q27-serverless:v0.14.3
+docker build -f Dockerfile -t <you>/q27-serverless:v0.14.4 .
+docker push <you>/q27-serverless:v0.14.4
 ```
 
-Both Dockerfiles pin release v0.14.3. `Dockerfile.source` takes
+Both Dockerfiles pin release v0.14.4. `Dockerfile.source` takes
 `--build-arg Q27_REF=<tag>` to build another release; the prebuilt
 `Dockerfile` takes `Q27_VERSION` plus the tarball's `Q27_SHA256` (from the
 release's `SHA256SUMS-<version>`) and refuses a tarball that does not
-match. Release tarballs exist for v0.3.1, v0.14.2 and v0.14.3. The prebuilt
+match. Release tarballs exist for v0.3.1 and v0.14.2 through v0.14.4. The prebuilt
 image carries `q27`, `q27-server`, `q27-server-w8`, `q27-server-w16` and
 `q27-server-12g` (sm_86 only, the 8-12 GB Bonsai 2 build);
 `Dockerfile.source` builds and ships only `q27-server-w8`, so to use
 another target there, add it to the `make` line and the `COPY`. Both images
 were built and their binaries loaded on 2026-10-03 (v0.14.2); the v0.14.3
-bump changes only the pins.
+and v0.14.4 bumps change only the pins.
 
 ## 3. Create the endpoint
 
