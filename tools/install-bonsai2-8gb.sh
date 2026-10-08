@@ -21,7 +21,7 @@
 set -euo pipefail
 
 DIR=${BONSAI2_DIR:-$HOME/bonsai2}
-Q27_REF=${Q27_REF:-v0.14.3}          # the q27 release this was tested with (T3 pack, faster T3 GEMV, MCP-schema crash fix, draft vocab)
+Q27_REF=${Q27_REF:-v0.14.4}          # the q27 release this was tested with (T3 pack, faster T3 GEMV, draft vocab, the forced-close fix for the non-MTP pack)
 HF=https://huggingface.co/signalnine/Bonsai-2-27B-q27/resolve/main
 PACK=bonsai2-27b-t3-slim.q27; STACK=0.6; DV=0
 if [ "${1:-}" = "--mtp" ]; then PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; DV=40960; fi
