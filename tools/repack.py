@@ -20,6 +20,7 @@ import argparse
 import json
 import re
 import struct
+import os
 import sys
 import time
 
@@ -103,6 +104,35 @@ def policy(name: str) -> int:
     if name.endswith(".weight"):
         return DTYPE_Q4
     return DTYPE_F32  # biases and anything unrecognized stay f32
+
+
+def _check_tensor_layout(reader, path: str) -> None:
+    """gguf-py hands out whatever byte window the tensor-info table points at
+    and never checks that the windows are aligned, in order, disjoint and
+    inside the file (llama.cpp's loader does). A corrupted offset therefore
+    repacked silently: the tensor read a neighbour's bytes shifted by a few
+    elements, quantized without complaint, and the RMSE report (computed
+    against the same shifted bytes) looked normal (bug hunt 2026-10-19).
+    Refuse such a file before anything is written."""
+    align = 32
+    f = reader.fields.get("general.alignment")
+    if f is not None:
+        align = int(f.parts[f.data[0]][0])
+    size = os.path.getsize(path)
+    data_start = None
+    for t in reader.tensors:
+        if data_start is None or t.data_offset < data_start:
+            data_start = t.data_offset
+    prev_end, prev_name = -1, None
+    for t in sorted(reader.tensors, key=lambda t: t.data_offset):
+        off, end = int(t.data_offset), int(t.data_offset) + int(t.n_bytes)
+        if data_start is not None and (off - data_start) % align:
+            sys.exit(f"{path}: tensor {t.name} data offset {off} is not {align}-byte aligned -- corrupt tensor table, refusing")
+        if off < prev_end:
+            sys.exit(f"{path}: tensor {t.name} at {off} overlaps {prev_name} (ends {prev_end}) -- corrupt tensor table, refusing")
+        if end > size:
+            sys.exit(f"{path}: tensor {t.name} runs past the end of the file ({end} > {size}) -- truncated or corrupt, refusing")
+        prev_end, prev_name = end, t.name
 
 
 def to_f32(t) -> np.ndarray:
@@ -943,7 +973,10 @@ def main():
 
     t0 = time.time()
     r = GGUFReader(args.input)
+    _check_tensor_layout(r, args.input)
     mtp_reader = GGUFReader(args.mtp) if args.mtp else None
+    if mtp_reader is not None:
+        _check_tensor_layout(mtp_reader, args.mtp)
     source_tensors = merge_mtp_tensors(r, mtp_reader) if mtp_reader else list(r.tensors)
     arch = _field_value(r, "general.architecture")
     if not isinstance(arch, str) or not arch:
@@ -1040,6 +1073,11 @@ def main():
         # Mtp" for bytkim/Qwen3.8-27B-pi); the engine keys the XML tool
         # dialect and the 3.8 template rules on a "qwen38" substring.
         meta["general.name"] = args.name
+        norm = "".join(c for c in args.name.lower() if c.isalnum())
+        if "qwen38" not in norm and "qwen36" not in norm:
+            print(f"WARNING: --name {args.name!r} contains neither qwen38 nor qwen36: the engine keys the "
+                  "tool dialect and template rules on that substring and will boot this pack with "
+                  "the JSON dialect + 3.6 rules", file=sys.stderr)
     if bonsai2:
         # The GGUF's general.name is "Hf"; the engine keys the tool dialect and
         # the 3.8 template rules on a "qwen38" substring (api_common.h

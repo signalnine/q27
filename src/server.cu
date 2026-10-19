@@ -41,6 +41,9 @@
 #include "toolgram.h"
 #include "toolconstrain.h"
 #include "../third_party/httplib.h"
+#include <cerrno>
+#include <cstring>
+#include <cmath>
 #include "../third_party/json.hpp"
 
 using json = nlohmann::json;
@@ -326,11 +329,30 @@ static void req_log_body(const char* api, const char* path, const std::string& b
 // Every streaming handler's provider goes through this adapter: log, close the
 // stream, keep the process. Unwinding still runs the handler's guards (slot
 // release, batch member drain) because they live in the provider's frame.
+// Thrown out of claim_slot when the client that queued the request has
+// already disconnected (bug hunt 2026-10-19: a request abandoned while queued
+// still claimed a slot and ran its full prefill, and a non-stream request was
+// never cancelled at all). The exception handler maps it to 499.
+struct ClientGone : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// Client-controlled bytes headed for stderr: no control characters (terminal
+// escapes, forged "[req]" lines for the log parsers), bounded length.
+static std::string log_safe(const std::string& in, size_t cap = 256) {
+    std::string out = in.substr(0, cap);
+    for (char& c : out)
+        if ((unsigned char)c < 0x20 || c == 0x7f) c = '?';
+    return out;
+}
+
 template <class F>
 static auto guard_provider(F f) {
     return [f = std::move(f)](size_t offset, auto& sink) mutable -> bool {
         try {
             return f(offset, sink);
+        } catch (const ClientGone& e) {
+            fprintf(stderr, "[stream] %s -- stream closed\n", e.what()); // expected, not a throw to worry about
         } catch (const std::exception& e) {
             fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", e.what());
         } catch (...) {
@@ -423,45 +445,71 @@ int main(int argc, char** argv) {
     std::vector<std::string> api_keys;
     q27::PrefixCacheCfg pfx_cfg; // P16: root empty = off
     double pfx_ram_gb = 0;       // P16c: host-RAM tier budget (0 = off)
+    // Numeric flags are parsed strictly (bug hunt 2026-10-19: atoi turned
+    // "--ctx abc" / an empty shell variable into a 32-token server that
+    // reported healthy and 400'd every prompt; "--port abc" bound port 0;
+    // "--think-budget abc" meant UNBOUNDED), and an unknown option or a
+    // flag with its value missing refuses to start instead of being ignored.
+    auto arg_int = [&](const char* flag, const char* v, long lo, long hi) -> long {
+        char* end = nullptr;
+        errno = 0;
+        const long x = strtol(v, &end, 10);
+        if (!*v || *end || errno || x < lo || x > hi) {
+            fprintf(stderr, "error: %s expects an integer in [%ld, %ld], got \"%s\"\n", flag, lo, hi, v);
+            exit(1);
+        }
+        return x;
+    };
+    auto arg_num = [&](const char* flag, const char* v) -> double {
+        char* end = nullptr;
+        const double x = strtod(v, &end);
+        if (!*v || *end || std::isnan(x)) {
+            fprintf(stderr, "error: %s expects a number, got \"%s\"\n", flag, v);
+            exit(1);
+        }
+        return x;
+    };
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (int)arg_int("--port", argv[++i], 1, 65535);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
-            ++i; // "auto" -> -1 (VRAM auto-size). atoi("auto") is 0, which would
-                 // SILENTLY start a ctx-0 server (issue #6); the docs advertise
-                 // --ctx auto, so honor it. (Omitting --ctx also auto-sizes.)
-            ctx = strcmp(argv[i], "auto") == 0 ? -1 : atoi(argv[i]);
+            ++i; // "auto" (or any negative) -> -1: VRAM auto-size (issue #6).
+                 // 0 and non-numbers are refused above instead of starting a
+                 // ctx-0 server. (Omitting --ctx also auto-sizes.)
+            ctx = strcmp(argv[i], "auto") == 0 ? -1 : (int)arg_int("--ctx", argv[i], -(1L << 30), 1L << 30);
+            if (ctx == 0) { fprintf(stderr, "error: --ctx 0 is not a context size (use auto)\n"); return 1; }
+            if (ctx < 0) ctx = -1;
             ctx_explicit = ctx > 0;
             ctx_requested = ctx;
         }
-        else if (!strcmp(argv[i], "--slots") && i + 1 < argc) { n_slots = atoi(argv[++i]); n_slots_requested = n_slots; }
-        else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = atoi(argv[++i]); slot1_ctx_set = true; }
+        else if (!strcmp(argv[i], "--slots") && i + 1 < argc) { n_slots = (int)arg_int("--slots", argv[++i], 1, 64); n_slots_requested = n_slots; }
+        else if (!strcmp(argv[i], "--slot1-ctx") && i + 1 < argc) { slot1_ctx = (int)arg_int("--slot1-ctx", argv[++i], 1, 1L << 30); slot1_ctx_set = true; }
         else if (!strcmp(argv[i], "--fast-head")) fast_flag = 1;
         else if (!strcmp(argv[i], "--no-fast-head")) fast_flag = 0;
         else if (!strcmp(argv[i], "--no-think")) think_flag = 0;
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--request-think")) req_think = true;
         else if (!strcmp(argv[i], "--think-budget") && i + 1 < argc)
-            think_budget_flag = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) g_default_temp = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) g_default_top_p = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) g_default_top_k = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) g_default_min_p = atof(argv[++i]);
+            think_budget_flag = (int)arg_int("--think-budget", argv[++i], 0, 1L << 30);
+        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) g_default_temp = arg_num("--temp", argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) g_default_top_p = arg_num("--top-p", argv[++i]);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) g_default_top_k = (int)arg_int("--top-k", argv[++i], 0, 1L << 30);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) g_default_min_p = arg_num("--min-p", argv[++i]);
         else if (!strcmp(argv[i], "--constrain-tools")) constrain_tools = true;
         else if (!strcmp(argv[i], "--enable-metrics")) enable_metrics = true;
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
         else if (!strcmp(argv[i], "--prefix-cache") && i + 1 < argc) pfx_cfg.root = argv[++i];
         else if (!strcmp(argv[i], "--prefix-cache-max-gb") && i + 1 < argc)
-            pfx_cfg.max_bytes = (size_t)(atof(argv[++i]) * 1e9);
+            pfx_cfg.max_bytes = (size_t)(arg_num("--prefix-cache-max-gb", argv[++i]) * 1e9);
         else if (!strcmp(argv[i], "--prefix-cache-min") && i + 1 < argc)
-            pfx_cfg.min_tokens = atoi(argv[++i]);
+            pfx_cfg.min_tokens = (int)arg_int("--prefix-cache-min", argv[++i], 0, 1L << 30);
         else if (!strcmp(argv[i], "--prefix-cache-max-tokens") && i + 1 < argc)
-            pfx_cfg.max_tokens = atoi(argv[++i]);
+            pfx_cfg.max_tokens = (int)arg_int("--prefix-cache-max-tokens", argv[++i], 0, 1L << 30);
         else if (!strcmp(argv[i], "--prefix-cache-step") && i + 1 < argc)
-            pfx_cfg.step_tokens = atoi(argv[++i]);
+            pfx_cfg.step_tokens = (int)arg_int("--prefix-cache-step", argv[++i], 0, 1L << 30);
         else if (!strcmp(argv[i], "--prefix-cache-ram-gb") && i + 1 < argc)
-            pfx_ram_gb = atof(argv[++i]);
+            pfx_ram_gb = arg_num("--prefix-cache-ram-gb", argv[++i]);
         // Auth config is fail-LOUD in both directions: an empty key can never
         // authenticate anything (api_key_valid rejects an empty `provided`
         // before comparing), so accepting one would stand up a server that
@@ -488,6 +536,11 @@ int main(int argc, char** argv) {
                         argv[i]);
                 return 1;
             }
+        }
+        else {
+            fprintf(stderr, "error: unknown option %s (or its value is missing); see --help text above\n",
+                    argv[i]);
+            return 1;
         }
     }
     // Q27_API_KEY: a second, additive source (not exclusive with the CLI
@@ -1500,6 +1553,23 @@ int main(int argc, char** argv) {
     // engine parses the same env, so slot 0's reserve speaks for all; all
     // three routes preflight against this before claiming a slot.
     const int max_prompt = max_slot_ctx - slots[0].eng->ctx_round_reserve();
+    // Bytes that cannot fit: no token is longer than max_token_bytes, so a
+    // rendered prompt above max_prompt * that holds more tokens than any
+    // slot's window. Refused BEFORE tokenizing (bug hunt 2026-10-19: every
+    // oversized request first paid the full render + encode of up to 100 MB).
+    size_t max_token_bytes = 1;
+    for (size_t i = 0; i < tok.vocab_size(); i++)
+        max_token_bytes = std::max(max_token_bytes, tok.decode_one((int)i).size());
+    const size_t max_prompt_bytes = (size_t)max_prompt * max_token_bytes;
+    auto prompt_bytes_too_long = [&](size_t bytes, const char* api) {
+        if (bytes <= max_prompt_bytes) return false;
+        fprintf(stderr, "[ctx-limit] %s prompt %zu bytes (>= %zu tokens, max %d) -> 400 before tokenizing\n",
+                api, bytes, bytes / max_token_bytes, max_prompt);
+        return true;
+    };
+    auto prompt_bytes_tokens = [&](size_t bytes) {
+        return (int)std::min<size_t>(bytes / max_token_bytes, (size_t)INT_MAX);
+    };
     const int EOS = tok.eos();
     // P7 shared mask cache (mutated only from generation callbacks, which
     // run while holding the GPU gate; pool ids are per-slot)
@@ -1818,9 +1888,14 @@ int main(int argc, char** argv) {
         }
         return ok;
     };
+    // `gone` (optional): is the client already disconnected? Polled while the
+    // request waits for a slot; a dead client's request leaves the queue
+    // (ClientGone) instead of claiming a slot and running its prefill for
+    // nobody (bug hunt 2026-10-19).
     auto claim_slot = [&](const std::vector<int>& prompt, int requested,
                           bool thinking, const q27::ThinkCfg& cfg,
-                          bool budget_aware, long rid) -> Slot& {
+                          bool budget_aware, long rid,
+                          const std::function<bool()>& gone = nullptr) -> Slot& {
         std::unique_lock<std::mutex> lk(route_m);
         // wait diagnostics: why the last selection failed, and when to say so
         const auto wait_t0 = std::chrono::steady_clock::now();
@@ -1828,15 +1903,25 @@ int main(int argc, char** argv) {
         bool wait_logged = false;
         std::string why;
         auto wait_route = [&] {
-            if (wait_log_ms <= 0) { route_cv.wait(lk); return; }
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= wait_next) {
-                fprintf(stderr, "[wait] rid=%ld not started after %.1f s (prompt %zu tokens): %s; %s\n",
-                        rid, secs_since(wait_t0), prompt.size(), why.c_str(), pool_state().c_str());
-                wait_logged = true;
-                wait_next = now + kWaitRepeat;
+            const auto slice = std::chrono::milliseconds(250); // disconnect poll period
+            if (wait_log_ms <= 0) {
+                if (gone) route_cv.wait_for(lk, slice);
+                else route_cv.wait(lk);
+            } else {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= wait_next) {
+                    fprintf(stderr, "[wait] rid=%ld not started after %.1f s (prompt %zu tokens): %s; %s\n",
+                            rid, secs_since(wait_t0), prompt.size(), why.c_str(), pool_state().c_str());
+                    wait_logged = true;
+                    wait_next = now + kWaitRepeat;
+                }
+                route_cv.wait_until(lk, gone ? std::min(wait_next, now + slice) : wait_next);
             }
-            route_cv.wait_until(lk, wait_next);
+            if (gone && gone()) {
+                fprintf(stderr, "[wait] rid=%ld client disconnected after %.1f s in the queue -- dropped\n",
+                        rid, secs_since(wait_t0));
+                throw ClientGone("client disconnected while queued for a slot");
+            }
         };
         const q27::ThinkCfg raw_cfg{false, -1, true};
         const q27::ThinkCfg& limit_cfg = budget_aware ? cfg : raw_cfg;
@@ -2338,9 +2423,32 @@ int main(int argc, char** argv) {
     };
 
     httplib::Server srv;
+    // Bound the accept queue: httplib parks every accepted socket in an
+    // UNBOUNDED job list once all pool workers are busy (23 base / 92 max
+    // here), so a flood of idle connections held fds without limit (bug hunt
+    // 2026-10-19). Past 256 queued sockets new ones are closed on accept.
+    // (The per-connection worker pinning by a slow sender is httplib's
+    // design -- only a per-recv timeout exists -- and stays as is.)
+    srv.new_task_queue = [] {
+        return new httplib::ThreadPool(CPPHTTPLIB_THREAD_POOL_COUNT,
+                                       CPPHTTPLIB_THREAD_POOL_MAX_COUNT, 256);
+    };
     srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
-        fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(),
+        // the path is URL-decoded client input (bug hunt 2026-10-19: "%1b[2J"
+        // and "%0a[req] ..." reached the terminal and the reqlog parsers raw)
+        fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), log_safe(req.path).c_str(),
                 res.status);
+    });
+    // A handler throw is httplib's bare 500 by default; ClientGone (the client
+    // left while its request was queued) is not an error at all.
+    srv.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+        try { std::rethrow_exception(ep); }
+        catch (const ClientGone&) { res.status = 499; } // nobody is listening; the status is for the log
+        catch (const std::exception& e) {
+            res.status = 500;
+            fprintf(stderr, "[http] handler threw: %s\n", log_safe(e.what()).c_str());
+        }
+        catch (...) { res.status = 500; fprintf(stderr, "[http] handler threw (non-std)\n"); }
     });
 
     // Opt-in API key auth (no-op, zero overhead beyond one empty-vector
@@ -2355,10 +2463,13 @@ int main(int argc, char** argv) {
     // tokenization, or any generation work.
     if (!api_keys.empty()) {
         srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
-            // bare /health stays open for liveness probes; ?verify=1 runs a
-            // full weight checksum on the GPU, so it needs the key (2026-10-04)
-            if (req.path == "/health" && !req.has_param("verify"))
-                return httplib::Server::HandlerResponse::Unhandled;
+            // /health stays open for liveness probes. ?verify=1 (a full weight
+            // checksum on the GPU) needs the key, checked IN the handler: here
+            // only the URL query has been parsed, and httplib later merges a
+            // form-urlencoded BODY into req.params, so "GET /health" with the
+            // body "verify=1" passed this exemption and ran the checksum
+            // unauthenticated (bug hunt 2026-10-19).
+            if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
             if (req.path == "/metrics") return httplib::Server::HandlerResponse::Unhandled;
             std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
                                                          req.get_header_value("x-api-key"));
@@ -2386,6 +2497,15 @@ int main(int argc, char** argv) {
         // kernels on the blocking engine streams: expect a multi-ms stall
         // injected into whoever holds the GPU gate, not true overlap).
         if (req.has_param("verify")) {
+            if (!api_keys.empty() &&
+                !q27::api_key_valid(q27::extract_api_key(req.get_header_value("Authorization"),
+                                                         req.get_header_value("x-api-key")),
+                                    api_keys)) {
+                res.status = 401;
+                res.set_header("WWW-Authenticate", "Bearer");
+                res.set_content(q27::auth_error_json(false), "application/json");
+                return;
+            }
             int bad = shared_dm.checksum_verify(true);
             res.set_content(std::string("{\"status\":\"") + (bad ? "corrupted" : "ok") +
                                 "\",\"weight_mismatches\":" + std::to_string(bad) + "}",
@@ -2539,6 +2659,8 @@ int main(int argc, char** argv) {
                 q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
                 tools=std::move(selected.tools);
                 tool_names_v=std::move(selected.names);
+                if (const std::string p = q27::tool_decl_problem(tools); !p.empty())
+                    throw std::runtime_error(p);
             } catch (const std::exception& e) {
                 res.status = 400;
                 res.set_content(json{{"error",{{"message",e.what()},
@@ -2575,6 +2697,17 @@ int main(int argc, char** argv) {
             // is pre-seeded straight into the TOOL channel since the marker
             // itself never appears in the GENERATED text this way.
             if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
+            if (prompt_bytes_too_long(rendered.size(), "oai")) {
+                res.status = 400;
+                res.set_content(json{{"error",
+                                      {{"message", q27::ctx_limit_error_message(
+                                                       prompt_bytes_tokens(rendered.size()), max_prompt)},
+                                       {"type", "invalid_request_error"},
+                                       {"code", "context_length_exceeded"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             // P8/P16b: ONE pass over the prompt, in three pieces -- the system
             // block [0, sys_off), the rest of the stable history [sys_off,
             // stable_off), the volatile tail. Both cuts abut an <|im_start|>
@@ -2599,6 +2732,17 @@ int main(int argc, char** argv) {
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
         } else {
+            if (prompt_bytes_too_long(req.body.size(), chat ? "oai" : "cmpl")) {
+                res.status = 400;
+                res.set_content(json{{"error",
+                                      {{"message", q27::ctx_limit_error_message(
+                                                       prompt_bytes_tokens(req.body.size()), max_prompt)},
+                                       {"type", "invalid_request_error"},
+                                       {"code", "context_length_exceeded"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             prompt = build_prompt(body);
         }
         ReqTrace rt{rid, chat ? "oai" : "cmpl", conv_fp(body),
@@ -2669,7 +2813,8 @@ int main(int argc, char** argv) {
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid); // may wait for a free engine
+            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
+                                  [&req] { return req.is_connection_closed(); }); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
@@ -2699,9 +2844,9 @@ int main(int argc, char** argv) {
                 // ORIGINAL text-only behavior, byte-for-byte unchanged.
                 std::string text;
                 q27::Utf8Gate ugate;
-                auto on_tok = [&](int id) {
+                auto on_tok = [&, gen_n = 0](int id) mutable {
                     text += ugate.feed(tok.decode_one(id));
-                    return true;
+                    return (++gen_n & 15) != 0 || !req.is_connection_closed();
                 };
                 Engine::DecodeTask bt;
                 std::string berr;
@@ -2798,13 +2943,15 @@ int main(int argc, char** argv) {
                 if (kept < nr) return kept;
                 return m;
             };
-            auto on_tok = [&](int id, bool forced) {
+            auto on_tok = [&, gen_n = 0](int id, bool forced) mutable {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                return true;
+                // non-stream: nothing is written until the end, so poll the
+                // socket for a disconnect (a dead client used to be served to n_max)
+                return (++gen_n & 15) != 0 || !req.is_connection_closed();
             };
             std::string berr;
             int n = conductor
@@ -2907,8 +3054,10 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, created, chat, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid);
+                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
+                                      [&sink] { return !sink.is_writable(); });
                 auto sl_lease = slot_guard(sl);
+                if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;
@@ -3203,6 +3352,8 @@ int main(int argc, char** argv) {
         // in a separately labelled accounting block.
         tools=std::move(selected.tools);
         tool_names=std::move(selected.names);
+        if (const std::string p = q27::tool_decl_problem(tools); !p.empty())
+            throw std::runtime_error(p);
         tcfg=q27::resolve_think_cfg(body,!no_think_srv,req_think,-1);
         q27::validate_anthropic_tool_choice_thinking(tchoice,tcfg);
         thinking=tcfg.enabled;
@@ -3257,6 +3408,10 @@ int main(int argc, char** argv) {
             anthropic_400(res,e.what());
             return;
         }
+        if (prompt_bytes_too_long(rendered.size(), "count")) {
+            anthropic_400(res, q27::ctx_limit_error_message(prompt_bytes_tokens(rendered.size()), max_prompt));
+            return;
+        }
         json out = {{"input_tokens", (long)tok.encode(rendered).size()}};
         res.set_content(jdump(out), "application/json");
     });
@@ -3304,6 +3459,10 @@ int main(int argc, char** argv) {
             return;
         }
         auto tk1 = std::chrono::steady_clock::now();
+        if (prompt_bytes_too_long(rendered.size(), "anth")) {
+            anthropic_400(res, q27::ctx_limit_error_message(prompt_bytes_tokens(rendered.size()), max_prompt));
+            return;
+        }
         const std::set<std::string> allowed_tool_names(
             tool_names_v.begin(),tool_names_v.end());
         int sys_len = 0; // P16b: system-block tokens (0 = none/feature off)
@@ -3377,7 +3536,8 @@ int main(int argc, char** argv) {
                     std::chrono::duration<double, std::milli>(tk2 - tk0).count()};
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
+                                  [&req] { return req.is_connection_closed(); });
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
@@ -3432,13 +3592,15 @@ int main(int argc, char** argv) {
                 if (kept < nr) return kept;
                 return m;
             };
-            auto on_tok = [&](int id, bool forced) {
+            auto on_tok = [&, gen_n = 0](int id, bool forced) mutable {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                return true;
+                // non-stream: nothing is written until the end, so poll the
+                // socket for a disconnect (a dead client used to be served to n_max)
+                return (++gen_n & 15) != 0 || !req.is_connection_closed();
             };
             std::string berr;
             // batch: tc.on_id rides on_emit -- the CONDUCTOR thread, between
@@ -3550,8 +3712,10 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, mid, rid, has_tools, tool_names_v,
              allowed_tool_names, tchoice, tools, stable_len, rt, thinking, tcfg,
              sys_len, resp_model](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
+                                      [&sink] { return !sink.is_writable(); });
                 auto sl_lease = slot_guard(sl);
+                if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // M1: clears tc hooks on unwind, pre slot-free
                 eng.samp = samp;
@@ -3875,6 +4039,8 @@ int main(int argc, char** argv) {
         try {
             if (duplicate_tool_name)
                 throw std::runtime_error("ambiguous duplicate Responses tool name");
+            if (const std::string p = q27::tool_decl_problem(tools); !p.empty())
+                throw std::runtime_error(p);
             if (q27::responses_tool_names_ambiguous(
                     function_names, custom_names, hosted_tool_types))
                 throw std::runtime_error("ambiguous duplicate Responses tool name");
@@ -4004,6 +4170,11 @@ int main(int argc, char** argv) {
         const q27::TemplateOpts topts=q27::template_opts_from_body(body);
         std::string rendered = q27::chatml_prompt(merged, tools, thinking, nullptr, &sys_off, {}, {}, &topts);
         if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
+        if (prompt_bytes_too_long(rendered.size(), "resp")) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"code\":\"context_length_exceeded\"}}", "application/json");
+            return;
+        }
         // P16b applies here even though P16a does not: this shape computes no
         // stable_off (so it never persists a stable entry), but a system+tools
         // block is a system+tools block, and codex re-sends one every session.
@@ -4143,7 +4314,8 @@ int main(int argc, char** argv) {
         };
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
+            Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
+                                  [&req] { return req.is_connection_closed(); });
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng};
@@ -4235,13 +4407,15 @@ int main(int argc, char** argv) {
                 }
             };
             q27::Utf8Gate ugate;
-            auto on_tok = [&](int id, bool forced) {
+            auto on_tok = [&, gen_n = 0](int id, bool forced) mutable {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                return true;
+                // non-stream: nothing is written until the end, so poll the
+                // socket for a disconnect (a dead client used to be served to n_max)
+                return (++gen_n & 15) != 0 || !req.is_connection_closed();
             };
             std::string berr;
             int produced = conductor
@@ -4338,8 +4512,10 @@ int main(int argc, char** argv) {
             [&, samp, prompt, n_max, resp_id, rid, custom_names, tools, rt,
              thinking, tcfg, sys_len, tchoice, response_choice,
              eligible_call_names](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid);
+                Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
+                                      [&sink] { return !sink.is_writable(); });
                 auto sl_lease = slot_guard(sl);
+                if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng};
                 eng.samp = samp;
@@ -4865,12 +5041,21 @@ int main(int argc, char** argv) {
             fprintf(stderr, "wait diagnostics: [wait] lines after %d ms (Q27_WAIT_LOG_MS; 0 = off)\n",
                     wait_log_ms);
     }
-    srv.listen_after_bind();
+    const bool served = srv.listen_after_bind();
+    const int listen_errno = errno;
     // P1 Task 10 shutdown: stop the conductor (its thread cancels + closes
     // any remaining members) and join it BEFORE the engines it drives tear
     // down with `slots` at scope exit.
     if (conductor) conductor->request_stop();
     kv_conductor = nullptr; // free_slot must not poke a destroyed conductor
     conductor.reset();
+    if (!served) {
+        // the accept loop gave up (ENFILE/ENOMEM/...): say so and exit
+        // non-zero so a unit with Restart=on-failure brings the server back
+        // (bug hunt 2026-10-19: this was a silent exit 0)
+        fprintf(stderr, "error: the HTTP accept loop stopped (errno %d: %s)\n", listen_errno,
+                strerror(listen_errno));
+        return 1;
+    }
     return 0;
 }

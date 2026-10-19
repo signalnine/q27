@@ -57,7 +57,19 @@ struct TestServer {
         srv.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
             const std::string provided = q27::extract_api_key(
                 req.get_header_value("Authorization"), req.get_header_value("x-api-key"));
+            // ?verify=1 is key-gated IN the handler, as in server.cu: the
+            // pre-routing exemption sees only the URL query, and httplib
+            // merges a form-urlencoded body into req.params afterwards
+            // (bug hunt 2026-10-19).
+            if (req.has_param("verify") && !api_keys.empty() &&
+                !q27::api_key_valid(provided, api_keys)) {
+                res.status = 401;
+                res.set_header("WWW-Authenticate", "Bearer");
+                res.set_content(q27::auth_error_json(false), "application/json");
+                return;
+            }
             nlohmann::json body = {{"status", "ok"}};
+            if (req.has_param("verify")) body["verified"] = true;
             if (api_keys.empty() || q27::api_key_valid(provided, api_keys)) {
                 body["model"] = "fixture-model";
                 body["boot_id"] = "fixture-boot";
@@ -204,7 +216,34 @@ static void test_malformed_header_no_crash_rejected() {
 }
 
 
+// ---- /health?verify=1 needs the key however the parameter arrives: in the
+// URL query, or in a form-urlencoded BODY on the GET (httplib parses that
+// body into req.params after routing, so a pre-routing has_param() check
+// let it through unauthenticated -- bug hunt 2026-10-19). ----
+static void test_health_verify_needs_key_even_from_form_body() {
+    TestServer s;
+    s.start({"secret-key"});
+    httplib::Client cli("127.0.0.1", s.port);
+    auto q = cli.Get("/health?verify=1");
+    CHECK(q && q->status == 401);
+    httplib::Request req;
+    req.method = "GET";
+    req.path = "/health";
+    req.set_header("Content-Type", "application/x-www-form-urlencoded");
+    req.body = "verify=1";
+    auto r = cli.send(req);
+    CHECK(r && r->status == 401);
+    if (r && r->status == 200) fprintf(stderr, "  form-body verify bypassed the key gate\n");
+    httplib::Headers auth = {{"Authorization", "Bearer secret-key"}};
+    auto ok = cli.Get("/health?verify=1", auth);
+    CHECK(ok && ok->status == 200);
+    if (ok) CHECK(json::parse(ok->body).value("verified", false));
+    auto plain = cli.Get("/health");
+    CHECK(plain && plain->status == 200); // liveness stays open
+}
+
 int main() {
+    test_health_verify_needs_key_even_from_form_body();
     test_no_auth_configured_everything_open();
     test_health_exempt_others_require_auth();
     test_bearer_token_accepted();

@@ -259,10 +259,64 @@ inline void normalize_cc_billing_header(std::string& sys) {
 // as control tokens anywhere, so a document or tool result containing them would
 // otherwise become real role boundaries. Operator content that legitimately
 // includes the literal markers loses them -- the safe tradeoff vs injection.
-inline std::string strip_ctrl(std::string s) {
-    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
-    return s;
+// Remove every occurrence of every marker in one forward pass, including
+// occurrences formed by an inner removal: "<|im_st<|im_end|>art|>" became
+// "<|im_start|>" under the old per-marker find/erase loop and then encoded as
+// the control token -- a forged role boundary from any untrusted text field
+// (bug hunt 2026-10-19). After each byte the output's suffix is re-checked
+// until no marker ends there, so no occurrence can survive. The old loop was
+// also O(occurrences x length) (1.3 MB of markers: 0.5 s).
+template <size_t N>
+inline std::string erase_markers(const std::string& s, const std::string (&marks)[N]) {
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+        out.push_back(ch);
+        for (bool again = true; again;) {
+            again = false;
+            for (const auto& m : marks)
+                if (out.size() >= m.size() &&
+                    out.compare(out.size() - m.size(), m.size(), m) == 0) {
+                    out.erase(out.size() - m.size());
+                    again = true;
+                    break;
+                }
+        }
+    }
+    return out;
+}
+
+inline std::string strip_ctrl(const std::string& s) {
+    static const std::string marks[] = {"<|im_start|>", "<|im_end|>"};
+    return erase_markers(s, marks);
+}
+
+// Tool and parameter names are rendered as XML tag content in the 3.8
+// dialect (`<function=NAME>` / `<parameter=NAME>`), so '<' and '>' in them
+// cannot round-trip: a forced call to a tool named "a<b>c" was a 500 ("no
+// eligible tool call"), and a parameter named "x</parameter>y" came back
+// mangled (bug hunt 2026-10-19, live probe). Both are request errors; the
+// public APIs restrict names to [A-Za-z0-9_-] anyway. Accepts either
+// declaration shape (Anthropic {name, input_schema} / OpenAI
+// {function: {name, parameters}}); returns "" when every name is fine.
+inline std::string tool_decl_problem(const json& tools) {
+    if (!tools.is_array()) return "";
+    auto bad = [](const std::string& n) { return n.find_first_of("<>") != std::string::npos; };
+    for (const auto& t : tools) {
+        if (!t.is_object()) continue;
+        const json& fn = (t.contains("function") && t["function"].is_object()) ? t["function"] : t;
+        std::string name;
+        if (fn.contains("name") && fn["name"].is_string()) name = fn["name"].get<std::string>();
+        if (bad(name)) return "tool name " + json(name).dump() + " may not contain '<' or '>'";
+        const char* pkey = fn.contains("parameters") ? "parameters" : "input_schema";
+        if (fn.contains(pkey) && fn[pkey].is_object() && fn[pkey].contains("properties") &&
+            fn[pkey]["properties"].is_object())
+            for (auto it = fn[pkey]["properties"].begin(); it != fn[pkey]["properties"].end(); ++it)
+                if (bad(it.key()))
+                    return "parameter name " + json(it.key()).dump() + " of tool " + json(name).dump() +
+                           " may not contain '<' or '>'";
+    }
+    return "";
 }
 
 // Per-model dialect default, set once at boot from the artifact's
@@ -426,8 +480,7 @@ inline void strip_think_markers(std::string& s) {
                                      "<|think_ultracode|>", "<|think_extreme|>",
                                      "<|think_max|>", "<|think_medium|>",
                                      "<|think_low|>", "<|think_minimal|>"};
-    for (const auto& m : mk)
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
+    s = erase_markers(s, mk);
 }
 
 // P1a forward-scan of the (flattened) message list for <|think_*|> toggles;

@@ -15714,6 +15714,242 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-19 (bg): fifth bug hunt -- three quadratic paths in request text, a marker-strip bypass that forged role boundaries, a key bypass on /health?verify, and requests served to clients that had left
+
+Four read-only reviews over the last unread surfaces (the HTTP layer:
+auth, limits, logger, providers, shutdown; the scheduler and every
+disconnect/cancel path; the kernels no hunt had read: GDN, rmsnorm/rope,
+the T2/T3/i8g64 containers, vgemm, fdmma, pf4, the graph capture; and the
+edges: installer, RunPod handler, repack.py's GGUF parsing, the CLI arg
+loops), every CPU suite built with -fsanitize=address,undefined (all pass,
+no UBSan report; 60K fuzz-gcc iterations clean), compute-sanitizer
+memcheck over nine decode/prefill configs on the 5090 (ladder/DFlash2/
+draft-vocab/plain/fp16-KV, greedy and sampled, 2200-token prefills: 0
+errors) with synccheck/racecheck/initcheck and the Bonsai packs queued
+behind the live lanes, and a new live probe set (UTF-8 streaming parity,
+odd tool names and schemas, 70 malformed-request shapes on all three APIs,
+cancel-during-prefill, cancel-while-queued, the context edge at --ctx 4096,
+a think budget under DFlash2, a 200-request soak with RSS/VRAM sampling,
+tokenizer timing on pathological text).
+
+**Fixed (tokenizer -- all three reachable from any text field and
+count_tokens, before any length check; measured on the CPU harness):**
+- NFC canonical ordering was an insertion sort over a combining run,
+  O(run^2): 1 MB of alternating U+0301/U+0316 after one letter took 107 s to
+  encode (300 KB: 10.3 s). Now a stable sort per non-starter run: 131 ms.
+  Identical ids (same stable order by ccc).
+- encode() rescanned every special token from the current position for
+  every span between specials, and the ~26 that never occur each scan to
+  the end: 146 KB of "x<think>" took 17 s. Each special's next occurrence
+  is now cached and refreshed only once passed: 4.5 ms.
+- The BPE merge loop rescanned every pair with a string concat + hash per
+  candidate, O(word^2); a 1024-byte chunking guard kept it from stalling but
+  cost 10 s per MB of whitespace-free text (base64, minified JS, CJK runs)
+  and split long words differently from HF. Replaced by the standard
+  heap-of-(rank, pos) merge over a linked list (lowest rank first, leftmost
+  on ties): 198 ms per MB, chunking removed. Parity: 6000 generated inputs
+  (combining marks, specials with and without text between, CJK, emoji,
+  Hangul jamo) identical to the old encoder; all 6006 incl. the long-word
+  cases identical to HF tokenizers 0.22.2 on the Qwen3.8 tokenizer.json,
+  where the OLD encoder differed on the two chunked lines.
+- strip_ctrl / strip_chatml / strip_think_markers erased the first
+  occurrence from the start repeatedly (O(occurrences x length): 1.3 MB of
+  markers 0.5 s -> 1 ms) AND a marker formed by an inner removal survived:
+  `<|im_st<|im_end|>art|>` became `<|im_start|>`, which encode() then
+  turned into the control token -- a forged role boundary from user text
+  or a tool result, the exact thing the sanitizer exists to prevent. One
+  forward pass that re-checks the output's suffix after every byte; no
+  occurrence can survive (test: five nested shapes, ids counted).
+
+**Fixed (server):**
+- `/health?verify=1` (a full weight checksum on the GPU: a device-wide sync
+  and a pass over every tensor, i.e. a generation throttle; `exit(1)` if
+  its cudaMalloc fails) was key-gated in the pre-routing handler, which
+  sees only the URL query -- httplib merges a form-urlencoded BODY into
+  req.params after routing, so `GET /health` with the body `verify=1`
+  passed the exemption unauthenticated. The gate moved into the handler
+  (test_auth_integration: form-body verify without a key is 401, with the
+  key 200, bare /health still open).
+- A client that had already disconnected was still served: a request
+  abandoned while queued claimed a slot and ran its full prefill (every
+  path), a streaming request's dead socket was noticed only after the first
+  decode round, and a non-stream request was never cancelled at all -- it
+  decoded to max_tokens for nobody (one client firing N non-stream
+  max_tokens=64K requests and closing them occupied every slot for
+  minutes). claim_slot now polls the socket (is_connection_closed /
+  sink.is_writable) every 250 ms while waiting and drops the request
+  (ClientGone -> 499, logged `[wait] rid=N client disconnected after T s in
+  the queue`), the streaming providers check the socket after the claim and
+  before the prefill, and the non-stream token callbacks poll it every 16
+  tokens. Live (same probes, patched binary): the 12 requests closed while
+  queued on the 1-slot server were dropped at the queue (`[wait] rid=N
+  client disconnected after 0.3 s in the queue -- dropped`, 499) instead
+  of prefilled; a short request after 20 cancelled prefills answers in
+  0.1 s (0.9 s before) and after 5 abandoned non-stream generations in
+  0.1 s (3.5 s before, the old binary finishing them); on the 2-slot
+  conductor 18 queued requests were dropped and the after-first-round
+  cancels went from 12 to 3.
+- Rendering + tokenization ran on up to the 100 MB body cap before the
+  token count was compared to max_prompt. The longest vocab token is 128
+  bytes (computed at boot), so a rendered prompt above max_prompt x 128
+  bytes cannot fit any window: all three APIs and count_tokens now 400 it
+  before encoding (8192 ctx: anything over ~1 MB; 262K: 33 MB).
+- httplib parks every accepted socket in an unbounded job list once the 92
+  pool workers are busy; the accept queue is bounded at 256 (new sockets
+  are closed on accept past that). The per-connection worker pinning by a
+  slow sender (one header byte every 4 s holds a worker forever; only a
+  per-recv 5 s timeout exists) is httplib's design and stays: documented.
+- The `[http] METHOD PATH -> status` logger printed the URL-decoded path
+  raw: `/%1b[2J` cleared the terminal, `/%0a[req] ...` forged a reqlog
+  line for the bench parsers. Control bytes become `?`, 256-byte cap; the
+  same sanitizer covers the new exception-handler log line.
+- `listen_after_bind()` returning false (the accept loop gave up on
+  ENFILE/ENOMEM/...) was a silent `return 0`: now an error line and exit 1,
+  so a unit with Restart=on-failure brings the server back.
+- Numeric flags: `--ctx abc` / `--ctx 0` / an empty shell variable booted
+  a 32-token server that reported healthy and 400'd every prompt; `--port
+  abc` bound port 0; `--think-budget abc` meant UNBOUNDED; unknown options
+  and a trailing flag with no value were ignored. All refuse to start with
+  a message (strtol/strtod with range checks, `--ctx auto`/negative =
+  auto-size kept).
+
+**Fixed (CLI, tools, deploy):**
+- q27 CLI: `--tokens-file` ids are range-checked like `--tokens` (an id
+  past the vocab went to the embedding gather); `-n <1` and `--ctx <1`
+  refuse (a large negative -n wrapped the output vector size to a
+  length_error terminate); `--dump-logits` on an unwritable path was a
+  NULL fwrite after the full prefill.
+- `build/inspect` reported FAILED on every pack without an MTP head (the
+  installer's default Bonsai pack): the blk.64 spot-check is conditional.
+- repack.py: gguf-py never checks the tensor table's offsets, so a corrupt
+  offset repacked SILENTLY -- a tensor read its neighbour's bytes shifted by
+  a few elements, quantized fine, and the RMSE report (computed against the
+  same shifted bytes) looked normal (reviewer's probe). Offsets must be
+  aligned, in order, disjoint and inside the file, or the file is refused
+  before anything is written (probe: shifted and overlapping tables
+  refused, a good file accepted). `--name` without qwen38/qwen36 warns (the
+  pack would boot JSON-dialect + 3.6 rules).
+- install-bonsai2-8gb.sh: any argument but exactly `--mtp` was silently
+  ignored (a typo installed the plain pack); the CHECKSUMS.md5 fetch
+  failed silently under set -e (and a checksum list missing the pack sent
+  the user into a delete/redownload loop); the health wait ran out after 6
+  minutes without dying and then blamed the smoke request. All three die
+  with the cause.
+- RunPod handler.py: a q27-server that died after boot left the worker
+  alive and fast-failing every job forever (RunPod's liveness is the
+  handler process); it reboots the server once and exits the worker if that
+  fails. `int()`/`float()` of job fields ran outside the try (a non-numeric
+  max_tokens was a traceback, not the documented error dict); a
+  `Q27_API_KEY` set on the endpoint was inherited by the server while the
+  handler sent "local" (every job 401) -- it sends the configured key.
+
+**Found, not fixed:**
+- The disk-tier prefix restore (find's per-candidate preads, the ~1 GB
+  read_state, the shared-cut directory scan) runs under the GPU gate
+  inside generate_prefill, so a cold restore (206 ms warm / 681 ms cold,
+  more on a slow drive) freezes every other stream once per session. Fix
+  shape: do the file I/O before taking the Lease, keep pfx_import under it.
+- httplib's per-connection worker pinning (above).
+- Latent kernel contracts (kernel review, nothing reachable today): the
+  turbo3/turbo5/i8g64 quant_group helpers end on a cross-thread smem read
+  with no trailing barrier (a second call per block on the same scratch
+  would race; every caller is one group per block); k_gdn_gates3 (64
+  threads) and k_rope3 (32 pairs) are pinned to GDN_HEADS<=64 / N_ROT<=64,
+  which the loader asserts.
+- Responses history drops reasoning items, assistant prefill as a closed
+  turn, stop sequences, the (ba)/(be)/(bf) open items stand.
+
+**Fixed (live probe find):** a tool named with `<` or `>` (`a<b>c`,
+`x</function>y`) under a forced tool_choice was a 500 ("model produced no
+eligible tool call"): the name is XML tag content in the 3.8 dialect and
+cannot round-trip; a parameter named `x</parameter>y` came back mangled.
+Both are request errors now (400 on all three APIs, test in
+test_openai_bridge). Every other odd name passed live: spaces, quotes,
+dots, slashes, `=`, commas, a newline, a backslash, 200 characters,
+non-ASCII, `mcp__server__tool`; odd schemas (`type: [string, null]`, enum,
+5-deep objects, required naming a missing property, `properties: null`,
+`required: "city"`, a 3000-property schema that correctly hit the context
+limit) all 200/400.
+
+**Live, release binary v0.14.5 (5090, default tier + DFlash2 Q8, fp8 KV,
+--ctx 8192):** UTF-8 streaming parity 8/8 (CJK/emoji/ZWJ/flags/RTL/Thai:
+stream == non-stream byte for byte, no U+FFFD, tool arguments with
+Japanese through partial_json); 91/91 malformed-request shapes on the three
+APIs (huge/negative/wrong-typed sampling params, 2^70 seeds, messages as a
+string, null/int content, unknown roles, two user turns in a row, system as
+int/[]/[{}], tools as {}/[5]/[{}]/[{name:5}], tool_choice naming a missing
+tool, 1 MB metadata, 2000 messages, duplicate JSON keys, truncated JSON,
+NUL bytes, invalid UTF-8, a lone surrogate, a BOM, a 4 MB message,
+max_tokens 1e999): every one a 200 or 400, no 5xx, server healthy after
+each; 20 prefills cancelled at 50 ms-2 s (stream and non-stream) + 5
+abandoned non-stream generations: no slot leak, the cached prompt still
+returns the baseline text, a short request answered in 0.9 s / 3.5 s
+after them (the 3.5 s is the old binary finishing the abandoned
+generations -- see the post-fix numbers); 200-request soak (stream, tools,
+3K-token prompts, 15% mid-stream disconnects): 0 errors, RSS 21,113 ->
+21,114 MB, VRAM 29,508 -> 29,508 MB, decode 119.6 -> 121.9 t/s.
+Think budget 48 under DFlash2 (greedy, three prompts): the forced close
+landed on every one (reasoning_budget_exceeded), answers in the text
+channel (17*23 vs 20*19 -> "391"), stream == non-stream byte for byte;
+same on the ladder and the 2-slot conductor, except one cosmetic gap: a
+thinking block cut by the budget right after a token that ends in a space
+keeps that space in the stream and loses it in the non-stream response
+(149 vs 148 characters). Context edge at --ctx 4096 (prompts 1..200 tokens
+under the window and 10 over the count_tokens estimate, max_tokens 1 and
+64, stream and not), DFlash2 and ladder: 50/50 -- every one a 200 with the
+output clamped to the room left and stop_reason max_tokens, usage never
+past the window, streams end with message_stop, no hang. Queued cancels on
+the 2-slot config (6 streaming requests, 3 or all 6 closed at 0.3-2 s):
+the survivors finish, a short request answers in 0.1-0.4 s after each
+round, nothing leaks; the closed-while-queued requests were still prefilled
+and decoded by the old binary (12 `end=cancelled` after their first
+round). All six configs shut down healthy: 0 provider throws, 0
+terminates, 0 CUDA errors in any server log.
+
+**Live, patched binary (same configs):** every tokenizer case under 0.25 s
+(1 MB combining run 110.8 -> 0.17 s on count_tokens, 1 MB no-space 10.2 ->
+0.24 s, 1 MB CJK 10.7 -> 0.17 s, the 300 KB combining message 10.6 -> 0.05
+s to its 400); a 5 MB message is a 400 in 0.02-0.17 s on all five
+endpoints (messages, count_tokens, chat, completions, responses) with the
+normal token-count 400 and a normal request still working after; UTF-8
+8/8, malformed shapes 91/91, cancel-during-prefill 6/6, queued cancels
+7/7, the DFlash2/ladder/2-slot think-budget runs as before; `GET /health`
+with the form body `verify=1` on a keyed server: 401 (query form 401, with
+the key 200, bare /health 200, the checksum ran once); the escape-byte
+path reached the log as `GET /?[2Jx?[req] forged -> 404`; the strict
+flags refuse `--ctx abc/0/32k`, `--port abc/70000`, `--think-budget x`,
+`--temp nan`, `--bogus` and a trailing `--port` before touching the GPU.
+Server logs: 0 terminates, 0 CUDA errors, 0 real provider throws (the
+queued-disconnect exits are logged as such).
+
+**Clean (reviews):** the conductor's state machine under cancel (every
+wait has a predicate and a notify on every path, membership erase pairs
+with on_leave, finish_decode exactly once on every exit, no lock-order
+cycle, TokenQueue lifetime), the KV banker arithmetic, the prefix-cache
+writer/reader locking and eviction, every content-provider capture list
+(by value), nlohmann asserts behind contains() on every raw-body read, the
+100 MB body cap and header caps, auth path/method/header variants and the
+constant-time compare, metrics.h bounds, SIGPIPE, the full kernels list
+(GDN chunk/delta/convnorm, rmsnorm/rope/embed, every GEMV width table
+2..16, the T2/T3 containers and relayouts, hadamard, vgemm fragment
+indexing and pad rows, fdmma split geometry for every W, pf4 cp.async
+accounting, every captured graph's baked arguments, the DFlash2 side
+stream joins), the installer's quoting and md5 flow, repack's header
+bounds and fail-closed MTP join, loader.cpp's per-tensor checks.
+
+**Gates:** `make test-tools test-inspect test-repack corpus-check` 0 FAIL on
+the final tree (plus every orphan suite under ASan/UBSan, 100K fuzz-gcc
+iterations on the patched header); the three sm_120 canonicals on the
+rebuilt CLI equal the published values (default tier 8cf639c2..., q4s
+10e654eb..., 1500-token 8f735a13; wsum b743d26b1f0562a9); the release
+binary v0.14.5 reproduced the /health bypass live (form-body verify with no
+key: 200 and the checksum ran; query form: 401). The Bonsai-pack
+compute-sanitizer lane (T2/T3 plain, ladder, draft-vocab, sampled, 1100-token
+prefill; the 12g-flavoured W_MAX=8/PF_T=256 build serving under
+memcheck/synccheck/racecheck) and the synccheck/racecheck/initcheck pass
+over the main configs run after this entry; their results are appended
+below when they finish.
+
 ## 2026-10-10 (bf): fourth bug sweep -- request semantics against a live server, the engine lifecycle, prefill, and the KV kernels
 
 Four read-only reviews over the remaining unread surfaces (request-feature

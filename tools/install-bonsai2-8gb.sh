@@ -23,12 +23,19 @@ set -euo pipefail
 DIR=${BONSAI2_DIR:-$HOME/bonsai2}
 Q27_REF=${Q27_REF:-v0.14.5}          # the q27 release this was tested with (T3 pack, faster T3 GEMV, draft vocab, the forced-close fix for the non-MTP pack, sweep-4 request fixes)
 HF=https://huggingface.co/signalnine/Bonsai-2-27B-q27/resolve/main
-PACK=bonsai2-27b-t3-slim.q27; STACK=0.6; DV=0
-if [ "${1:-}" = "--mtp" ]; then PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; DV=40960; fi
 PORT=${PORT:-8090}
 
 say() { printf '\n== %s\n' "$*"; }
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
+
+PACK=bonsai2-27b-t3-slim.q27; STACK=0.6; DV=0
+for a in "$@"; do
+  case "$a" in
+    --mtp) PACK=bonsai2-27b-t3-mtp-slim.q27; STACK=0.8; DV=40960 ;;
+    *) die "unknown argument '$a' (the only option is --mtp)" ;;   # a typo used to silently install the plain pack
+  esac
+done
+echo "   pack: $PACK"
 
 say "preflight"
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found -- install the NVIDIA driver first"
@@ -59,7 +66,10 @@ make -C "$DIR/q27" build/q27-server-12g >"$DIR/build.log" 2>&1 || { tail -30 "$D
 ls -la "$DIR/q27/build/q27-server-12g" | awk '{print $5" bytes", $NF}'
 
 say "downloading the pack and tokenizer (6 GB, resumable; already-verified files are skipped)"
-curl -sL --fail --retry 5 -o "$DIR/models/CHECKSUMS.md5" "$HF/CHECKSUMS.md5"
+curl -sSL --fail --retry 5 -o "$DIR/models/CHECKSUMS.md5" "$HF/CHECKSUMS.md5" || die "could not fetch $HF/CHECKSUMS.md5"
+for f in qwen38-27b-mtp.tok "$PACK"; do
+  grep -q " $f\$" "$DIR/models/CHECKSUMS.md5" || die "$f is not listed in CHECKSUMS.md5 (the upstream repo changed, or the download was not the checksum file)"
+done
 for f in qwen38-27b-mtp.tok "$PACK"; do
   if [ -s "$DIR/models/$f" ] && ( cd "$DIR/models" && grep " $f\$" CHECKSUMS.md5 | md5sum -c --quiet - ) 2>/dev/null; then
     echo "   $f: present, md5 ok"; continue
@@ -90,11 +100,13 @@ say "smoke test: booting the server once (first boot ~1-2 min: the pack is relai
 "$DIR/run.sh" >"$DIR/server.log" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null || true' EXIT
+UP=0
 for i in $(seq 1 180); do
-  if curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q 200; then break; fi
+  if curl -s -m 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q 200; then UP=1; break; fi
   kill -0 $SPID 2>/dev/null || { tail -20 "$DIR/server.log"; die "server died during boot -- see $DIR/server.log"; }
   sleep 2
 done
+[ "$UP" = 1 ] || { tail -20 "$DIR/server.log"; die "server did not answer /health within 6 minutes -- see $DIR/server.log"; }
 grep -E "vram: free|\[pool\] (paged|ctx)|KV cache|wsum" "$DIR/server.log" | sed 's/^/   /'
 BODY=$(curl -s -m 300 "http://127.0.0.1:$PORT/v1/messages" \
   -H 'content-type: application/json' -H 'x-api-key: local' -H 'anthropic-version: 2023-06-01' \

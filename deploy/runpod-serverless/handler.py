@@ -37,6 +37,10 @@ TOK = os.environ.get("Q27_TOK", "/runpod-volume/qwen36-27b-mtp.tok")
 BOOT_TIMEOUT_S = int(os.environ.get("Q27_BOOT_TIMEOUT_S", "600"))
 GEN_TIMEOUT_S = int(os.environ.get("Q27_GEN_TIMEOUT_S", "600"))
 BASE = f"http://127.0.0.1:{PORT}"
+# The child inherits the environment, so a Q27_API_KEY set on the endpoint
+# turns auth on in the server; send that key (bug hunt 2026-10-19: the
+# handler always sent "local" and every job came back 401).
+API_KEY = os.environ.get("Q27_API_KEY") or "local"
 
 
 def _log(*a):
@@ -73,17 +77,38 @@ _SERVER = _boot_server()
 def _post(path, body):
     req = urllib.request.Request(
         f"{BASE}{path}", data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "x-api-key": "local"})
+        headers={"Content-Type": "application/json", "x-api-key": API_KEY})
     with urllib.request.urlopen(req, timeout=GEN_TIMEOUT_S) as r:
         return json.load(r)
 
 
-def handler(job):
-    inp = job.get("input") or {}
-    max_tokens = int(inp.get("max_tokens", 512))
-    temperature = float(inp.get("temperature", 0.0))
-    top_p = float(inp.get("top_p", 1.0))
+def _ensure_server():
+    """A q27-server that died after boot (a CUDA abort, an OOM) used to leave
+    this worker alive and healthy from RunPod's side, returning a connection
+    error for every job in milliseconds, forever (bug hunt 2026-10-19). Reboot
+    it once; if that fails, exit the worker so the platform recycles it."""
+    global _SERVER
+    if _SERVER.poll() is None:
+        return
+    _log(f"q27-server died (exit code {_SERVER.returncode}); rebooting")
     try:
+        _SERVER = _boot_server()
+    except Exception as e:  # noqa: BLE001
+        _log(f"reboot failed: {e}; exiting so the worker is recycled")
+        sys.stderr.flush()
+        os._exit(3)
+
+
+def handler(job):
+    try:
+        _ensure_server()
+        inp = job.get("input") or {}
+        if not isinstance(inp, dict):
+            return {"error": "input must be an object"}
+        # inside the try: a non-numeric field is a job error, not a traceback
+        max_tokens = int(inp.get("max_tokens") or 512)
+        temperature = float(inp.get("temperature") or 0.0)
+        top_p = float(inp.get("top_p") or 1.0)
         if "messages" in inp:  # one-turn chat via the Anthropic endpoint
             body = {"model": "q27", "max_tokens": max_tokens,
                     "messages": inp["messages"]}

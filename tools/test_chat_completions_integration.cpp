@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <climits>
 #include <vector>
 
 using json = nlohmann::json;
@@ -386,11 +387,15 @@ struct ReasoningBudgetObserver {
 
 // ---- fake httplib -------------------------------------------------------
 namespace httplib {
-struct Request { std::string body; };
+struct Request {
+    std::string body;
+    std::function<bool()> is_connection_closed = [] { return false; };
+};
 struct DataSink {
     std::string* out;
     bool write(const char* d, size_t n) { out->append(d, n); return true; }
     bool done() { return true; }
+    std::function<bool()> is_writable = [] { return true; };
 };
 struct Response {
     int status = 200;
@@ -445,6 +450,8 @@ static PreparedAnthropicPrompt prepare_anthropic_prompt_for_test(
         // in a separately labelled accounting block.
         tools=std::move(selected.tools);
         tool_names=std::move(selected.names);
+        if (const std::string p = q27::tool_decl_problem(tools); !p.empty())
+            throw std::runtime_error(p);
         tcfg=q27::resolve_think_cfg(body,!no_think_srv,req_think,-1);
         q27::validate_anthropic_tool_choice_thinking(tchoice,tcfg);
         thinking=tcfg.enabled;
@@ -505,9 +512,17 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         long rid; const char* api; unsigned long long conv;
         std::chrono::steady_clock::time_point t0; double tok_ms;
     };
-    auto claim_slot = [&](const std::vector<int>&, int, bool, const q27::ThinkCfg&, bool, long) -> Slot& {
+    auto claim_slot = [&](const std::vector<int>&, int, bool, const q27::ThinkCfg&, bool, long,
+                          const std::function<bool()>& = nullptr) -> Slot& {
         slots[0].busy = true;
         return slots[0];
+    };
+    // the byte gate (server.cu computes max_token_bytes from the vocab at boot)
+    const size_t max_token_bytes = 128;
+    const size_t max_prompt_bytes = (size_t)max_prompt * max_token_bytes;
+    auto prompt_bytes_too_long = [&](size_t bytes, const char*) { return bytes > max_prompt_bytes; };
+    auto prompt_bytes_tokens = [&](size_t bytes) {
+        return (int)std::min<size_t>(bytes / max_token_bytes, (size_t)INT_MAX);
     };
     auto slot_guard = [&](Slot& s) {
         return std::shared_ptr<Slot>(&s, [](Slot* p) { p->busy = false; });
@@ -677,6 +692,8 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 q27::OpenAIToolSelection selected=q27::select_openai_tools(body,tchoice);
                 tools=std::move(selected.tools);
                 tool_names_v=std::move(selected.names);
+                if (const std::string p = q27::tool_decl_problem(tools); !p.empty())
+                    throw std::runtime_error(p);
             } catch (const std::exception& e) {
                 res.status = 400;
                 res.set_content(json{{"error",{{"message",e.what()},
@@ -713,6 +730,17 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             // is pre-seeded straight into the TOOL channel since the marker
             // itself never appears in the GENERATED text this way.
             if (tchoice.mode == q27::ToolChoice::FORCED) rendered += "<tool_call>\n";
+            if (prompt_bytes_too_long(rendered.size(), "oai")) {
+                res.status = 400;
+                res.set_content(json{{"error",
+                                      {{"message", q27::ctx_limit_error_message(
+                                                       prompt_bytes_tokens(rendered.size()), max_prompt)},
+                                       {"type", "invalid_request_error"},
+                                       {"code", "context_length_exceeded"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             // P8/P16b: ONE pass over the prompt, in three pieces -- the system
             // block [0, sys_off), the rest of the stable history [sys_off,
             // stable_off), the volatile tail. Both cuts abut an <|im_start|>
@@ -737,6 +765,17 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             std::vector<int> tailv = tok.encode(rendered.substr(stable_off));
             prompt.insert(prompt.end(), tailv.begin(), tailv.end());
         } else {
+            if (prompt_bytes_too_long(req.body.size(), chat ? "oai" : "cmpl")) {
+                res.status = 400;
+                res.set_content(json{{"error",
+                                      {{"message", q27::ctx_limit_error_message(
+                                                       prompt_bytes_tokens(req.body.size()), max_prompt)},
+                                       {"type", "invalid_request_error"},
+                                       {"code", "context_length_exceeded"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             prompt = build_prompt(body);
         }
         ReqTrace rt{rid, chat ? "oai" : "cmpl", conv_fp(body),
@@ -807,7 +846,8 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
         const char* objd = chat ? "chat.completion.chunk" : "text_completion";
 
         if (!stream) {
-            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid); // may wait for a free engine
+            Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
+                                  [&req] { return req.is_connection_closed(); }); // may wait for a free engine
             auto sl_lease = slot_guard(sl);
             Engine& eng = *sl.eng;
             HookGuard hooks{eng}; // safe even when routed_chat is false: hooks
@@ -837,9 +877,9 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 // ORIGINAL text-only behavior, byte-for-byte unchanged.
                 std::string text;
                 q27::Utf8Gate ugate;
-                auto on_tok = [&](int id) {
+                auto on_tok = [&, gen_n = 0](int id) mutable {
                     text += ugate.feed(tok.decode_one(id));
-                    return true;
+                    return (++gen_n & 15) != 0 || !req.is_connection_closed();
                 };
                 Engine::DecodeTask bt;
                 std::string berr;
@@ -936,13 +976,15 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 if (kept < nr) return kept;
                 return m;
             };
-            auto on_tok = [&](int id, bool forced) {
+            auto on_tok = [&, gen_n = 0](int id, bool forced) mutable {
                 for (auto& [ch, t] : sp.feed(ugate.feed(tok.decode_one(id)))) {
                     if (forced && ch == StreamSplitter::TEXT && q27::strip_ws2(t).empty())
                         continue;
                     route(ch, t);
                 }
-                return true;
+                // non-stream: nothing is written until the end, so poll the
+                // socket for a disconnect (a dead client used to be served to n_max)
+                return (++gen_n & 15) != 0 || !req.is_connection_closed();
             };
             std::string berr;
             int n = conductor
@@ -1045,8 +1087,10 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             [&, samp, prompt, n_max, created, chat, objd, rt, inc_usage, routed_chat,
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
-                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid);
+                Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
+                                      [&sink] { return !sink.is_writable(); });
                 auto sl_lease = slot_guard(sl);
+                if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
                 HookGuard hooks{eng}; // see the non-stream twin
                 eng.samp = samp;

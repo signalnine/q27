@@ -262,6 +262,26 @@ static void test_anthropic_msgs_system_array_of_strings() {
 // two messages (the <tool_response> group, then the text as its own user
 // turn), in document order; until then the text was glued onto the end of
 // the tool block. Image/document blocks leave a marker instead of vanishing.
+// Bug hunt 2026-10-19 (live probe): a tool named "a<b>c" under a forced
+// tool_choice was a 500 ("no eligible tool call") and a parameter named
+// "x</parameter>y" came back mangled -- the names are XML tag content in the
+// 3.8 dialect. Both declaration shapes are checked; ordinary odd names pass.
+static void test_tool_decl_problem_rejects_angle_brackets() {
+    using json = nlohmann::json;
+    json anth = json::array({{{"name", "get weather"}, {"input_schema", {{"type", "object"}, {"properties", {{"a b", {{"type", "string"}}}}}}}}});
+    CHECK(q27::tool_decl_problem(anth).empty());
+    json anth_bad = json::array({{{"name", "a<b>c"}, {"input_schema", {{"type", "object"}}}}});
+    CHECK(q27::tool_decl_problem(anth_bad).find("tool name") != std::string::npos);
+    json anth_param = json::array({{{"name", "t"}, {"input_schema", {{"type", "object"}, {"properties", {{"x</parameter>y", {{"type", "string"}}}}}}}}});
+    CHECK(q27::tool_decl_problem(anth_param).find("parameter name") != std::string::npos);
+    json oai_bad = json::array({{{"type", "function"}, {"function", {{"name", "x</function>y"}, {"parameters", {{"type", "object"}}}}}}});
+    CHECK(q27::tool_decl_problem(oai_bad).find("tool name") != std::string::npos);
+    json oai_ok = json::array({{{"type", "function"}, {"function", {{"name", "mcp__s__t"}, {"parameters", {{"type", "object"}, {"properties", {{"a.b", {{"type", "string"}}}}}}}}}}});
+    CHECK(q27::tool_decl_problem(oai_ok).empty());
+    CHECK(q27::tool_decl_problem(json::array({5, "x", json::object()})).empty());  // wrong-typed entries are not this check's job
+    CHECK(q27::tool_decl_problem(json(nullptr)).empty());
+}
+
 static void test_anthropic_msgs_mixed_tool_result_and_text_split() {
     json body = json::parse(R"({"messages":[{"role":"user","content":[
         {"type":"tool_result","tool_use_id":"t1","content":"out1"},
@@ -3373,6 +3393,7 @@ int main() {
     test_anthropic_msgs_system_array_of_strings();
     test_anthropic_msgs_tool_result_bare_string_content();
     test_anthropic_msgs_mixed_tool_result_and_text_split();
+    test_tool_decl_problem_rejects_angle_brackets();
     test_anthropic_tools_non_array_and_non_object_entries();
     test_tool_choice_absent_is_auto();
     test_tool_choice_none();

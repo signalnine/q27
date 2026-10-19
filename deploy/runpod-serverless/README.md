@@ -85,6 +85,7 @@ and v0.14.4 bumps change only the pins.
 | `Q27_BOOT_TIMEOUT_S` | `600` | health-wait budget for cold boot |
 | `Q27_GEN_TIMEOUT_S` | `600` | per-job HTTP timeout to the local server |
 | `Q27_PORT` | `8081` | local server port (bound to 127.0.0.1) |
+| `Q27_API_KEY` | (unset) | optional; the server inherits it and turns auth on, and the handler sends it with every job. Leave unset: the server is loopback-only |
 
 ## 4. Call it
 

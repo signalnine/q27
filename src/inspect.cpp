@@ -3,6 +3,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -37,11 +38,15 @@ int main(int argc, char** argv) {
     for (const auto& [k, v] : by_type)
         printf("  %-8s %4d tensors  %8.2f GB\n", k.c_str(), v.first, v.second / 1e9);
 
-    // spot checks
+    // spot checks (the MTP block is optional: slim/no-MTP packs have no blk.64
+    // -- bug hunt 2026-10-19: the installer's default pack reported FAILED)
+    const bool has_mtp = m.find("blk.64.nextn.eh_proj.weight") != nullptr;
+    printf("mtp head: %s\n", has_mtp ? "present" : "absent (plain pack)");
     for (const char* name : {"token_embd.weight", "blk.0.ffn_gate.weight",
                              "blk.3.attn_q.weight", "blk.64.nextn.eh_proj.weight",
                              "output_norm.weight"}) {
         const q27::Tensor* t = m.find(name);
+        if (!t && !has_mtp && !strcmp(name, "blk.64.nextn.eh_proj.weight")) continue;
         if (!t) { printf("MISSING: %s\n", name); bad++; continue; }
         printf("  %-32s %-8s [", t->name.c_str(), q27::dtype_name(t->dtype));
         for (size_t i = 0; i < t->shape.size(); i++)

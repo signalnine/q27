@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <queue>
 #include <cctype>
 #include <cstdint>
 #include <unordered_map>
@@ -190,42 +191,51 @@ std::vector<int> Tokenizer::bpe_word(const std::string& word) const {
 }
 
 std::vector<int> Tokenizer::bpe_word_uncached(const std::string& word) const {
-    // Bounded-word guard: the merge loop below is O(word^2) (full pair rescan +
-    // erase-in-loop per merge). A pathological no-whitespace blob (minified JS,
-    // base64) collapses to one huge "word" and stalls tokenization single-threaded
-    // before any context check. Cap the word and BPE in WORD_CAP-byte chunks so cost
-    // is O(n * WORD_CAP), not O(n^2). Only over-cap words (already-degenerate input)
-    // get different token boundaries; normal whitespace-delimited text is far under
-    // the cap and byte-identical (the canonical is unaffected).
-    static constexpr size_t WORD_CAP = 1024;
-    if (word.size() > WORD_CAP) {
-        std::vector<int> out;
-        for (size_t off = 0; off < word.size(); off += WORD_CAP) {
-            auto chunk = bpe_word_uncached(word.substr(off, WORD_CAP));
-            out.insert(out.end(), chunk.begin(), chunk.end());
-        }
-        return out;
+    // Byte-level BPE with the HF/llama.cpp merge order: lowest-rank adjacent
+    // pair first, leftmost on a tie. O(n log n): a min-heap of (rank, pos)
+    // candidates over a linked list of symbols; stale heap entries (a pair
+    // that no longer exists at pos) are recognised by recomputing the rank.
+    // Bug hunt 2026-10-19: the full-rescan loop this replaces was O(word^2)
+    // with a string concat + hash per pair -- 10 s per MB of whitespace-free
+    // input (base64, minified JS, CJK runs) even after a 1024-byte chunking
+    // guard that also split long words differently from HF. The chunking is
+    // gone: long words now merge exactly as HF does.
+    if (word.empty()) return {};
+    struct Sym { std::string s; int prev, next; };
+    std::vector<Sym> sym;
+    sym.reserve(word.size());
+    for (unsigned char c : word) {
+        const int i = (int)sym.size();
+        sym.push_back({impl_->b2u[c], i - 1, i + 1});
     }
-    // word is raw bytes; map to byte-encoded char strings
-    std::vector<std::string> parts;
-    parts.reserve(word.size());
-    for (unsigned char c : word) parts.push_back(impl_->b2u[c]);
-
-    while (parts.size() > 1) {
-        int best = INT32_MAX, bi = -1;
-        for (size_t i = 0; i + 1 < parts.size(); i++) {
-            auto it = impl_->merge_rank.find(parts[i] + " " + parts[i + 1]);
-            if (it != impl_->merge_rank.end() && it->second < best) {
-                best = it->second;
-                bi = (int)i;
-            }
-        }
-        if (bi < 0) break;
-        parts[bi] += parts[bi + 1];
-        parts.erase(parts.begin() + bi + 1);
+    sym.back().next = -1;
+    auto rank_at = [&](int i) -> int {  // rank of the pair starting at symbol i, or -1
+        if (i < 0 || sym[i].next < 0) return -1;
+        auto it = impl_->merge_rank.find(sym[i].s + " " + sym[sym[i].next].s);
+        return it == impl_->merge_rank.end() ? -1 : it->second;
+    };
+    using Cand = std::pair<int, int>;  // (rank, pos): smallest rank, then leftmost
+    std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> heap;
+    for (int i = 0; i + 1 < (int)sym.size(); i++) {
+        const int r = rank_at(i);
+        if (r >= 0) heap.push({r, i});
+    }
+    std::vector<char> alive(sym.size(), 1);
+    while (!heap.empty()) {
+        const auto [r, i] = heap.top();
+        heap.pop();
+        if (!alive[i] || rank_at(i) != r) continue;  // stale: pos merged away or pair changed
+        const int j = sym[i].next;
+        sym[i].s += sym[j].s;
+        alive[j] = 0;
+        sym[i].next = sym[j].next;
+        if (sym[i].next >= 0) sym[sym[i].next].prev = i;
+        if (const int rl = rank_at(sym[i].prev); rl >= 0) heap.push({rl, sym[i].prev});
+        if (const int rr = rank_at(i); rr >= 0) heap.push({rr, i});
     }
     std::vector<int> out;
-    for (auto& p : parts) {
+    for (int i = 0; i >= 0; i = sym[i].next) {
+        const std::string& p = sym[i].s;
         auto it = impl_->tok2id.find(p);
         if (it != impl_->tok2id.end()) out.push_back(it->second);
         else // byte fallback: emit each char separately (should be in vocab)
@@ -392,10 +402,20 @@ std::string Tokenizer::nfc(const std::string& s) {
         decompose_cp(cp, d);
         i += len;
     }
-    for (size_t i = 1; i < d.size(); i++) {  // canonical ordering (stable)
-        const uint8_t c = ccc_of(d[i]);
-        if (c == 0) continue;
-        for (size_t j = i; j > 0 && ccc_of(d[j - 1]) > c; j--) std::swap(d[j - 1], d[j]);
+    // Canonical ordering: a stable sort by ccc within each run of non-starters
+    // (starters are barriers). Bug hunt 2026-10-19: the insertion sort this
+    // replaces was O(run^2) -- 1 MB of alternating U+0301/U+0316 after one
+    // letter took 107 s to encode (300 KB: 10 s), reachable from any request
+    // text field and count_tokens before any length check. Same result: both
+    // orderings are stable by ccc.
+    for (size_t i = 0; i < d.size();) {
+        if (ccc_of(d[i]) == 0) { i++; continue; }
+        size_t j = i + 1;
+        while (j < d.size() && ccc_of(d[j]) != 0) j++;
+        if (j - i > 1)
+            std::stable_sort(d.begin() + i, d.begin() + j,
+                             [](uint32_t a, uint32_t b) { return ccc_of(a) < ccc_of(b); });
+        i = j;
     }
     std::vector<uint32_t> r;
     r.reserve(d.size());
@@ -513,6 +533,14 @@ Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> out;
     size_t i = 0;
+    // Next occurrence of each special at or after i, refreshed only once i
+    // has passed it: every special is searched at most once per occurrence.
+    // Bug hunt 2026-10-19: the per-span rescan of every special (most of which
+    // never occur, so each find ran to the end) was O(spans x specials x text)
+    // -- 146 KB of "x<think>" took 17 s, reachable from any request text.
+    const size_t ns = impl_->specials.size();
+    std::vector<size_t> nxt(ns, 0);
+    bool nxt_valid = false;
     while (i < text.size()) {
         // greedy special-token match
         bool matched = false;
@@ -527,10 +555,12 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         if (matched) continue;
         // find next special occurrence; encode the plain span before it
         size_t next = std::string::npos;
-        for (auto& [s, id] : impl_->specials) {
-            size_t p = text.find(s, i);
-            if (p != std::string::npos && p < next) next = p;
+        for (size_t k = 0; k < ns; k++) {
+            if (!nxt_valid || (nxt[k] != std::string::npos && nxt[k] < i))
+                nxt[k] = text.find(impl_->specials[k].first, i);
+            if (nxt[k] < next) next = nxt[k];
         }
+        nxt_valid = true;
         size_t end = next == std::string::npos ? text.size() : next;
         const std::string span = nfc(text.substr(i, end - i));
         for (auto& w : pretokenize(span)) {
@@ -577,10 +607,29 @@ int Tokenizer::token_id(const std::string& s) const {
 // strip_ctrl, applied here so EVERY template caller is covered; review
 // 2026-07-09 P1 #5: the OpenAI chat path reached this function with raw
 // client strings and bypassed the Anthropic path's sanitizer).
-static std::string strip_chatml(std::string s) {
-    for (const std::string& m : {std::string("<|im_start|>"), std::string("<|im_end|>")})
-        for (size_t p; (p = s.find(m)) != std::string::npos;) s.erase(p, m.size());
-    return s;
+// One forward pass that also catches markers formed by an inner removal:
+// "<|im_st<|im_end|>art|>" became "<|im_start|>" under the old per-marker
+// erase loop and encoded as the control token (bug hunt 2026-10-19). After
+// each byte the output's suffix is re-checked until no marker ends there, so
+// no occurrence can survive. The old loop was also O(occurrences x length).
+static std::string strip_chatml(const std::string& s) {
+    static const std::string marks[] = {"<|im_start|>", "<|im_end|>"};
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+        out.push_back(ch);
+        for (bool again = true; again;) {
+            again = false;
+            for (const auto& m : marks)
+                if (out.size() >= m.size() &&
+                    out.compare(out.size() - m.size(), m.size(), m) == 0) {
+                    out.erase(out.size() - m.size());
+                    again = true;
+                    break;
+                }
+        }
+    }
+    return out;
 }
 
 std::vector<int> Tokenizer::apply_chat_template(

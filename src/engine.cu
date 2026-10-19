@@ -31,10 +31,22 @@ int main(int argc, char** argv) {
             FILE* tf = fopen(argv[++i], "r");
             if (!tf) { fprintf(stderr, "cannot open tokens-file %s\n", argv[i]); return 1; }
             int v; char sep;
-            while (fscanf(tf, "%d", &v) == 1) { toks.push_back(v); (void)fscanf(tf, "%c", &sep); }
+            while (fscanf(tf, "%d", &v) == 1) {
+                // same range check as --tokens (bug hunt 2026-10-19: an id past the
+                // vocab went straight to the embedding gather)
+                if (v < 0 || v >= VOCAB) { fprintf(stderr, "--tokens-file: id %d outside [0, %d)\n", v, VOCAB); fclose(tf); return 1; }
+                toks.push_back(v);
+                (void)fscanf(tf, "%c", &sep);
+            }
             fclose(tf);
-        } else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_gen = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
+            n_gen = atoi(argv[++i]);
+            if (n_gen < 1) { fprintf(stderr, "-n: expects a positive count, got \"%s\"\n", argv[i]); return 1; }
+        }
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
+            ctx = atoi(argv[++i]);
+            if (ctx < 1) { fprintf(stderr, "--ctx: expects a positive size, got \"%s\"\n", argv[i]); return 1; }
+        }
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
     }
     bool mtp_stats = false, spec = false, fast = false;
@@ -1437,6 +1449,7 @@ int main(int argc, char** argv) {
         std::vector<float> lg(VOCAB);
         CUDA_CHECK(cudaMemcpy(lg.data(), e.logits, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
         FILE* f = fopen(dump.c_str(), "wb");
+        if (!f) { fprintf(stderr, "--dump-logits: cannot open %s for writing\n", dump.c_str()); return 1; }
         fwrite(lg.data(), 4, VOCAB, f);
         fclose(f);
         fprintf(stderr, "logits -> %s\n", dump.c_str());
