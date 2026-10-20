@@ -15943,12 +15943,30 @@ iterations on the patched header); the three sm_120 canonicals on the
 rebuilt CLI equal the published values (default tier 8cf639c2..., q4s
 10e654eb..., 1500-token 8f735a13; wsum b743d26b1f0562a9); the release
 binary v0.14.5 reproduced the /health bypass live (form-body verify with no
-key: 200 and the checksum ran; query form: 401). The Bonsai-pack
-compute-sanitizer lane (T2/T3 plain, ladder, draft-vocab, sampled, 1100-token
-prefill; the 12g-flavoured W_MAX=8/PF_T=256 build serving under
-memcheck/synccheck/racecheck) and the synccheck/racecheck/initcheck pass
-over the main configs run after this entry; their results are appended
-below when they finish.
+key: 200 and the checksum ran; query form: 401).
+
+**compute-sanitizer (5090, CUDA 13.2.2):** memcheck 0 errors on the main
+build's ladder/DFlash2 greedy and sampled, draft-vocab, plain, fp16-KV and
+2200-token ladder prefill configs plus the 1100-token DFlash2 prefill (the
+2200-token DFlash2 prefill ran past the 25-minute timeout); synccheck 0
+errors on all eight main configs incl. the 1100-token prefill; the Bonsai
+T3/T2 packs (plain lanes, ladder, draft-vocab, sampled, 1100-token T3
+prefill, T2 plain and ladder): memcheck 0 and synccheck 0 on all seven;
+the 12g-flavoured build (W_MAX=8, PF_T=256, compiled for sm_120) serving
+the installer's --mtp config (T3+MTP, Q27_DRAFT_VOCAB=40960, --think-budget
+64, three requests incl. a tool call): memcheck 0 errors with every launch
+tracked and synccheck 0 -- with the installer's 0.8 GB fixed-stack reserve
+the sanitizer had no VRAM left and reported 14,052 UNTRACKED launches, not
+errors; the clean run used a 12 GB reserve. racecheck is not usable on
+these binaries: two unbounded runs were OOM-killed by the kernel at the
+box's 128 GB during the weight upload, and a run capped at 40 GB with
+--launch-skip 4000 hit the cap 8 s after "token graph captured". initcheck:
+plain 0; ladder 10,240 and DFlash2 2,498,562 uninitialized-read reports,
+every displayed one at two graph-construction warm-up sites (k_rmsnorm in
+mtp_pre under build_spec_graphs, k_quantize_x in gdn_block under
+build_graph) reading scratch no token had written yet -- the graphs are
+built by running the launch sequence on unwritten buffers; the generated
+tokens of all three runs are identical. Not a decode-path read; left as is.
 
 ## 2026-10-10 (bf): fourth bug sweep -- request semantics against a live server, the engine lifecycle, prefill, and the KV kernels
 
