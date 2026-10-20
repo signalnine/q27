@@ -21,7 +21,7 @@
 set -euo pipefail
 
 DIR=${BONSAI2_DIR:-$HOME/bonsai2}
-Q27_REF=${Q27_REF:-v0.14.5}          # the q27 release this was tested with (T3 pack, faster T3 GEMV, draft vocab, the forced-close fix for the non-MTP pack, sweep-4 request fixes)
+Q27_REF=${Q27_REF:-v0.14.6}          # the q27 release this was tested with (T3 pack, faster T3 GEMV, draft vocab, the forced-close fix for the non-MTP pack, sweep-4 request fixes, hunt-5 tokenizer/server fixes)
 HF=https://huggingface.co/signalnine/Bonsai-2-27B-q27/resolve/main
 PORT=${PORT:-8090}
 
