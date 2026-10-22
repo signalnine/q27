@@ -180,6 +180,68 @@ static void test_truncated_file_is_not_indexed() {
     CHECK(pc2.size() == 0); // size != header's declared payload -> skipped
 }
 
+// bug hunt 2026-10-22: an entry above --prefix-cache-max-tokens is skipped by
+// find() (it would not fit the staging buffer pinned at boot)
+static void test_entry_above_max_tokens_is_skipped() {
+    const std::string root = tmproot("ceiling");
+    q27::PrefixCache pc;
+    q27::PrefixCacheCfg c = cfg_for(root);
+    c.max_tokens = 40;
+    CHECK(pc.init(c, COMPAT_A));
+    CHECK(pc.write(seq(64), 32, "g", 1, "k", 1));
+    CHECK(pc.write(seq(64), 48, "g", 1, "k", 1)); // over the cap: still written (the cap is the reader's)
+    q27::PrefixCache::Entry e;
+    CHECK(pc.find(seq(100), &e));
+    CHECK(e.L == 32); // the longest FITTING entry, not the longest
+}
+
+// bug hunt 2026-10-22: an entry unlinked by another process on the root is
+// dropped from the index on the next lookup (has() said "present" forever, so
+// that boundary was never persisted again)
+static void test_vanished_entry_is_dropped() {
+    const std::string root = tmproot("vanish");
+    q27::PrefixCache pc;
+    CHECK(pc.init(cfg_for(root), COMPAT_A));
+    CHECK(pc.write(seq(64), 32, "g", 1, "k", 1));
+    q27::PrefixCache::Entry e;
+    CHECK(pc.find(seq(100), &e));
+    CHECK(pc.has(seq(64), 32));
+    CHECK(::unlink(e.path.c_str()) == 0); // "the other server evicted it"
+    CHECK(!pc.find(seq(100), &e));
+    CHECK(!pc.has(seq(64), 32));          // a writer may persist this boundary again
+    CHECK(pc.size() == 0);
+}
+
+// bug hunt 2026-10-22: entries of another compat are counted and reported
+// (they never counted against the budget); --prefix-cache-gc-foreign removes
+// them at boot, a plain boot leaves them alone
+static void test_foreign_entries_reported_and_gc() {
+    const std::string root = tmproot("foreign");
+    {
+        q27::PrefixCache pc;
+        CHECK(pc.init(cfg_for(root), COMPAT_A));
+        CHECK(pc.write(seq(64), 32, "g", 1, "k", 1));
+    }
+    {
+        q27::PrefixCache other;
+        CHECK(other.init(cfg_for(root), COMPAT_B));
+        CHECK(other.size() == 0);
+        CHECK(other.write(seq(64, 5000), 32, "g", 1, "k", 1)); // B's own entry (its own tokens: the file name is the token hash)
+        CHECK(other.size() == 1);
+    }
+    q27::PrefixCache again; // A's entry survived B's boot
+    CHECK(again.init(cfg_for(root), COMPAT_A));
+    CHECK(again.size() == 1);
+    q27::PrefixCacheCfg gc = cfg_for(root);
+    gc.gc_foreign = true;
+    q27::PrefixCache sweeper;
+    CHECK(sweeper.init(gc, COMPAT_A)); // removes B's file
+    CHECK(sweeper.size() == 1);
+    q27::PrefixCache b2;
+    CHECK(b2.init(cfg_for(root), COMPAT_B));
+    CHECK(b2.size() == 0);
+}
+
 static void test_rescan_survives_restart() {
     const std::string root = tmproot("restart");
     {
@@ -332,6 +394,9 @@ int main() {
     test_forged_key_collision_is_refused();
     test_compat_mismatch_is_invisible();
     test_truncated_file_is_not_indexed();
+    test_entry_above_max_tokens_is_skipped();
+    test_vanished_entry_is_dropped();
+    test_foreign_entries_reported_and_gc();
     test_rescan_survives_restart();
     test_eviction_respects_budget();
     test_touch_protects_hot_entry();

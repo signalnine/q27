@@ -164,13 +164,21 @@ class PrefixRam {
         std::lock_guard<std::mutex> lk(m_);
         if (b->inflight) { b->inflight = false; inflight_--; }
         b->toks.assign(prompt.begin(), prompt.begin() + L);
-        lru_.erase(std::remove_if(lru_.begin(), lru_.end(),
-                                  [&](const BlobPtr& x) {
-                                      return x != b && x->toks.size() == b->toks.size() &&
-                                             std::equal(x->toks.begin(), x->toks.end(),
-                                                        b->toks.begin());
-                                  }),
-                   lru_.end());
+        // a duplicate (two engines restored the same entry at once) keeps
+        // its pinned allocation: it goes to the LRU FRONT with no tokens, so
+        // acquire() reuses it next. Erasing it freed the slot for good and
+        // the next acquire() paid a cudaMallocHost on the serving path (bug
+        // hunt 2026-10-22).
+        std::vector<BlobPtr> dups;
+        for (auto& x : lru_)
+            if (x != b && x->toks.size() == b->toks.size() &&
+                std::equal(x->toks.begin(), x->toks.end(), b->toks.begin()))
+                dups.push_back(x);
+        for (auto& x : dups) {
+            lru_.erase(std::remove(lru_.begin(), lru_.end(), x), lru_.end());
+            x->toks.clear();
+            lru_.insert(lru_.begin(), x);
+        }
         lru_.erase(std::remove(lru_.begin(), lru_.end(), b), lru_.end());
         lru_.push_back(b);  // back = most recently used
     }

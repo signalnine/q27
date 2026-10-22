@@ -20,6 +20,9 @@
 // on bench-time-tracker that was worth 0.779 vs 0.967 (see docs/BUILDLOG.md
 // 2026-08-22 (c)). For Qwen3.8 agentic serving: --temp 1.0 --top-p 0.95.
 #include <atomic>
+#include <ctime>
+#include <unordered_map>
+#include "envparse.h"
 #include <random>
 #include <condition_variable>
 #include <functional>
@@ -89,8 +92,8 @@ static int g_default_top_k = 0;      // 0 = off
 static double g_default_min_p = 0.0; // 0 = off
 
 static q27k::SampleParams parse_sample(const json& body) {
-    static const double force_temp = []{ const char* e = getenv("Q27_FORCE_TEMP"); return e ? atof(e) : 0.0; }();
-    static const double force_tp   = []{ const char* e = getenv("Q27_FORCE_TOP_P"); return e ? atof(e) : 1.0; }();
+    static const double force_temp = q27::env_num("Q27_FORCE_TEMP", 0.0, 0.0, 10.0);
+    static const double force_tp   = q27::env_num("Q27_FORCE_TOP_P", 1.0, 0.0, 1.0);
     static std::atomic<unsigned long long> force_seed_ctr{0};
 
     q27k::SampleParams s{0.f, 1.f, 0ull};
@@ -100,7 +103,10 @@ static q27k::SampleParams parse_sample(const json& body) {
     double temp = q27::jnum(body, "temperature",
                             force_temp > 0.0 ? force_temp : g_default_temp);
     if (temp > 0.0) {
-        s.inv_temp = (float)(1.0 / temp);
+        // "temperature": 1e-40 made inv_temp +inf and the softmax NaN (one
+        // repeated token, every draft rejected); below 1e-4 the draw is
+        // greedy in every practical sense (bug hunt 2026-10-22)
+        s.inv_temp = (float)(1.0 / std::max(temp, 1e-4));
         double tp = q27::jnum(body, "top_p",
                               force_tp < 1.0 ? force_tp : g_default_top_p);
         s.top_p = (float)((tp > 0.0 && tp <= 1.0) ? tp : 1.0);
@@ -113,12 +119,7 @@ static q27k::SampleParams parse_sample(const json& body) {
         // -- the 12-instance campaigns were one seed, not twelve. Q27_SEED=random
         // draws a fresh seed per such request (logged in [req] as seed=, so a
         // turn stays reproducible by replaying it); Q27_SEED=N fixes the base.
-        static const long long seed_mode = [] {
-            const char* e = getenv("Q27_SEED");
-            if (!e || !*e) return 0LL;               // seed 0, the historical default
-            if (!strcmp(e, "random")) return -1LL;
-            return atoll(e);
-        }();
+        static const long long seed_mode = q27::env_seed_mode(); // 0 = the historical default
         static std::atomic<unsigned long long> auto_seed_ctr{0};
         if (body.contains("seed") && body["seed"].is_number()) {
             const json& sj = body["seed"];
@@ -346,28 +347,67 @@ static std::string log_safe(const std::string& in, size_t cap = 256) {
     return out;
 }
 
+// A provider that threw used to end the SSE with a clean chunked terminator
+// and no terminal event, so the client could not tell a failed generation
+// from a complete answer that lost its last chunk (bug hunt 2026-10-22).
+// Each API gets its own error shape: Anthropic `error` + message_stop,
+// OpenAI an `error` data chunk + [DONE], Responses `response.failed`.
+template <class Sink>
+static void abort_stream(Sink& sink, const char* api, const std::string& what) {
+    const std::string msg = json(log_safe(what, 400)).dump();
+    std::string s;
+    if (!strcmp(api, "anth"))
+        s = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":" + msg +
+            "}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    else if (!strcmp(api, "resp"))
+        s = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"object\":\"response\","
+            "\"status\":\"failed\",\"error\":{\"code\":\"internal_error\",\"message\":" + msg + "}}}\n\n";
+    else
+        s = "data: {\"error\":{\"message\":" + msg + ",\"type\":\"api_error\"}}\n\ndata: [DONE]\n\n";
+    sink.write(s.data(), s.size());
+}
 template <class F>
-static auto guard_provider(F f) {
-    return [f = std::move(f)](size_t offset, auto& sink) mutable -> bool {
+static auto guard_provider(F f, const char* api) {
+    return [f = std::move(f), api](size_t offset, auto& sink) mutable -> bool {
         try {
             return f(offset, sink);
         } catch (const ClientGone& e) {
             fprintf(stderr, "[stream] %s -- stream closed\n", e.what()); // expected, not a throw to worry about
         } catch (const std::exception& e) {
-            fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", e.what());
+            // what() can carry model text (nlohmann's "last read" excerpt)
+            fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", log_safe(e.what(), 400).c_str());
+            try { abort_stream(sink, api, e.what()); } catch (...) {}
         } catch (...) {
             fprintf(stderr, "[stream] provider threw (non-std) -- stream closed\n");
+            try { abort_stream(sink, api, "internal error"); } catch (...) {}
         }
         sink.done();
         return true;
     };
 }
 
+// SSE keepalive while a streaming request waits for a slot: an SSE comment
+// line every 10 s. Every client's SSE decoder skips comment lines; without
+// it a long queue wait was dead air after the headers (codex-rs idle timeout
+// 300 s, nginx proxy_read_timeout 60 s) (bug hunt 2026-10-22).
+static std::function<void()> keepalive_tick(httplib::DataSink& sink) {
+    auto last = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    return [&sink, last] {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - *last < std::chrono::seconds(10)) return;
+        *last = now;
+        static const char ping[] = ": ping\n\n";
+        sink.write(ping, sizeof ping - 1);
+    };
+}
+
 int main(int argc, char** argv) {
+    q27::env_preflight("q27-server"); // empty Q27_* exports dropped, string knobs lowercased, every numeric/flag knob parsed once
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s model.q27 model.tok [--port N] [--host H] [--ctx C]\n"
                 "  [--api-key KEY] [--api-key-file PATH]\n"
+                "  [--read-deadline SEC] [--max-conn-per-ip N] [--prefix-cache-gc-foreign]\n"
                 "  Defaults (2026-07-10) = the measured Claude-Code stack: fp8 KV +\n"
                 "  Q27_PMIN=0.5 + Q27_MAXD=auto7 + Q27_SUFFIX_W=<W_MAX> + Q27_FD=mma (sm_89+)\n"
                 "  + fast-head + no-think + phase stats; --ctx auto-sizes to VRAM\n"
@@ -422,6 +462,8 @@ int main(int argc, char** argv) {
     if (served_name.size() > 4 && served_name.substr(served_name.size() - 4) == ".q27")
         served_name.resize(served_name.size() - 4);
     int port = 8080, ctx = -1; // -1 = auto-size to VRAM (single-slot)
+    int read_deadline_s = 30;  // --read-deadline: whole-request read budget (slowloris guard), 0 = off
+    int max_conn_per_ip = 64;  // --max-conn-per-ip: open connections per peer address, 0 = off
     // Remembered separately because the auto-ctx block writes the chosen size
     // back into `ctx`: by the post-ready headroom check (issue #25) the value
     // no longer says whether the OPERATOR pinned it.
@@ -471,6 +513,8 @@ int main(int argc, char** argv) {
     };
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = (int)arg_int("--port", argv[++i], 1, 65535);
+        else if (!strcmp(argv[i], "--read-deadline") && i + 1 < argc) read_deadline_s = (int)arg_int("--read-deadline", argv[++i], 0, 86400);
+        else if (!strcmp(argv[i], "--max-conn-per-ip") && i + 1 < argc) max_conn_per_ip = (int)arg_int("--max-conn-per-ip", argv[++i], 0, 1000000);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
             ++i; // "auto" (or any negative) -> -1: VRAM auto-size (issue #6).
@@ -500,16 +544,22 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--kv-fp16")) kv_fp16 = true;
         // P16 persistent prefix cache (opt-in: it writes to the user's disk)
         else if (!strcmp(argv[i], "--prefix-cache") && i + 1 < argc) pfx_cfg.root = argv[++i];
-        else if (!strcmp(argv[i], "--prefix-cache-max-gb") && i + 1 < argc)
-            pfx_cfg.max_bytes = (size_t)(arg_num("--prefix-cache-max-gb", argv[++i]) * 1e9);
+        else if (!strcmp(argv[i], "--prefix-cache-max-gb") && i + 1 < argc) {
+            const double g = arg_num("--prefix-cache-max-gb", argv[++i]);
+            if (g < 0) { fprintf(stderr, "error: --prefix-cache-max-gb must be >= 0\n"); return 1; }
+            pfx_cfg.max_bytes = (size_t)(g * 1e9);
+        }
+        else if (!strcmp(argv[i], "--prefix-cache-gc-foreign")) pfx_cfg.gc_foreign = true;
         else if (!strcmp(argv[i], "--prefix-cache-min") && i + 1 < argc)
             pfx_cfg.min_tokens = (int)arg_int("--prefix-cache-min", argv[++i], 0, 1L << 30);
         else if (!strcmp(argv[i], "--prefix-cache-max-tokens") && i + 1 < argc)
             pfx_cfg.max_tokens = (int)arg_int("--prefix-cache-max-tokens", argv[++i], 0, 1L << 30);
         else if (!strcmp(argv[i], "--prefix-cache-step") && i + 1 < argc)
             pfx_cfg.step_tokens = (int)arg_int("--prefix-cache-step", argv[++i], 0, 1L << 30);
-        else if (!strcmp(argv[i], "--prefix-cache-ram-gb") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--prefix-cache-ram-gb") && i + 1 < argc) {
             pfx_ram_gb = arg_num("--prefix-cache-ram-gb", argv[++i]);
+            if (pfx_ram_gb < 0) { fprintf(stderr, "error: --prefix-cache-ram-gb must be >= 0\n"); return 1; }
+        }
         // Auth config is fail-LOUD in both directions: an empty key can never
         // authenticate anything (api_key_valid rejects an empty `provided`
         // before comparing), so accepting one would stand up a server that
@@ -683,13 +733,10 @@ int main(int argc, char** argv) {
     // 400 up front. Contradiction guard (two-tier precedent): forcing
     // sampling onto a boot that cannot sample is a config error -- refuse
     // loudly at boot, not per-request.
-    const bool sampled_on = [] {
-        const char* e = getenv("Q27_SAMPLED");
-        return !e || atoi(e) != 0;
-    }();
+    const bool sampled_on = q27::env_flag("Q27_SAMPLED", true);
     if (!sampled_on) {
         const char* ft = getenv("Q27_FORCE_TEMP");
-        if (ft && atof(ft) > 0.0) {
+        if (ft && q27::env_num("Q27_FORCE_TEMP", 0.0, 0.0, 10.0) > 0.0) {
             fprintf(stderr,
                     "q27-server: FATAL -- Q27_SAMPLED=0 with Q27_FORCE_TEMP=%s: every "
                     "request would be forced onto the disabled sampled path\n",
@@ -761,12 +808,12 @@ int main(int argc, char** argv) {
     // GB against it -- more than an 8 GB card has left after a 6 GB pack.
     // Measure it as "vram at ready" minus the pool and the arena on the
     // target build, with the arena on.
-    const double fixed_env = getenv("Q27_FIXED_STACK_GB") ? atof(getenv("Q27_FIXED_STACK_GB")) * 1e9 : -1.0;
+    const double fixed_env = getenv("Q27_FIXED_STACK_GB") ? q27::env_num("Q27_FIXED_STACK_GB", 0.0, 0.0, 64.0) * 1e9 : -1.0;
     // M3a: chunk-sized prefill scratch. Computed from the same constants the
     // arena allocates from (not a guess): the PF_T staging set + split-attn
     // partials + fp4 pair + g64 FFN staging + WY/split-K panels. Charged ONCE
     // per process when the arena is on (like kEngBase); per-slot otherwise.
-    const bool pf_arena_on = !getenv("Q27_PF_ARENA") || atoi(getenv("Q27_PF_ARENA")) != 0;
+    const bool pf_arena_on = q27::env_flag("Q27_PF_ARENA", true);
     // Shared prefill arena size, for the estimator that runs BEFORE it is
     // allocated (auto-ctx multi-slot). 0.84 GB: the PF_T staging set is 0.75,
     // and xquant_alloc + the WY panels + the SM-count-sized split-K partials
@@ -888,10 +935,7 @@ int main(int argc, char** argv) {
     // 270.0/309.8 vs 271.2/307.7 -- while buying a 7th slot and per-request
     // ctx). Q27_KV_POOL=0 restores per-slot KV. Read here, before auto-ctx,
     // because it decides whether multi-slot windows are divided or elastic.
-    const bool want_pool = [] {
-        const char* e = getenv("Q27_KV_POOL");
-        return !e || atoi(e) != 0;
-    }();
+    const bool want_pool = q27::env_flag("Q27_KV_POOL", true);
     // ELASTIC multi-slot windows (issue #42, 2026-09-10). With the pool on,
     // KV pages are already shared and handed out per request at claim_slot;
     // the only thing that still partitioned the card was each slot's
@@ -1181,7 +1225,10 @@ int main(int argc, char** argv) {
         double d2_reserve = 0;
         if (getenv("Q27_DFLASH2")) {
             d2_reserve = 2.0e9;
-            if (const char* r = getenv("Q27_DFLASH2_RESERVE_GB")) d2_reserve = atof(r) * 1e9;
+            // strict: an empty or non-numeric value used to be a ZERO reserve
+            // (silent, then a boot OOM -- issue #47's shape); a negative one
+            // made fit_slots UB and built no engine (bug hunt 2026-10-22)
+            d2_reserve = q27::env_num("Q27_DFLASH2_RESERVE_GB", d2_reserve / 1e9, 0.0, 64.0) * 1e9;
         }
         const double per_extra = (double)(ENG_FIXED_BYTES - (size_t)kEngBase) +
                                  (double)kSlotPad + d2_reserve;
@@ -1520,10 +1567,7 @@ int main(int argc, char** argv) {
         // assumes, and testing the branch itself without having to build a
         // genuinely OOM-adjacent config.
         size_t floor_mb = 192;
-        if (const char* e = getenv("Q27_READY_FLOOR_MB")) {
-            long v = atol(e);
-            if (v >= 0) floor_mb = (size_t)v;
-        }
+        floor_mb = (size_t)q27::env_int("Q27_READY_FLOOR_MB", (long)floor_mb, 0, 1000000);
         if (free_b < (floor_mb << 20)) {
             fprintf(stderr,
                     "vram: WARNING -- only %.0f MB free at ready; the conductor, "
@@ -1609,7 +1653,7 @@ int main(int argc, char** argv) {
     q27::GpuGate gpu_gate;
     std::mutex route_m;
     std::condition_variable route_cv;
-    const bool no_interleave = getenv("Q27_NO_INTERLEAVE") != nullptr;
+    const bool no_interleave = q27::env_flag("Q27_NO_INTERLEAVE", false); // was presence-only: "=0" meant ON
     fprintf(stderr, "interleave: %s\n",
             no_interleave ? "OFF (Q27_NO_INTERLEAVE)" : "round-granularity");
     std::atomic<long> req_counter{0};
@@ -1820,10 +1864,7 @@ int main(int argc, char** argv) {
     // short), parked KV growth, the GPU gate before a prefill, the gap from
     // prefill to first token -- repeated every 30 s while it lasts, and once
     // more when it ends. rid= matches the request's [req] line.
-    const int wait_log_ms = [] {
-        const char* e = getenv("Q27_WAIT_LOG_MS");
-        return e && *e ? std::max(0, atoi(e)) : 5000;
-    }();
+    const int wait_log_ms = (int)q27::env_int("Q27_WAIT_LOG_MS", 5000, 0, 10000000);
     constexpr auto kWaitRepeat = std::chrono::seconds(30);
     auto secs_since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
@@ -1895,7 +1936,8 @@ int main(int argc, char** argv) {
     auto claim_slot = [&](const std::vector<int>& prompt, int requested,
                           bool thinking, const q27::ThinkCfg& cfg,
                           bool budget_aware, long rid,
-                          const std::function<bool()>& gone = nullptr) -> Slot& {
+                          const std::function<bool()>& gone = nullptr,
+                          const std::function<void()>& tick = nullptr) -> Slot& {
         std::unique_lock<std::mutex> lk(route_m);
         // wait diagnostics: why the last selection failed, and when to say so
         const auto wait_t0 = std::chrono::steady_clock::now();
@@ -1905,7 +1947,7 @@ int main(int argc, char** argv) {
         auto wait_route = [&] {
             const auto slice = std::chrono::milliseconds(250); // disconnect poll period
             if (wait_log_ms <= 0) {
-                if (gone) route_cv.wait_for(lk, slice);
+                if (gone || tick) route_cv.wait_for(lk, slice);
                 else route_cv.wait(lk);
             } else {
                 const auto now = std::chrono::steady_clock::now();
@@ -1915,8 +1957,9 @@ int main(int argc, char** argv) {
                     wait_logged = true;
                     wait_next = now + kWaitRepeat;
                 }
-                route_cv.wait_until(lk, gone ? std::min(wait_next, now + slice) : wait_next);
+                route_cv.wait_until(lk, (gone || tick) ? std::min(wait_next, now + slice) : wait_next);
             }
+            if (tick) tick(); // SSE keepalive (rate-limited inside)
             if (gone && gone()) {
                 fprintf(stderr, "[wait] rid=%ld client disconnected after %.1f s in the queue -- dropped\n",
                         rid, secs_since(wait_t0));
@@ -2114,8 +2157,8 @@ int main(int argc, char** argv) {
     // not a server path.
     std::unique_ptr<q27::Conductor> conductor;
     {
-        const char* e = getenv("Q27_BATCH");
-        if (e && atoi(e) != 0) {
+        const char* e = getenv("Q27_BATCH"); // for the OFF line below; the flag parse is strict
+        if (q27::env_flag("Q27_BATCH", false)) {
             // Batch-mode config validation (review M2), mirroring the
             // gemm_min guardrail's refuse-to-run posture (engine.cuh "THE
             // GUARDRAIL"): the conductor's draft_and_gate() asserts the
@@ -2142,9 +2185,9 @@ int main(int argc, char** argv) {
             // simply OFF (ref = conservative reference, not a refusal).
             const char* why = nullptr; // non-null = config cannot batch
             char whybuf[96];
-            const char* pm = getenv("Q27_PMIN");  // engine: atof; gate iff > 0
-            const char* de = getenv("Q27_DEXIT"); // engine: atoi != 0, default on
-            if (!pm || atof(pm) <= 0) {
+            const char* pm = getenv("Q27_PMIN");  // engine: gate iff > 0 (finite, [0,1]: env_preflight)
+            const char* de = getenv("Q27_DEXIT"); // engine: flag, default on
+            if (!pm || q27::env_num("Q27_PMIN", 0.0, 0.0, 1.0) <= 0) {
                 if (batch_env_user) {
                     fprintf(stderr, "q27-server: FATAL -- Q27_BATCH=1 requires the gated draft "
                                     "(Q27_PMIN > 0; it is %s). Set Q27_PMIN=0.5 or drop Q27_BATCH.\n",
@@ -2208,8 +2251,7 @@ int main(int argc, char** argv) {
     // from pre_round, holding the GPU gate, then route_m -- no route_m holder
     // ever takes the gate, so the order is safe.
     {
-        const char* e = getenv("Q27_KV_INCREMENTAL");
-        const bool want = !e || atoi(e) != 0;
+        const bool want = q27::env_flag("Q27_KV_INCREMENTAL", true);
         if (conductor && kv_pool.enabled() && slots.size() > 1 && want) {
             kv_incremental = true;
             kv_conductor = conductor.get();
@@ -2436,8 +2478,53 @@ int main(int argc, char** argv) {
     srv.set_logger([](const httplib::Request& req, const httplib::Response& res) {
         // the path is URL-decoded client input (bug hunt 2026-10-19: "%1b[2J"
         // and "%0a[req] ..." reached the terminal and the reqlog parsers raw)
-        fprintf(stderr, "[http] %s %s -> %d\n", req.method.c_str(), log_safe(req.path).c_str(),
-                res.status);
+        // the METHOD is the first token of the request line and is logged
+        // (status 400) BEFORE httplib validates it, so it took the same
+        // escapes (bug hunt 2026-10-22)
+        // an unknown method is logged as a fixed word: the bench parsers key
+        // on the "[req]" substring anywhere in a line, so "GET[req]..." as a
+        // method forged a record without a single control byte
+        static const char* const known[] = {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH", "CONNECT", "TRACE"};
+        const char* method = "BADMETHOD";
+        for (const char* k : known) if (req.method == k) { method = k; break; }
+        fprintf(stderr, "[http] %s %s -> %d\n", method, log_safe(req.path).c_str(), res.status);
+    });
+    // Slowloris guard (bug hunt 2026-10-22: 100 connections dripping one
+    // header byte every 3 s, no key needed, took the server fully offline --
+    // every worker of the 23..92 pool sat in a header read). Two layers:
+    // each request's read (request line, headers, body) must finish within
+    // --read-deadline seconds of its first byte (writes are not affected, a
+    // long streaming response is fine), and one peer address may hold at
+    // most --max-conn-per-ip open connections, so a single source cannot
+    // pin the pool. Behind a reverse proxy every client shares the proxy's
+    // address: raise the cap or pass 0 there.
+    srv.set_request_read_deadline(read_deadline_s);
+    if (max_conn_per_ip > 0) {
+        static std::mutex conn_m;
+        static std::unordered_map<std::string, int> conn_per_ip;
+        static long conn_refused = 0;
+        srv.set_accept_filter([max_conn_per_ip](const std::string& ip) {
+            std::lock_guard<std::mutex> lk(conn_m);
+            int& n = conn_per_ip[ip];
+            if (n >= max_conn_per_ip) {
+                if ((conn_refused++ % 100) == 0)
+                    fprintf(stderr, "[http] %s holds %d connections (--max-conn-per-ip %d) -- refused (%ld so far)\n",
+                            log_safe(ip, 64).c_str(), n, max_conn_per_ip, conn_refused + 1);
+                return false;
+            }
+            n++;
+            return true;
+        });
+        srv.set_connection_close_hook([](const std::string& ip) {
+            std::lock_guard<std::mutex> lk(conn_m);
+            auto it = conn_per_ip.find(ip);
+            if (it == conn_per_ip.end()) return;
+            if (--it->second <= 0) conn_per_ip.erase(it);
+        });
+    }
+    // the accept-queue cap (256) and other httplib-side refusals were silent
+    srv.set_error_logger([](const httplib::Error& e, const httplib::Request*) {
+        fprintf(stderr, "[http] %s\n", httplib::to_string(e).c_str());
     });
     // A handler throw is httplib's bare 500 by default; ClientGone (the client
     // left while its request was queued) is not an error at all.
@@ -2461,8 +2548,9 @@ int main(int argc, char** argv) {
     // scraper). Every other endpoint requires a valid key. Runs before route
     // dispatch, so an invalid/missing key never reaches slot allocation,
     // tokenization, or any generation work.
-    if (!api_keys.empty()) {
-        srv.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+    {
+        const bool loopback_bind = host == "127.0.0.1" || host == "localhost" || host == "::1";
+        srv.set_pre_routing_handler([&, loopback_bind](const httplib::Request& req, httplib::Response& res) {
             // /health stays open for liveness probes. ?verify=1 (a full weight
             // checksum on the GPU) needs the key, checked IN the handler: here
             // only the URL query has been parsed, and httplib later merges a
@@ -2471,6 +2559,47 @@ int main(int argc, char** argv) {
             // unauthenticated (bug hunt 2026-10-19).
             if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
             if (req.path == "/metrics") return httplib::Server::HandlerResponse::Unhandled;
+            // Browser guards (bug hunt 2026-10-22). A page the operator visits
+            // can POST to a loopback server with no key (no-cors fetch, or a
+            // DNS-rebinding page that then reads the answers). A form
+            // content-type is what a browser can send without a preflight and
+            // no API client sends one; a non-loopback Host on a loopback bind
+            // is a rebinding page's name for this server.
+            if (req.method == "POST") {
+                std::string ct = req.get_header_value("Content-Type");
+                for (char& c : ct) c = (char)tolower((unsigned char)c);
+                if (ct.rfind("text/plain", 0) == 0 || ct.rfind("multipart/form-data", 0) == 0 ||
+                    ct.rfind("application/x-www-form-urlencoded", 0) == 0) {
+                    res.status = 415;
+                    res.set_content(json{{"error", {{"message", "Content-Type " + ct.substr(0, 40) +
+                                                                " is not accepted; send application/json"},
+                                                    {"type", "invalid_request_error"}}}}.dump(),
+                                    "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            if (loopback_bind && api_keys.empty()) {
+                std::string h = req.get_header_value("Host");
+                for (char& c : h) c = (char)tolower((unsigned char)c);
+                if (!h.empty() && h[0] == '[') { // [::1]:port
+                    const size_t rb = h.find(']');
+                    h = rb == std::string::npos ? h : h.substr(1, rb - 1);
+                } else {
+                    const size_t colon = h.find(':');
+                    if (colon != std::string::npos) h = h.substr(0, colon);
+                }
+                if (!h.empty() && h != "127.0.0.1" && h != "localhost" && h != "::1") {
+                    res.status = 403;
+                    res.set_content(json{{"error", {{"message", "Host header " + json(log_safe(h, 64)).dump() +
+                                                                " does not name this loopback server (DNS rebinding "
+                                                                "guard); connect via 127.0.0.1/localhost, or set "
+                                                                "--api-key to serve other names"},
+                                                    {"type", "permission_error"}}}}.dump(),
+                                    "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            if (api_keys.empty()) return httplib::Server::HandlerResponse::Unhandled;
             std::string provided = q27::extract_api_key(req.get_header_value("Authorization"),
                                                          req.get_header_value("x-api-key"));
             if (q27::api_key_valid(provided, api_keys))
@@ -2486,8 +2615,11 @@ int main(int argc, char** argv) {
             res.set_content(q27::auth_error_json(anthropic_shape), "application/json");
             return httplib::Server::HandlerResponse::Handled;
         });
-        fprintf(stderr, "API key authentication enabled (%zu key%s configured)\n",
-                api_keys.size(), api_keys.size() == 1 ? "" : "s");
+        if (!api_keys.empty())
+            fprintf(stderr, "API key authentication enabled (%zu key%s configured)\n",
+                    api_keys.size(), api_keys.size() == 1 ? "" : "s");
+        else if (loopback_bind)
+            fprintf(stderr, "no API key: loopback-only serving, Host header must name 127.0.0.1/localhost\n");
     }
 
     srv.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
@@ -2862,7 +2994,7 @@ int main(int argc, char** argv) {
                 // honest 500 in the OpenAI error envelope; if tokens WERE
                 // produced, keep the 200 with the partial text -- end=error is
                 // already in the [req] line either way.
-                if (!berr.empty() && n == 0) {
+                if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                     res.status = 500;
                     res.set_content(json{{"error", {{"message", berr},
                                                     {"type", "api_error"}}}}
@@ -2969,7 +3101,7 @@ int main(int argc, char** argv) {
             eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
-            if (!berr.empty() && n == 0) {
+            if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                 res.status = 500;
                 res.set_content(json{{"error", {{"message", berr}, {"type", "api_error"}}}}
                                     .dump(),
@@ -3055,7 +3187,7 @@ int main(int argc, char** argv) {
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
-                                      [&sink] { return !sink.is_writable(); });
+                                      [&sink] { return !sink.is_writable(); }, keepalive_tick(sink));
                 auto sl_lease = slot_guard(sl);
                 if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
@@ -3075,10 +3207,20 @@ int main(int argc, char** argv) {
                           0, false, q27::ThinkCfg{false, -1, true}, 0);
                 const int nm = limits.n_max;
                 const int think_budget = limits.budget;
-                auto send = [&](const json& j) {
+                bool role_sent = false;
+                auto send = [&](json j) {
+                    // the first delta carries role:"assistant" (OpenAI's shape;
+                    // stream accumulators key the message off it -- q27 never
+                    // sent it, bug hunt 2026-10-22)
+                    if (!role_sent && j.contains("choices") && !j["choices"].empty() &&
+                        j["choices"][0].contains("delta")) {
+                        j["choices"][0]["delta"]["role"] = "assistant";
+                        role_sent = true;
+                    }
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
+                std::string berr; // conductor-path failure (end=error): surfaced as an error chunk
 
                 if (!routed_chat) {
                     // ORIGINAL text-only streaming behavior, byte-for-byte unchanged.
@@ -3105,9 +3247,14 @@ int main(int argc, char** argv) {
                     int produced = conductor
                                        ? batch_generate(eng, prompt, nm,
                                                         [&](int id, bool) { return on_tok(id); },
-                                                        nullptr, -1, qw, rt, bt, nullptr)
+                                                        nullptr, -1, qw, rt, bt, &berr)
                                        : eng.generate(prompt, nm, EOS, on_tok);
                     eng.on_round_gap = nullptr;
+                    if (!berr.empty()) {
+                        abort_stream(sink, "oai", berr);
+                        sink.done();
+                        return true;
+                    }
                     std::string tailp = ugate.flush();
                     if (!tailp.empty()) send(piece_chunk(tailp));
                     // Terminal chunk with a real finish_reason (OpenAI streaming spec):
@@ -3218,10 +3365,21 @@ int main(int argc, char** argv) {
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
                 auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    const std::string body = q27::strip_ws2(tool_buf);
                     tool_buf.clear();
+                    // more than one call in one wrapper (or text after the
+                    // last): the strict parser takes the first and drops the
+                    // rest silently. The non-stream resolver hands these to
+                    // the bare chain; this leg did not (bug hunt 2026-10-22).
+                    // No EOF repair on a CLOSED wrapper on either leg: a call
+                    // assembled from a truncated argument stays text.
+                    if (has_tools && q27::wrapped_body_exceeds_one_call(body)) {
+                        if (!classify_bare(body,false,emit_text)) emit_text(body);
+                        return;
+                    }
+                    auto c = q27::parse_tool_call(body);
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) {
+                        if (!classify_bare(c.raw,false,emit_text)) {
                             // dialect control bytes only (a repeated <tool_call>
                             // opener at EOS) -- no call, and echoing the marker
                             // is worse than saying nothing. Logged, not silent.
@@ -3257,7 +3415,7 @@ int main(int argc, char** argv) {
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
                                                     [&](int id) { tc.on_id(id); },
-                                                    stable_len, qw, rt, bt, nullptr)
+                                                    stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
                                          return on_tok(id, bt.callback_forced);
@@ -3289,11 +3447,14 @@ int main(int argc, char** argv) {
                 if (!final_tool_incomplete)
                     router.finish(produced < nm && !bt.budget_truncated,
                                   allowed_tool_names, emit_text, emit_think, classify_bare);
-                // TODO(batch error surfacing): no standard OpenAI mid-stream
-                // error chunk exists (matches the plain-text leg's TODO
-                // above); end=error lands in the [req] line, [req-error]
-                // carries the what() (batch_generate logs it unconditionally
-                // when err_out is null, same as that leg's nullptr err_out).
+                // a conductor-path failure ends the stream with an error chunk
+                // (the shape the forced-tool miss below already uses; the
+                // openai SDKs raise on it) instead of finish_reason "stop"
+                if (!berr.empty()) {
+                    abort_stream(sink, "oai", berr);
+                    sink.done();
+                    return true;
+                }
                 if (q27::forced_tool_choice_missing_is_error(
                         tchoice, any_call, produced >= nm || bt.budget_truncated)) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
@@ -3322,7 +3483,7 @@ int main(int argc, char** argv) {
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
-            }));
+            }, "oai"));
     };
 
     // ---------------- Anthropic /v1/messages ----------------
@@ -3625,7 +3786,7 @@ int main(int argc, char** argv) {
             // invalid_request_error: 400s tell Claude Code to compact/give
             // up, 500s are retryable). Tokens produced = keep the 200 with
             // partial content; end=error is in the [req] line either way.
-            if (!berr.empty() && n == 0) {
+            if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                 res.status = 500;
                 res.set_content(q27::anthropic_error_json("api_error", berr),
                                 "application/json");
@@ -3713,7 +3874,7 @@ int main(int argc, char** argv) {
              allowed_tool_names, tchoice, tools, stable_len, rt, thinking, tcfg,
              sys_len, resp_model](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
-                                      [&sink] { return !sink.is_writable(); });
+                                      [&sink] { return !sink.is_writable(); }, keepalive_tick(sink));
                 auto sl_lease = slot_guard(sl);
                 if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
@@ -3772,6 +3933,8 @@ int main(int argc, char** argv) {
                 int idx = -1;       // open think/text block index, -1 = none
                 int chan_open = -1; // 0 text, 1 think
                 bool any = false;
+                std::string think_ws;    // held whitespace of the open thinking block
+                bool think_body = false; // a non-whitespace byte has been emitted in it
                 auto close_block = [&]() {
                     if (idx < 0) return;
                     if (chan_open == 1)
@@ -3779,6 +3942,8 @@ int main(int argc, char** argv) {
                             {"delta", {{"type", "signature_delta"}, {"signature", "q27-local"}}}});
                     ev("content_block_stop", {{"type", "content_block_stop"}, {"index", idx}});
                     idx = -1;
+                    think_ws.clear();
+                    think_body = false;
                 };
                 auto open_block = [&](int chan) {
                     if (idx >= 0 && chan_open != chan) close_block();
@@ -3800,9 +3965,24 @@ int main(int argc, char** argv) {
                 };
                 auto emit_think = [&](const std::string& t) {
                     if (t.empty()) return;
+                    // the non-stream body strips the block's outer whitespace
+                    // (strip_ws2); the stream used to emit every byte, so the
+                    // two differed by the trailing newline on every close (and
+                    // a whitespace-only block existed only in the stream).
+                    // Hold leading whitespace until a real byte and trailing
+                    // whitespace until the next one; the close drops it
+                    // (bug hunt 2026-10-22).
+                    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+                    size_t b = 0, e = t.size();
+                    while (b < e && ws(t[b])) b++;
+                    while (e > b && ws(t[e - 1])) e--;
+                    if (b == e) { if (think_body) think_ws += t; return; }
+                    const std::string out = think_body ? think_ws + t.substr(0, e) : t.substr(b, e - b);
+                    think_ws = t.substr(e);
+                    think_body = true;
                     open_block(1);
                     ev("content_block_delta", {{"type", "content_block_delta"}, {"index", idx},
-                        {"delta", {{"type", "thinking_delta"}, {"thinking", t}}}});
+                        {"delta", {{"type", "thinking_delta"}, {"thinking", out}}}});
                 };
                 auto emit_call = [&](const q27::ToolCall& c) {
                     if (!c.ok || !q27::tool_choice_allows_call(
@@ -3846,10 +4026,21 @@ int main(int argc, char** argv) {
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
                 auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    const std::string body = q27::strip_ws2(tool_buf);
                     tool_buf.clear();
+                    // more than one call in one wrapper (or text after the
+                    // last): the strict parser takes the first and drops the
+                    // rest silently. The non-stream resolver hands these to
+                    // the bare chain; this leg did not (bug hunt 2026-10-22).
+                    // No EOF repair on a CLOSED wrapper on either leg: a call
+                    // assembled from a truncated argument stays text.
+                    if (has_tools && q27::wrapped_body_exceeds_one_call(body)) {
+                        if (!classify_bare(body,false,emit_text)) emit_text(body);
+                        return;
+                    }
+                    auto c = q27::parse_tool_call(body);
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) {
+                        if (!classify_bare(c.raw,false,emit_text)) {
                             // dialect control bytes only (a repeated <tool_call>
                             // opener at EOS) -- no call, and echoing the marker
                             // is worse than saying nothing. Logged, not silent.
@@ -3952,7 +4143,7 @@ int main(int argc, char** argv) {
                 ev("message_stop", {{"type", "message_stop"}});
                 sink.done();
                 return true;
-            }));
+            }, "anth"));
     });
 
     // ---------------- OpenAI Responses API (Codex CLI) ----------------
@@ -4270,10 +4461,26 @@ int main(int argc, char** argv) {
                 items.push_back(item);
                 return item;
             };
-            auto flush_tool=[ctx,emit_tool]() {
-                auto c=q27::parse_tool_call(q27::strip_ws2(ctx->tool_buf));
+            auto flush_tool=[ctx,emit_tool,push_text,&tools]() {
+                const std::string body=q27::strip_ws2(ctx->tool_buf);
                 ctx->tool_buf.clear();
-                return emit_tool(std::move(c));
+                // two calls in one wrapper: hand the body to the bare chain
+                // (no EOF repair) instead of keeping the first call only
+                if(!tools.empty() && q27::wrapped_body_exceeds_one_call(body)) {
+                    std::string pre,residual;
+                    auto calls=q27::parse_bare_tool_calls(body,&pre,&tools,true,false,&residual);
+                    if(calls.empty()) return push_text(body);
+                    json last;
+                    size_t cursor=0;
+                    for(auto& call:calls) {
+                        if(call.source_begin>cursor) push_text(body.substr(cursor,call.source_begin-cursor));
+                        cursor=call.source_end;
+                        last=emit_tool(std::move(call));
+                    }
+                    if(cursor<body.size()) push_text(body.substr(cursor));
+                    return last;
+                }
+                return emit_tool(q27::parse_tool_call(body));
             };
             // Issue #38 (reopened): a complete call inside <think> used to be
             // emitted as a reasoning item and never fire on this leg too. The
@@ -4432,7 +4639,7 @@ int main(int argc, char** argv) {
             // batch error surfacing (review pass 2): nothing emitted = 500
             // (retryable-class for codex; 400 is fatal, header comment).
             // Tokens produced = keep the 200 with partial items.
-            if (!berr.empty() && produced == 0) {
+            if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                 res.status = 500;
                 res.set_content(json{{"error", {{"code", "internal_error"},
                                                 {"message", berr}}}}
@@ -4513,7 +4720,7 @@ int main(int argc, char** argv) {
              thinking, tcfg, sys_len, tchoice, response_choice,
              eligible_call_names](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt, n_max, thinking, tcfg, true, rt.rid,
-                                      [&sink] { return !sink.is_writable(); });
+                                      [&sink] { return !sink.is_writable(); }, keepalive_tick(sink));
                 auto sl_lease = slot_guard(sl);
                 if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
@@ -4530,7 +4737,11 @@ int main(int argc, char** argv) {
                 const int nm = limits.n_max;
                 const int think_budget = limits.budget;
                 bool alive = true; // cleared when a write fails (client disconnected)
-                auto ev = [&](const json& j) {
+                int seq_no = 0;
+                auto ev = [&](json j) {
+                    // every event carries a contiguous sequence_number (the
+                    // openai SDK's stream helper reads it; codex does not)
+                    j["sequence_number"] = seq_no++;
                     // codex keys off data.type; the event: line is decorative
                     std::string s = "event: " + j.value("type", std::string("x")) +
                                     "\ndata: " + jdump(j) + "\n\n";
@@ -4540,7 +4751,9 @@ int main(int argc, char** argv) {
                 };
                 ev({{"type", "response.created"},
                     {"response", {{"id", resp_id}, {"object", "response"},
-                                  {"status", "in_progress"}}}});
+                                  {"status", "in_progress"}, {"output", json::array()},
+                                  {"model", served_name},
+                                  {"created_at", (long)std::time(nullptr)}}}});
 
                 json items=json::array();
                 int tool_counter=0,out_index=0;
@@ -4555,7 +4768,17 @@ int main(int argc, char** argv) {
                 q27::IncrementalBareJsonEnd bare_scan;
                 q27::JsonStringLexState bare_text_lex;
                 q27::MarkdownFenceLexState bare_text_fence;
+                std::set<int> announced; // output indices that already had output_item.added
                 auto item_done=[&](const json& item) {
+                    // every item is announced before it is done (a reasoning
+                    // item used to appear as a bare .done)
+                    if(!announced.count(out_index)) {
+                        json added=item;
+                        if(added.value("type","")!="reasoning") added["status"]="in_progress";
+                        ev({{"type","response.output_item.added"},{"output_index",out_index},
+                            {"item",added}});
+                    }
+                    announced.erase(out_index);
                     ev({{"type","response.output_item.done"},{"output_index",out_index++},
                         {"item",item}});
                     items.push_back(item);
@@ -4674,20 +4897,22 @@ int main(int argc, char** argv) {
                     else added["input"]="";
                     ev({{"type","response.output_item.added"},{"output_index",out_index},
                         {"item",added}});
-                    if(item["type"]=="function_call")
+                    announced.insert(out_index);
+                    if(item["type"]=="function_call") {
+                        // the arguments arrive as one delta then .done (the
+                        // wire shape; they were .done only)
+                        ev({{"type","response.function_call_arguments.delta"},
+                            {"item_id",iid},{"output_index",out_index},
+                            {"delta",item["arguments"]}});
                         ev({{"type","response.function_call_arguments.done"},
                             {"item_id",iid},{"output_index",out_index},
                             {"name",call.name},{"arguments",item["arguments"]}});
+                    }
                     item_done(item);
                     output_tool_tail=true;
                     return true;
                 };
                 emit_call_ref=emit_call;
-                auto flush_tool=[&]() {
-                    auto call=q27::parse_tool_call(q27::strip_ws2(tool_buf));
-                    tool_buf.clear();
-                    if(!emit_call(call)) append_text(call.raw);
-                };
                 auto emit_recovered=[&](const std::string& source,
                                          std::vector<q27::ToolCall>& calls,
                                          bool incomplete_item) {
@@ -4723,6 +4948,21 @@ int main(int argc, char** argv) {
                     }
                     append_text(source.substr(cursor));
                     return recovered;
+                };
+                auto flush_tool=[&]() {
+                    const std::string body=q27::strip_ws2(tool_buf);
+                    tool_buf.clear();
+                    // two calls in one wrapper: the strict parser kept the first
+                    // and dropped the second silently (bug hunt 2026-10-22)
+                    if(!tools.empty() && q27::wrapped_body_exceeds_one_call(body)) {
+                        std::string pre,residual;
+                        auto calls=q27::parse_bare_tool_calls(body,&pre,&tools,true,false,&residual);
+                        if(calls.empty()) append_text(body);
+                        else emit_recovered(body,calls,false);
+                        return;
+                    }
+                    auto call=q27::parse_tool_call(body);
+                    if(!emit_call(call)) append_text(call.raw);
                 };
                 auto flush_bare=[&](bool allow_repair,bool incomplete_item=false,
                                     bool defer_failure=false) {
@@ -4910,10 +5150,11 @@ int main(int argc, char** argv) {
                 // error shape we could mirror without inventing protocol;
                 // end=error lands in the [req] line and [req-error] carries
                 // the what().
+                std::string berr; // conductor-path failure -> response.failed
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
                                                     nullptr, -1,
-                                                    qw, rt, bt, nullptr)
+                                                    qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          return on_tok(id, bt.callback_forced);
                                      }, -1, &bt);
@@ -4964,6 +5205,16 @@ int main(int argc, char** argv) {
                 const auto terminal=q27::responses_terminal_state(limit_reached);
                 finish_bare(allow_repair,terminal.incomplete);
                 flush_text(terminal.incomplete);
+                if (!berr.empty()) {
+                    // was: response.completed with status "completed" over a
+                    // generation that died (codex acted on the half answer)
+                    ev({{"type","response.failed"},
+                        {"response",{{"id",resp_id},{"object","response"},{"status","failed"},
+                                     {"output",items},
+                                     {"error",{{"code","internal_error"},{"message",berr}}}}}});
+                    sink.done();
+                    return true;
+                }
                 if (q27::forced_tool_choice_missing_is_error(
                         tchoice, tool_counter != 0, limit_reached)) {
                     json failed_response = {{"id", resp_id}, {"object", "response"},
@@ -4989,7 +5240,7 @@ int main(int argc, char** argv) {
                 ev({{"type", terminal.event}, {"response", final_response}});
                 sink.done();
                 return true;
-            }));
+            }, "resp"));
     });
 
     srv.Post("/v1/chat/completions",

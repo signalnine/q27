@@ -5,6 +5,7 @@
 //   results go back as user content wrapped in <tool_response>...</tool_response>
 #pragma once
 #include <algorithm>
+#include "envparse.h"
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -299,22 +300,40 @@ inline std::string strip_ctrl(const std::string& s) {
 // public APIs restrict names to [A-Za-z0-9_-] anyway. Accepts either
 // declaration shape (Anthropic {name, input_schema} / OpenAI
 // {function: {name, parameters}}); returns "" when every name is fine.
+// Model or client text headed for stderr: control bytes become '?' (terminal
+// escapes, a forged "[req]" line for the log parsers), bounded length. The
+// server's log_safe() is the same rule; this copy serves the parser's lines
+// (bug hunt 2026-10-22: the drift-rescue lines printed tool names and
+// model text raw).
+inline std::string log_text(const std::string& in, size_t cap = 400) {
+    std::string out = in.substr(0, cap);
+    for (char& c : out)
+        if ((unsigned char)c < 0x20 || c == 0x7f) c = '?';
+    return out;
+}
+
 inline std::string tool_decl_problem(const json& tools) {
     if (!tools.is_array()) return "";
-    auto bad = [](const std::string& n) { return n.find_first_of("<>") != std::string::npos; };
+    // '<' and '>' cannot round-trip through the XML dialect; control bytes
+    // (a newline in a tool name) reach stderr in every rescue line
+    auto bad = [](const std::string& n) {
+        for (unsigned char c : n)
+            if (c == '<' || c == '>' || c < 0x20 || c == 0x7f) return true;
+        return false;
+    };
     for (const auto& t : tools) {
         if (!t.is_object()) continue;
         const json& fn = (t.contains("function") && t["function"].is_object()) ? t["function"] : t;
         std::string name;
         if (fn.contains("name") && fn["name"].is_string()) name = fn["name"].get<std::string>();
-        if (bad(name)) return "tool name " + json(name).dump() + " may not contain '<' or '>'";
+        if (bad(name)) return "tool name " + json(name).dump() + " may not contain '<', '>' or control characters";
         const char* pkey = fn.contains("parameters") ? "parameters" : "input_schema";
         if (fn.contains(pkey) && fn[pkey].is_object() && fn[pkey].contains("properties") &&
             fn[pkey]["properties"].is_object())
             for (auto it = fn[pkey]["properties"].begin(); it != fn[pkey]["properties"].end(); ++it)
                 if (bad(it.key()))
                     return "parameter name " + json(it.key()).dump() + " of tool " + json(name).dump() +
-                           " may not contain '<' or '>'";
+                           " may not contain '<', '>' or control characters";
     }
     return "";
 }
@@ -1198,9 +1217,7 @@ static constexpr double THINK_BUDGET_FRAC = 0.5;
 // unparseable values fall back to the default rather than half-applying.
 inline double think_budget_frac() {
     static const double v = [] {
-        const char* e = getenv("Q27_THINK_BUDGET_FRAC");
-        if (!e) return THINK_BUDGET_FRAC;
-        const double d = atof(e);
+        const double d = env_num("Q27_THINK_BUDGET_FRAC", THINK_BUDGET_FRAC, 0.0, 1.0);
         return (d > 0.0 && d < 1.0) ? d : THINK_BUDGET_FRAC;
     }();
     return v;
@@ -5059,8 +5076,8 @@ inline bool recover_raw_value_call(const std::string& text, const json& tools,
             tc.rewritten_end=source_end;
             tc.arguments = std::move(args);
             tc.raw=text.substr(mo,source_end-mo);
-            fprintf(stderr, "[drift] mode-11 raw-value rescue: %s.%s (%zu bytes)\n", nm.c_str(),
-                    k.c_str(), cand - opener - 1);
+            fprintf(stderr, "[drift] mode-11 raw-value rescue: %s.%s (%zu bytes)\n", log_text(nm).c_str(),
+                    log_text(k).c_str(), cand - opener - 1);
             out.push_back(std::move(tc));
             return true;
         }
@@ -5179,7 +5196,7 @@ inline bool recover_args_object_call(const std::string& text, const json& tools,
     tc.rewritten_begin=mo;
     tc.rewritten_end=q;
     fprintf(stderr,"[drift] mode 23: args-only object + XML closers -> %s\n",
-            hit_name.c_str());
+            log_text(hit_name).c_str());
     out.push_back(std::move(tc));
     return true;
 }
@@ -5558,8 +5575,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                                text_in.find("{\"tool_call\"") != std::string::npos ||
                                text_in.find("</content>") != std::string::npos;
         if (plausible)
-            fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %.200s\n",
-                    text_in.c_str());
+            fprintf(stderr, "[q27-strict] SUPPRESSED bare-call rescue: %s\n",
+                    log_text(text_in, 200).c_str());
         return out;
     }
     // DRIFT MODE 14 (2026-08-14, Qwen3.8-27B): the model abandons the
@@ -5723,7 +5740,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     if (prefix) *prefix = text_in.substr(0, p);
                     if (remaining_text) *remaining_text = "";
                     fprintf(stderr, "[q27] drift mode 15: recovered <name>%s bare-args call\n",
-                            nm.c_str());
+                            log_text(nm).c_str());
                     drift_mode_hint = "15";
                     return std::vector<ToolCall>{std::move(tc)};
                 }
@@ -5778,7 +5795,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                             if (prefix) *prefix = text_in.substr(0, p);
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 16: recovered <function>-wrapped %s\n",
-                                    nm.c_str());
+                                    log_text(nm).c_str());
                             drift_mode_hint = "16";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
@@ -6049,7 +6066,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         if (undeclared_passthrough() && plausible_tool_identifier(tc.name) &&
                             !tc.arguments.empty()) {
                             fprintf(stderr, "[q27] undeclared tool `%s` passed through -- the client "
-                                            "answers it, the model corrects itself\n", tc.name.c_str());
+                                            "answers it, the model corrects itself\n", log_text(tc.name).c_str());
                         } else { named_undeclared = true; break; }
                     } else tc.name = alt;
                 }
@@ -6107,7 +6124,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                             if (prefix) *prefix = text_in.substr(0, jb);
                             if (remaining_text) *remaining_text = "";
                             fprintf(stderr, "[q27] drift mode 17: chimera json-head/xml-params %s\n",
-                                    nm.c_str());
+                                    log_text(nm).c_str());
                             drift_mode_hint = "17";
                             return std::vector<ToolCall>{std::move(tc)};
                         }
@@ -6298,7 +6315,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                         if (remaining_text) *remaining_text = "";
                         fprintf(stderr,
                                 "[q27] drift mode 21: openerless parameter list -> %s\n",
-                                nm.c_str());
+                                log_text(nm).c_str());
                         drift_mode_hint = "21";
                         return std::vector<ToolCall>{std::move(tc)};
                     }
@@ -6915,7 +6932,7 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
                     first=out.front().source_begin;
                     if(prefix) *prefix=strip_ws2(text.substr(0,first));
                     fprintf(stderr,"[drift] mode-10 dropped-opener rescue: %s (%zu calls)\n",
-                            candidates.front().name.c_str(),out.size());
+                            log_text(candidates.front().name).c_str(),out.size());
                 }
             }
         }
@@ -7019,8 +7036,8 @@ inline std::vector<ToolCall> parse_bare_tool_calls_impl(const std::string& text_
         // ntools distinguishes plumbing (-1/0) from a schema/inference miss (>0 =
         // mode-6 args didn't confidently match any tool). Longer window so the call
         // (not just a long preamble) is visible for post-hoc arg-shape diagnosis.
-        fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %.400s\n",
-                tools ? (int)tools->size() : -1, text_in.c_str());
+        fprintf(stderr, "[drift] UN-RESCUED (ntools=%d) intended tool call: %s\n",
+                tools ? (int)tools->size() : -1, log_text(text_in, 400).c_str());
         // The corpus record for this miss (Q27_DRIFT_CORPUS, full and
         // redacted, where the stderr line caps at 400 chars -- issue #4's
         // payload was invisible for that reason) is written by the

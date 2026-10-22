@@ -38,20 +38,29 @@ using json = nlohmann::json;
 // Every streaming handler's provider goes through this adapter: log, close the
 // stream, keep the process. Unwinding still runs the handler's guards (slot
 // release, batch member drain) because they live in the provider's frame.
+template <class Sink>
+static void abort_stream(Sink& sink, const char* api, const std::string& what) {
+    const std::string s = std::string("ABORT[") + api + "] " + what + "\n";
+    sink.write(s.data(), s.size());
+}
 template <class F>
-static auto guard_provider(F f) {
-    return [f = std::move(f)](size_t offset, auto& sink) mutable -> bool {
+static auto guard_provider(F f, const char* api) {
+    return [f = std::move(f), api](size_t offset, auto& sink) mutable -> bool {
         try {
             return f(offset, sink);
         } catch (const std::exception& e) {
             fprintf(stderr, "[stream] provider threw: %s -- stream closed\n", e.what());
+            abort_stream(sink, api, e.what());
         } catch (...) {
             fprintf(stderr, "[stream] provider threw (non-std) -- stream closed\n");
+            abort_stream(sink, api, "internal error");
         }
         sink.done();
         return true;
     };
 }
+template <class Sink>
+static std::function<void()> keepalive_tick(Sink&) { return [] {}; }
 
 using q27::Msg;
 using q27::StreamSplitter;
@@ -513,7 +522,8 @@ static void run_request(FakeTok& tok, std::string served_name, bool no_think_srv
         std::chrono::steady_clock::time_point t0; double tok_ms;
     };
     auto claim_slot = [&](const std::vector<int>&, int, bool, const q27::ThinkCfg&, bool, long,
-                          const std::function<bool()>& = nullptr) -> Slot& {
+                          const std::function<bool()>& = nullptr,
+                          const std::function<void()>& = nullptr) -> Slot& {
         slots[0].busy = true;
         return slots[0];
     };
@@ -895,7 +905,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 // honest 500 in the OpenAI error envelope; if tokens WERE
                 // produced, keep the 200 with the partial text -- end=error is
                 // already in the [req] line either way.
-                if (!berr.empty() && n == 0) {
+                if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                     res.status = 500;
                     res.set_content(json{{"error", {{"message", berr},
                                                     {"type", "api_error"}}}}
@@ -1002,7 +1012,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
             eng.on_round = nullptr;
             eng.on_round_gap = nullptr;
             req_log(rt, qw, eng, sl.id, tg_stats(tc) + bat_stats(bt));
-            if (!berr.empty() && n == 0) {
+            if (!berr.empty()) { // partial output over a failed generation is not an answer (bug hunt 2026-10-22)
                 res.status = 500;
                 res.set_content(json{{"error", {{"message", berr}, {"type", "api_error"}}}}
                                     .dump(),
@@ -1088,7 +1098,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
              tools, tool_names_v, allowed_tool_names, tchoice, stable_len, has_tools, rid,
              thinking, tcfg, sys_len, think_aware](size_t, httplib::DataSink& sink) {
                 Slot& sl = claim_slot(prompt,n_max,thinking,tcfg,think_aware,rt.rid,
-                                      [&sink] { return !sink.is_writable(); });
+                                      [&sink] { return !sink.is_writable(); }, keepalive_tick(sink));
                 auto sl_lease = slot_guard(sl);
                 if (!sink.is_writable()) { sink.done(); return true; } // gone before the prefill
                 Engine& eng = *sl.eng;
@@ -1108,10 +1118,20 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                           0, false, q27::ThinkCfg{false, -1, true}, 0);
                 const int nm = limits.n_max;
                 const int think_budget = limits.budget;
-                auto send = [&](const json& j) {
+                bool role_sent = false;
+                auto send = [&](json j) {
+                    // the first delta carries role:"assistant" (OpenAI's shape;
+                    // stream accumulators key the message off it -- q27 never
+                    // sent it, bug hunt 2026-10-22)
+                    if (!role_sent && j.contains("choices") && !j["choices"].empty() &&
+                        j["choices"][0].contains("delta")) {
+                        j["choices"][0]["delta"]["role"] = "assistant";
+                        role_sent = true;
+                    }
                     std::string s = "data: " + jdump(j) + "\n\n";
                     return sink.write(s.data(), s.size());
                 };
+                std::string berr; // conductor-path failure (end=error): surfaced as an error chunk
 
                 if (!routed_chat) {
                     // ORIGINAL text-only streaming behavior, byte-for-byte unchanged.
@@ -1138,9 +1158,14 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     int produced = conductor
                                        ? batch_generate(eng, prompt, nm,
                                                         [&](int id, bool) { return on_tok(id); },
-                                                        nullptr, -1, qw, rt, bt, nullptr)
+                                                        nullptr, -1, qw, rt, bt, &berr)
                                        : eng.generate(prompt, nm, EOS, on_tok);
                     eng.on_round_gap = nullptr;
+                    if (!berr.empty()) {
+                        abort_stream(sink, "oai", berr);
+                        sink.done();
+                        return true;
+                    }
                     std::string tailp = ugate.flush();
                     if (!tailp.empty()) send(piece_chunk(tailp));
                     // Terminal chunk with a real finish_reason (OpenAI streaming spec):
@@ -1251,10 +1276,21 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                     return q27::BareToolCandidateResult{true,recovered!=0};
                 };
                 auto emit_tool = [&]() {
-                    auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
+                    const std::string body = q27::strip_ws2(tool_buf);
                     tool_buf.clear();
+                    // more than one call in one wrapper (or text after the
+                    // last): the strict parser takes the first and drops the
+                    // rest silently. The non-stream resolver hands these to
+                    // the bare chain; this leg did not (bug hunt 2026-10-22).
+                    // No EOF repair on a CLOSED wrapper on either leg: a call
+                    // assembled from a truncated argument stays text.
+                    if (has_tools && q27::wrapped_body_exceeds_one_call(body)) {
+                        if (!classify_bare(body,false,emit_text)) emit_text(body);
+                        return;
+                    }
+                    auto c = q27::parse_tool_call(body);
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) {
+                        if (!classify_bare(c.raw,false,emit_text)) {
                             // dialect control bytes only (a repeated <tool_call>
                             // opener at EOS) -- no call, and echoing the marker
                             // is worse than saying nothing. Logged, not silent.
@@ -1290,7 +1326,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 int produced = conductor
                                    ? batch_generate(eng, prompt, nm, on_tok,
                                                     [&](int id) { tc.on_id(id); },
-                                                    stable_len, qw, rt, bt, nullptr)
+                                                    stable_len, qw, rt, bt, &berr)
                                    : eng.generate(prompt, nm, EOS, [&](int id) {
                                          tc.on_id(id);
                                          return on_tok(id, bt.callback_forced);
@@ -1322,11 +1358,14 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 if (!final_tool_incomplete)
                     router.finish(produced < nm && !bt.budget_truncated,
                                   allowed_tool_names, emit_text, emit_think, classify_bare);
-                // TODO(batch error surfacing): no standard OpenAI mid-stream
-                // error chunk exists (matches the plain-text leg's TODO
-                // above); end=error lands in the [req] line, [req-error]
-                // carries the what() (batch_generate logs it unconditionally
-                // when err_out is null, same as that leg's nullptr err_out).
+                // a conductor-path failure ends the stream with an error chunk
+                // (the shape the forced-tool miss below already uses; the
+                // openai SDKs raise on it) instead of finish_reason "stop"
+                if (!berr.empty()) {
+                    abort_stream(sink, "oai", berr);
+                    sink.done();
+                    return true;
+                }
                 if (q27::forced_tool_choice_missing_is_error(
                         tchoice, any_call, produced >= nm || bt.budget_truncated)) {
                     send(json{{"error",{{"message","model produced no eligible tool call for forced tool_choice"},
@@ -1355,7 +1394,7 @@ auto handle = [&](const httplib::Request& req, httplib::Response& res, bool chat
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
-            }));
+            }, "oai"));
     };
 
     handle(req, res, chat);

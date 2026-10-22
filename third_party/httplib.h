@@ -2147,6 +2147,16 @@ public:
   Server &set_tcp_nodelay(bool on);
   Server &set_ipv6_v6only(bool on);
   Server &set_socket_options(SocketOptions socket_options);
+  // q27: slowloris guard. The deadline bounds the read of ONE request
+  // (request line + headers + body) from its first byte; a socket that
+  // drips header bytes slower than that is closed and its worker freed.
+  // The accept filter runs on the accept thread before the connection is
+  // handed to a worker (per-peer connection cap); the close hook fires when
+  // that connection ends (or could not be queued), so the filter's count
+  // can be released.
+  Server &set_request_read_deadline(time_t sec);
+  Server &set_accept_filter(std::function<bool(const std::string &remote_addr)> filter);
+  Server &set_connection_close_hook(std::function<void(const std::string &remote_addr)> hook);
 
   Server &set_default_headers(Headers headers);
   Server &
@@ -2339,6 +2349,9 @@ private:
   bool tcp_nodelay_ = CPPHTTPLIB_TCP_NODELAY;
   bool ipv6_v6only_ = CPPHTTPLIB_IPV6_V6ONLY;
   SocketOptions socket_options_ = default_socket_options;
+  time_t request_read_deadline_msec_ = 0; // q27: 0 = off (upstream behaviour)
+  std::function<bool(const std::string &)> accept_filter_;         // q27
+  std::function<void(const std::string &)> connection_close_hook_; // q27
 
   Headers default_headers_;
   std::function<ssize_t(Stream &, Headers &)> header_writer_ =
@@ -6309,12 +6322,19 @@ process_server_socket(const std::atomic<socket_t> &svr_sock, socket_t sock,
                       size_t keep_alive_max_count,
                       time_t keep_alive_timeout_sec, time_t read_timeout_sec,
                       time_t read_timeout_usec, time_t write_timeout_sec,
-                      time_t write_timeout_usec, T callback) {
+                      time_t write_timeout_usec, time_t request_read_deadline_msec,
+                      T callback) {
   return process_server_socket_core(
       svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
       [&](bool close_connection, bool &connection_closed) {
+        // q27: the stream is created once keep_alive() saw the first byte of
+        // this request; the deadline (0 = none) caps every read of the
+        // request from here. Writes keep the plain write timeout, so a long
+        // streaming response is not affected.
         SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
-                          write_timeout_sec, write_timeout_usec);
+                          write_timeout_sec, write_timeout_usec,
+                          request_read_deadline_msec,
+                          std::chrono::steady_clock::now());
         // process_server_socket_core() only gets here once keep_alive() has
         // seen the socket go readable.
         strm.set_readable_hint();
@@ -12305,6 +12325,22 @@ inline Server &Server::set_socket_options(SocketOptions socket_options) {
   return *this;
 }
 
+// q27
+inline Server &Server::set_request_read_deadline(time_t sec) {
+  request_read_deadline_msec_ = sec > 0 ? sec * 1000 : 0;
+  return *this;
+}
+inline Server &
+Server::set_accept_filter(std::function<bool(const std::string &)> filter) {
+  accept_filter_ = std::move(filter);
+  return *this;
+}
+inline Server &
+Server::set_connection_close_hook(std::function<void(const std::string &)> hook) {
+  connection_close_hook_ = std::move(hook);
+  return *this;
+}
+
 inline Server &Server::set_default_headers(Headers headers) {
   default_headers_ = std::move(headers);
   return *this;
@@ -13037,6 +13073,14 @@ inline bool Server::listen_internal() {
           continue;
         } else if (errno == EINTR || errno == EAGAIN) {
           continue;
+        } else if (errno == ENFILE || errno == ENOBUFS || errno == ENOMEM ||
+                   errno == ECONNABORTED || errno == EPERM) {
+          // q27: transient host pressure (system fd table, socket buffers,
+          // memory) or an aborted handshake -- back off and keep accepting
+          // instead of closing the listener (which exits the server and
+          // costs a full model reload).
+          std::this_thread::sleep_for(std::chrono::milliseconds{10});
+          continue;
         }
         if (svr_sock_ != INVALID_SOCKET) {
           detail::close_socket(svr_sock_);
@@ -13055,11 +13099,25 @@ inline bool Server::listen_internal() {
 
       if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
 
+      // q27: per-peer accept filter (runs on the accept thread, before a
+      // worker is committed to this socket)
+      std::string q27_peer;
+      if (accept_filter_ || connection_close_hook_) {
+        int q27_peer_port = 0;
+        detail::get_remote_ip_and_port(sock, q27_peer, q27_peer_port);
+      }
+      if (accept_filter_ && !accept_filter_(q27_peer)) {
+        detail::shutdown_socket(sock);
+        detail::close_socket(sock);
+        continue;
+      }
+
       if (!task_queue->enqueue(
               [this, sock]() { process_and_close_socket(sock); })) {
         output_error_log(Error::ResourceExhaustion, nullptr);
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
+        if (connection_close_hook_) { connection_close_hook_(q27_peer); } // q27
       }
     }
 
@@ -13671,7 +13729,7 @@ inline bool Server::process_and_close_socket(socket_t sock) {
   auto ret = detail::process_server_socket(
       svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
       read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
-      write_timeout_usec_,
+      write_timeout_usec_, request_read_deadline_msec_,
       [&](Stream &strm, bool close_connection, bool &connection_closed) {
         return process_request(strm, remote_addr, remote_port, local_addr,
                                local_port, close_connection, connection_closed,
@@ -13679,6 +13737,7 @@ inline bool Server::process_and_close_socket(socket_t sock) {
       });
 
   detail::drain_and_close_socket(sock);
+  if (connection_close_hook_) { connection_close_hook_(remote_addr); } // q27
   return ret;
 }
 

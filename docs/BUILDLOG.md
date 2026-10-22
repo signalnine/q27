@@ -15714,6 +15714,204 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-22 (bh): sixth bug hunt -- a request-read-deadline + per-peer connection cap, failed generations no longer reported as finished answers, a dropped second tool call on the stream legs, a 500 on short prompts for no-MTP packs, and strict environment-knob parsing
+
+Four read-only reviews over the surfaces no earlier hunt had read (response
+assembly and SSE for the three APIs; the prefix cache and every state
+import/export path; the generate loop's exits, the DFlash2/ladder runtime,
+and the ~108 Q27_* environment knobs; the process layer -- lifecycle,
+logging, metrics, drift capture, auth, httplib's accept loop), plus a live
+probe set that weighed what reading could not: an SSE grammar validator for
+all three APIs (event order, block indices, partial_json concatenation,
+sequence numbers, stream vs non-stream byte parity), 22 conversation-history
+shapes, raw-socket protocol edges (chunked bodies, Expect: 100-continue,
+HTTP/1.0, pipelining, mismatched Content-Length, oversize headers, compressed
+bodies, bare-LF framing), connection-pool saturation, file-descriptor /
+thread / RSS growth under distinct tool schemas, SIGTERM and kill -9 lanes,
+and a tokenizer decode harness under ASan (every id, out-of-range ids, 2000
+random sequences: clean).
+
+**Fixed (availability -- the HTTP front):**
+- Each connection holds one pool worker for its whole life, and the pool is
+  bounded (23 workers growing to 92). A set of connections that never finish
+  sending their request headers could therefore hold every worker and leave
+  the server unable to answer, with no key required (the header read happens
+  before auth). Measured: 100 such connections held the server unresponsive
+  for as long as they were kept open. Two limits now bound this. Every
+  request's bytes (request line, headers, body) must arrive within
+  `--read-deadline` seconds of the first byte (default 30; a long streaming
+  RESPONSE is unaffected -- only the read is bounded), implemented as a
+  per-request deadline on the vendored httplib SocketStream. And one peer
+  address may hold at most `--max-conn-per-ip` open connections (default 64,
+  below the worker ceiling), enforced by an accept-thread filter with a
+  matching close hook, both added to httplib behind the existing
+  vendored-patch comment convention. Live: with the cap, 100/200 connections
+  from one address are capped while a second address is served normally;
+  with the cap off, the read deadline frees the held workers and the server
+  recovers. A caller that shares its address with others (behind a reverse
+  proxy) is the documented case to raise or disable the cap.
+- `accept()` returning a transient error (ENFILE/ENOBUFS/ENOMEM/
+  ECONNABORTED/EPERM) closed the listen socket and exited the process, which
+  costs a full model reload. Those cases now back off 10 ms and keep
+  accepting; only a genuinely broken listener exits.
+
+**Fixed (correctness the client sees):**
+- A generation that failed partway (a CUDA fault, a parser throw on odd model
+  output, an allocation failure) was reported to the client as a normal
+  finish: the streaming providers ended the SSE with a clean terminator and
+  no terminal event, the OpenAI stream sent `finish_reason: stop`, the
+  Responses stream sent `response.completed`, and every non-stream leg
+  returned 200 with the partial text. A client could not tell a failed answer
+  from a complete one. A provider throw now emits the API's own error shape
+  before closing (Anthropic `error` + `message_stop`, OpenAI an `error` chunk
+  + `[DONE]`, Responses `response.failed`); a conductor-path failure takes the
+  same shapes; and a non-stream leg with a failed generation returns 500
+  even when partial tokens were produced.
+- Two tool calls inside one `<tool_call>` wrapper: the strict parser keeps the
+  first and drops the second silently. The non-stream Anthropic resolver
+  already routed a multi-call wrapper to the batch-aware chain; the three
+  streaming legs and the Responses non-stream leg did not. They do now. A
+  closed wrapper with a malformed body is no longer EOF-repaired on the
+  streaming legs (the non-stream legs never did): a call assembled from a
+  truncated argument stays visible text rather than executing.
+- OpenAI chat streaming never sent `role: "assistant"` in the first delta,
+  which the SDK stream accumulators key on; it does now.
+- Responses streaming carried no `sequence_number` on any event, announced a
+  reasoning item with only a `done` (no `added`), sent function-call
+  arguments only as `done` (no `delta`), and sent a stub `response.created`.
+  Every event now carries a contiguous sequence number, every item is
+  announced before it is done, arguments arrive as a delta then done, and
+  `response.created` carries the full response stub. Codex was unaffected (it
+  keys off the item/terminal types); the official SDK stream helper reads
+  these fields.
+- The Anthropic thinking stream emitted one more trailing byte than the
+  non-stream body on every close (the non-stream path strips the block's
+  outer whitespace, the stream emitted every byte), and a whitespace-only
+  thinking block existed only in the stream. The stream now holds a thinking
+  block's leading and trailing whitespace until a non-whitespace byte and
+  drops a block that never had one, matching the non-stream body.
+
+**Fixed (engine):**
+- On a pack with no MTP head (the Bonsai 2 plain pack, the installer's
+  default), the server's serial prefill path called the MTP forward step
+  unconditionally, so every prompt of 2..31 tokens through `/v1/completions`
+  or a short chat turn was a 500 ("not resident on device:
+  blk.64.nextn.enorm.weight"). The CLI's equivalent loop already guarded this;
+  the server's did not. Guarded now, and the Claude Code profile's
+  `Q27_PF_BATCH_MIN=2` is read before the no-MTP early return so Bonsai short
+  prompts take the chunked path the profile intends. Live old-vs-new on the
+  plain T3 pack: the 4-word, 12-word and tiny-chat prompts were 500/500/500,
+  now 200/200/200, zero not-resident errors in the new log.
+- A sub-normal `temperature` (for example 1e-40) made the inverse-temperature
+  infinite and the softmax NaN, so the sampler degenerated to one repeated
+  token. Clamped: below 1e-4 the draw is greedy.
+
+**Fixed (configuration -- a strict environment-knob parser, src/envparse.h):**
+The ~108 Q27_* knobs were read with bare atoi/atof, so a value that did not
+parse silently meant 0 (= off for a default-on feature), an exported EMPTY
+variable from an unset shell variable in a recipe beat the serving profile's
+default (Q27_KV= gave fp16 KV and half the context; an empty DFlash2 reserve
+gave a zero reserve and a boot out-of-memory), and a few presence-only knobs
+were on at "=0". `env_preflight()` now runs once at boot (server and CLI):
+empty Q27_* exports are dropped with a notice, the string-valued knobs are
+lowercased, and every numeric/flag knob is parsed once with a range so a bad
+value refuses to boot with the variable named rather than failing at the
+first request that reaches a lazily-read static. Flags take
+0/1/on/off/true/false/yes/no; a few that were presence-only (Q27_TOOL_SPLIT,
+Q27_SAMPLE_PLAIN, Q27_NO_INTERLEAVE, Q27_D2_NOGRAPH) now parse their value;
+Q27_SUFFIX_L has a floor of 4 and its host staging is zero-initialised (a
+threshold of 0 fired a suffix round every round with uninitialised draft ids);
+Q27_CKPT_SLOTS is capped at 256 (2e9 was a first-prefill bad_alloc);
+Q27_PMIN=nan is refused (it passed the `<=0` check and later tripped an
+assert). Live boot refusals confirmed for each class.
+
+**Fixed (logging / request hardening):**
+- The `[http]` log line printed the raw request METHOD, which httplib fills
+  before validating it, so an unknown method took terminal escapes and could
+  forge a `[req]` record for the log parsers (the 2026-10-19 path fix left
+  this sibling). An unknown method is now logged as a fixed word; the escape
+  path reaches the log as `[http] BADMETHOD -> 400`, no control bytes.
+- Ten tool-parser rescue log lines and the provider-threw line printed tool
+  names and model text raw; all go through a sanitizer now (control bytes to
+  `?`, length capped). A tool declared with a control character in its name
+  is refused at the request (the existing `<`/`>` check extended).
+- Browser guards, always on: a POST with a form content-type (`text/plain`,
+  `multipart/form-data`, `application/x-www-form-urlencoded`) is a 415, and on
+  a loopback bind with no key a `Host` header that does not name the loopback
+  address is a 403, so a web page cannot drive a loopback server through the
+  operator's browser.
+- A streaming request that waits for a slot now gets an SSE keepalive comment
+  every 10 s, so a long queue wait is not silent after the headers (client
+  idle timeouts).
+
+**Fixed (prefix cache):**
+- `find()` skips an entry longer than `--prefix-cache-max-tokens` (a root
+  shared with a larger config, or the cap lowered): restoring it meant a
+  pinned free+alloc under the GPU gate.
+- An entry removed by another process on the same root is dropped from the
+  index on the next lookup (the stale index had `has()` reporting it present
+  forever, so that boundary was never persisted again, and the log blamed the
+  tokens); the startup tmp sweep skips files belonging to a live pid.
+- Entries written by another configuration on the same root (different model,
+  KV dtype or drafter mode) were invisible to the budget and never evicted --
+  on a tmpfs root they hold RAM indefinitely. They are counted and reported at
+  boot; `--prefix-cache-gc-foreign` removes them once.
+- The RAM tier's publish erased a duplicate slot's pinned allocation (two
+  engines restoring the same entry at once), shrinking the tier for good and
+  paying a pinned alloc on the next serving-path acquire; it now keeps the
+  allocation and reuses it. A writer thread that fails to start releases its
+  reserve claim instead of stranding the key.
+- `--prefix-cache-max-gb` / `--prefix-cache-ram-gb` refuse a negative value.
+
+**Found, not fixed (documented):** a literal `<tool_call>` the model writes
+inside its reasoning is blanked in the stream but kept in the non-stream body
+(the two differ for that case); a call recovered from inside reasoning gives a
+thinking/tool/thinking block order in the stream vs thinking-then-tool in the
+non-stream body; the prefill wait still has no keepalive (only the slot wait
+does); the disk-tier restore's file I/O still runs under the GPU gate (the
+reviewer's lease-hoisting analysis is in the hunt notes); the MTP row at the
+cut boundary keeps the writer's token; the `--constrain-tools` device mask
+pool is append-only (512 per engine) and its host cache is unbounded; a
+graceful SIGTERM (drain in-flight) is not implemented -- instant kill is safe
+for the on-disk state (tmp + rename), which the live kill-9 and SIGTERM lanes
+confirmed; httplib serves one response per pipelined read and rejects bare-LF
+framing (both its design). The (bg)/(bf)/(be) open items stand.
+
+**Live (patched binary, 5090, default tier + DFlash2 Q8, fp8 KV):** SSE
+grammar + stream-vs-non-stream parity 49/49 on the DFlash2, think-budget and
+2-slot configs for all three APIs; 22/22 history shapes; the forged-method and
+escape injection reach the log sanitized; the Host and content-type guards
+return 403/415 and leave normal loopback traffic at 200 (11/11, keyed and
+unkeyed); a sub-normal temperature no longer degenerates; the per-peer cap
+protects a second address under a 100/200-connection load and the read
+deadline lets the server recover without it; fd/thread/RSS flat over 100
+distinct-schema requests; the Bonsai old-vs-new short-prompt lane 500->200;
+the SIGTERM and kill-9 lanes leave no torn cache file and the restart restores
+the warm answer. 0 real provider throws, 0 terminates, 0 CUDA errors in any
+server log.
+
+**Clean (reviews):** the SSE builders' index/usage/stop-reason bookkeeping,
+the UTF-8 gate ahead of every holdback, the substr/offset arithmetic in the
+bare-call resolvers, the prefix-cache header trust (magic/version/compat/size
+all checked before any copy; tokens compared element-wise; device bounds on
+import), the cache write atomicity (tmp + fsync + rename under the index
+lock), the forced-close sequencing under every drafter mode, the DFlash2 ring
+rollback and ladder bounds, draft-vocab indexing, the sampling edge values,
+the auth constant-time compare and header precedence, the metrics
+concurrency, drift_capture's opt-in file handling, and no per-request fd or
+thread leak.
+
+**Gates:** `make test-tools test-inspect test-repack corpus-check` 0 FAIL on
+the final tree (corpus 165/165); every orphan suite under ASan/UBSan with no
+runtime error and `fuzz-gcc` 60,000 iterations clean (test_manifest's non-zero
+exit is its argument-required usage message, not a sanitizer finding); the
+three sm_120 canonicals on the rebuilt CLI equal the published values (default
+tier 8cf639c2..., q4s 10e654eb..., 1500-token 8f735a13; wsum
+b743d26b1f0562a9); the three new prefix-cache tests, the env-knob and
+log-sanitizer tests, and the tool-name control-character test pass; the
+chat-completions integration harness resynced and byte-identical
+(extract_check).
+
 ## 2026-10-19 (bg): fifth bug hunt -- three quadratic paths in request text, a marker-strip bypass that forged role boundaries, a key bypass on /health?verify, and requests served to clients that had left
 
 Four read-only reviews over the last unread surfaces (the HTTP layer:

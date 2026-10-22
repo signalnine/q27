@@ -279,6 +279,46 @@ static void test_tool_decl_problem_rejects_angle_brackets() {
     json oai_ok = json::array({{{"type", "function"}, {"function", {{"name", "mcp__s__t"}, {"parameters", {{"type", "object"}, {"properties", {{"a.b", {{"type", "string"}}}}}}}}}}});
     CHECK(q27::tool_decl_problem(oai_ok).empty());
     CHECK(q27::tool_decl_problem(json::array({5, "x", json::object()})).empty());  // wrong-typed entries are not this check's job
+    // bug hunt 2026-10-22: control bytes in a name reach every rescue log line
+    json ctl = json::array({{{"name", "Read\n[req] rid=9 end=stop"}, {"input_schema", {{"type", "object"}}}}});
+    CHECK(q27::tool_decl_problem(ctl).find("control characters") != std::string::npos);
+    json ctl_param = json::array({{{"name", "t"}, {"input_schema", {{"type", "object"}, {"properties", {{"x\x1b[2Jy", {{"type", "string"}}}}}}}}});
+    CHECK(q27::tool_decl_problem(ctl_param).find("parameter name") != std::string::npos);
+    CHECK(q27::log_text("a\nb\x1b[2J\x7f" "c") == "a?b?[2J?c");
+    CHECK(q27::log_text(std::string(600, 'x'), 10).size() == 10);
+}
+
+// bug hunt 2026-10-22: strict environment knobs (empty = unset; flags accept
+// on/off/true/false/yes/no; numbers must parse completely and sit in range)
+static void test_env_knob_parsing() {
+    setenv("Q27_T_FLAG", "", 1);
+    CHECK(q27::env_flag("Q27_T_FLAG", true) == true);   // empty = unset
+    setenv("Q27_T_FLAG", "on", 1);
+    CHECK(q27::env_flag("Q27_T_FLAG", false) == true);
+    setenv("Q27_T_FLAG", "FALSE", 1);
+    CHECK(q27::env_flag("Q27_T_FLAG", true) == false);
+    setenv("Q27_T_FLAG", "0", 1);
+    CHECK(q27::env_flag("Q27_T_FLAG", true) == false); // presence is not "on"
+    setenv("Q27_T_INT", "42", 1);
+    CHECK(q27::env_int("Q27_T_INT", 0, 0, 100) == 42);
+    unsetenv("Q27_T_INT");
+    CHECK(q27::env_int("Q27_T_INT", 7, 0, 100) == 7);
+    setenv("Q27_T_NUM", "0.5", 1);
+    CHECK(q27::env_num("Q27_T_NUM", 0, 0, 1) == 0.5);
+    setenv("Q27_SEED", "random", 1);
+    CHECK(q27::env_seed_mode() == -1);
+    setenv("Q27_SEED", "123", 1);
+    CHECK(q27::env_seed_mode() == 123);
+    unsetenv("Q27_SEED");
+    CHECK(q27::env_seed_mode() == 0);
+    // preflight drops empties and lowercases the string knobs
+    setenv("Q27_T_EMPTY", "", 1);
+    setenv("Q27_TOOL_DIALECT", "XML", 1);
+    q27::env_preflight("test");
+    CHECK(getenv("Q27_T_EMPTY") == nullptr);
+    CHECK(std::string(getenv("Q27_TOOL_DIALECT")) == "xml");
+    unsetenv("Q27_TOOL_DIALECT");
+    unsetenv("Q27_T_FLAG"); unsetenv("Q27_T_NUM");
     CHECK(q27::tool_decl_problem(json(nullptr)).empty());
 }
 
@@ -3394,6 +3434,7 @@ int main() {
     test_anthropic_msgs_tool_result_bare_string_content();
     test_anthropic_msgs_mixed_tool_result_and_text_split();
     test_tool_decl_problem_rejects_angle_brackets();
+    test_env_knob_parsing();
     test_anthropic_tools_non_array_and_non_object_entries();
     test_tool_choice_absent_is_auto();
     test_tool_choice_none();

@@ -26,6 +26,8 @@
 // Host-only (no CUDA here) so it unit-tests on CPU; the device-side copies
 // live in Engine::pfx_export / pfx_import.
 #include <dirent.h>
+#include <cerrno>
+#include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -88,6 +90,7 @@ struct PrefixCacheCfg {
     int min_tokens = 4096;           // below this, prefill is cheap enough
     int max_tokens = 32768;          // caps the staging buffer the engine pins
     int step_tokens = 8192;          // growth required before re-persisting a chain
+    bool gc_foreign = false;         // --prefix-cache-gc-foreign: unlink entries of another compat at boot
 };
 
 class PrefixCache {
@@ -177,7 +180,7 @@ class PrefixCache {
     // decode from, mirroring the snapshot predicate in generate()). The token
     // vector is read back from disk and compared element by element; the key
     // hash only picks candidates.
-    bool find(const std::vector<int>& prompt, Entry* out) const {
+    bool find(const std::vector<int>& prompt, Entry* out) {
         if (!enabled_ || prompt.empty()) return false;
         std::vector<Entry> cands;
         {
@@ -188,8 +191,25 @@ class PrefixCache {
                   [](const Entry& a, const Entry& b) { return a.L > b.L; });
         for (const auto& e : cands) {
             if (e.L < cfg_.min_tokens) continue;
+            // an entry above --prefix-cache-max-tokens (a root shared with a
+            // larger config, or the cap lowered) does not fit the staging
+            // buffer pinned at boot: restoring it meant a cudaFreeHost +
+            // cudaMallocHost under the GPU gate (bug hunt 2026-10-22)
+            if (cfg_.max_tokens > 0 && e.L > cfg_.max_tokens) continue;
             if ((size_t)e.L + 1 > prompt.size()) continue;  // needs >=1 token to decode from
             if (pfx_fnv1a64(prompt.data(), (size_t)e.L * sizeof(int)) != e.key) continue;
+            if (::access(e.path.c_str(), F_OK) != 0 && errno == ENOENT) {
+                // evicted or removed by another process on this root: drop it
+                // here (has() kept saying "present", so the boundary was never
+                // re-persisted, and the old log blamed the tokens)
+                fprintf(stderr, "prefix-cache: %s vanished (another process on this root?) -- dropped from the index\n",
+                        e.path.c_str());
+                std::lock_guard<std::mutex> lk(m_);
+                index_.erase(std::remove_if(index_.begin(), index_.end(),
+                                            [&](const Entry& x) { return x.path == e.path; }),
+                             index_.end());
+                continue;
+            }
             if (!verify(e, prompt)) {
                 fprintf(stderr, "prefix-cache: key hit but TOKENS DIFFER for %s -- ignoring\n",
                         e.path.c_str());
@@ -442,12 +462,22 @@ class PrefixCache {
     // killed write from leaking gigabytes forever.
     void rescan() {
         std::vector<Entry> found;
+        size_t foreign_n = 0, foreign_bytes = 0;
         DIR* d = ::opendir(cfg_.root.c_str());
         if (!d) return;
         while (dirent* de = ::readdir(d)) {
             const std::string n = de->d_name;
-            if (n.find(".q27pc.tmp") != std::string::npos) {  // ".q27pc.tmp.<pid>.<n>"
+            const size_t tp = n.find(".q27pc.tmp.");
+            if (tp != std::string::npos) {  // ".q27pc.tmp.<pid>.<n>"
                 const std::string stale = cfg_.root + "/" + n;
+                // another live server on this root may be mid-write: leave its
+                // file alone (its rename publishes it); sweep only dead pids
+                const long pid = atol(n.c_str() + tp + 11);
+                if (pid > 0 && pid != (long)getpid() && ::kill((pid_t)pid, 0) == 0) {
+                    fprintf(stderr, "prefix-cache: %s belongs to live pid %ld -- left alone\n",
+                            stale.c_str(), pid);
+                    continue;
+                }
                 if (::unlink(stale.c_str()) == 0)
                     fprintf(stderr, "prefix-cache: swept incomplete write %s\n", stale.c_str());
                 continue;
@@ -464,7 +494,18 @@ class PrefixCache {
                             (uint64_t)st.st_size ==
                                 sizeof(PfxHdr) + (uint64_t)h.L * 4 + h.gdn_bytes + h.kv_bytes;
             ::close(fd);
-            if (!ok) continue;
+            if (!ok) {
+                // a well-formed entry of another configuration (model file,
+                // KV dtype, drafter mode, format version): invisible to the
+                // budget and never evicted, so on tmpfs it holds RAM forever
+                if (h.magic == PFX_MAGIC && h.L > 0 && ::stat(path.c_str(), &st) == 0) {
+                    if (cfg_.gc_foreign && ::unlink(path.c_str()) == 0)
+                        fprintf(stderr, "prefix-cache: removed foreign entry %s (%.2f GB)\n",
+                                path.c_str(), st.st_size / 1e9);
+                    else { foreign_n++; foreign_bytes += (size_t)st.st_size; }
+                }
+                continue;
+            }
             Entry e;
             e.path = path;
             e.L = h.L;
@@ -474,6 +515,12 @@ class PrefixCache {
             found.push_back(e);
         }
         ::closedir(d);
+        if (foreign_n)
+            fprintf(stderr,
+                    "prefix-cache: %zu entr%s (%.2f GB) in %s belong to another configuration "
+                    "(model/KV/drafter) and do not count against the budget -- remove them, or boot "
+                    "once with --prefix-cache-gc-foreign\n",
+                    foreign_n, foreign_n == 1 ? "y" : "ies", foreign_bytes / 1e9, cfg_.root.c_str());
         std::lock_guard<std::mutex> lk(m_);
         index_.swap(found);
     }

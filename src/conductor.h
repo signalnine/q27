@@ -31,6 +31,7 @@
 // (the __CUDACC__ guard), so the CPU unit test never sees them.
 
 #include <algorithm>
+#include "envparse.h"
 #include <cassert>
 #include <condition_variable>
 #include <cstdio>
@@ -983,12 +984,10 @@ public:
         // Default OFF -- the Q27_BATCH precedent: eager is the reference
         // path, capture is the opt-in lever.
         {
-            const char* e = getenv("Q27_BATCH_GRAPH");
-            graphs_on_ = e && atoi(e) != 0;
+            graphs_on_ = q27::env_flag("Q27_BATCH_GRAPH", false);
         }
         if (graphs_on_) {
-            const char* c = getenv("Q27_BATCH_GRAPH_CAP");
-            if (c && atoi(c) > 0) gc_cap_ = atoi(c);
+            gc_cap_ = (int)q27::env_int("Q27_BATCH_GRAPH_CAP", gc_cap_, 1, 100000);
             // Startup headroom check (T0 finding: ~7.2 MB device memory per
             // instantiated exec; budgeted 8 MB, so cap 32 ~ 230 MB). Runs
             // here because both the server and fused_smoke construct the
@@ -1034,7 +1033,7 @@ public:
             // Bonsai 2 packs take fused rounds since 2026-09-18 (the rotation
             // is mirrored in fused_verify_round); Q27_BONSAI_FUSED=0 pins them
             // to solo rounds -- the A/B control for the fused path.
-            static const bool bz_solo = [] { const char* e = getenv("Q27_BONSAI_FUSED"); return e && atoi(e) == 0; }();
+            static const bool bz_solo = !q27::env_flag("Q27_BONSAI_FUSED", true);
             core.needs_solo_round = [](Member& mm) { return mm.t->round_forced || (mm.e->bonsai2 && bz_solo); };
             core.always_fused = [](Member& mm) { return mm.e->plain_lanes && !bz_solo; };
             core.fused_round = [this](Member** ms, const int* granted, const bool* sfx,
@@ -1407,10 +1406,7 @@ private:
         // uses (bs 1-7 -> up to 7, 8-31 -> up to 3, 32+ -> 0-1), derived instead
         // of tuned: q27 knows k and cap exactly at round start, so it needs no
         // lagged acceptance EMA to infer what the scheduler already decided.
-        static const bool ceil_on = [] { // Q27_DRAFT_CEIL=0 restores pre-T4 depth
-            const char* e = getenv("Q27_DRAFT_CEIL");
-            return !(e && atoi(e) == 0);
-        }();
+        static const bool ceil_on = q27::env_flag("Q27_DRAFT_CEIL", true); // =0 restores pre-T4 depth
         // Ceiling is max_grant, NOT max_grant-1. A width-W verify walks W-1
         // drafts, but draft_and_gate's floor top-up maintains the stronger
         // invariant "W draft ROWS must exist" (engine.cuh, the cap==0 case), so
@@ -1444,10 +1440,7 @@ private:
         // At C>=6 the trim floors every lane to 2, so today every member runs 2
         // draft steps per round and uses exactly ONE of them, forever. This
         // makes the second step pure waste at high concurrency.
-        static const bool ceil1 = [] {
-            const char* e = getenv("Q27_DRAFT_CEIL1");
-            return e && atoi(e) != 0;
-        }();
+        static const bool ceil1 = q27::env_flag("Q27_DRAFT_CEIL1", false);
         const int step_ceiling = (ceil1 && max_grant > 1) ? max_grant - 1 : max_grant;
         for (int i = 0; i < k; i++) {
             Member& mm = *ms[i];
@@ -1985,10 +1978,7 @@ private:
         // Every fused round ends with the outcome D2H + host sync on cstm
         // before the next round captures, and round_active asserts rounds never
         // overlap -- so no cached exec is in flight here.
-        static const bool recycle_on = [] { // Q27_GC_RECYCLE=0 -> always instantiate
-            const char* e = getenv("Q27_GC_RECYCLE");
-            return !(e && atoi(e) == 0);
-        }();
+        static const bool recycle_on = q27::env_flag("Q27_GC_RECYCLE", true); // =0 -> always instantiate
         auto same_class = [&](const GraphKey& a, const GraphKey& b) {
             if (a.k != b.k) return false;
             int va[GK_MAX], vb[GK_MAX];

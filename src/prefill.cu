@@ -1,4 +1,5 @@
 #include <cfloat>
+#include "envparse.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2573,8 +2574,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row,
                           (sizeof(CT) == 1 ? (size_t)2 * PP * 256 * sizeof(CT) : 0);
         static int cpa_env = -1;
         if (cpa_env < 0) {
-            const char* ce = getenv("Q27_PF_CPASYNC");
-            cpa_env = ce ? atoi(ce) : 1;  // default ON for the fp8 path
+            cpa_env = q27::env_flag("Q27_PF_CPASYNC", true) ? 1 : 0;  // default ON for the fp8 path
         }
         // Phase 2: fp8 QK^T MMA -- DEFAULT ON for the fp8 KV path (fully gated:
         // +11.8% @128K, greedy-identical, logit A/B cosine 0.99998 argmax-match
@@ -2610,8 +2610,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row,
                         "using f16-MMA\n",
                         h_arch / 10);
         }
-        const char* fe = getenv("Q27_PF_FP8MMA");
-        const int fp8mma_env = (fe ? atoi(fe) : 1) && fp8mma_arch;  // default ON
+        const int fp8mma_env = q27::env_flag("Q27_PF_FP8MMA", true) && fp8mma_arch;  // default ON
         if constexpr (sizeof(CT) == 1) {
             if (fp8mma_env) {
                 constexpr int LDQ = 260, LDK = 272;  // match k_attn_prefill_mma_fp8q pads
@@ -2640,8 +2639,7 @@ static void attn_prefill_launch(const float* qT, int q_stride, int q_row,
                 // @128K prefill, needle 6/6 to ~166K (beyond-native), logit
                 // cosine 0.99997/argmax MATCH @131K -- same gate class that
                 // defaulted fp8q on. Q27_PF_PV8=0 forces the convert path.
-                const char* pv8e = getenv("Q27_PF_PV8");
-                if (!pv8e || atoi(pv8e)) {
+                if (q27::env_flag("Q27_PF_PV8", true)) {
                     const size_t SMP = (size_t)6 * TT * LDQ * sizeof(__nv_fp8_e4m3) +
                                        (size_t)(2 * PP * LDK + 2 * PP * 256 + 6 * TT * PP +
                                                 256 * PP) * sizeof(__nv_fp8_e4m3);

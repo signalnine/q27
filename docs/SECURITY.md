@@ -123,6 +123,22 @@ this trade; q27 currently sits at the permissive end.
   prompt text or generated content. Without the flag the route does not
   exist (404).
 - No auth by default is a loopback-only assumption. Do not expose the port.
+- Slow connections: a request's bytes (request line, headers, body) must
+  arrive within `--read-deadline` seconds of the first one (30 by default),
+  and one peer address may hold at most `--max-conn-per-ip` connections (64,
+  below the 92 worker threads the pool grows to). Each HTTP connection
+  occupies one worker for its whole life, so without these limits a modest
+  number of connections that never finish sending their headers could hold
+  every worker (found 2026-10-22, before any key check runs). Many sources
+  can still fill the pool; put a reverse proxy in front of an exposed port.
+- Browser guards: form content-types are refused (415) on every POST, and on a
+  loopback bind with no key a `Host` header that does not name the loopback
+  address is refused (403). Both close the paths a web page has to a
+  loopback service through the operator's browser.
+- Log lines never carry raw client or model bytes: the request path and
+  method, tool names, and every parser rescue line go through a sanitizer
+  (control bytes become `?`, lengths are capped), and tool names with control
+  characters are rejected at the request.
 
 ## Reporting
 

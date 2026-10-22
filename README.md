@@ -574,6 +574,9 @@ card is oversubscribed, which shows up as decode at a third of its speed;
 `--prefix-cache-max-gb`. Stores conversation content on disk in plaintext --
 see [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md). The pinned host-RAM
 tier above it (`--prefix-cache-ram-gb`) is off by default on measured grounds.
+Entries written by another configuration on the same root (a different model
+file, KV dtype or drafter mode) are reported at boot and left alone;
+`--prefix-cache-gc-foreign` removes them once.
 
 **DFlash2 drafter (the production decode path since 2026-09-08).** The
 drafter is z-lab's
@@ -609,7 +612,18 @@ recipe, prefix-cache tiers included.
 **Auth**: off by default -- loopback-only binding is the safety net.
 `--api-key KEY`, `--api-key-file PATH`, or `Q27_API_KEY` (preferred in
 containers) all add keys; both `Authorization: Bearer` and `x-api-key` work.
-Binding non-loopback with no key warns but is not refused.
+Binding non-loopback with no key warns but is not refused. Two browser guards
+are always on: a POST with a form content-type (`text/plain`,
+`multipart/form-data`, `application/x-www-form-urlencoded`) is a 415, and on a
+loopback bind with no key a `Host` header that does not name
+`127.0.0.1`/`localhost`/`::1` is a 403 (DNS rebinding). Two connection
+limits: each request's bytes must arrive within `--read-deadline` seconds
+(30; 0 = off) and one peer address holds at most `--max-conn-per-ip`
+connections (64; 0 = off) -- raise or disable the latter behind a reverse
+proxy, where every client shares the proxy's address. `Q27_*` environment
+knobs are parsed strictly: an empty export counts as unset, flags take
+`0/1/on/off/true/false/yes/no`, and a value that does not parse refuses to
+boot with the variable named.
 
 **Metrics**: `--enable-metrics` (opt-in, default off) exposes `GET /metrics`
 in Prometheus text exposition -- per-API request/token counters, prefill

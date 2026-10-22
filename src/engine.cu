@@ -1,11 +1,13 @@
 // q27 CLI: bench / greedy / spec-decode harness.
 #include <algorithm>
+#include "envparse.h"
 #include <chrono>
 #include <tuple>
 #include "dflash2.h"
 #include "engine.cuh"
 
 int main(int argc, char** argv) {
+    q27::env_preflight("q27");
     if (argc < 2) {
         fprintf(stderr,
                 "usage: %s model.q27 --tokens \"1,2,3\" [-n N] [--ctx C] [--dump-logits f]\n"
@@ -267,7 +269,7 @@ int main(int argc, char** argv) {
         // per-round input (staged drafts, positions, d_token, d_P) is a device
         // buffer written by prep_round/the draft stage BEFORE the replay, so the
         // graph reads current state. Q27_D2_NOGRAPH=1 keeps the eager path.
-        const bool d2_graph = !getenv("Q27_D2_NOGRAPH");
+        const bool d2_graph = !q27::env_flag("Q27_D2_NOGRAPH", false); // was presence-only
         cudaGraphExec_t verify_exec = nullptr;
         if (d2_graph) {
             auto v = e.solo_view();

@@ -2,6 +2,7 @@
 // (all methods inline) so both the CLI and the server can embed it.
 #pragma once
 #include <algorithm>
+#include "envparse.h"
 #include <atomic>
 #include <memory>
 #include <chrono>
@@ -393,11 +394,9 @@ struct DraftVocabPlan {
 };
 inline DraftVocabPlan draft_vocab_plan(const q27::Model& m) {
     DraftVocabPlan p;
-    const char* e = getenv("Q27_DRAFT_VOCAB");
-    const int n = e ? atoi(e) : 0;
+    const int n = (int)q27::env_int("Q27_DRAFT_VOCAB", 0, 0, 1L << 30);
     if (n <= 0 || !m.find("blk.64.nextn.eh_proj.weight")) return p;
-    const char* b = getenv("Q27_BATCH");
-    if (b && atoi(b) != 0) { p.off_why = "needs Q27_BATCH=0: fused rounds share one head"; return p; }
+    if (q27::env_flag("Q27_BATCH", false)) { p.off_why = "needs Q27_BATCH=0: fused rounds share one head"; return p; }
     if (getenv("Q27_DFLASH2")) { p.off_why = "DFlash2 drafts without the MTP head"; return p; }
     const q27::Tensor* h = m.find("output_q4.weight");
     if (!h) h = m.find("output.weight");
@@ -413,8 +412,7 @@ inline DraftVocabPlan draft_vocab_plan(const q27::Model& m) {
     const int nstat = std::min(n, p.vocab);
     // ids [0, nstat) + the control/special tokens at the top (<tool_call>, <think>, ...)
     p.nstatic = nstat + std::max(0, p.vocab - std::max(nstat, p.vocab - 320));
-    const char* c = getenv("Q27_DRAFT_VOCAB_CTX");
-    p.ctx_cap = c ? std::max(0, atoi(c)) : 8192;
+    p.ctx_cap = (int)q27::env_int("Q27_DRAFT_VOCAB_CTX", 8192, 0, 1L << 30);
     p.rows = std::min(p.vocab, p.nstatic + p.ctx_cap);
     p.on = true;
     return p;
@@ -941,7 +939,7 @@ struct Engine {
     q27::SuffixDraft sfx;
     bool sfx_valid = false;      // last_pending valid (>=1 round this request)
     long sfx_fired = 0, sfx_tok = 0; // engine-cumulative, like glf/gla
-    int h_sfx_prop[W_MAX];       // host staging for the H2D draft copies (W_MAX-1 max)
+    int h_sfx_prop[W_MAX] = {};  // host staging for the H2D draft copies (W_MAX-1 max)
     bool sfx_dbg = false;        // Q27_SUFFIX_DBG: per-round propose trace
     bool tool_split_active = false; // set by set_tool_constraint when constraining
     // M1: SBuf/RBuf (the host role resolvers) are gone with the rotation --
@@ -1310,11 +1308,11 @@ struct Engine {
         mask_words = (VOCAB + 31) / 32;
         A((void**)&d_mask_pool, (size_t)MASK_POOL_CAP * mask_words * 4);
         A((void**)&d_mask_ids, W_MAX * 4);
-        if (const char* ce = getenv("Q27_CKPT_INTERVAL")) ckpt_interval = atoi(ce);
+        ckpt_interval = (int)q27::env_int("Q27_CKPT_INTERVAL", ckpt_interval, -(1L << 30), 1L << 30);
         // read here (not build_spec_graphs): sample_graph captures in
         // build_graph, which runs first
-        if (const char* se = getenv("Q27_SAMPLED")) sampled_graphs = atoi(se) != 0;
-        if (const char* cs = getenv("Q27_CKPT_SLOTS")) ckpt_slots = std::max(1, atoi(cs));
+        sampled_graphs = q27::env_flag("Q27_SAMPLED", sampled_graphs);
+        ckpt_slots = (int)q27::env_int("Q27_CKPT_SLOTS", ckpt_slots, 1, 256); // 2e9 was a bad_alloc at the first prefill
         A((void**)&d_accept_cap, 4);
         CUDA_CHECK(cudaMemset(d_mask_ids, 0xFF, W_MAX * 4)); // all -1 = unconstrained
         CUDA_CHECK(cudaMemset(d_accept_cap, 0, 4));
@@ -2110,7 +2108,7 @@ struct Engine {
         dv_row_bytes = p.row_bytes;
         dv_row_scales = p.row_scales;
         const int vocab = p.vocab;
-        const int nstat = std::min(atoi(getenv("Q27_DRAFT_VOCAB")), vocab);
+        const int nstat = std::min((int)q27::env_int("Q27_DRAFT_VOCAB", 0, 0, 1L << 30), vocab);
         dv_ctx_cap = p.ctx_cap;
         dv_rows = p.rows;
         if (cudaMallocHost((void**)&dv_ids, (size_t)dv_rows * sizeof(int)) != cudaSuccess) {
@@ -2953,6 +2951,14 @@ struct Engine {
     }
 
     void build_spec_graphs() {
+
+        // read BEFORE the no-MTP early return below: on a pack without the MTP
+
+        // head this used to sit after it, so the Claude Code profile's
+
+        // Q27_PF_BATCH_MIN=2 never applied to Bonsai (bug hunt 2026-10-22)
+
+        pf_batch_min = (int)q27::env_int("Q27_PF_BATCH_MIN", pf_batch_min, 2, 1L << 20);
         if (!has_mtp) {
             // No MTP block: the ladder's draft/verify graph zoo has nothing to
             // capture. decode_step runs plain rounds, or DFlash2 rounds when a
@@ -3009,7 +3015,7 @@ struct Engine {
         // P14 draft early-exit: default ON when gated; Q27_DEXIT=0 restores the
         // monolithic draft (the A/B lever). Read BEFORE Q27_MAXD: the auto
         // ladder ceiling depends on it (below).
-        if (const char* de = getenv("Q27_DEXIT")) dexit_on = atoi(de) != 0;
+        dexit_on = q27::env_flag("Q27_DEXIT", dexit_on);
         if (const char* md = getenv("Q27_MAXD")) {
             // maxd6: auto = the 4..6 ladder (per-step drafting serves every
             // ceiling). Under Q27_DEXIT=0 the monolithic gated draft has no
@@ -3030,8 +3036,7 @@ struct Engine {
         // Q27_GEMM_MIN=99 disables the GEMM entirely (the in-binary A/B control:
         // same binary, GEMM off, must reproduce the old round AND byte-identical
         // output -- gate 5).
-        if (const char* e = getenv("Q27_GEMM_MIN")) gemm_min = atoi(e);
-        if (const char* e = getenv("Q27_PF_BATCH_MIN")) pf_batch_min = std::max(2, atoi(e));
+        gemm_min = (int)q27::env_int("Q27_GEMM_MIN", gemm_min, 0, 99);
         // Canonical coupling (same failure class as the gemm_min guardrail):
         // the canonical bitwise prompt is 5 tokens, i.e. SERIAL-path under the
         // default 32. The chunked path rounds differently (measured: greedy
@@ -3058,22 +3063,33 @@ struct Engine {
             abort();
         }
         // P13 adaptive-maxd tunables (bench-tunable; defaults from the design)
-        if (const char* e = getenv("Q27_MAXD_RESET")) maxd_reset = atoi(e) != 0;
-        if (const char* e = getenv("Q27_MAXD_EMA")) dctl.ema_a = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_HI")) dctl.hi = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_HI6")) dctl.hi6 = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_HI7")) dctl.hi7 = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_FLO7")) dctl.flo7 = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_FLO6")) dctl.flo6 = (float)atof(e);
-        if (const char* e = getenv("Q27_MAXD_LO")) dctl.lo = (float)atof(e);
+        maxd_reset = q27::env_flag("Q27_MAXD_RESET", maxd_reset);
+        dctl.ema_a = (float)q27::env_num("Q27_MAXD_EMA", dctl.ema_a, 0.0, 1.0);
+        dctl.hi = (float)q27::env_num("Q27_MAXD_HI", dctl.hi, 0.0, 1.0);
+        dctl.hi6 = (float)q27::env_num("Q27_MAXD_HI6", dctl.hi6, 0.0, 1.0);
+        dctl.hi7 = (float)q27::env_num("Q27_MAXD_HI7", dctl.hi7, 0.0, 1.0);
+        dctl.flo7 = (float)q27::env_num("Q27_MAXD_FLO7", dctl.flo7, 0.0, 1.0);
+        dctl.flo6 = (float)q27::env_num("Q27_MAXD_FLO6", dctl.flo6, 0.0, 1.0);
+        dctl.lo = (float)q27::env_num("Q27_MAXD_LO", dctl.lo, 0.0, 1.0);
         // width-12 P1: suffix envs parsed BEFORE the warm/capture section --
         // Q27_SUFFIX_W shapes the warm width and adds one verify
         // graph at exactly that width. <= gate_maxd+1 (or unset) = legacy.
         // value-aware since the CC-defaults flip: Q27_SUFFIX=0 disables
         // (was presence-only -- =0 used to ENABLE).
-        suffix_on = getenv("Q27_SUFFIX") && atoi(getenv("Q27_SUFFIX")) != 0;
+        suffix_on = q27::env_flag("Q27_SUFFIX", false);
         sfx_dbg = getenv("Q27_SUFFIX_DBG") != nullptr;
-        if (const char* sl = getenv("Q27_SUFFIX_L")) sfx_L = atoi(sl);
+        if (const char* sl = getenv("Q27_SUFFIX_L")) {
+            // propose_with() returns 0 on no match without writing the staging
+            // ids, so a threshold <= 0 fired a suffix round every round with
+            // stale (or on a fresh engine, uninitialized) draft ids -- one
+            // token per round, or an out-of-range embed read (bug hunt
+            // 2026-10-22). Floor at the n-gram order.
+            sfx_L = atoi(sl);
+            if (sfx_L < 4) {
+                fprintf(stderr, "Q27_SUFFIX_L=%s is below the 4-token n-gram order -- using 4\n", sl);
+                sfx_L = 4;
+            }
+        }
         if (const char* sw = getenv("Q27_SUFFIX_W")) {
             sfx_w = atoi(sw);
             if (sfx_w < gate_maxd + 1) sfx_w = 0;      // narrower than gated = legacy
@@ -3406,7 +3422,7 @@ struct Engine {
         // accumulation order of the int8 products), deterministic run-to-run
         // (no atomics) and outside the canonical contract by construction --
         // serving greedy was already not width-invariant across depth configs.
-        if (const char* vg = getenv("Q27_D2_VGEMM"); !vg || atoi(vg)) v.gemm_min = d2_w;
+        if (q27::env_flag("Q27_D2_VGEMM", true)) v.gemm_min = d2_w;
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stm, cudaStreamCaptureModeGlobal));
         spec_verify_forward(v, d2_vtaps);
@@ -3451,7 +3467,7 @@ struct Engine {
             CUDA_CHECK(cudaGraphDestroy(gsmp));
         }
         d2->capture_draft(d2_k, stm); // graph the drafter forward too (eager -> replay)
-        if (const char* tg = getenv("Q27_D2_TOKGRAPH"); !tg || atoi(tg)) {
+        if (q27::env_flag("Q27_D2_TOKGRAPH", true)) {
             // token_launches' kernels were warmed by build_graph; the five tap
             // copies are plain D2D memcpy nodes. Position/token come from
             // device state (d_pos, d_token), so one graph serves every turn.
@@ -4285,7 +4301,7 @@ struct Engine {
         // racecheck AND initcheck (memcheck won't catch it); suspect the async
         // d_mask_ids/d_mask_pool staging ordering vs the verify graph launch.
         // Default = the safe capped path until fixed.
-        static const bool split_ok = getenv("Q27_TOOL_SPLIT") != nullptr;
+        static const bool split_ok = q27::env_flag("Q27_TOOL_SPLIT", false); // was presence-only: "=0" meant ON
         tool_split_active = (mask_id >= 0) && (bool)on_drafts && split_ok;
         // cap only when constraining WITHOUT the split path (P7 v1 fallback)
         h_cap0 = (mask_id >= 0 && !tool_split_active) ? 1 : 0;
@@ -4389,7 +4405,7 @@ struct Engine {
     // served model, and the Phase 2 path it replaced. Anything else is the base.
     const DevTensor& TP(int il, const char* leaf) {
         const DevTensor& base = T(il, leaf);
-        static const bool shadow = [] { const char* e = getenv("Q27_T2_PF_SHADOW"); return e && atoi(e) != 0; }();
+        static const bool shadow = q27::env_flag("Q27_T2_PF_SHADOW", false);
         if (base.dtype != DType::T2_G128 || !shadow) return base;
         char buf[128];
         snprintf(buf, sizeof buf, "blk.%d.%s.q4x", il, leaf);
@@ -4564,7 +4580,7 @@ struct Engine {
     // Q27_MTP_WARM=0: skip the prefill-time MTP KV warm (bisect lever, 2026-09-18:
     // drafts then start cold -- acceptance drops, emitted text must not move).
     static bool mtp_warm_on() {
-        static const bool on = [] { const char* e = getenv("Q27_MTP_WARM"); return !(e && atoi(e) == 0); }();
+        static const bool on = q27::env_flag("Q27_MTP_WARM", true);
         return on;
     }
     void mtp_warm_T(const int* d_toks_next, int base, int T) {
@@ -5017,10 +5033,20 @@ struct Engine {
         pfx_busy.store(true);
         fprintf(stderr, "[pfx] persisting L=%d (%.2f GB, export %.0f ms%s)\n", L,
                 (gn + kn) / 1e9, ms, slot ? ", RAM-resident" : "");
-        pfx_thr = std::thread([this, toks = std::move(toks), L, gn, kn, dst, slot] {
-            pcache->write(toks, L, dst, gn, dst + gn, kn);
+        try {
+            pfx_thr = std::thread([this, toks = std::move(toks), L, gn, kn, dst, slot] {
+                pcache->write(toks, L, dst, gn, dst + gn, kn);
+                pfx_busy.store(false);
+            });
+        } catch (const std::exception& e) {
+            // EAGAIN under a pid/thread limit: without this the reserve()
+            // claim and pfx_busy stayed set forever and this engine never
+            // persisted again (bug hunt 2026-10-22)
+            fprintf(stderr, "[pfx] writer thread for L=%d could not start (%s) -- skipped\n", L,
+                    e.what());
+            pcache->release(prompt, L);
             pfx_busy.store(false);
-        });
+        }
     }
 
     // Reset all decode state for a fresh request (positions, GDN recurrent state,
@@ -5294,7 +5320,7 @@ struct Engine {
         // Q27_SAMPLE_PLAIN forces the Phase-1 plain sampler (one token/round, no
         // spec) even under sampling -- the A/B lever for the spec==non-spec
         // distribution gate (docs/sampling-design.md sec 4).
-        static const bool force_plain_sample = getenv("Q27_SAMPLE_PLAIN") != nullptr;
+        static const bool force_plain_sample = q27::env_flag("Q27_SAMPLE_PLAIN", false); // was presence-only
         if (sampling) {
             CUDA_CHECK(cudaMemcpyAsync(d_samp, &samp, sizeof samp, cudaMemcpyHostToDevice, stm));
             samp_first = true;
@@ -6014,7 +6040,13 @@ struct Engine {
             d2_prefill_align(prompt, 0); // serial path: cold ring
             for (size_t i = 0; i < prompt.size(); i++) {
                 step_with(prompt[i]);
-                if (i + 1 < prompt.size()) {
+                // has_mtp: a pack without the MTP head (Bonsai 2 plain, the
+                // installer's default) has no nextn weights to warm -- the CLI
+                // guards this loop the same way; the server's copy did not, so
+                // every 2..31-token prompt on such a pack was a 500 ("not
+                // resident on device: blk.64.nextn.enorm.weight") (bug hunt
+                // 2026-10-22).
+                if (i + 1 < prompt.size() && has_mtp) {
                     CUDA_CHECK(cudaStreamSynchronize(stm));
                     CUDA_CHECK(cudaMemcpyAsync(h_next, x1, N_EMBD * 4, cudaMemcpyDeviceToDevice,
                                                stm));
