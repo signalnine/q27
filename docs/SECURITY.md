@@ -87,6 +87,12 @@ Status 2026-08-24: 1.7M inputs under ASan+UBSan with the standalone mutator
 exec/s that added 8,161 coverage-increasing inputs without a crash. Neither is
 a proof. Run it after touching the parser.
 
+Re-run on every hunt since. 2026-10-10: `make fuzz` 592,842 runs and `make
+fuzz-schema` 1,280,475 runs, 20 minutes each, clean. 2026-10-19 and
+2026-10-22: every CPU suite under ASan+UBSan with no report and 60,000
+`fuzz-gcc` iterations clean each time, plus (10-19) compute-sanitizer
+memcheck over nine decode/prefill configs on the 5090, 0 errors.
+
 ### 2. Semantic escalation (would give client-sandbox execution)
 
 A well-formed parse that produces a call the model never made. This is the
@@ -139,6 +145,48 @@ this trade; q27 currently sits at the permissive end.
   method, tool names, and every parser rescue line go through a sanitizer
   (control bytes become `?`, lengths are capped), and tool names with control
   characters are rejected at the request.
+- Size limits before any work: the HTTP body cap is 100 MB, and a rendered
+  prompt longer than any window could hold (`max_prompt` x the longest vocab
+  token, 128 bytes) is a 400 on all three APIs and `count_tokens` before it
+  is tokenized (2026-10-19). The three request-text paths that were
+  quadratic (NFC ordering over a combining run, the specials scan, the BPE
+  merge loop) are linear or n log n now; the worst crafted megabyte went
+  from 107 s to 131 ms. Past the worker pool the accept queue holds 256
+  sockets and closes the rest.
+- A client that leaves is dropped: while queued (499 in the log), between
+  the slot claim and the prefill, and every 16 tokens on the non-stream legs
+  (2026-10-19). Before that a closed non-stream request decoded to
+  `max_tokens` for nobody.
+- A failed generation is never presented as a finished answer: each API's
+  stream ends in its own error shape and a non-stream leg returns 500 even
+  with partial text (2026-10-22). The failure this closes is an agent acting
+  on a truncated answer it believes complete.
+- Configuration is parsed strictly: every `Q27_*` knob is checked once at
+  boot against a range, an empty export counts as unset, and a value that
+  does not parse refuses to boot naming the variable (2026-10-22). The
+  failure this replaces was silent: an empty `Q27_KV=` from an unset shell
+  variable meant fp16 KV and half the context, and an empty DFlash2 reserve
+  meant a zero reserve and an out-of-memory at the first request.
+
+## Bug hunts
+
+Each hunt is a set of read-only reviews over surfaces no earlier hunt had
+read, plus a live probe set against the production config, and each shipped
+as a release. The receipts are the BUILDLOG entries.
+
+| date | BUILDLOG | release | closed |
+|---|---|---|---|
+| 2026-10-01 | (az) | v0.14.2 | a silent T3 GEMV error on unused widths, the CLI DFlash2 `map::at`, an estimator mismatch |
+| 2026-10-04 | (ba) | v0.14.3 | a server-killing tool schema, a stack-overflow body, a cache key that trusted file size |
+| 2026-10-07 | (be) | v0.14.4 | the plain-lanes forced close broken both ways, a grammar cache that mixed schemas, a re-engage that never fired |
+| 2026-10-10 | (bf) | v0.14.5 | request semantics against a live server (`max_tokens`/`n` 400s, Responses dialect, image placeholders), a sampler barrier race, the cache key by drafter mode |
+| 2026-10-19 | (bg) | v0.14.6 | three quadratic paths in request text, the marker-strip bypass that forged role boundaries, the `/health?verify` key bypass, dead clients still served |
+| 2026-10-22 | (bh) | v0.14.7 | the request-read deadline and per-address cap, failed generations reported as finished, a dropped second tool call on the stream legs, a 500 on short prompts for no-MTP packs, strict knob parsing |
+
+Still open from the hunts, listed under the README's open items: stream
+vs non-stream divergence for two reasoning shapes, no SIGTERM drain, the
+keepalive on the slot wait only, the disk-tier restore under the GPU gate,
+and the `--constrain-tools` mask-pool growth.
 
 ## Reporting
 

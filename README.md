@@ -291,7 +291,7 @@ Expect ~170-230 t/s decode on a 5090 depending on traffic shape, warm
 multi-turn prefills from the prefix cache, and `count_tokens` plus
 anthropic-shaped context-limit errors so Claude Code compacts correctly.
 
-## State of the engine (2026-10-01)
+## State of the engine (2026-10-22)
 
 One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
@@ -495,6 +495,20 @@ fuzzing under ASan+UBSan (`make fuzz`, millions of inputs clean), per-shape
 adversarial tests, and a replayed drift corpus (below) that gates parser
 changes.
 
+Six bug hunts since 2026-10-01 (BUILDLOG (az), (ba), (be), (bf), (bg),
+(bh)) widened that from the parser to the whole serving path. Each hunt is
+a set of read-only reviews over surfaces no earlier hunt had read plus a
+live probe set against the production config, and each shipped as a
+release, v0.14.2 through v0.14.7. The last two hardened the HTTP front:
+v0.14.6 closed three quadratic paths in request text, a marker-strip bypass
+that could forge a role boundary, a key bypass on `/health?verify`, and
+requests still served to clients that had left; v0.14.7 added a
+request-read deadline and a per-address connection cap, browser guards (a
+form-content-type POST is a 415, a foreign `Host` on a keyless loopback
+bind is a 403), failed generations surfaced as errors on every API, and
+strict parsing of the `Q27_*` knobs. The posture, the limits and what stays
+open are in [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Serving
 
 ```
@@ -557,8 +571,13 @@ its final `[req]` line -- and the reason: all slots busy, the KV pool
 short or unsafe to grow into, a parked KV growth, the GPU gate before a
 prefill, or a prefill time-sliced with other requests' prefills. It
 repeats every 30 s while the wait lasts and once more when it ends. The
-`http:` startup line gives the HTTP worker count; connections past it
-queue inside the HTTP layer before q27 sees them, with no log line.
+`http:` startup line gives the HTTP worker count; the pool grows to four
+times that under load, connections past it wait in a 256-deep accept queue,
+and past the queue they are closed on accept (no log line for either). Two
+limits added in v0.14.7 do show up: a peer address over `--max-conn-per-ip`
+(64) is refused with an `[http] ... refused` line, and a connection whose
+request has not fully arrived within `--read-deadline` seconds (30) of its
+first byte is closed.
 
 Two things to know on WSL2 or any box that caps pinned host memory. Each
 slot lazily pins a GDN checkpoint ring for mid-history divergence (up to 16
@@ -653,6 +672,20 @@ Three API shapes on one server:
 - **OpenAI Responses**: `/v1/responses` -- Codex-compatible: function tools,
   `custom` freeform tools, reasoning items; event set verified against the
   codex-rs source.
+
+What a stream promises, as of v0.14.7: a request waiting for a slot gets
+an SSE comment (`: ping`) every 10 s, so a queue wait does not trip a
+client's idle timeout (the prefill itself is still silent after the
+headers). A generation that fails partway ends in the API's own error
+shape -- Anthropic an `error` event then `message_stop`, OpenAI an `error`
+chunk then `[DONE]`, Responses `response.failed` -- and a non-stream leg
+returns 500 even when partial text exists; before v0.14.7 every leg
+reported a clean finish. OpenAI chunks carry `role: "assistant"` in the
+first delta; Responses events carry a contiguous `sequence_number`, every
+item is announced before it is done, and function-call arguments arrive as
+a delta then a done. Stream and non-stream bodies are byte-identical on
+the production configs (49/49 shapes across the three APIs), with the two
+reasoning-shape exceptions listed under open items.
 
 Codex config (`~/.codex/config.toml`):
 ```toml
@@ -850,6 +883,29 @@ real coding while MTP nearly doubled stock llama.cpp.
   catastrophic positions and introduces 40 new ones. Net -43%, but a workload
   fine on one is not guaranteed fine on the other. TCQ filed as its own plan,
   not started.
+- **Stream and non-stream bodies differ for two reasoning shapes.** A
+  literal `<tool_call>` the model writes inside its reasoning is blanked in
+  the stream and kept in the non-stream body, and a call recovered from
+  inside reasoning streams as thinking/tool/thinking where the non-stream
+  body orders it thinking-then-tool (hunt 6, 2026-10-22).
+- **No drain on SIGTERM.** A restart ends in-flight requests at once. The
+  on-disk cache survives an instant kill (tmp + rename; the kill -9 lane
+  restarted into the warm answer), so a restart costs the in-flight work
+  and nothing on disk.
+- **The SSE keepalive covers the slot wait only.** A long prefill is silent
+  after the headers, so a client with a short idle timeout can drop a
+  request the server is still working on.
+- **The disk-tier prefix restore runs under the GPU gate.** A cold restore
+  (206 ms warm / 681 ms cold here, more on a slow drive) freezes every
+  other stream once per session; the fix shape is to do the file I/O before
+  taking the lease (hunt 5, 2026-10-19).
+- **`--constrain-tools` state grows without bound.** The device mask pool
+  is append-only (512 per engine) and its host cache has no cap, so a
+  long-lived server that sees many distinct schemas should run without it
+  or restart on a schedule.
+- **Stop sequences are accepted and ignored** (`stop`, `stop_sequences`;
+  the server logs it). No client in the campaigns sends them. Responses
+  history also drops reasoning items.
 
 Closed items keep their receipts in [docs/BUILDLOG.md](docs/BUILDLOG.md);
 measured-and-parked levers in [docs/notes.md](docs/notes.md).

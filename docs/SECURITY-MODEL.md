@@ -65,7 +65,11 @@ bite the operator's own coding-agent workload -- a single large no-whitespace bl
 (minified JS, base64) collapses to one word and tokenizes O(n^2) single-threaded before
 any context check. Not a security issue, but the one sub-point of #3 worth a bounded-word
 fix on performance grounds. *Shipped 2026-07-14 (94e645a): WORD_CAP=1024 chunks over-cap
-words; inert below 1024 B, canonical byte-identical.*
+words; inert below 1024 B, canonical byte-identical.* *Update 2026-10-22: the
+availability sub-points of this finding are bounded now; see the addendum of
+that date. The WORD_CAP chunking is gone with them: the BPE merge is the
+standard heap merge (2026-10-19), 198 ms per MB and HF-identical on long words,
+where the chunked path split them differently.*
 
 **#5 -- Disconnected clients keep consuming GPU; public `/health?verify` stalls
 inference.** Both are resource-abuse vectors: a hostile client disconnects mid-generation
@@ -74,6 +78,12 @@ who disconnects has simply cancelled their own work, and does not attack their o
 endpoint. Cancellation-on-disconnect is a *nicety* (frees your own GPU sooner), not a
 security control. *The nicety shipped 2026-07-14 (94e645a): all three streaming APIs
 (OpenAI, Anthropic, Responses) now stop generating when the client drops.*
+*Update 2026-10-19: it covers a request abandoned while queued (dropped at the
+queue, 499), the window between the slot claim and the prefill, and the
+non-stream legs (polled every 16 tokens); before that a closed non-stream
+request decoded to `max_tokens` for nobody. `/health?verify` is key-gated
+inside the handler now; the pre-routing exemption had let a form-urlencoded
+body carry `verify=1` past it.*
 
 **#6 -- Tool parsing "fails open."** The tolerant parser scans prose for call-shaped
 JSON, repairs truncation, and does not check parsed tool names against the request's
@@ -293,7 +303,8 @@ findings above are otherwise unchanged by this:
   interceptable.
 - Not rate-limiting or request-size bounding (finding #3's other
   sub-points -- unbounded httplib payload size, unbounded work queue --
-  are still open).
+  are still open). *Bounded since 2026-10-19/22: see the addendum of
+  2026-10-22. Rate limiting is still the proxy's.*
 - Not multi-tenant isolation. One valid key authenticates the caller as
   *the* operator, full stop -- there is still one principal, one KV/mask
   cache, one set of slots. This narrows "who can send requests" without
@@ -393,3 +404,44 @@ q27 server and how busy it is -- so it stays opt-in and rides on the same
 loopback / api-key posture as everything else. When the flag is absent the
 route is not registered at all (404). Nothing in this addendum re-activates
 or weakens the dispositions above.
+
+---
+
+## Addendum 2026-10-22: the availability sub-points after bug hunts 5 and 6
+
+Finding #3's dismissal rested on "the operator does not DoS themselves".
+Two hunts (BUILDLOG (bg) 2026-10-19 and (bh) 2026-10-22; the posture list is
+in `docs/SECURITY.md`) found the single operator doing exactly that through
+their own tooling, and bounded the paths inside q27 rather than at a proxy,
+because each one bites on loopback:
+
+- A coding-agent harness that opens connections and never finishes a
+  request, or a browser tab, could hold every HTTP worker (one worker per
+  connection for its life, 23 growing to 92 on this box) before any key
+  check runs. Each request's read now has to finish within `--read-deadline`
+  seconds of its first byte (30; writes are unaffected, a long streaming
+  response is fine) and one peer address holds at most `--max-conn-per-ip`
+  connections (64). Past the pool the accept queue holds 256 sockets.
+- Request-size bounding: the body cap is 100 MB (the vendored httplib's
+  default since the 0.53.1 update, so the `SIZE_MAX` in #3 is stale), and a
+  rendered prompt that cannot fit the window is a 400 before it is
+  tokenized. The three quadratic request-text paths (NFC ordering, the
+  specials scan, the BPE merge) are gone, chunking included; the worst
+  crafted megabyte went from 107 s to 131 ms.
+- Browser guards that matter precisely in the single-operator model: a
+  form-content-type POST is a 415 and, on a loopback bind with no key, a
+  `Host` header naming anything but the loopback address is a 403. Both
+  close the paths a web page has to a loopback service through the
+  operator's own browser (DNS rebinding, simple-request form posts), which
+  a proxy in front would never have seen.
+- An abandoned request is dropped at every stage (the 2026-10-19 update to
+  #5 above), so the operator's own cancelled work frees the GPU.
+- Strict `Q27_*` parsing: an empty export or a typo refuses to boot naming
+  the variable, instead of silently selecting fp16 KV or a zero drafter
+  reserve.
+
+The threat model is unchanged: one principal, no TLS, rate limiting still
+a proxy's job, and `--max-conn-per-ip` is the one knob a proxy deployment
+has to raise or disable, since every client arrives from the proxy's
+address. What changed is the list of things that need the proxy: payload
+size, slow senders and the quadratic tokenizer have come off it.

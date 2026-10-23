@@ -51,13 +51,34 @@ Both Dockerfiles pin release v0.14.4. `Dockerfile.source` takes
 `--build-arg Q27_REF=<tag>` to build another release; the prebuilt
 `Dockerfile` takes `Q27_VERSION` plus the tarball's `Q27_SHA256` (from the
 release's `SHA256SUMS-<version>`) and refuses a tarball that does not
-match. Release tarballs exist for v0.3.1 and v0.14.2 through v0.14.4. The prebuilt
+match. Release tarballs exist for v0.3.1 and v0.14.2 through v0.14.7. The prebuilt
 image carries `q27`, `q27-server`, `q27-server-w8`, `q27-server-w16` and
 `q27-server-12g` (sm_86 only, the 8-12 GB Bonsai 2 build);
 `Dockerfile.source` builds and ships only `q27-server-w8`, so to use
 another target there, add it to the `make` line and the `COPY`. Both images
 were built and their binaries loaded on 2026-10-03 (v0.14.2); the v0.14.3
 and v0.14.4 bumps change only the pins.
+
+To build a newer release without touching the Dockerfiles, pass the pin on
+the command line (the sha256 is the tarball's line in the release's
+`SHA256SUMS-<version>`):
+
+```bash
+docker build -f Dockerfile.source --build-arg Q27_REF=v0.14.7 \
+  -t <you>/q27-serverless:v0.14.7 .
+docker build -f Dockerfile --build-arg Q27_VERSION=0.14.7 \
+  --build-arg Q27_SHA256=4e8dc9e6b30a1cf79407262487ba5ebd30e0ac4b5f02bbf1e3a52ad53be28a7b \
+  -t <you>/q27-serverless:v0.14.7 .
+```
+
+v0.14.5 through v0.14.7 are bug-hunt releases (request-surface 400s, the
+tokenizer's quadratic paths, dead-client cancellation, slow-connection
+limits, failed generations surfaced as errors, strict `Q27_*` parsing);
+the handler needs no change for them. One new limit is visible from here:
+the server refuses a peer address holding more than 64 connections
+(`--max-conn-per-ip`), and every job arrives over loopback, so a
+per-worker concurrency above that needs the flag raised in the handler's
+cmd.
 
 ## 3. Create the endpoint
 

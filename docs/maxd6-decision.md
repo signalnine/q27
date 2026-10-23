@@ -234,7 +234,9 @@ Checklist for d6 (`gate_maxd=6`, perm mod-7, verify width 7):
    at 4 today). Widening sampled to depth-6 = a second P12b-class change: `dr5`,
    `dr6`, `x1f`, `x1g`, `d_nuc` 5 -> 7 lanes (engine.cuh:290), and the
    `k_finish_sampled` src-select extended. Do not conflate the two.
-7. **P12b bisect recipe (for when d6 diverges).** `Q27_PMIN=100` forces width-2
+7. **P12b bisect recipe (for when d6 diverges).** `Q27_PMIN=1` forces width-2 (the strict
+   parser caps it at 1 since v0.14.7 and refuses the old `=100` at boot; a
+   margin of exactly 1.0 still passes, which 100 never did)
    (PASS = the narrow path is clean); `cap<=4` via a low theta forces width<=5
    (PASS narrows the blast radius to width-6/7 only); `Q27_FD=v1` rules attention
    in/out. A divergence that survives `Q27_FD=v1` and appears only at width>=7 is
