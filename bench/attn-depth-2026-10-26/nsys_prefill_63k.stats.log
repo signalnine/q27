@@ -1,0 +1,10 @@
+Generating SQLite file bench/attn-depth-2026-10-26/nsys_prefill_63k.sqlite from bench/attn-depth-2026-10-26/nsys_prefill_63k.nsys-rep
+Processing [bench/attn-depth-2026-10-26/nsys_prefill_63k.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_gpu_kern_sum.py] to [bench/attn-depth-2026-10-26/nsys_prefill_63k_cuda_gpu_kern_sum.csv]... PROCESSED
+
+
+NOTICE: Existing SQLite export found: bench/attn-depth-2026-10-26/nsys_prefill_63k.sqlite
+        It is assumed file was previously exported from: bench/attn-depth-2026-10-26/nsys_prefill_63k.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [bench/attn-depth-2026-10-26/nsys_prefill_63k.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_gpu_trace.py] to [bench/attn-depth-2026-10-26/nsys_prefill_63k_cuda_gpu_trace.csv]... PROCESSED
+

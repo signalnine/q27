@@ -1,0 +1,24 @@
+[kv_turbo3] boot 1: ok
+[kv_turbo3] depth 4096: ms/round 17.02 verify 0.00 draft 0.00 tok/round 2.54 prompt 4068.0
+[kv_turbo3] depth 4096: ms/round 17.05 verify 0.00 draft 0.00 tok/round 2.54 prompt 4068.0
+[kv_turbo3] depth 24576: ms/round 18.29 verify 0.00 draft 0.00 tok/round 2.55 prompt 24578.0
+[kv_turbo3] depth 45056: ms/round 19.53 verify 0.00 draft 0.00 tok/round 2.44 prompt 45286.0
+[kv_turbo3] depth 65536: ms/round 20.76 verify 0.00 draft 0.00 tok/round 2.28 prompt 65484.0
+[kv_turbo5k] boot 1: ok
+[kv_turbo5k] depth 4096: ms/round 17.05 verify 0.00 draft 0.00 tok/round 2.59 prompt 4068.0
+[kv_turbo5k] depth 4096: ms/round 17.05 verify 0.00 draft 0.00 tok/round 2.59 prompt 4068.0
+[kv_turbo5k] depth 24576: ms/round 19.28 verify 0.00 draft 0.00 tok/round 2.68 prompt 24578.0
+[kv_turbo5k] depth 45056: ms/round 21.51 verify 0.00 draft 0.00 tok/round 2.29 prompt 45286.0
+[kv_turbo5k] depth 65536: ms/round 23.70 verify 0.00 draft 0.00 tok/round 2.34 prompt 65484.0
+[kv_int8g64] boot 1: ok
+[kv_int8g64] depth 4096: ms/round 18.28 verify 0.00 draft 0.00 tok/round 2.61 prompt 4068.0
+[kv_int8g64] depth 4096: ms/round 18.28 verify 0.00 draft 0.00 tok/round 2.61 prompt 4068.0
+[kv_int8g64] depth 24576: ms/round 23.06 verify 0.00 draft 0.00 tok/round 2.94 prompt 24578.0
+[kv_int8g64] depth 45056: ms/round 28.31 verify 0.00 draft 0.00 tok/round 2.54 prompt 45286.0
+[kv_int8g64] depth 65536: ms/round 33.59 verify 0.00 draft 0.00 tok/round 2.43 prompt 65484.0
+[default_a] boot 1: ok
+[default_a] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[default_a] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[default_a] depth 24576: ms/round 17.33 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[default_a] depth 45056: ms/round 17.83 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[default_a] depth 65536: ms/round 18.33 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0

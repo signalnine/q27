@@ -1,0 +1,9 @@
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+uploading weights...
+resident: 17.00 GB (checksummed)
+wsum: b743d26b1f0562a9 hsum: 95e7da19c0d9b636
+token graph captured
+sample graph captured
+spec graphs captured (ONE set, M1b; depth-4; +split D/V; +per-width verify 2..5; +sampled per-width verify 2..maxd+1; +per-step draft 0..3); Q27_PMIN=0.000 (off), gate_maxd=4, dexit=1
+[gen] prompt=65484 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[gen-done] n_max: 32 tokens in 0.3s (103.9 t/s), n_max=32

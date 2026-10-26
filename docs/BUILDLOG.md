@@ -15714,6 +15714,75 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-26 (bj): attention at depth, priced -- the decode KV read runs at 77% of SOL and every smaller KV format is slower on the d2 verify; prefill attention runs at 71% of the fp8 tensor peak and equals the GEMM at 63K; no lever worth a campaign on Claude Code traffic
+
+Follow-up to (bi): where does the depth cost go, and can it be moved.
+
+**Decode (served d2, the (bi) ladder).** Round 16.8 -> 18.3 ms from 4K to 64K;
+the verify slope is 1.55 ms per 61K tokens = 16 full-attention layers x 2 KB
+per token of fp8 KV = 2.0 GB streamed per round at 1.3 TB/s = 77% of the
+1.69 TB/s measured SOL. Kernel headroom at 64K is therefore <= 0.35 ms/round
+(1.4% traffic-weighted). The only way to move it is fewer bytes, and q27 has
+three smaller KV formats (turbo3 13.4 KB/token, turbo5k 18.6, int8g64 25.6).
+Same ladder, same served config (`bench/attn-depth-2026-10-26/`, legs
+`kv_*`), ms/round vs fp8:
+
+| KV format | 4K | 24K | 45K | 64K | traffic-weighted |
+|---|---|---|---|---|---|
+| turbo3 (3-bit K+V) | +0.23 | +0.97 | +1.70 | +2.43 | +1.66 |
+| turbo5k (5-bit K + turbo3 V) | +0.24 | +1.95 | +3.68 | +5.38 | +3.59 |
+| int8g64 K + turbo3 V | +1.47 | +5.74 | +10.48 | +15.26 | +10.27 |
+
+Slower at every depth, and the slope is worse than fp8's: the in-tile expand
+to the e4m3 MMA operand costs more than the bytes save. Their cold prefill is
+20-52% slower too. The 07-11 "turbo3 now FASTER at 61K (+9.6%)" was the
+basin fork that entry itself flagged (rounds 101 vs 84); on ms/round turbo3
+is +2.4 ms there. **fp8 stays; the flip gate for turbo3 was not run (moot).**
+A dequant-free sub-8-bit operand path does not exist on sm_120 for a mixed
+e4m3 Q x fp4 K product, so decode attention at depth is at its floor short of
+attention sparsity, which is a model-level change.
+
+**Prefill (nsys, cold 65484-token `--pf`, fp8 KV, `Q27_PF_NOSERIAL=1`;
+134,878 kernels, 21.6 s of kernel time, 20.63 s wall = 3174 tok/s).** Per
+1024-token chunk by launch index (`nsys_chunks.py`):
+
+| chunk | depth | chunk ms | attention | GEMM | GDN | attention share |
+|---|---|---|---|---|---|---|
+| 1 | 0 | 229 | 2.5 | 176 | 32 | 1% |
+| 16 | 15K | 280 | 46 | 177 | 32 | 16% |
+| 32 | 32K | 322 | 87 | 177 | 32 | 27% |
+| 48 | 48K | 367 | 131 | 177 | 32 | 36% |
+| 63 | 63K | 401 | 171 | 177 | 32 | 43% |
+
+GEMM and GDN are flat with depth; attention per chunk = 4.2 ms + 2.63 ms per
+1K tokens of depth (linear to 63K). At 63K the attention kernel
+(`k_attn_prefill_mma_pv8`, 10.7 ms per launch, 16 launches) does 51 TFLOP in
+171 ms = **298 TFLOPS = 71% of the fp8 `mma.sync` fp32-accumulate dense peak
+(~419 on the 5090)**, register-bound to 1 CTA/SM (254 regs x 192 threads,
+the 07-07 starvation signature) and still at 71% of peak. Whole run: GEMM
+53%, attention 26%, GDN 10%, H2D 4%. On Claude Code traffic (warm turns of
+~800 tokens at 32-64K) attention is 2.63 x depth x T/1024 = 80-130 ms per
+turn against ~140 ms of GEMM; prefill is ~20% of engine time, so prefill
+attention is ~6% of engine time and a perfect kernel (1.4x) recovers <= 2%.
+
+**Levers, priced:** (1) kernel to peak, <= 1.4x on attention (the 07-07 plan's
+Task 4 longer tiles plus a register diet to 2 CTAs/SM): <= 2% engine, bitwise
+or tolerance-class depending on the tile; (2) fp4 MMA attention (mxf4nvf4 runs
+2x the fp8 rate on sm_120a, proven 08-14): <= 3% engine, numerics-class, flip
+gate decides; (3) windowed or sparse attention: model-level. **None clears a
+bar.** The larger prefill lever stays the GEMM (177 ms/chunk flat, ~40% of
+its vendor ceiling per (f) 09-08, W4A8 spike 1.26-1.41x in (h)); on decode
+the vgemm weight sweep (11.8 of the 14.2 ms verify at 4K) dwarfs attention.
+
+**Instrument notes.** ncu is blocked for non-root on driver 580.119.02
+(`ERR_NVGPUCTRPERM`; the 07-07 attribution predates the driver) -- unblocking
+is a modprobe option plus a module reload. nsys needs no counters; attribute
+by attention-launch index (16 per chunk) rather than by time window. The
+served depth ladder chains through in-process prefix hits (`hit=`), so each
+step prefills only the increment; a cold 64K prefill is 20.6 s on both the
+CLI and the server, and the (bi) `pf_ms` columns are ~20K new tokens per band
+(3.70K / 3.11K / 2.68K tok/s at 4-24K / 24-45K / 45-64K).
+
 ## 2026-10-26 (bi): per-depth dispatch sweep on the served DFlash2 binary -- the auto rules are the optimum at every production depth; every traffic-weighted alternative reads >= 0
 
 The idea under test: a per-shape table of measured implementation choices
