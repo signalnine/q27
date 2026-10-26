@@ -1,0 +1,65 @@
+profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=1 think=1 batch-gemm=auto(k>=3) sampler=temp=1.00/top_p=0.95/top_k=20/min_p=0.05
+loading tokenizer...
+loading model...
+tool dialect: xml (trained-format default) (general.name "Qwen38 27b Hf")
+uploading weights...
+resident: 17.00 GB (checksummed)
+wsum: b743d26b1f0562a9 hsum: 95e7da19c0d9b636
+vram: free 14.15 GB post-weights
+--ctx auto: 262144 (free 14.2GB post-weights, fp8 KV, W_MAX=12)
+[prefill] shared arena 0.85 GB (one per process)
+[pool] 1 slots, floor 0.57 GB (16384 rows x slots), pool 8.17 GB
+[pool] reserved 3.00 GB per slot for the DFlash2 drafter (3.00 GB over 1 slot, inside the fixed stacks above)
+[pool] paged KV: 8.17 GB (K 62358 pages x 65536 B, V 62358 pages x 65536 B)
+[pool] ctx 262144 -> 233472 (pool-entitlable window)
+KV cache: fp8 E4M3 (opt-in, 34 KB/token)
+token graph captured
+sample graph captured
+q27: Q27_PF_BATCH_MIN=2 < 32 -- tiny prompts take the CHUNKED prefill path; the 5-token canonical md5 does NOT hold here
+suffix drafter ON: L>=12, width 12 (greedy gated rounds only)
+spec graphs captured (ONE set, M1b; depth-4; mono D/V SKIPPED (dexit on, no --constrain-tools); +per-width verify 2..8; +sampled per-width verify 2..maxd+1; +per-step draft 0..6); Q27_PMIN=0.500 (gated), gate_maxd=7 (auto: ladder 4..7), dexit=1
+dflash2 serving ON: K=7 (width 8), ring 4096, head output_q4.weight, walk sampled
+slot 0 ready: ctx=233472
+vram: free 2.06 GB at ready
+interleave: round-granularity
+continuous batching: OFF (Q27_BATCH=0)
+no API key: loopback-only serving, Host header must name 127.0.0.1/localhost
+q27-server listening on http://127.0.0.1:18082 (ctx 233472, fast head)
+http: 23 worker threads, 1 slots
+wait diagnostics: [wait] lines after 5000 ms (Q27_WAIT_LOG_MS; 0 = off)
+[gen] prompt=4068 prefix_hit=0 snap=0 ckpt=-1 pfx=0
+[d2] ring align: keep 0 rows (lcp-capped 0, base 0, seq 0)
+[d2timing] 200 rounds: wall 16.60 = fold 0.00 + draft 2.35 + verify 14.02 + host 0.23 ms/round
+[d2timing] 400 rounds: wall 16.61 = fold 0.00 + draft 2.35 + verify 14.03 + host 0.22 ms/round
+[d2timing] 600 rounds: wall 16.62 = fold 0.00 + draft 2.35 + verify 14.04 + host 0.22 ms/round
+[gen-done] n_max: 1600 tokens in 10.4s (153.7 t/s), n_max=1600
+[sample-stats] T=1.000 top_p=0.950: 2.556 tokens/round (1600 tok/626 rounds)
+[req] rid=0 api=cmpl conv=175ddb3418344b0e qw_ms=0 tok_ms=3 prompt=4068 hit=0 ckpt=-1 pf=4068 pf_ms=997 dec=1600 dec_ms=10407 cb_ms=1 rounds=626 tps=153.7 end=n_max gw=0 yields=0 slot=0 t=12796 seed=0 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=214,172,106,43,41,21,8,21 glf=626,626,626,626,626,626,626 gla=412,240,134,91,50,29,21 phd=0.0 phv=0.0 phs=0 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=0.0 sfx=0,0
+[http] POST /v1/completions -> 200
+[gen] prompt=24578 prefix_hit=4067 snap=4067 ckpt=-1 pfx=0
+[d2] ring align: keep 2047 rows (lcp-capped 4067, base 4067, seq 5671)
+[d2timing] 800 rounds: wall 16.82 = fold 0.00 + draft 2.35 + verify 14.24 + host 0.22 ms/round
+[d2timing] 1000 rounds: wall 16.97 = fold 0.00 + draft 2.35 + verify 14.39 + host 0.22 ms/round
+[d2timing] 1200 rounds: wall 17.08 = fold 0.00 + draft 2.35 + verify 14.50 + host 0.22 ms/round
+[gen-done] n_max: 1600 tokens in 11.0s (145.8 t/s), n_max=1600
+[sample-stats] T=1.000 top_p=0.950: 2.564 tokens/round (1600 tok/624 rounds)
+[req] rid=1 api=cmpl conv=aee8f637d11f2fcd qw_ms=0 tok_ms=11 prompt=24578 hit=4067 ckpt=-1 pf=20511 pf_ms=5571 dec=1600 dec_ms=10973 cb_ms=0 rounds=624 tps=145.8 end=n_max gw=0 yields=0 slot=0 t=29356 seed=0 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=402,362,223,92,79,37,14,41 glf=1250,1250,1250,1250,1250,1250,1250 gla=848,486,263,171,92,55,41 phd=0.0 phv=0.0 phs=0 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=0.0 sfx=0,0
+[http] POST /v1/completions -> 200
+[gen] prompt=45286 prefix_hit=24577 snap=24577 ckpt=-1 pfx=0
+[d2] ring align: keep 2047 rows (lcp-capped 24577, base 24577, seq 26181)
+[d2timing] 1400 rounds: wall 17.25 = fold 0.00 + draft 2.35 + verify 14.67 + host 0.22 ms/round
+[d2timing] 1600 rounds: wall 17.41 = fold 0.00 + draft 2.35 + verify 14.83 + host 0.22 ms/round
+[d2timing] 1800 rounds: wall 17.54 = fold 0.00 + draft 2.35 + verify 14.96 + host 0.22 ms/round
+[gen-done] n_max: 1600 tokens in 11.5s (138.9 t/s), n_max=1600
+[sample-stats] T=1.000 top_p=0.950: 2.576 tokens/round (1600 tok/621 rounds)
+[req] rid=2 api=cmpl conv=e63b7e44b0671655 qw_ms=0 tok_ms=16 prompt=45286 hit=24577 ckpt=-1 pf=20709 pf_ms=6711 dec=1600 dec_ms=11521 cb_ms=1 rounds=621 tps=138.9 end=n_max gw=0 yields=0 slot=0 t=47609 seed=0 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=609,541,307,152,119,59,30,54 glf=1871,1871,1871,1871,1871,1871,1871 gla=1262,721,414,262,143,84,54 phd=0.0 phv=0.0 phs=0 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=0.0 sfx=0,0
+[http] POST /v1/completions -> 200
+[gen] prompt=65484 prefix_hit=45285 snap=45285 ckpt=-1 pfx=0
+[d2] ring align: keep 2047 rows (lcp-capped 45285, base 45285, seq 46891)
+[d2timing] 2000 rounds: wall 17.70 = fold 0.00 + draft 2.35 + verify 15.12 + host 0.22 ms/round
+[d2timing] 2200 rounds: wall 17.86 = fold 0.00 + draft 2.35 + verify 15.28 + host 0.22 ms/round
+[d2timing] 2400 rounds: wall 18.00 = fold 0.00 + draft 2.35 + verify 15.42 + host 0.22 ms/round
+[gen-done] n_max: 1600 tokens in 12.9s (123.8 t/s), n_max=1600
+[sample-stats] T=1.000 top_p=0.950: 2.413 tokens/round (1600 tok/663 rounds)
+[req] rid=3 api=cmpl conv=745dcee098dd04b qw_ms=0 tok_ms=21 prompt=65484 hit=45285 ckpt=-1 pf=20199 pf_ms=7586 dec=1600 dec_ms=12929 cb_ms=1 rounds=663 tps=123.8 end=n_max gw=0 yields=0 slot=0 t=68156 seed=0 md4=0 md5=0 md6=0 md7=0 mprom=0 mdem=0 gch=0,0,0,0,0,0,0,0 gnh=844,723,423,216,146,76,40,66 glf=2534,2534,2534,2534,2534,2534,2534 gla=1690,967,544,328,182,106,66 phd=0.0 phv=0.0 phs=0 phwn=0,0,0,0,0,0,0 phwm=0.0,0.0,0.0,0.0,0.0,0.0,0.0 sfxm=0.0 sfxn=0 phfd=0.0 sfx=0,0
+[http] POST /v1/completions -> 200

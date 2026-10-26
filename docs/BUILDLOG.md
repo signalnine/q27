@@ -15714,6 +15714,82 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-10-26 (bi): per-depth dispatch sweep on the served DFlash2 binary -- the auto rules are the optimum at every production depth; every traffic-weighted alternative reads >= 0
+
+The idea under test: a per-shape table of measured implementation choices
+behind one interface, instead of global thresholds. q27's equivalent is a
+handful of hand-set dispatch knobs, each picked once on one measurement; this
+entry measures them per depth against the traffic that actually runs.
+
+**Instrument** (`bench/shape-sweep-2026-10-26/`, `sweep_driver.py`, `analyze.py`,
+raw `results.jsonl` + `journal_<leg>.log`): one scratch `systemd-run` unit per
+knob value (the knobs are process-wide statics) with the production d2 env
+(fp8 KV, DFlash2 Q8 pack, `Q27_BATCH=0`, no prefix cache) on 127.0.0.1:18082;
+four prompts = BUILDLOG prefixes cut to 4068 / 24578 / 45286 / 65484 tokens,
+`max_tokens` 1600, one `[req]` line per request. Judged on `dec_ms/rounds`
+only; verify/draft from DIFFERENCED `[d2timing]` 200-round windows kept when
+>= 90% inside one request (`phd/phv/phfd` read 0 under DFlash2 -- ladder-only
+brackets). Every load wsum-gated: 2 of 16 loads came up one bit off
+`b743d26b1f0562a9` and were torn down. Traffic weights = the 09-10 Claude Code
+campaign's decode-time share by prompt depth (322 requests, decode 80% of
+engine time): 4K 4%, 24K 16%, 45K 60%, 64K 19%. The CLI `build/q27 --dflash2`
+path is the P1c eager bring-up loop, not the served round -- it was NOT used.
+
+**Controls.** default a/b/c interleaved across the run: band half-width
+<= 0.04 ms/round at every depth (b, c, ns85 and ds1/2/4 are identical to
+0.01 ms -- seed-0 trajectories on graph replay). ns85 = the explicit auto
+value = default (null rung). ds1/2/4 decode rows = default (prefill-only
+knob, null rung). `Q27_D2_VGEMM=0` (the incumbent-known answer from (c)
+09-08): +1.44 / +1.49 / +1.59 / +1.62 ms/round, verify +1.4..+1.5 --
+reproduced.
+
+**ms/round, delta vs the default mean (negative = faster):**
+
+| leg | 4K | 24K | 45K | 64K | traffic-weighted |
+|---|---|---|---|---|---|
+| default mean | 16.78 | 17.31 | 17.81 | 18.30 | -- |
+| `Q27_FDMMA_NS=16` | -0.07 | +1.40 | +2.94 | +4.44 | +2.86 |
+| `=32` | -0.23 | +0.25 | +0.76 | +1.29 | +0.74 |
+| `=43` | -0.16 | +0.27 | +0.74 | +1.20 | +0.72 |
+| `=64` | -0.12 | +0.00 | +0.18 | +0.34 | +0.17 |
+| `=85` (= auto) | +0.03 | +0.01 | +0.01 | +0.02 | +0.01 |
+| `=128` (FD_MAXNS) | +0.35 | +0.42 | +0.58 | +0.72 | +0.57 |
+| `Q27_FDMMA_STAGES=2` | +0.08 | +0.17 | +0.24 | +0.36 | +0.24 |
+| `Q27_D2_VGEMM=0` | +1.44 | +1.49 | +1.59 | +1.62 | +1.57 |
+| `Q27_DS_SPLIT=1/2/4` | +0.03 | +0.01 | +0.02 | +0.02 | +0.02 |
+
+**Prefill (cold, 1024-chunks), pf_ms:** default 1002 / 5580 / 6714 / 7591;
+ds1 1003 / 5586 / 6716 / 7592; ds2 1004 / 5581 / 6716 / 7593; ds4 1002 /
+5582 / 6718 / 7593 -- within 0.1% at every depth. The delta split count is
+dead weight on the 1024-chunk path (the "26K 15.02 -> 13.48 s" figure in
+`delta_scan_nsplit`'s comment predates the current prefill, which does 64K in
+7.6 s). Prefill throughput 4.12K -> 2.66K tok/s from 4K to 64K: attention at
+depth is 35% of the prefill wall at 64K, the only prefill-side shape lever
+left, and `Q27_PF_SPLIT` was already swept in (n) 09-08.
+
+**Round anatomy under auto:** 16.8 / 17.3 / 17.8 / 18.3 ms = draft 2.36 +
+verify 14.2 / 14.7 / 15.2 / 15.75 + host 0.22. The verify's depth slope is
+1.5 ms per 60K tokens under auto vs 6 ms under ns16.
+
+**Why 85 wins and 32 wins at 4K:** `fdmma_ns = SMs x 2 CTAs / n_kv_heads`
+= 85 on the 5090 is exactly one wave; 128 is 1.5 waves (a partial second
+wave), 64 and below leave SMs idle once the KV is deep. At 4K the attention
+is small enough that 32 splits save 0.23 ms, worth 0.01 ms traffic-weighted,
+and NS changes the partial-combine order (not bitwise, trajectories fork):
+NO-GO for a depth-dependent rule. A finer probe (72 / 96 / 112) would land
+between the measured points and was not run.
+
+**Verdict: no dispatch change.** The knobs matter (ns16 costs 24% at 64K);
+they are already set where the 07-10 and 09-08 measurements put them, and
+the sweep's value is that it now says so per depth with a 0.04 ms band and a
+reproduced control. Scope limit: cold full prefills + solo decode at K=7
+(W=8), BUILDLOG text (tok/round 2.2-3.1, below Claude Code's 4.1-4.5;
+ms/round is width-fixed so unaffected). NOT covered: warm small turns
+(T 36-64 chunks need the prefix cache + `bench/ladder/drive_warm_turn.py`),
+the GEMV CTA compile-time tiers (ladder/batch path only), DFlash2 K per depth
+(stays with (q) 09-08). The driver takes legs by name; a new knob is one
+dict entry.
+
 ## 2026-10-22 (bh): sixth bug hunt -- a request-read-deadline + per-peer connection cap, failed generations no longer reported as finished answers, a dropped second tool call on the stream legs, a 500 on short prompts for no-MTP packs, and strict environment-knob parsing
 
 Four read-only reviews over the surfaces no earlier hunt had read (response

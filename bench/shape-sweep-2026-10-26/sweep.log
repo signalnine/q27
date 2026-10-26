@@ -1,0 +1,72 @@
+[default_a] boot 1: wsum b745d26b1f0562a9
+[default_a] boot 2: ok
+[default_a] depth 4096: ms/round 16.74 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[default_a] depth 24576: ms/round 17.29 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[default_a] depth 45056: ms/round 17.78 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[default_a] depth 65536: ms/round 18.25 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[ns16] boot 1: ok
+[ns16] depth 4096: ms/round 16.71 verify 0.00 draft 0.00 tok/round 2.67 prompt 4068.0
+[ns16] depth 24576: ms/round 18.71 verify 0.00 draft 0.00 tok/round 2.72 prompt 24578.0
+[ns16] depth 45056: ms/round 20.75 verify 0.00 draft 0.00 tok/round 2.26 prompt 45286.0
+[ns16] depth 65536: ms/round 22.74 verify 0.00 draft 0.00 tok/round 2.50 prompt 65484.0
+[ns32] boot 1: ok
+[ns32] depth 4096: ms/round 16.56 verify 0.00 draft 0.00 tok/round 2.64 prompt 4068.0
+[ns32] depth 24576: ms/round 17.56 verify 0.00 draft 0.00 tok/round 2.63 prompt 24578.0
+[ns32] depth 45056: ms/round 18.57 verify 0.00 draft 0.00 tok/round 2.41 prompt 45286.0
+[ns32] depth 65536: ms/round 19.59 verify 0.00 draft 0.00 tok/round 2.41 prompt 65484.0
+[ns43] boot 1: ok
+[ns43] depth 4096: ms/round 16.62 verify 0.00 draft 0.00 tok/round 2.56 prompt 4068.0
+[ns43] depth 24576: ms/round 17.58 verify 0.00 draft 0.00 tok/round 2.56 prompt 24578.0
+[ns43] depth 45056: ms/round 18.55 verify 0.00 draft 0.00 tok/round 2.58 prompt 45286.0
+[ns43] depth 65536: ms/round 19.50 verify 0.00 draft 0.00 tok/round 2.41 prompt 65484.0
+[ns64] boot 1: wsum b735d26b1f0562a9
+[ns64] boot 2: ok
+[ns64] depth 4096: ms/round 16.66 verify 0.00 draft 0.00 tok/round 2.86 prompt 4068.0
+[ns64] depth 24576: ms/round 17.31 verify 0.00 draft 0.00 tok/round 2.83 prompt 24578.0
+[ns64] depth 45056: ms/round 17.99 verify 0.00 draft 0.00 tok/round 2.36 prompt 45286.0
+[ns64] depth 65536: ms/round 18.64 verify 0.00 draft 0.00 tok/round 2.37 prompt 65484.0
+[default_b] boot 1: ok
+[default_b] depth 4096: ms/round 16.80 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[default_b] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[default_b] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[default_b] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[ns85] boot 1: ok
+[ns85] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[ns85] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[ns85] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[ns85] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[ns128] boot 1: ok
+[ns128] depth 4096: ms/round 17.13 verify 0.00 draft 0.00 tok/round 2.68 prompt 4068.0
+[ns128] depth 24576: ms/round 17.73 verify 0.00 draft 0.00 tok/round 2.40 prompt 24578.0
+[ns128] depth 45056: ms/round 18.39 verify 0.00 draft 0.00 tok/round 2.61 prompt 45286.0
+[ns128] depth 65536: ms/round 19.02 verify 0.00 draft 0.00 tok/round 2.46 prompt 65484.0
+[stages2] boot 1: ok
+[stages2] depth 4096: ms/round 16.86 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[stages2] depth 24576: ms/round 17.48 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[stages2] depth 45056: ms/round 18.05 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[stages2] depth 65536: ms/round 18.66 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[vgemm0] boot 1: ok
+[vgemm0] depth 4096: ms/round 18.22 verify 0.00 draft 0.00 tok/round 2.84 prompt 4068.0
+[vgemm0] depth 24576: ms/round 18.80 verify 0.00 draft 0.00 tok/round 2.31 prompt 24578.0
+[vgemm0] depth 45056: ms/round 19.39 verify 0.00 draft 0.00 tok/round 2.48 prompt 45286.0
+[vgemm0] depth 65536: ms/round 19.92 verify 0.00 draft 0.00 tok/round 2.60 prompt 65484.0
+[ds1] boot 1: ok
+[ds1] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[ds1] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[ds1] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[ds1] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[ds2] boot 1: ok
+[ds2] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[ds2] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[ds2] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[ds2] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[ds4] boot 1: ok
+[ds4] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[ds4] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[ds4] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[ds4] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
+[default_c] boot 1: ok
+[default_c] depth 4096: ms/round 16.81 verify 0.00 draft 0.00 tok/round 2.65 prompt 4068.0
+[default_c] depth 24576: ms/round 17.32 verify 0.00 draft 0.00 tok/round 3.09 prompt 24578.0
+[default_c] depth 45056: ms/round 17.82 verify 0.00 draft 0.00 tok/round 2.42 prompt 45286.0
+[default_c] depth 65536: ms/round 18.32 verify 0.00 draft 0.00 tok/round 2.22 prompt 65484.0
