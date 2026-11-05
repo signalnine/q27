@@ -297,7 +297,7 @@ One binary serves Claude Code, Codex, and OpenAI clients on a 5090 with a
 DFlash2 block drafter (K=7, MMA verify) as the production decode path, a
 persistent prefix cache that hits on real agentic traffic, and a tool-call
 parser measured against a labelled corpus of the model's own drift. Current
-release: [v0.14.7](https://github.com/signalnine/q27/releases).
+release: [v0.14.8](https://github.com/signalnine/q27/releases).
 
 Headline numbers, each dated in the BUILDLOG and in the campaign READMEs
 under [bench/crossengine/](bench/crossengine/):
@@ -495,18 +495,22 @@ fuzzing under ASan+UBSan (`make fuzz`, millions of inputs clean), per-shape
 adversarial tests, and a replayed drift corpus (below) that gates parser
 changes.
 
-Six bug hunts since 2026-10-01 (BUILDLOG (az), (ba), (be), (bf), (bg),
-(bh)) widened that from the parser to the whole serving path. Each hunt is
+Seven bug hunts since 2026-10-01 (BUILDLOG (az), (ba), (be), (bf), (bg),
+(bh), (bk)) widened that from the parser to the whole serving path. Each hunt is
 a set of read-only reviews over surfaces no earlier hunt had read plus a
 live probe set against the production config, and each shipped as a
-release, v0.14.2 through v0.14.7. The last two hardened the HTTP front:
+release, v0.14.2 through v0.14.8. Two hardened the HTTP front:
 v0.14.6 closed three quadratic paths in request text, a marker-strip bypass
 that could forge a role boundary, a key bypass on `/health?verify`, and
 requests still served to clients that had left; v0.14.7 added a
 request-read deadline and a per-address connection cap, browser guards (a
 form-content-type POST is a 415, a foreign `Host` on a keyless loopback
 bind is a 403), failed generations surfaced as errors on every API, and
-strict parsing of the `Q27_*` knobs. The posture, the limits and what stays
+strict parsing of the `Q27_*` knobs. v0.14.8 treated the model files
+themselves as untrusted input: a short `.tok` is refused (it caused a heap
+over-read under `--constrain-tools`), added-token matching is one linear
+pass, and the `.pf4`/`.q4x` prefill sidecars are checked against their
+base tensors. The posture, the limits and what stays
 open are in [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Serving
