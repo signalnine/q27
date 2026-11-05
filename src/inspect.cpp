@@ -51,8 +51,11 @@ int main(int argc, char** argv) {
         printf("  %-32s %-8s [", t->name.c_str(), q27::dtype_name(t->dtype));
         for (size_t i = 0; i < t->shape.size(); i++)
             printf("%s%" PRIu64, i ? ", " : "", t->shape[i]);
-        printf("]  first bytes: %02x %02x %02x %02x\n",
-               t->data[0], t->data[1], t->data[2], t->data[3]);
+        // data_size can be < 4 (a zero-element tensor sits at the end of the
+        // file): print only the bytes the tensor owns (bug hunt 2026-11-05)
+        printf("]  first bytes:");
+        for (uint64_t b = 0; b < t->data_size && b < 4; b++) printf(" %02x", t->data[b]);
+        printf("\n");
     }
 
     printf("\n%s\n", bad ? "FAILED" : "OK");

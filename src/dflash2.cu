@@ -522,8 +522,10 @@ void Dflash2::load(const char* path) {
         int64_t nel = 1;
         for (int d = 0; d < ndim; d++) {
             if (dims[d] < 1 || dims[d] > ((int64_t)1 << 31)) d2_die(name + ": bad dim " + std::to_string(dims[d]));
+            // check BEFORE multiplying: 2^40 * 2^31 overflows int64 (signed-overflow
+            // UB; in practice it wrapped to 0 and passed -- bug hunt 2026-11-05)
+            if (nel > (((int64_t)1 << 40) / dims[d])) d2_die(name + ": too many elements");
             nel *= dims[d];
-            if (nel > ((int64_t)1 << 40)) d2_die(name + ": too many elements");
         }
         dims_of[name].assign(dims, dims + ndim);
         int64_t nbytes = 0;

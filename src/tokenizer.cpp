@@ -50,6 +50,89 @@ static void build_byte_maps(std::string b2u[256], std::unordered_map<std::string
 static std::atomic<int> tokenizer_live_impls{0};
 #endif
 
+// Added-token matcher (bug hunt 2026-11-05). encode() needs, at each position,
+// the LONGEST added token starting there, and the next position where any
+// starts. The per-special scan this replaces cost O(specials) per position: a
+// .tok with 200k added tokens took 12 s to encode a 70 KB prompt. This is
+// Aho-Corasick over the REVERSED tokens, run over the text right to left: the
+// automaton's state after reading text[p] is the longest reversed-token prefix
+// that ends the reversed text so far, so the longest token that is one of its
+// suffixes is exactly the longest token STARTING at p. One linear pass yields
+// every (position, longest match) pair; the walk in encode() is unchanged.
+struct SpecialMatcher {
+    struct Match { size_t pos; uint32_t len; int id; };
+    std::unordered_map<uint64_t, int> edge;  // (node << 8) | byte -> child
+    std::vector<int> fail, best_len, best_id; // per node; best_* = longest token suffix
+    std::array<bool, 256> root_edge{};
+
+    int child(int node, uint8_t c) const {
+        auto it = edge.find(((uint64_t)node << 8) | c);
+        return it == edge.end() ? -1 : it->second;
+    }
+    int step(int s, uint8_t c) const {
+        for (;;) {
+            const int nx = child(s, c);
+            if (nx >= 0) return nx;
+            if (s == 0) return 0;
+            s = fail[s];
+        }
+    }
+    void build(const std::vector<std::pair<std::string, int>>& tokens) {
+        std::vector<int> depth{0}, term{-1};
+        std::vector<std::vector<std::pair<uint8_t, int>>> kids(1);
+        for (const auto& [tok, id] : tokens) {
+            if (tok.empty()) continue;
+            int s = 0;
+            for (size_t k = tok.size(); k-- > 0;) {
+                const uint8_t c = (uint8_t)tok[k];
+                int nx = child(s, c);
+                if (nx < 0) {
+                    nx = (int)depth.size();
+                    depth.push_back(depth[s] + 1);
+                    term.push_back(-1);
+                    kids.emplace_back();
+                    kids[s].push_back({c, nx});
+                    edge.emplace(((uint64_t)s << 8) | c, nx);
+                    if (s == 0) root_edge[c] = true;
+                }
+                s = nx;
+            }
+            // duplicate strings: the lowest id wins, as tok2id's emplace does
+            if (term[s] < 0 || id < term[s]) term[s] = id;
+        }
+        const size_t n = depth.size();
+        fail.assign(n, 0);
+        best_len.assign(n, 0);
+        best_id.assign(n, -1);
+        std::vector<int> order{0};
+        for (size_t h = 0; h < order.size(); h++) {  // BFS: fail[] is always shallower
+            const int u = order[h];
+            if (u) {
+                if (term[u] >= 0) { best_len[u] = depth[u]; best_id[u] = term[u]; }
+                else { best_len[u] = best_len[fail[u]]; best_id[u] = best_id[fail[u]]; }
+            }
+            for (const auto& [c, v] : kids[u]) {
+                fail[v] = u == 0 ? 0 : step(fail[u], c);
+                order.push_back(v);
+            }
+        }
+    }
+    // every position with an added token starting there, ascending
+    std::vector<Match> find_all(const std::string& text) const {
+        std::vector<Match> out;
+        if (best_len.size() <= 1) return out;
+        int s = 0;
+        for (size_t p = text.size(); p-- > 0;) {
+            const uint8_t c = (uint8_t)text[p];
+            if (s == 0 && !root_edge[c]) continue;
+            s = step(s, c);
+            if (best_len[s]) out.push_back({p, (uint32_t)best_len[s], best_id[s]});
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+};
+
 struct Tokenizer::Impl {
 #ifdef Q27_TOKENIZER_TESTING
     Impl() { tokenizer_live_impls.fetch_add(1, std::memory_order_relaxed); }
@@ -60,6 +143,7 @@ struct Tokenizer::Impl {
     std::string b2u[256];
     std::unordered_map<std::string, uint8_t> u2b;
     std::vector<std::pair<std::string, int>> specials; // control tokens, longest first
+    SpecialMatcher special_matcher;                    // built from specials
     uint64_t id = 0;                                   // BpeCache owner key
 };
 
@@ -134,6 +218,7 @@ Tokenizer::Tokenizer(const std::string& path) : impl_(std::make_unique<Impl>()) 
     // longest-first for greedy matching
     std::sort(impl_->specials.begin(), impl_->specials.end(),
               [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
+    impl_->special_matcher.build(impl_->specials);
 }
 
 // split a UTF-8 string into unicode chars (as utf8 substrings)
@@ -532,36 +617,22 @@ Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> out;
-    size_t i = 0;
-    // Next occurrence of each special at or after i, refreshed only once i
-    // has passed it: every special is searched at most once per occurrence.
-    // Bug hunt 2026-10-19: the per-span rescan of every special (most of which
-    // never occur, so each find ran to the end) was O(spans x specials x text)
-    // -- 146 KB of "x<think>" took 17 s, reachable from any request text.
-    const size_t ns = impl_->specials.size();
-    std::vector<size_t> nxt(ns, 0);
-    bool nxt_valid = false;
+    // Greedy added-token matching: at i, the longest added token starting
+    // there; otherwise the plain span up to the next position where any
+    // starts. Bug hunt 2026-10-19 removed the per-span rescan of every
+    // special (146 KB of "x<think>" took 17 s); bug hunt 2026-11-05 removed
+    // the remaining O(specials) per-position scan (SpecialMatcher above).
+    const std::vector<SpecialMatcher::Match> ms = impl_->special_matcher.find_all(text);
+    size_t i = 0, mi = 0;
     while (i < text.size()) {
-        // greedy special-token match
-        bool matched = false;
-        for (auto& [s, id] : impl_->specials) {
-            if (text.compare(i, s.size(), s) == 0) {
-                out.push_back(id);
-                i += s.size();
-                matched = true;
-                break;
-            }
+        while (mi < ms.size() && ms[mi].pos < i) mi++;  // starts inside a taken token
+        if (mi < ms.size() && ms[mi].pos == i) {
+            out.push_back(ms[mi].id);
+            i += ms[mi].len;
+            mi++;
+            continue;
         }
-        if (matched) continue;
-        // find next special occurrence; encode the plain span before it
-        size_t next = std::string::npos;
-        for (size_t k = 0; k < ns; k++) {
-            if (!nxt_valid || (nxt[k] != std::string::npos && nxt[k] < i))
-                nxt[k] = text.find(impl_->specials[k].first, i);
-            if (nxt[k] < next) next = nxt[k];
-        }
-        nxt_valid = true;
-        size_t end = next == std::string::npos ? text.size() : next;
+        const size_t end = mi < ms.size() ? ms[mi].pos : text.size();
         const std::string span = nfc(text.substr(i, end - i));
         for (auto& w : pretokenize(span)) {
             auto ids = bpe_word(w);

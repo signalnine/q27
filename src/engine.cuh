@@ -316,6 +316,31 @@ static inline void validate_tensor_manifest(const q27::Model& m, const bool* att
         layer_set(N_LAYER, kTAttn, sizeof kTAttn / sizeof *kTAttn);
         layer_set(N_LAYER, kTMtp, sizeof kTMtp / sizeof *kTMtp);
     }
+    // Prefill sidecars (bug hunt 2026-11-05). "<base>.pf4" (Q27_PREFILL=fp4,
+    // mmT_pf4) and "<base>.q4x" (Q27_T2_PF_SHADOW=1, TP) REPLACE their base in
+    // the prefill GEMM, which takes rows/cols/dtype from the sidecar and
+    // writes into buffers sized for the base. Nothing above names them, so a
+    // sidecar wider than its base, or of another dtype, was an out-of-bounds
+    // device read/write. Each must shadow a manifest tensor exactly: same
+    // shape, the one dtype its consumer reads (repack.py writes FP4_G16 for
+    // .pf4 and the exact-Q4 shadow as Q4_G64 for .q4x).
+    for (const q27::Tensor& t : m.tensors) {
+        const size_t n = t.name.size();
+        const bool pf4 = n > 4 && t.name.compare(n - 4, 4, ".pf4") == 0;
+        const bool q4x = n > 4 && t.name.compare(n - 4, 4, ".q4x") == 0;
+        if (!pf4 && !q4x) continue;
+        const q27::DType want = pf4 ? q27::DType::FP4_G16 : q27::DType::Q4_G64;
+        const q27::Tensor* base = m.find(t.name.substr(0, n - 4));
+        if (!base)
+            bad.push_back(t.name + ": sidecar without its base tensor");
+        else if (base->shape != t.shape)
+            bad.push_back(t.name + ": sidecar shape differs from its base");
+        else if (base->dtype == q27::DType::F32 || base->dtype == q27::DType::FP4_G16)
+            bad.push_back(t.name + ": sidecar of a tensor that is not a weight");
+        if (t.dtype != want)
+            bad.push_back(t.name + ": dtype " + q27::dtype_name(t.dtype) + ", sidecar must be " +
+                          q27::dtype_name(want));
+    }
 
     if (bad.empty()) return;
     fprintf(stderr, "q27: model tensor manifest does not match this build (%zu problem%s):\n",
