@@ -15714,6 +15714,74 @@ Remaining (optional): server flag Q27_DFLASH2 for live-CC + the suffix
 composition A/B; and the ~2 ms eager drafter tail (graphing needs a
 device-indexed embedding). Commit chain adds fbb19b6 (P4).
 
+## 2026-11-05 (bk): seventh bug hunt, loader lane -- model files as untrusted input: a heap over-read from a short .tok under --constrain-tools, a per-request CPU DoS from a .tok with many added tokens, unvalidated prefill sidecars, and two small parser fixes
+
+Users download .q27 packs and .tok files and load them into a process that
+also listens on HTTP, so the file parsers are attack surface. No earlier hunt
+had fuzzed the C++ loaders. Read in full: loader.cpp/.h, the .tok load path
+in tokenizer.cpp, inspect.cpp, Dflash2::load, plus every host/device consumer
+of tensor shapes (validate_arch, the tensor manifest, device_model upload,
+draft_vocab_plan, the bonsai2 hadamard checks).
+
+**Fixed:**
+- **Short .tok -> host heap over-read (`--constrain-tools`).** server.cu only
+  rejected `tok.vocab_size() > VOCAB`. The tool-mask cache sizes its host
+  bitsets from the tokenizer, and `mask_pool_add` copies `(VOCAB+31)/32`
+  words from them, so a 633-token .tok read 31,040 bytes past an 80-byte heap
+  block per mask (ASan repro on a CPU mirror of the path). The gate is `!=`
+  now, as the Metal server has always required. All six .tok files on disk
+  have 248,320 tokens.
+- **Added-token matching was O(specials) per position.** A .tok with 200k
+  added tokens took 11.9 s to encode a 70 KB prompt, reachable from any
+  request. encode() now runs reversed-pattern Aho-Corasick once per call
+  (the longest added token starting at each position, one linear pass): 7 MB
+  in 0.07 s on that file, and the "specials with text" self-test 4.6 -> 1.4
+  ms. Encodings are identical to the old matcher: diffed on the Qwen3.8 .tok
+  and four synthetic vocabs over 4,000 texts, five overlapping/nested
+  vocabs over 3,000 more; test_tokenizer passes.
+- **Prefill sidecars were never validated.** `<base>.pf4` (Q27_PREFILL=fp4)
+  and `<base>.q4x` (Q27_T2_PF_SHADOW=1) replace their base in the prefill
+  GEMM with their own rows/cols/dtype, and the manifest never named them: a
+  wider or wrong-dtype sidecar was an out-of-bounds device read/write. The
+  manifest now requires the base to exist and be a weight, the same shape,
+  and FP4_G16 / Q4_G64. All 637 sidecars in the three shipped sidecar packs
+  pass.
+- **DFlash2 pack element count** was bounded after the multiply, so dims like
+  [2^20, 2^20, 2^31] overflowed int64 (UB; in practice wrapped to 0 and
+  passed). Checked before multiplying now. Benign before: the manifest wants
+  exact dims for every tensor it reads.
+- **inspect** printed `data[0..3]` of a zero-size tensor at end of file (OOB
+  read; on the real mmap it printed 4 bytes of the neighbouring mapping).
+  It prints at most `data_size` bytes.
+
+**Clean:** the .q27 container -- header sizes against the remaining bytes,
+the tensor-table lower bound, every cursor read, overflow-safe shape
+products and offset+size checks, 256-byte alignment, scales-iff-size, exact
+dtype/shape-to-bytes payloads, the T2/T3 code checks; host upload and
+checksums use data_size; the .tok reads (exact, bounded by file size, empty
+added tokens skipped; out-of-range bos/eos are only compared); Dflash2::load's
+take/pad64 bounds, dtype/ndim/name limits, byte-size equality, trailing-byte
+check and manifest. A .tok declaring 2^32 tokens only reserves lazily and is
+rejected as truncated.
+
+**Fuzzing (ASan+UBSan, CPU):** .q27 loader ~89.8M libFuzzer execs (mmap
+swapped for an exact-size heap copy so over-reads trap), .tok ~7.7M, the
+fixed tokenizer another ~3.3M, Dflash2::load (extracted, CUDA stubbed)
+~20.8M, 2,400 mutated loads of the real .tok. No memory-safety finding
+beyond the above.
+
+**Found, not fixed:** load failures in server main are uncaught exceptions
+(abort with the message, not a clean exit).
+
+**Gates:** `make test-tools test-inspect test-repack corpus-check` 0 FAIL
+(extract_check byte-identical, corpus 165/165); test_tokenizer and
+test_loader_contracts under ASan/UBSan clean; `fuzz-gcc` 60,000 iterations
+clean; the three sm_120 canonicals on the rebuilt CLI equal the published
+values (default 8cf639c2..., q4s 10e654eb..., 1500-token 8f735a13; wsum
+b743d26b1f0562a9); live on the 5090: the 633-token .tok is refused at boot,
+qwen38 + --constrain-tools serves a grammar-locked tool call, and the qwen36
+q4s-pf4 pack boots past the new sidecar rule with Q27_PREFILL=fp4 and serves.
+
 ## 2026-10-26 (bj): attention at depth, priced -- the decode KV read runs at 77% of SOL and every smaller KV format is slower on the d2 verify; prefill attention runs at 71% of the fp8 tensor peak and equals the GEMM at 63K; no lever worth a campaign on Claude Code traffic
 
 Follow-up to (bi): where does the depth cost go, and can it be moved.

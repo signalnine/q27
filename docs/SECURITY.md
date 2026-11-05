@@ -182,6 +182,7 @@ as a release. The receipts are the BUILDLOG entries.
 | 2026-10-10 | (bf) | v0.14.5 | request semantics against a live server (`max_tokens`/`n` 400s, Responses dialect, image placeholders), a sampler barrier race, the cache key by drafter mode |
 | 2026-10-19 | (bg) | v0.14.6 | three quadratic paths in request text, the marker-strip bypass that forged role boundaries, the `/health?verify` key bypass, dead clients still served |
 | 2026-10-22 | (bh) | v0.14.7 | the request-read deadline and per-address cap, failed generations reported as finished, a dropped second tool call on the stream legs, a 500 on short prompts for no-MTP packs, strict knob parsing |
+| 2026-11-05 | (bk) | v0.14.8 | model files as untrusted input: a heap over-read from a short `.tok` under `--constrain-tools`, an O(added tokens) encode, unvalidated `.pf4`/`.q4x` prefill sidecars |
 
 Still open from the hunts, listed under the README's open items: stream
 vs non-stream divergence for two reasoning shapes, no SIGTERM drain, the
